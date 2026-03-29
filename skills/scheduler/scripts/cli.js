@@ -18,7 +18,8 @@ function escapeLike(str) {
 
 const ALLOWED_UPDATE_COLUMNS = new Set([
   'name', 'prompt', 'priority', 'require_idle', 'reply_channel', 'reply_endpoint',
-  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at'
+  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at',
+  'target_instance'
 ]);
 
 const HELP = `
@@ -49,6 +50,7 @@ Add Options:
   --reply-channel "<source>"      Reply channel (e.g., "telegram", "lark")
   --reply-endpoint "<endpoint>"  Reply endpoint (e.g., "8101553026", "chat_id topic_id")
   --miss-threshold <seconds>  Skip if overdue by more than this (default=300)
+  --target-instance "<id>"  Target a specific Claude instance (multi-session)
 
 Update Options (same as Add, plus):
   --prompt "<prompt>"     Update task content
@@ -134,7 +136,8 @@ function cmdList() {
                     formatTime(task.next_run_at).padEnd(18);
     const name = task.name || task.prompt.substring(0, 30);
 
-    console.log(`  ${id} | ${pri} | ${type} | ${status} | ${nextRun} | ${name}`);
+    const instanceTag = task.target_instance ? ` [→${task.target_instance}]` : '';
+    console.log(`  ${id} | ${pri} | ${type} | ${status} | ${nextRun} | ${name}${instanceTag}`);
 
     // Show prompt (truncated to 80 chars)
     const promptPreview = task.prompt.substring(0, 80).replace(/\n/g, ' ');
@@ -214,6 +217,9 @@ function cmdAdd(args, options) {
     return;
   }
 
+  // Parse target-instance
+  const targetInstance = options['target-instance'] || null;
+
   const taskId = generateId();
   const currentTime = now();
 
@@ -224,8 +230,9 @@ function cmdAdd(args, options) {
       next_run_at, priority, status,
       require_idle, miss_threshold,
       reply_channel, reply_endpoint,
+      target_instance,
       created_at, updated_at, timezone
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     taskId,
     options.name || prompt.substring(0, 40),  // Default name to truncated prompt
@@ -239,6 +246,7 @@ function cmdAdd(args, options) {
     missThreshold,
     replyChannel,
     replyEndpoint,
+    targetInstance,
     currentTime,
     currentTime,
     getDefaultTimezone()
@@ -251,6 +259,9 @@ function cmdAdd(args, options) {
 
   if (cronExpression) {
     console.log(`  Schedule: ${describeCron(cronExpression)}`);
+  }
+  if (targetInstance) {
+    console.log(`  Target instance: ${targetInstance}`);
   }
   console.log();
 }
@@ -569,6 +580,12 @@ function cmdUpdate(taskId, options) {
       updates.reply_endpoint = options['reply-endpoint'];
       updatedFields.push('reply_endpoint');
     }
+  }
+
+  // Update target_instance (empty string clears it)
+  if (options['target-instance'] !== undefined) {
+    updates.target_instance = options['target-instance'] || null;
+    updatedFields.push('target_instance');
   }
 
   // Update miss_threshold

@@ -62,6 +62,9 @@ function initSchema() {
       reply_channel TEXT DEFAULT NULL,          -- reply channel (e.g., 'telegram')
       reply_endpoint TEXT DEFAULT NULL,         -- reply endpoint (e.g., user ID)
 
+      -- Instance Targeting (multi-session)
+      target_instance TEXT DEFAULT NULL,        -- target instance ID for task dispatch
+
       -- Retry Logic (reserved, not currently used)
       -- Implicit retry is handled via miss_threshold: tasks stay pending
       -- until dispatched or overdue beyond miss_threshold window (default 300s).
@@ -107,6 +110,19 @@ function initSchema() {
     );
   `);
 
+  // Migrations for existing databases
+  migrateTargetInstance();
+}
+
+/**
+ * Add target_instance column if missing (for databases created before multi-session support).
+ */
+function migrateTargetInstance() {
+  const columns = db.prepare("PRAGMA table_info(tasks)").all();
+  const hasColumn = columns.some(c => c.name === 'target_instance');
+  if (!hasColumn) {
+    db.exec("ALTER TABLE tasks ADD COLUMN target_instance TEXT DEFAULT NULL");
+  }
 }
 
 // Clean up old history entries (older than HISTORY_RETENTION_DAYS)

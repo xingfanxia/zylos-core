@@ -18,7 +18,8 @@ import { smartSync, formatMergeResult } from './smart-merge.js';
 import { runMigrations } from './migrate.js';
 import { writeCodexConfig } from './runtime-setup.js';
 
-const REPO = 'zylos-ai/zylos-core';
+const UPSTREAM_REPO = 'zylos-ai/zylos-core';
+const REPO = 'xingfanxia/zylos-core';
 
 // ---------------------------------------------------------------------------
 // Version helpers
@@ -512,13 +513,143 @@ function generateMigrationHints(templatesDir) {
 }
 
 // ---------------------------------------------------------------------------
+// Upstream merge helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Step 0: Merge upstream (zylos-ai/zylos-core) into fork (xingfanxia/zylos-core).
+ *
+ * Best-effort: if anything fails, log and continue. The normal upgrade will
+ * proceed from the fork's current state.
+ *
+ * @param {object} ctx - Upgrade context
+ * @returns {{ step: number, name: string, status: string, message?: string, error?: string, duration: number }}
+ */
+function step0_mergeUpstream(ctx) {
+  const startTime = Date.now();
+
+  if (ctx.skipUpstreamMerge) {
+    return { step: 0, name: 'merge_upstream', status: 'skipped', message: 'opt-in only (use --merge-upstream)', duration: Date.now() - startTime };
+  }
+
+  const tmpClone = path.join(os.tmpdir(), `zylos-upstream-merge-${Date.now()}`);
+
+  try {
+    // 1. Clone the fork (shallow for speed)
+    execSync(`git clone --depth 50 https://github.com/${REPO}.git "${tmpClone}"`, {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 120000,
+    });
+
+    // 2. Add upstream remote
+    execSync(`git remote add upstream https://github.com/${UPSTREAM_REPO}.git`, {
+      cwd: tmpClone,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 30000,
+    });
+
+    // 3. Fetch upstream
+    execSync('git fetch upstream main', {
+      cwd: tmpClone,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 120000,
+    });
+
+    // 4. Check if there's anything to merge
+    const behindCount = execSync('git rev-list --count HEAD..upstream/main', {
+      cwd: tmpClone,
+      encoding: 'utf8',
+      stdio: 'pipe',
+    }).trim();
+
+    if (behindCount === '0') {
+      fs.rmSync(tmpClone, { recursive: true, force: true });
+      return { step: 0, name: 'merge_upstream', status: 'done', message: 'already up to date', duration: Date.now() - startTime };
+    }
+
+    // 5. Attempt merge
+    try {
+      execSync('git merge upstream/main --no-edit', {
+        cwd: tmpClone,
+        encoding: 'utf8',
+        stdio: 'pipe',
+        timeout: 60000,
+      });
+    } catch (mergeErr) {
+      // Merge conflict — gather conflict files and abort
+      let conflictFiles = [];
+      try {
+        const conflictOutput = execSync('git diff --name-only --diff-filter=U', {
+          cwd: tmpClone,
+          encoding: 'utf8',
+          stdio: 'pipe',
+        }).trim();
+        conflictFiles = conflictOutput ? conflictOutput.split('\n') : [];
+      } catch { /* best-effort */ }
+
+      try {
+        execSync('git merge --abort', { cwd: tmpClone, stdio: 'pipe' });
+      } catch { /* best-effort */ }
+
+      fs.rmSync(tmpClone, { recursive: true, force: true });
+      return {
+        step: 0,
+        name: 'merge_upstream',
+        status: 'skipped',
+        message: `merge conflicts in ${conflictFiles.length} file(s): ${conflictFiles.join(', ')}`,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    // 6. Safety check: verify local main is not behind origin/main.
+    //    On shallow clones the merge may silently diverge — pushing in
+    //    that state would overwrite remote commits. Abort if behind.
+    const aheadBehind = execSync('git rev-list --left-right --count origin/main...HEAD', {
+      cwd: tmpClone,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 15000,
+    }).trim();
+    const [behind] = aheadBehind.split(/\s+/).map(Number);
+    if (behind > 0) {
+      fs.rmSync(tmpClone, { recursive: true, force: true });
+      return {
+        step: 0,
+        name: 'merge_upstream',
+        status: 'skipped',
+        message: `local branch is ${behind} commit(s) behind origin/main — aborting push to avoid overwriting remote commits (shallow clone divergence)`,
+        duration: Date.now() - startTime,
+      };
+    }
+
+    // 7. Push merged result to fork
+    execSync('git push origin main', {
+      cwd: tmpClone,
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 120000,
+    });
+
+    fs.rmSync(tmpClone, { recursive: true, force: true });
+    return { step: 0, name: 'merge_upstream', status: 'done', message: `merged ${behindCount} commit(s) from upstream`, duration: Date.now() - startTime };
+  } catch (err) {
+    // Clean up on any failure
+    try { fs.rmSync(tmpClone, { recursive: true, force: true }); } catch { /* ignore */ }
+    return { step: 0, name: 'merge_upstream', status: 'skipped', message: `upstream merge failed: ${err.message}`, duration: Date.now() - startTime };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 11-step self-upgrade pipeline
 // ---------------------------------------------------------------------------
 
 /**
  * Create self-upgrade context.
  */
-function createContext({ tempDir, newVersion, mode } = {}) {
+function createContext({ tempDir, newVersion, mode, mergeUpstream } = {}) {
   const coreDir = path.join(import.meta.dirname, '..', '..');
 
   return {
@@ -526,8 +657,10 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     tempDir: tempDir || null,
     newVersion: newVersion || null,
     mode: mode || 'merge',
+    skipUpstreamMerge: !mergeUpstream,
     // State tracking
     backupDir: null,
+    previousCliVersion: null,
     servicesStopped: [],
     servicesWereRunning: [],
     mergeConflicts: [],
@@ -651,6 +784,12 @@ function step4_npmInstallGlobal(ctx) {
   }
 
   try {
+    // Save current CLI version before overwriting (for rollback)
+    const currentVer = getCurrentVersion();
+    if (currentVer.success) {
+      ctx.previousCliVersion = currentVer.version;
+    }
+
     // Pack first — creates a .tgz tarball (copies, not symlinks)
     const tarballName = execSync('npm pack --pack-destination .', {
       cwd: ctx.tempDir,
@@ -1229,6 +1368,22 @@ function rollbackSelf(ctx) {
     }
   }
 
+  // Attempt to restore previous CLI global install
+  if (ctx.previousCliVersion) {
+    try {
+      execSync(`npm install -g zylos@${ctx.previousCliVersion}`, {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, ZYLOS_SKIP_POSTINSTALL: '1' },
+        timeout: 120000,
+      });
+      results.push({ action: 'restore_cli_version', success: true, version: ctx.previousCliVersion });
+    } catch {
+      console.warn(`[rollback] Warning: CLI binary may be at a newer version than rolled-back skills. Previous version was ${ctx.previousCliVersion}.`);
+      results.push({ action: 'restore_cli_version', success: false, error: `Could not restore CLI to v${ctx.previousCliVersion} — CLI binary may be newer than rolled-back skills` });
+    }
+  }
+
   // Restart services if they were running
   for (const name of ctx.servicesWereRunning) {
     try {
@@ -1248,14 +1403,15 @@ function rollbackSelf(ctx) {
 
 /**
  * Run the 11-step self-upgrade pipeline.
+ * Step 0 (merge upstream) runs first, then steps 1-10 as before.
  * Template migration and Claude restart are handled by Claude after this completes.
  * Lock must be acquired by caller.
  *
- * @param {{ tempDir: string, newVersion: string, onStep?: function }} opts
+ * @param {{ tempDir: string, newVersion: string, onStep?: function, mergeUpstream?: boolean }} opts
  * @returns {object} Upgrade result
  */
-export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
-  const ctx = createContext({ tempDir, newVersion, mode });
+export function runSelfUpgrade({ tempDir, newVersion, mode, onStep, mergeUpstream } = {}) {
+  const ctx = createContext({ tempDir, newVersion, mode, mergeUpstream });
 
   const current = getCurrentVersion();
   if (current.success) {
@@ -1264,6 +1420,7 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
   ctx.to = newVersion || null;
 
   const steps = [
+    step0_mergeUpstream,
     step1_backupCoreSkills,
     step2_preUpgradeHook,
     step3_stopCoreServices,

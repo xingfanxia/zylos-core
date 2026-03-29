@@ -22,6 +22,7 @@ import { attachCommand } from './commands/attach.js';
 import { doctorCommand } from './commands/doctor.js';
 import { shellCommand } from './commands/shell.js';
 import { runtimeCommand } from './commands/runtime.js';
+import { instanceCommand } from './commands/instance.js';
 
 const commands = {
   // Environment setup
@@ -45,6 +46,8 @@ const commands = {
   remove: uninstallComponent,
   list: listComponents,
   search: searchComponents,
+  // Instance management
+  instance: instanceCommand,
   // Help
   help: showHelp,
 };
@@ -119,6 +122,21 @@ Component Management:
   remove <name>       Alias for uninstall
   list                List installed components
   search [keyword]    Search available components
+
+Instance Management:
+  instance list                   List all instances
+  instance create <id> [options]  Create a new instance
+  instance start <id>             Start an instance
+  instance stop <id>              Stop an instance
+  instance enable <id>            Enable an instance
+  instance disable <id>           Disable an instance
+  instance suspend <id>           Suspend an instance
+  instance resume <id>            Resume a suspended instance
+  instance suspend-all            Suspend all non-primary instances
+  instance resume-all             Resume all suspended instances
+  instance set-quota <id> --daily <n>  Set daily token quota
+  instance destroy <id>           Remove and archive instance
+  instance status <id>            Show instance status
 
 Other:
   help                Show this help

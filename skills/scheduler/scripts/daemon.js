@@ -85,7 +85,8 @@ function dispatchTask(task) {
     priority: task.priority,
     requireIdle: task.require_idle === 1,
     replyChannel: task.reply_channel,
-    replyEndpoint: task.reply_endpoint
+    replyEndpoint: task.reply_endpoint,
+    targetInstance: task.target_instance || null
   });
 
   if (!success) {

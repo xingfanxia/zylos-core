@@ -21,7 +21,20 @@ import path from 'path';
 import os from 'os';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const AM_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+// Monitor directory: reads state_dir from instances.json, falls back to convention
+function getMonitorDir() {
+  if (!INSTANCE_ID) return path.join(ZYLOS_DIR, 'activity-monitor');
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, 'instances.json'), 'utf8'));
+    const inst = config.instances?.[INSTANCE_ID];
+    if (inst?.state_dir) return inst.state_dir.replace(/^~/, os.homedir());
+  } catch { /* fall through to convention */ }
+  return path.join(ZYLOS_DIR, 'activity-monitor', INSTANCE_ID);
+}
+
+const AM_DIR = getMonitorDir();
 const STATUS_FILE = path.join(AM_DIR, 'statusline.json');
 const STATE_FILE = path.join(AM_DIR, 'context-monitor-state.json');
 const COST_LOG_FILE = path.join(AM_DIR, 'cost-log.jsonl');
@@ -83,17 +96,22 @@ function main(raw) {
   // delivers it even when health !== 'ok' (fixes #274: context rotation deadlock)
   const MAX_RETRIES = 3;
   let enqueued = false;
+  const instanceId = process.env.ZYLOS_INSTANCE_ID;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      execFileSync('node', [C4_CONTROL, 'enqueue',
+      const enqueueArgs = [C4_CONTROL, 'enqueue',
         '--content', `Context usage at ${usedPct}%, exceeding 70% threshold. Use the new-session skill to start a fresh session.`,
         '--priority', '1',
         '--bypass-state',
         '--ack-deadline', '300'
-      ], { encoding: 'utf8', stdio: 'pipe' });
+      ];
+      if (instanceId) {
+        enqueueArgs.push('--target-instance', instanceId);
+      }
+      execFileSync('node', enqueueArgs, { encoding: 'utf8', stdio: 'pipe', timeout: 15000 });
 
       enqueued = true;
-      log(`Triggered new-session: context at ${usedPct}%`);
+      log(`Triggered new-session: context at ${usedPct}%${process.env.ZYLOS_INSTANCE_ID ? ` (instance: ${process.env.ZYLOS_INSTANCE_ID})` : ''}`);
       break;
     } catch (err) {
       log(`Failed to enqueue new-session (attempt ${attempt}/${MAX_RETRIES}): ${err.message}`);

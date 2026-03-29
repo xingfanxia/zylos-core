@@ -9,7 +9,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR, SESSIONS_DIR, BUDGETS, REFERENCE_FILES, walkFiles, loadTimezoneFromEnv, dateInTimeZone } from './shared.js';
+import { MEMORY_DIR, SESSIONS_DIR, BUDGETS, REFERENCE_FILES, walkFiles, loadTimezoneFromEnv, dateInTimeZone, resolveSharedFile, resolveInstanceFile, resolveSessionsDir, resolveReferenceFiles } from './shared.js';
+
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const EFFECTIVE_SESSIONS_DIR = resolveSessionsDir(INSTANCE_ID);
 
 export function parseSessionDate(fileName) {
   const match = fileName.match(/^(\d{4}-\d{2}-\d{2})(?:-\d+)?\.md$/);
@@ -19,7 +22,7 @@ export function parseSessionDate(fileName) {
 function sessionArchiveCandidates(tz) {
   const candidates = [];
 
-  if (!fs.existsSync(SESSIONS_DIR)) {
+  if (!fs.existsSync(EFFECTIVE_SESSIONS_DIR)) {
     return candidates;
   }
 
@@ -27,7 +30,7 @@ function sessionArchiveCandidates(tz) {
   cutoffDate.setDate(cutoffDate.getDate() - 30);
   const cutoffStr = dateInTimeZone(cutoffDate, tz);
 
-  for (const fileName of fs.readdirSync(SESSIONS_DIR)) {
+  for (const fileName of fs.readdirSync(EFFECTIVE_SESSIONS_DIR)) {
     if (fileName === 'current.md' || fileName.startsWith('.')) {
       continue;
     }
@@ -46,11 +49,16 @@ function sessionArchiveCandidates(tz) {
   return candidates;
 }
 
+// Per-instance files use resolveInstanceFile; shared files use resolveSharedFile
+const INSTANCE_BUDGET_FILES = new Set(['state.md']);
+
 function coreBudgetChecks() {
   const checks = [];
 
   for (const [name, budget] of Object.entries(BUDGETS)) {
-    const filePath = path.join(MEMORY_DIR, name);
+    const filePath = INSTANCE_BUDGET_FILES.has(name)
+      ? resolveInstanceFile(INSTANCE_ID, name)
+      : resolveSharedFile(name);
     if (!fs.existsSync(filePath)) {
       checks.push({ file: name, exists: false, budgetBytes: budget, overBudget: false });
       continue;
@@ -80,9 +88,11 @@ export function freshnessState(ageDays) {
 
 function referenceFileFreshness() {
   const results = [];
+  const resolvedPaths = resolveReferenceFiles();
 
-  for (const relPath of REFERENCE_FILES) {
-    const filePath = path.join(MEMORY_DIR, relPath);
+  for (let i = 0; i < REFERENCE_FILES.length; i++) {
+    const relPath = REFERENCE_FILES[i];
+    const filePath = resolvedPaths[i];
     if (!fs.existsSync(filePath)) {
       results.push({ file: relPath, exists: false });
       continue;
