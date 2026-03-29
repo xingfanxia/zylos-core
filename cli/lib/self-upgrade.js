@@ -1302,7 +1302,7 @@ function step12_verifyServices(ctx) {
   }
 
   const POLL_INTERVAL_MS = 2000;
-  const TIMEOUT_MS = 30000;
+  const TIMEOUT_MS = 60000;
 
   while (Date.now() - startTime < TIMEOUT_MS) {
     try { execSync('sleep 2', { stdio: 'pipe' }); } catch { /* ignore */ }

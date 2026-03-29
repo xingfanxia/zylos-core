@@ -135,8 +135,6 @@ function parseArgs(argv) {
       flags.tmuxSession = argv[++i];
     } else if (arg === '--type' && i + 1 < argv.length) {
       flags.type = argv[++i];
-    } else if (arg === '--config-dir' && i + 1 < argv.length) {
-      flags.configDir = argv[++i];
     } else if (arg === '--description' && i + 1 < argv.length) {
       flags.description = argv[++i];
     } else if (arg === '--chat-ids' && i + 1 < argv.length) {
@@ -216,11 +214,9 @@ function cmdCreate(id, flags) {
 
   // Create directories
   const resolvedStateDir = resolveTilde(stateDir);
-  const resolvedConfigDir = resolveTilde(configDir);
   const resolvedMemoryDir = resolveTilde(memoryDir);
 
   fs.mkdirSync(resolvedStateDir, { recursive: true });
-  fs.mkdirSync(resolvedConfigDir, { recursive: true });
   fs.mkdirSync(resolvedMemoryDir, { recursive: true });
 
   if (jsonMode) {
@@ -229,7 +225,6 @@ function cmdCreate(id, flags) {
     console.log(`Created instance "${id}"`);
     console.log(`  Type:       ${type}`);
     console.log(`  Session:    ${tmuxSession}`);
-    console.log(`  Config dir: ${resolvedConfigDir}`);
     console.log(`  State dir:  ${resolvedStateDir}`);
     console.log(`  Memory dir: ${resolvedMemoryDir}`);
     if (flags.chatIds) {
@@ -317,7 +312,6 @@ function cmdShow(id) {
 
   const tmuxSession = inst.tmux_session || `claude-${id}`;
   const stateDir = inst.state_dir || `~/zylos/activity-monitor/${id}`;
-  const configDir = inst.config_dir || null;
   const status = readInstanceStatus(id);
 
   const details = {
@@ -326,7 +320,6 @@ function cmdShow(id) {
     enabled: inst.enabled !== false,
     primary: inst.primary || false,
     tmux_session: tmuxSession,
-    config_dir: configDir,
     state_dir: stateDir,
     status,
     chat_ids: inst.chat_ids || [],
@@ -345,7 +338,6 @@ function cmdShow(id) {
   console.log(`Enabled: ${details.enabled ? 'yes' : 'no'}`);
   console.log(`Primary: ${details.primary ? 'yes' : 'no'}`);
   console.log(`Session: ${tmuxSession}`);
-  console.log(`Config Dir: ${configDir || '(default)'}`);
   console.log(`State Dir: ${stateDir}`);
   console.log(`Status: ${status}`);
   if (details.chat_ids.length > 0) {
@@ -462,10 +454,8 @@ function cmdResume(id) {
   }
 
   // Launch Claude Code in a new tmux session (same pattern as startOnDemandInstance)
-  const configDir = inst.config_dir ? resolveTilde(inst.config_dir) : null;
   const runtime = inst.runtime || 'claude';
   const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
-  if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
   tmuxArgs.push(runtime);
 
   try {
@@ -533,7 +523,6 @@ function cmdRemove(id) {
   });
 
   const stateDir = resolveTilde(inst.state_dir);
-  const configDir = resolveTilde(inst.config_dir);
 
   if (jsonMode) {
     console.log(JSON.stringify({ ok: true, id, removed: true }));
@@ -541,7 +530,6 @@ function cmdRemove(id) {
     console.log(`Instance "${id}" removed from instances.json.`);
     console.log(`Note: data directories were NOT deleted:`);
     if (stateDir) console.log(`  State:  ${stateDir}`);
-    if (configDir) console.log(`  Config: ${configDir}`);
     console.log(`Delete them manually if no longer needed.`);
   }
 }
@@ -651,10 +639,8 @@ function cmdResumeAll() {
     }
 
     // Launch Claude Code
-    const configDir = inst.config_dir ? resolveTilde(inst.config_dir) : null;
     const runtime = inst.runtime || 'claude';
     const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
-    if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
     tmuxArgs.push(runtime);
 
     try {
@@ -748,7 +734,6 @@ Commands:
 Create options:
   --tmux-session <name>   Tmux session name (default: claude-<id>)
   --type <type>           Instance type: dedicated|on_demand (default: dedicated)
-  --config-dir <path>     CLAUDE_CONFIG_DIR path (default: ~/.claude-instances/<id>)
   --description <text>    Instance description
   --chat-ids <ids>        Comma-separated chat IDs to route to this instance
   --claude-md <path>      Path to per-instance CLAUDE.md file
