@@ -43,13 +43,16 @@ const prompt = [
 ].join(' ');
 
 async function main() {
+  const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
   try {
-    execFileSync('node', [
+    const enqueueArgs = [
       C4_CONTROL, 'enqueue',
       '--content', prompt,
       '--priority', '2',
       '--no-ack-suffix'
-    ], { stdio: 'pipe' });
+    ];
+    if (INSTANCE_ID) enqueueArgs.push('--target-instance', INSTANCE_ID);
+    execFileSync('node', enqueueArgs, { stdio: 'pipe' });
   } catch {
     // Silently fail — session still starts even if enqueue fails
   } finally {
