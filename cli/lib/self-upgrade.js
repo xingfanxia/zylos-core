@@ -96,26 +96,20 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
 
   // Use semver comparison (not string inequality) to avoid suggesting downgrades.
   // compareSemverDesc(a, b) > 0 means b is higher than a.
-  let hasUpdate = compareSemverDesc(current.version, latest.version) > 0;
-  let effectiveLatest = latest.version;
+  const hasUpdate = compareSemverDesc(current.version, latest.version) > 0;
 
-  // Also check upstream for newer versions (fork may lag behind upstream).
-  // If upstream is ahead of our fork, trigger the upgrade so step0_mergeUpstream runs.
-  if (!hasUpdate && !branch && UPSTREAM_REPO !== REPO) {
-    try {
-      const upstreamVersion = fetchLatestTag(UPSTREAM_REPO, { includePrerelease: beta });
-      if (upstreamVersion && compareSemverDesc(latest.version, upstreamVersion) > 0) {
-        hasUpdate = true;
-        effectiveLatest = upstreamVersion;
-      }
-    } catch { /* upstream check is best-effort */ }
-  }
+  // Fork setups need a git-level upstream check (rev-list --count) because version
+  // comparison can't detect new upstream commits when fork version >= upstream version.
+  // This flag tells the caller to proceed with the upgrade flow so step0_mergeUpstream
+  // can do the git-level check and push any new upstream commits to the fork.
+  const needsUpstreamCheck = !branch && UPSTREAM_REPO !== REPO;
 
   return {
     success: true,
     hasUpdate,
+    needsUpstreamCheck,
     current: current.version,
-    latest: effectiveLatest,
+    latest: latest.version,
   };
 }
 
