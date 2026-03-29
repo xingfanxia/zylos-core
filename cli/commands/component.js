@@ -1001,7 +1001,7 @@ async function upgradeSelfCore({ providedTempDir, branch, beta = false, mode = '
       return false;
     }
 
-    if (!branch && check.success && !check.hasUpdate) {
+    if (!branch && check.success && !check.hasUpdate && !check.needsUpstreamCheck) {
       if (jsonOutput) {
         const output = { action: 'check', target: 'zylos-core', ...check };
         output.reply = formatC4Reply('self-check', check);
@@ -1081,6 +1081,7 @@ async function upgradeSelfCore({ providedTempDir, branch, beta = false, mode = '
       tempDir,
       newVersion: check.latest,
       mode,
+      mergeUpstream: check.needsUpstreamCheck || false,
       onStep: !jsonOutput ? printStep : undefined,
     });
 

@@ -74,13 +74,15 @@ Persistent memory stored in `~/zylos/memory/` with an Inside Out-inspired archit
 
 | Tier | Path | Purpose | Loading |
 |------|------|---------|---------|
-| **Identity** | `memory/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
-| **State** | `memory/state.md` | Active work, pending tasks | Always (session start) |
-| **References** | `memory/references.md` | Pointers to config files, key paths | Always (session start) |
-| **User Profiles** | `memory/users/<id>/profile.md` | Per-user preferences | On demand |
-| **Reference** | `memory/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
-| **Sessions** | `memory/sessions/current.md` | Today's event log | On demand |
+| **Identity** | `memory/shared/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
+| **State** | `memory/instances/<id>/state.md` | Active work, pending tasks (per-instance) | Always (session start) |
+| **References** | `memory/shared/references.md` | Pointers to config files, key paths | Always (session start) |
+| **User Profiles** | `memory/shared/users/<id>/profile.md` | Per-user preferences | On demand |
+| **Reference** | `memory/shared/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
+| **Sessions** | `memory/instances/<id>/sessions/current.md` | Today's event log (per-instance) | On demand |
 | **Archive** | `memory/archive/` | Cold storage for old data | Rarely |
+
+Note: When `shared/` directory doesn't exist (single-session mode), all paths fall back to `memory/` directly.
 
 ### Multi-User
 
@@ -96,12 +98,25 @@ Route user-specific preferences to the correct profile file. Bot identity stays 
 
 ### Classification Rules for reference/ Files
 
-- **decisions.md:** Deliberate choices that close off alternatives
-- **projects.md:** Work efforts with defined scope and lifecycle
-- **preferences.md:** Standing instructions for how things should be done (shared across users)
-- **ideas.md:** Uncommitted plans, explorations, hypotheses
+- **decisions.md:** Deliberate choices that close off alternatives (shared/)
+- **projects.md:** Work efforts with defined scope and lifecycle (shared/)
+- **preferences.md:** Standing instructions for how things should be done (shared/)
+- **ideas.md:** Uncommitted plans, explorations, hypotheses (shared/)
+
+**Shared vs Instance-specific files:**
+- **Shared** (in `shared/`): identity.md, references.md, reference/*.md, users/ — common across all instances
+- **Instance-specific** (in `instances/<id>/`): state.md, sessions/ — unique per running instance
 
 When in doubt, write to sessions/current.md.
+
+### Instance Approval Flow
+
+When a new user first connects (multi-session mode), the approval process is:
+1. New instance requests are recorded in `instances.json` with `status: "pending"`
+2. The primary instance owner reviews pending instances via `zylos instance list`
+3. Owner approves with `zylos instance approve <id>` which sets `status: "enabled"`
+4. Denied instances are removed with `zylos instance remove <id>`
+5. Only enabled instances can dispatch tasks and access shared memory
 
 ### On-Demand Memory Loading
 

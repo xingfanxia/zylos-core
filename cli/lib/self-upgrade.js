@@ -18,6 +18,14 @@ import { smartSync, formatMergeResult } from './smart-merge.js';
 import { runMigrations } from './migrate.js';
 import { writeCodexConfig } from './runtime-setup.js';
 
+let forkConfig = null;
+try { forkConfig = await import('./fork-config.js'); } catch {}
+
+let upstreamMerge = null;
+if (forkConfig) {
+  try { upstreamMerge = await import('./upstream-merge.js'); } catch {}
+}
+
 const REPO = 'zylos-ai/zylos-core';
 
 // ---------------------------------------------------------------------------
@@ -47,10 +55,13 @@ export function getCurrentVersion() {
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) tags
  */
 function getLatestVersion({ branch, beta = false } = {}) {
+  // Use fork repo when available, otherwise default upstream
+  const repo = (forkConfig?.isFork() && forkConfig.FORK_REPO) ? forkConfig.FORK_REPO : REPO;
+
   // When --branch is specified, read package.json from that branch
   if (branch) {
     try {
-      const content = fetchRawFile(REPO, 'package.json', branch);
+      const content = fetchRawFile(repo, 'package.json', branch);
       const pkg = JSON.parse(content);
       return { success: true, version: pkg.version };
     } catch (err) {
@@ -60,7 +71,7 @@ function getLatestVersion({ branch, beta = false } = {}) {
 
   // Default: tag-based detection (unified with component upgrades)
   try {
-    const tagVersion = fetchLatestTag(REPO, { includePrerelease: beta });
+    const tagVersion = fetchLatestTag(repo, { includePrerelease: beta });
     if (tagVersion) {
       return { success: true, version: tagVersion };
     }
@@ -102,6 +113,7 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
     hasUpdate,
     current: current.version,
     latest: latest.version,
+    needsUpstreamCheck: forkConfig?.needsUpstreamCheck() || false,
   };
 }
 
@@ -518,7 +530,7 @@ function generateMigrationHints(templatesDir) {
 /**
  * Create self-upgrade context.
  */
-function createContext({ tempDir, newVersion, mode } = {}) {
+function createContext({ tempDir, newVersion, mode, mergeUpstream } = {}) {
   const coreDir = path.join(import.meta.dirname, '..', '..');
 
   return {
@@ -526,6 +538,7 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     tempDir: tempDir || null,
     newVersion: newVersion || null,
     mode: mode || 'merge',
+    skipUpstreamMerge: !mergeUpstream,
     // State tracking
     backupDir: null,
     servicesStopped: [],
@@ -1254,8 +1267,8 @@ function rollbackSelf(ctx) {
  * @param {{ tempDir: string, newVersion: string, onStep?: function }} opts
  * @returns {object} Upgrade result
  */
-export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
-  const ctx = createContext({ tempDir, newVersion, mode });
+export function runSelfUpgrade({ tempDir, newVersion, mode, mergeUpstream, onStep } = {}) {
+  const ctx = createContext({ tempDir, newVersion, mode, mergeUpstream });
 
   const current = getCurrentVersion();
   if (current.success) {
@@ -1277,6 +1290,11 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
     step11_startCoreServices,
     step12_verifyServices,
   ];
+
+  // Fork: prepend upstream merge step when mergeUpstream is requested
+  if (forkConfig && mergeUpstream && upstreamMerge) {
+    steps.unshift(upstreamMerge.step0_mergeUpstream);
+  }
 
   const total = steps.length;
   let failedStep = null;
