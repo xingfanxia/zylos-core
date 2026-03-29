@@ -194,7 +194,6 @@ function createInstance(id, flags) {
   const idleTimeout = flags.idleTimeout || 30;
 
   const stateDir = `~/zylos/activity-monitor/${id}`;
-  const configDir = `~/zylos/.claude-${id}`;
 
   config.instances[id] = {
     tmux_session: `claude-${id}`,
@@ -204,16 +203,13 @@ function createInstance(id, flags) {
     primary: false,
     auto_suspend: autoSuspend,
     idle_timeout_min: idleTimeout,
-    config_dir: configDir,
     state_dir: stateDir,
     description: `Instance ${id} (${type})`
   };
 
   // Create directories
   const resolvedStateDir = resolveDir(stateDir);
-  const resolvedConfigDir = resolveDir(configDir);
   fs.mkdirSync(resolvedStateDir, { recursive: true });
-  fs.mkdirSync(resolvedConfigDir, { recursive: true });
 
   // Add routing entries if --user or --group specified
   if (flags.user) {
@@ -383,18 +379,6 @@ function destroyInstance(id) {
       console.log(dim(`  State dir archived: ${archiveDir}`));
     } catch (err) {
       console.log(yellow(`  Warning: failed to archive state dir: ${err.message}`));
-    }
-  }
-
-  // Archive config_dir
-  const configDir = resolveDir(inst.config_dir);
-  if (configDir && fs.existsSync(configDir)) {
-    const archiveDir = `${configDir}.archived`;
-    try {
-      fs.renameSync(configDir, archiveDir);
-      console.log(dim(`  Config dir archived: ${archiveDir}`));
-    } catch (err) {
-      console.log(yellow(`  Warning: failed to archive config dir: ${err.message}`));
     }
   }
 
@@ -603,13 +587,10 @@ function resumeInstance(id) {
     process.exit(1);
   }
 
-  const configDir = resolveDir(inst.config_dir);
-  const envPrefix = configDir ? `CLAUDE_CONFIG_DIR='${configDir}' ` : '';
   const runtime = inst.runtime || 'claude';
-  const launchCmd = `${envPrefix}${runtime}`;
 
   try {
-    execSync(`tmux new-session -d -s "${tmuxSession}" -x 220 -y 50 '${launchCmd}'`, { encoding: 'utf8' });
+    execSync(`tmux new-session -d -s "${tmuxSession}" -x 220 -y 50 '${runtime}'`, { encoding: 'utf8' });
   } catch (err) {
     console.error(red(`Failed to start tmux session: ${err.message}`));
     process.exit(1);
@@ -700,10 +681,8 @@ function resumeAllInstances() {
       continue;
     }
 
-    const configDir = resolveDir(inst.config_dir);
-    const envPrefix = configDir ? `CLAUDE_CONFIG_DIR='${configDir}' ` : '';
     const runtime = inst.runtime || 'claude';
-    const launchCmd = `${envPrefix}${runtime}`;
+    const launchCmd = runtime;
 
     try {
       execSync(`tmux new-session -d -s "${tmuxSession}" -x 220 -y 50 '${launchCmd}'`, { encoding: 'utf8' });
