@@ -14,9 +14,21 @@ import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+
+// Health dashboard for system-wide data aggregation
+import { getSystemHealth } from '../../activity-monitor/scripts/health-dashboard.js';
+
+// Instance router for multi-session management
+import {
+  updateInstancesConfig,
+  getInstanceDef,
+  getStatusFileForInstance,
+  startWatcher,
+} from '../../comm-bridge/scripts/c4-instance-router.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -81,6 +93,10 @@ function authMiddleware(req, res, next) {
 
 // Middleware
 app.use(express.json());
+
+// Root redirect to dashboard
+app.get('/', (req, res) => res.redirect('/dashboard/'));
+
 app.use(express.static(path.join(SKILL_ROOT, 'public')));
 app.use('/api', authMiddleware);
 
@@ -435,6 +451,360 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Dashboard API routes
+// ---------------------------------------------------------------------------
+
+// Start instance config watcher for hot-reload (long-running process)
+startWatcher();
+
+/**
+ * Dashboard: full system health snapshot
+ */
+app.get('/api/dashboard', (req, res) => {
+  try {
+    const health = getSystemHealth();
+    res.json(health);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Token usage: per-instance daily breakdown for the last N days
+ */
+app.get('/api/dashboard/tokens', (req, res) => {
+  const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
+
+  const TOKEN_DB_PATH = path.join(ZYLOS_DIR, 'activity-monitor', 'token-usage.db');
+
+  // Open token DB readonly — resolve better-sqlite3 from sibling skills
+  let tokenDb = null;
+  try {
+    if (!fs.existsSync(TOKEN_DB_PATH)) {
+      return res.json({ daily: [], per_instance: [], totals: null });
+    }
+
+    // Resolve better-sqlite3 — try multiple paths
+    let DbCtor = null;
+    const candidates = [
+      path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge'),
+      path.join(ZYLOS_DIR, '.claude', 'skills', 'scheduler'),
+      path.join(__dirname, '..', '..', 'comm-bridge'),
+      path.join(__dirname, '..', '..', 'scheduler'),
+    ];
+    for (const base of candidates) {
+      try {
+        const require = createRequire(path.join(base, 'package.json'));
+        DbCtor = require('better-sqlite3');
+        break;
+      } catch { /* try next */ }
+    }
+
+    // Fall back to the already-imported Database constructor
+    if (!DbCtor) DbCtor = Database;
+
+    tokenDb = new DbCtor(TOKEN_DB_PATH, { readonly: true });
+
+    // Daily per-instance breakdown
+    const daily = tokenDb.prepare(`
+      SELECT date, instance_id,
+        COALESCE(SUM(input_tokens), 0) as input_tokens,
+        COALESCE(SUM(output_tokens), 0) as output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) as cache_read,
+        COALESCE(SUM(cache_write_tokens), 0) as cache_write,
+        COALESCE(SUM(cost_usd), 0) as cost_usd
+      FROM token_usage
+      WHERE date > date('now', ? || ' days')
+      GROUP BY date, instance_id
+      ORDER BY date DESC, instance_id
+    `).all(`-${days}`);
+
+    // Per-instance totals for the period
+    const per_instance = tokenDb.prepare(`
+      SELECT instance_id,
+        COALESCE(SUM(input_tokens), 0) as input_tokens,
+        COALESCE(SUM(output_tokens), 0) as output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) as cache_read,
+        COALESCE(SUM(cache_write_tokens), 0) as cache_write,
+        COALESCE(SUM(cost_usd), 0) as cost_usd
+      FROM token_usage
+      WHERE date > date('now', ? || ' days')
+      GROUP BY instance_id
+      ORDER BY instance_id
+    `).all(`-${days}`);
+
+    // Grand totals
+    const totals = tokenDb.prepare(`
+      SELECT
+        COALESCE(SUM(input_tokens), 0) as input_tokens,
+        COALESCE(SUM(output_tokens), 0) as output_tokens,
+        COALESCE(SUM(cache_read_tokens), 0) as cache_read,
+        COALESCE(SUM(cache_write_tokens), 0) as cache_write,
+        COALESCE(SUM(cost_usd), 0) as cost_usd
+      FROM token_usage
+      WHERE date > date('now', ? || ' days')
+    `).get(`-${days}`);
+
+    res.json({ daily, per_instance, totals, days });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (tokenDb) {
+      try { tokenDb.close(); } catch { /* best-effort */ }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Instance action helpers
+// ---------------------------------------------------------------------------
+
+function resolveTilde(p) {
+  if (!p) return p;
+  return p.replace(/^~/, os.homedir());
+}
+
+function tmuxSessionExists(session) {
+  try {
+    execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe', timeout: 15000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Instance action endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * Enable an instance
+ */
+app.post('/api/dashboard/instances/:id/enable', (req, res) => {
+  const { id } = req.params;
+  try {
+    const inst = getInstanceDef(id);
+    if (!inst) return res.status(404).json({ error: `Instance "${id}" not found` });
+
+    updateInstancesConfig((cfg) => {
+      if (!cfg) return null;
+      cfg.instances[id] = { ...cfg.instances[id], enabled: true };
+      return cfg;
+    });
+
+    res.json({ ok: true, id, enabled: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Disable an instance (cannot disable primary)
+ */
+app.post('/api/dashboard/instances/:id/disable', (req, res) => {
+  const { id } = req.params;
+  try {
+    const inst = getInstanceDef(id);
+    if (!inst) return res.status(404).json({ error: `Instance "${id}" not found` });
+    if (inst.primary) return res.status(400).json({ error: `Cannot disable primary instance "${id}"` });
+
+    updateInstancesConfig((cfg) => {
+      if (!cfg) return null;
+      cfg.instances[id] = { ...cfg.instances[id], enabled: false };
+      return cfg;
+    });
+
+    res.json({ ok: true, id, enabled: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Suspend an instance (kill tmux session, write suspended status)
+ */
+app.post('/api/dashboard/instances/:id/suspend', (req, res) => {
+  const { id } = req.params;
+  try {
+    const inst = getInstanceDef(id);
+    if (!inst) return res.status(404).json({ error: `Instance "${id}" not found` });
+    if (inst.primary) return res.status(400).json({ error: `Cannot suspend primary instance "${id}"` });
+
+    const tmuxSession = inst.tmux_session || `claude-${id}`;
+    if (!tmuxSessionExists(tmuxSession)) {
+      return res.status(400).json({ error: `Instance "${id}" is not running (tmux session not found)` });
+    }
+
+    // Kill tmux session
+    try {
+      execFileSync('tmux', ['kill-session', '-t', tmuxSession], { stdio: 'pipe', timeout: 15000 });
+    } catch (err) {
+      return res.status(500).json({ error: `Failed to kill tmux session: ${err.message}` });
+    }
+
+    // Write suspended status
+    const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
+    const statusFile = path.join(stateDir, 'claude-status.json');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(statusFile, JSON.stringify({
+      state: 'suspended',
+      suspended_at: Date.now(),
+      suspended_by: 'dashboard',
+      last_check_human: new Date().toISOString(),
+    }, null, 2) + '\n');
+
+    res.json({ ok: true, id, status: 'suspended' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Resume a suspended instance (create tmux session, clear suspended status)
+ */
+app.post('/api/dashboard/instances/:id/resume', (req, res) => {
+  const { id } = req.params;
+  try {
+    const inst = getInstanceDef(id);
+    if (!inst) return res.status(404).json({ error: `Instance "${id}" not found` });
+
+    const tmuxSession = inst.tmux_session || `claude-${id}`;
+
+    // Check it's suspended (read status file)
+    const statusFile = getStatusFileForInstance(id);
+    if (statusFile && fs.existsSync(statusFile)) {
+      try {
+        const statusData = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+        if (statusData.state !== 'suspended') {
+          return res.status(400).json({ error: `Instance "${id}" is not suspended (status: ${statusData.state})` });
+        }
+      } catch { /* proceed anyway */ }
+    }
+
+    if (tmuxSessionExists(tmuxSession)) {
+      return res.status(400).json({ error: `tmux session "${tmuxSession}" already exists` });
+    }
+
+    // Launch Claude Code in new tmux session
+    const configDir = inst.config_dir ? resolveTilde(inst.config_dir) : null;
+    const runtime = inst.runtime || 'claude';
+    const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
+    if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
+    tmuxArgs.push(runtime);
+
+    try {
+      execFileSync('tmux', tmuxArgs, { stdio: 'pipe', timeout: 15000 });
+    } catch (err) {
+      return res.status(500).json({ error: `Failed to create tmux session: ${err.message}` });
+    }
+
+    // Clear suspended status
+    const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
+    const stateStatusFile = path.join(stateDir, 'claude-status.json');
+    try {
+      fs.writeFileSync(stateStatusFile, JSON.stringify({
+        state: 'idle',
+        resumed_at: Date.now(),
+        resumed_by: 'dashboard',
+        last_check_human: new Date().toISOString(),
+      }, null, 2) + '\n');
+    } catch { /* best-effort */ }
+
+    res.json({ ok: true, id, status: 'resumed', session: tmuxSession });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Approval flow: pending users + approve/deny actions
+// ---------------------------------------------------------------------------
+
+// GET /api/dashboard/pending-users — list users awaiting approval
+// Source of truth: DB (pending_approval messages), NOT the tracking file
+app.get('/api/dashboard/pending-users', (req, res) => {
+  try {
+    // Query distinct chat_ids with pending_approval messages directly from DB
+    const rows = db.prepare(`
+      SELECT endpoint_id, channel, content, MIN(id) as first_id, COUNT(*) as msg_count
+      FROM conversations
+      WHERE status = 'pending_approval' AND direction = 'in'
+      GROUP BY substr(endpoint_id, 1, instr(endpoint_id || '|', '|') - 1)
+      ORDER BY first_id ASC
+    `).all();
+
+    const pending = rows.map(row => {
+      const chatId = row.endpoint_id?.split('|')[0] || '';
+
+      // Extract user name and preview from message content
+      let userName = '';
+      let preview = '';
+      if (row.content) {
+        const nameMatch = row.content.match(/\]\s+(.+?)\s+said:/);
+        if (nameMatch) userName = nameMatch[1];
+        const contentMatch = row.content.match(/<current-message>\n([\s\S]*?)\n<\/current-message>/);
+        preview = contentMatch ? contentMatch[1].substring(0, 200) : '';
+      }
+
+      // Generate suggested_id from name
+      const asciiName = userName ? userName.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+      const suggestedId = asciiName
+        ? `user-${asciiName.substring(0, 20)}`
+        : `user-${chatId.slice(-8)}`;
+
+      return {
+        channel: row.channel,
+        chat_id: chatId,
+        sender_name: userName,
+        suggested_id: suggestedId,
+        msg_count: row.msg_count,
+        preview,
+      };
+    });
+
+    res.json({ pending });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/dashboard/approve/:chatId — approve a pending user
+app.post('/api/dashboard/approve/:chatId', (req, res) => {
+  const { chatId } = req.params;
+  const instanceName = req.body?.name || `user-${chatId.substring(0, 12)}`;
+  try {
+    const approveScript = path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-approve.js');
+    const result = execFileSync('node', [approveScript, 'approve', chatId, '--name', instanceName], {
+      encoding: 'utf8', timeout: 60000, stdio: 'pipe'
+    });
+    res.json({ ok: true, instance: instanceName, output: result.trim() });
+  } catch (err) {
+    const stderr = err.stderr?.toString() || err.message;
+    res.status(500).json({ error: stderr });
+  }
+});
+
+// POST /api/dashboard/deny/:chatId — deny a pending user
+app.post('/api/dashboard/deny/:chatId', (req, res) => {
+  const { chatId } = req.params;
+  try {
+    const approveScript = path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-approve.js');
+    const result = execFileSync('node', [approveScript, 'deny', chatId], {
+      encoding: 'utf8', timeout: 30000, stdio: 'pipe'
+    });
+    res.json({ ok: true, output: result.trim() });
+  } catch (err) {
+    const stderr = err.stderr?.toString() || err.message;
+    res.status(500).json({ error: stderr });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Serve dashboard static files
+// ---------------------------------------------------------------------------
+app.use('/dashboard', express.static(path.join(SKILL_ROOT, 'public', 'dashboard')));
+
 // Serve index.html for root
 app.get('/', (req, res) => {
   res.sendFile(path.join(SKILL_ROOT, 'public', 'index.html'));
@@ -444,6 +814,7 @@ app.get('/', (req, res) => {
 const BIND_HOST = process.env.WEB_CONSOLE_BIND || '127.0.0.1';
 server.listen(PORT, BIND_HOST, () => {
   console.log(`Web Console server running on http://${BIND_HOST}:${PORT}`);
+  console.log(`Dashboard available at http://${BIND_HOST}:${PORT}/dashboard`);
   console.log(`WebSocket available at ws://${BIND_HOST}:${PORT}`);
   console.log(`Authentication: ${AUTH_ENABLED ? 'enabled' : 'disabled (no password set)'}`);
   console.log(`Database: ${DB_PATH}`);

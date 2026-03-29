@@ -185,6 +185,69 @@ function loadComponentServices() {
   }
 }
 
+/**
+ * Load per-instance activity-monitor entries from ~/zylos/instances.json.
+ * If instances.json doesn't exist, returns the legacy single activity-monitor entry.
+ */
+function loadInstanceMonitors() {
+  const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
+  const amScript = path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js');
+  const legacyEntry = {
+    name: 'activity-monitor',
+    script: amScript,
+    cwd: HOME,
+    env: {
+      PATH: ENHANCED_PATH,
+      NODE_ENV: 'production',
+      CLAUDE_BYPASS_PERMISSIONS,
+      CODEX_BYPASS_PERMISSIONS,
+      ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+    },
+    autorestart: true,
+    max_restarts: 10,
+    min_uptime: '10s'
+  };
+
+  try {
+    if (!fs.existsSync(instancesFile)) {
+      return [legacyEntry];
+    }
+
+    const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
+    if (!config || typeof config.instances !== 'object') {
+      return [legacyEntry];
+    }
+
+    const entries = [];
+    for (const [instanceId, instance] of Object.entries(config.instances)) {
+      if (instance.enabled === false) continue;
+      if (instance.type === 'on_demand') continue;
+      entries.push({
+        name: `activity-monitor-${instanceId}`,
+        script: amScript,
+        cwd: HOME,
+        env: {
+          PATH: ENHANCED_PATH,
+          NODE_ENV: 'production',
+          CLAUDE_BYPASS_PERMISSIONS,
+          CODEX_BYPASS_PERMISSIONS,
+          ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+          ZYLOS_INSTANCE_ID: instanceId
+        },
+        autorestart: true,
+        max_restarts: 10,
+        min_uptime: '10s'
+      });
+    }
+
+    // If instances.json exists but no eligible instances, return empty — don't
+    // fall back to legacy monitor (all instances are intentionally disabled/on_demand).
+    return entries;
+  } catch {
+    return [legacyEntry];
+  }
+}
+
 module.exports = {
   apps: [
     {
@@ -223,21 +286,8 @@ module.exports = {
       max_restarts: 10,
       min_uptime: '10s'
     },
-    {
-      name: 'activity-monitor',
-      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
-      cwd: HOME,
-      env: {
-        PATH: ENHANCED_PATH,
-        NODE_ENV: 'production',
-        CLAUDE_BYPASS_PERMISSIONS,
-        CODEX_BYPASS_PERMISSIONS,
-        ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
-      },
-      autorestart: true,
-      max_restarts: 10,
-      min_uptime: '10s'
-    },
+    // Activity monitor(s): per-instance when instances.json exists, single legacy otherwise
+    ...loadInstanceMonitors(),
     // Caddy web server (only if set up via `zylos init`)
     ...(fs.existsSync(path.join(BIN_DIR, 'caddy')) && fs.existsSync(path.join(HTTP_DIR, 'Caddyfile'))
       ? [{

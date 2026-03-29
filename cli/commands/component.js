@@ -1077,10 +1077,12 @@ async function upgradeSelfCore({ providedTempDir, branch, beta = false, mode = '
     }
 
     // 6. Execute self-upgrade — show progress in real time
+    const mergeUpstream = process.argv.includes('--merge-upstream');
     const result = runSelfUpgrade({
       tempDir,
       newVersion: check.latest,
       mode,
+      mergeUpstream,
       onStep: !jsonOutput ? printStep : undefined,
     });
 

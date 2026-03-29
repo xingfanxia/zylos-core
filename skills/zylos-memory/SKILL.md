@@ -19,21 +19,25 @@ This skill must be run via a runtime-appropriate background subagent mechanism. 
 
 ```text
 ~/zylos/memory/
-├── identity.md              # Bot soul + digital assets (always loaded)
-├── state.md                 # Active working state (always loaded)
-├── references.md            # Pointers to config files (always loaded)
+├── shared/                    # All instances share (read at session start)
+│   ├── identity.md            # Bot soul + digital assets
+│   ├── references.md          # Pointers to config files
+│   └── reference/
+│       ├── decisions.md       # Key decisions with rationale
+│       ├── projects.md        # Active/planned projects
+│       ├── preferences.md     # Shared team preferences
+│       └── ideas.md           # Uncommitted plans and ideas
+├── instances/                 # Per-instance working state
+│   └── <instance-id>/
+│       ├── state.md           # Active work for this instance
+│       └── sessions/
+│           └── current.md     # Today's session log
 ├── users/
-│   └── <id>/profile.md      # Per-user preferences
-├── reference/
-│   ├── decisions.md         # Key decisions with rationale
-│   ├── projects.md          # Active/planned projects
-│   ├── preferences.md       # Shared team preferences
-│   └── ideas.md             # Uncommitted plans and ideas
-├── sessions/
-│   ├── current.md           # Today's session log
-│   └── YYYY-MM-DD.md        # Past session logs
-└── archive/                 # Cold storage
+│   └── <id>/profile.md       # Per-user preferences
+└── archive/                   # Cold storage
 ```
+
+**Backward compatibility:** When `shared/` does not exist, all scripts fall back to the legacy flat layout (files directly in `memory/`). The `ZYLOS_INSTANCE_ID` env var determines per-instance paths; when unset, scripts behave as single-instance mode.
 
 ## Memory Sync
 
@@ -58,8 +62,16 @@ Both launch a background subagent using the current runtime's supported subagent
    If output says "No unsummarized conversations.", skip to step 5
    (still save current state). Otherwise, note the `end_id` from the
    `[Unsummarized Range]` line.
-3. Read memory files (`identity.md`, `state.md`, `references.md`, user profiles, `reference/*`, `sessions/current.md`).
-4. Extract and classify updates from conversations into the correct files.
+3. Read memory files: shared identity (`shared/identity.md`), instance state (`instances/<id>/state.md`), shared references (`shared/references.md`), user profiles, `shared/reference/*`, instance session log (`instances/<id>/sessions/current.md`). Falls back to legacy flat layout when `shared/` doesn't exist.
+4. Extract and classify updates from conversations into the correct files:
+   - Shared knowledge (decisions, projects, preferences, ideas) → `shared/reference/*.md`
+   - User-specific preferences → `users/<user_open_id>/profile.md` (create dir if needed)
+   - Session events and conversation context → `instances/<instance_id>/sessions/current.md`
+   - Active tasks and focus → `instances/<instance_id>/state.md`
+   - Note: each instance runs its own memory sync and only sees its own conversations
+     (via instance-filtered c4-fetch). Group context naturally goes into the group
+     instance's state.md and sessions/current.md — no separate groups/ directory needed.
+   - Only the primary (admin) instance should write to `shared/reference/*` files.
 5. Write memory updates (always — even without new conversations,
    update `state.md` and `sessions/current.md` with current context).
 6. Create checkpoint (only if conversations were fetched in step 2):
@@ -68,13 +80,14 @@ Both launch a background subagent using the current runtime's supported subagent
 
 ## Classification Rules
 
-- `reference/decisions.md`: committed choices that close alternatives.
-- `reference/projects.md`: scoped work efforts with status.
-- `reference/preferences.md`: standing team-wide preferences.
-- `reference/ideas.md`: uncommitted proposals.
+- `shared/reference/decisions.md`: committed choices that close alternatives.
+- `shared/reference/projects.md`: scoped work efforts with status.
+- `shared/reference/preferences.md`: standing team-wide preferences.
+- `shared/reference/ideas.md`: uncommitted proposals.
 - `users/<id>/profile.md`: user-specific preferences.
-- `state.md`: active focus and pending tasks.
-- `references.md`: pointers only; do not duplicate `.env` values.
+- `instances/<id>/state.md`: active focus and pending tasks for an instance.
+- `instances/<id>/sessions/current.md`: session log and conversation context for an instance.
+- `shared/references.md`: pointers only; do not duplicate `.env` values.
 
 ## File Formats and Examples
 

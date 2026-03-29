@@ -140,6 +140,8 @@ import { acquireUsageProbeLock, releaseUsageProbeLock } from './usage-probe-lock
 import { shouldStartUsageCheck } from './usage-check-engine.js';
 import { getInitialUsageCheckAt } from './usage-check-init.js';
 import { isRuntimeHeartbeatEnabled } from './heartbeat-config.js';
+import { SuspendManager } from './suspend-manager.js';
+import { getConfigDirForInstance } from '../../comm-bridge/scripts/c4-instance-router.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
 // the deployed path — the CLI lives in the globally installed zylos npm package.
@@ -176,7 +178,69 @@ const __dirname = path.dirname(__filename);
 
 // Core runtime config
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
+
+// Session name: reads tmux_session from instances.json, falls back to convention
+function getSessionName() {
+  if (!INSTANCE_ID) return 'claude-main';
+  try {
+    const config = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
+    const inst = config.instances?.[INSTANCE_ID];
+    if (inst?.tmux_session) return inst.tmux_session;
+  } catch { /* fall through to convention */ }
+  return `claude-${INSTANCE_ID}`;
+}
+const SESSION = getSessionName();
+
+// Monitor directory: reads state_dir from instances.json, falls back to convention
+function getMonitorDir() {
+  if (!INSTANCE_ID) return path.join(ZYLOS_DIR, 'activity-monitor');
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, 'instances.json'), 'utf8'));
+    const inst = config.instances?.[INSTANCE_ID];
+    if (inst?.state_dir) return inst.state_dir.replace(/^~/, os.homedir());
+  } catch { /* fall through to convention */ }
+  return path.join(ZYLOS_DIR, 'activity-monitor', INSTANCE_ID);
+}
+
+const MONITOR_DIR = getMonitorDir();
+
+// Cached instances.json read — refreshed every 10s to detect enabled/disabled changes
+let _instancesCache = null;
+let _instancesCacheAt = 0;
+function isInstanceEnabled() {
+  if (!INSTANCE_ID) return true; // non-multi-session: always enabled
+  const now = Date.now();
+  if (!_instancesCache || now - _instancesCacheAt > 10000) {
+    try {
+      _instancesCache = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
+    } catch {
+      _instancesCache = null;
+    }
+    _instancesCacheAt = now;
+  }
+  if (!_instancesCache) return true; // can't read → assume enabled (safe default)
+  const inst = _instancesCache.instances?.[INSTANCE_ID];
+  if (!inst) return true;
+  return inst.enabled !== false;
+}
+
+/**
+ * Check if this instance is the primary (or if running in legacy single-instance mode).
+ * Daily tasks like upgrade checks should only run on the primary to avoid duplicates.
+ */
+function isPrimary() {
+  if (!INSTANCE_ID) return true; // legacy single-instance: always primary
+  try {
+    const config = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
+    const inst = config?.instances?.[INSTANCE_ID];
+    return inst?.primary === true;
+  } catch {
+    return true; // can't read config → assume primary (safe default)
+  }
+}
+
 const STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
 const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
 const HEALTH_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'health-check-state.json');
@@ -194,9 +258,15 @@ const USAGE_CODEX_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-codex-probe.lo
 const API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
 const HOOK_STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
 
-// Conversation directory - auto-detect based on working directory
-const ZYLOS_PATH = ZYLOS_DIR.replace(/\//g, '-');
-const CONV_DIR = path.join(os.homedir(), '.claude', 'projects', ZYLOS_PATH);
+// Conversation directory - auto-detect based on working directory.
+// For non-admin instances with custom CLAUDE_CONFIG_DIR, use that instead of ~/.claude.
+function resolveConvDir() {
+  const configDir = INSTANCE_ID ? getConfigDirForInstance(INSTANCE_ID) : null;
+  const baseDir = configDir || path.join(os.homedir(), '.claude');
+  const zylosPath = ZYLOS_DIR.replace(/\//g, '-');
+  return path.join(baseDir, 'projects', zylosPath);
+}
+const CONV_DIR = resolveConvDir();
 
 // Activity monitor cadence
 const INTERVAL = 1000;
@@ -304,6 +374,7 @@ let adapter;         // initialized in init() via getActiveAdapter()
 let engine;          // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
 let procSampler;     // initialized in init()
+let suspendMgr;      // initialized in init()
 
 // Usage monitoring state machine: 'idle' → 'sent' → 'waiting' → 'capture' → 'idle'
 let usageCheckPhase = 'idle';
@@ -312,6 +383,11 @@ let lastUsageCheckAt = 0;
 let usageProbeBackoffUntil = 0;
 let usageProbeCircuitUntil = 0;
 let usageProbeConsecutiveFailures = 0;
+
+// Health alert state — tracks prolonged unhealthy episodes for admin notification
+let firstUnhealthyAt = 0;
+let healthAlertSentAt = 0;
+const HEALTH_ALERT_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
 // Timezone: reuse scheduler's tz.js (.env TZ → process.env.TZ → UTC)
 import { loadTimezone } from '../../scheduler/scripts/tz.js';
@@ -363,6 +439,15 @@ function checkDailyTruncate() {
   }
 }
 
+function runCommand(cmd, silent = false) {
+  try {
+    return execSync(cmd, { encoding: 'utf8', timeout: 15000, stdio: silent ? 'pipe' : 'inherit' }).trim();
+  } catch {
+    return null;
+  }
+}
+
+
 function resolveCommBridgeScript(fileName) {
   const prodPath = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', fileName);
   if (fs.existsSync(prodPath)) {
@@ -379,13 +464,119 @@ function resolveCommBridgeScript(fileName) {
 
 const C4_CONTROL_PATH = resolveCommBridgeScript('c4-control.js');
 const C4_SEND_PATH = resolveCommBridgeScript('c4-send.js');
+const C4_RECEIVE_PATH = resolveCommBridgeScript('c4-receive.js');
+
+// ---------------------------------------------------------------------------
+// Health Alerts — notify admin when an instance is unhealthy for >5 minutes
+// ---------------------------------------------------------------------------
+
+function sendHealthAlert(type, health) {
+  const instanceId = INSTANCE_ID || 'default';
+  const msg = type === 'recovered'
+    ? `[Health Alert] Instance '${instanceId}' has recovered and is now healthy.`
+    : `[Health Alert] Instance '${instanceId}' has been ${health} for over 5 minutes. Please investigate.`;
+
+  try {
+    execFileSync('node', [
+      C4_RECEIVE_PATH,
+      '--channel', 'system',
+      '--no-reply',
+      '--priority', '1',
+      '--content', msg
+    ], { timeout: 15000, stdio: 'pipe' });
+    log(`Health alert sent: ${type} (instance=${instanceId})`);
+  } catch (err) {
+    log(`Failed to send health alert: ${err.message}`);
+  }
+}
+
+function checkHealthAlert(health) {
+  // Only non-primary instances send alerts — the primary/admin instance
+  // doesn't need to alert itself.
+  if (isPrimary()) return;
+
+  if (health === 'ok') {
+    if (firstUnhealthyAt > 0 && healthAlertSentAt > 0) {
+      // Recovered after alert was sent — send recovery notice
+      sendHealthAlert('recovered', health);
+    }
+    firstUnhealthyAt = 0;
+    healthAlertSentAt = 0;
+    return;
+  }
+
+  // Track when the unhealthy episode started
+  if (firstUnhealthyAt === 0) {
+    firstUnhealthyAt = Date.now();
+  }
+
+  const unhealthyDuration = Date.now() - firstUnhealthyAt;
+  if (unhealthyDuration >= HEALTH_ALERT_THRESHOLD_MS && healthAlertSentAt === 0) {
+    sendHealthAlert('unhealthy', health);
+    healthAlertSentAt = Date.now();
+  }
+}
 
 function tmuxHasSession() {
   try {
-    execSync(`tmux has-session -t "${adapter.sessionName}" 2>/dev/null`, { encoding: 'utf8', timeout: 3000 });
+    execSync(`tmux has-session -t "${adapter.sessionName}" 2>/dev/null`, { encoding: 'utf8', timeout: 15000 });
     return true;
   } catch {
     return false;
+  }
+}
+
+function killTmuxSession() {
+  try {
+    execSync(`tmux kill-session -t "${adapter.sessionName}" 2>/dev/null`, { timeout: 15000 });
+    log('Heartbeat recovery: killed tmux session');
+  } catch {
+    log('Heartbeat recovery: tmux session kill skipped (already missing)');
+  }
+}
+
+function getTmuxPanePid() {
+  try {
+    return execSync(`tmux list-panes -t "${adapter.sessionName}" -F '#{pane_pid}' 2>/dev/null | head -1`, { encoding: 'utf8', timeout: 15000 }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function isClaudeRunning() {
+  const panePid = getTmuxPanePid();
+  if (!panePid) return false;
+
+  try {
+    const procName = execSync(`ps -p ${panePid} -o comm= 2>/dev/null`, { encoding: 'utf8', timeout: 15000 }).trim();
+    if (procName === 'claude') return true;
+  } catch { }
+
+  try {
+    execSync(`pgrep -P ${panePid} -f "claude" > /dev/null 2>&1`, { timeout: 15000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sendToTmux(text) {
+  const msgId = `${Date.now()}-${process.pid}`;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-'));
+  const tempFile = path.join(tempDir, 'msg.txt');
+  const bufferName = `monitor-${msgId}`;
+
+  try {
+    fs.writeFileSync(tempFile, text);
+    execSync(`tmux load-buffer -b "${bufferName}" "${tempFile}" 2>/dev/null`, { timeout: 15000 });
+    execSync('sleep 0.1', { timeout: 15000 });
+    execSync(`tmux paste-buffer -b "${bufferName}" -t "${adapter.sessionName}" 2>/dev/null`, { timeout: 15000 });
+    execSync('sleep 0.2', { timeout: 15000 });
+    execSync(`tmux send-keys -t "${adapter.sessionName}" Enter 2>/dev/null`, { timeout: 15000 });
+    execSync(`tmux delete-buffer -b "${bufferName}" 2>/dev/null`, { timeout: 15000 });
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  } catch {
+    // Best-effort.
   }
 }
 
@@ -394,17 +585,17 @@ function tmuxHasSession() {
 // maintenance scripts are detected; Codex maintenance runs would not be guarded.
 function getRunningMaintenance() {
   try {
-    execSync('pgrep -f "[r]estart-claude" > /dev/null 2>&1', { timeout: 500 });
+    execSync('pgrep -f "[r]estart-claude" > /dev/null 2>&1', { timeout: 15000 });
     return 'restart-claude';
   } catch { }
 
   try {
-    execSync('pgrep -f "[u]pgrade-claude" > /dev/null 2>&1', { timeout: 500 });
+    execSync('pgrep -f "[u]pgrade-claude" > /dev/null 2>&1', { timeout: 15000 });
     return 'upgrade-claude';
   } catch { }
 
   try {
-    execSync('pgrep -f "[c]laude.ai/install.sh" > /dev/null 2>&1', { timeout: 500 });
+    execSync('pgrep -f "[c]laude.ai/install.sh" > /dev/null 2>&1', { timeout: 15000 });
     return 'upgrade (curl install.sh)';
   } catch { }
 
@@ -435,7 +626,7 @@ function waitForMaintenance() {
       log(`Guardian: Still waiting for ${scriptName}... (${waited}s)`);
     }
 
-    execSync('sleep 1', { timeout: 1500 });
+    execSync('sleep 1', { timeout: 15000 });
     waited += 1;
   }
 
@@ -468,14 +659,18 @@ function hasStartupHook() {
 
 function enqueueStartupControl() {
   const content = 'reply to your human partner if they are waiting for your reply, then continue your ongoing tasks using the startup memory and C4 context already injected in this session, and do not query c4.db for recent conversations unless explicitly required.';
-  const result = runC4Control([
+  const args = [
     'enqueue',
     '--content', content,
     '--priority', '3',
     '--require-idle',
     '--available-in', '3',
-    '--no-ack-suffix'
-  ]);
+    '--ack-deadline', '600'
+  ];
+  if (INSTANCE_ID) {
+    args.push('--target-instance', INSTANCE_ID);
+  }
+  const result = runC4Control(args);
   if (result.ok) {
     const match = result.output.match(/control\s+(\d+)/i);
     log(`Startup control enqueued (fallback) id=${match?.[1] ?? '?'}`);
@@ -534,11 +729,20 @@ async function startAgent() {
   if (startAgentInProgress) return;
   startAgentInProgress = true;
 
+  const cooldownSuffix = INSTANCE_ID ? `-${INSTANCE_ID}` : '';
   try {
     if (isMaintenanceRunning()) {
       log('Guardian: Maintenance script detected, waiting for completion...');
       waitForMaintenance();
     }
+
+    // Clear context-related cooldown files for this instance
+    try {
+      fs.unlinkSync(`/tmp/context-alert-cooldown${cooldownSuffix}`);
+    } catch { }
+    try {
+      fs.unlinkSync(`/tmp/context-compact-scheduled${cooldownSuffix}`);
+    } catch { }
 
     // Live auth check before restarting — avoids infinite restart loop on revoked/expired tokens.
     const authResult = adapter.checkAuth ? await adapter.checkAuth() : { ok: true };
@@ -646,7 +850,7 @@ function getConversationFileModTime() {
 
 function getTmuxActivity() {
   try {
-    const output = execSync(`tmux list-windows -t "${adapter.sessionName}" -F '#{window_activity}' 2>/dev/null`, { encoding: 'utf8', timeout: 3000 });
+    const output = execSync(`tmux list-windows -t "${adapter.sessionName}" -F '#{window_activity}' 2>/dev/null`, { encoding: 'utf8', timeout: 15000 });
     return parseInt(output.trim(), 10);
   } catch {
     return null;
@@ -655,7 +859,7 @@ function getTmuxActivity() {
 
 function runC4Control(args) {
   try {
-    const output = execFileSync('node', [C4_CONTROL_PATH, ...args], { encoding: 'utf8', stdio: 'pipe', timeout: 10000 }).trim();
+    const output = execFileSync('node', [C4_CONTROL_PATH, ...args], { encoding: 'utf8', stdio: 'pipe', timeout: 15000 }).trim();
     return { ok: true, output };
   } catch (err) {
     const stdout = err.stdout ? String(err.stdout).trim() : '';
@@ -693,6 +897,65 @@ function readApiActivity() {
     return null;
   }
 }
+
+function enqueueHeartbeat(phase) {
+  const content = 'Heartbeat check.';
+  const deadline = phase === 'stuck' ? STUCK_ACK_DEADLINE : ACK_DEADLINE;
+  const args = [
+    'enqueue',
+    '--content', content,
+    '--priority', '0',
+    '--bypass-state',
+    '--ack-deadline', String(deadline)
+  ];
+  if (INSTANCE_ID) {
+    args.push('--target-instance', INSTANCE_ID);
+  }
+  const result = runC4Control(args);
+
+  if (!result.ok) {
+    log(`Heartbeat enqueue failed (${phase}): ${result.output}`);
+    return false;
+  }
+
+  const match = result.output.match(/control\s+(\d+)/i);
+  if (!match) {
+    log(`Heartbeat enqueue parse failed (${phase}): ${result.output}`);
+    return false;
+  }
+
+  const controlId = parseInt(match[1], 10);
+  const written = writeHeartbeatPending({
+    control_id: controlId,
+    phase,
+    created_at: Math.floor(Date.now() / 1000)
+  });
+  if (!written) {
+    log(`Heartbeat enqueue succeeded but pending file write failed (${phase})`);
+    return false;
+  }
+  log(`Heartbeat enqueued id=${controlId} phase=${phase}`);
+  return true;
+}
+
+function getHeartbeatStatus(controlId) {
+  const result = runC4Control(['get', '--id', String(controlId)]);
+  if (!result.ok) {
+    if (result.output.toLowerCase().includes('not found')) {
+      return 'not_found';
+    }
+    log(`Heartbeat status query failed for ${controlId}: ${result.output}`);
+    return 'error';
+  }
+
+  const match = result.output.match(/status=([a-z_]+)/i);
+  if (!match) {
+    log(`Heartbeat status parse failed for ${controlId}: ${result.output}`);
+    return 'error';
+  }
+  return match[1].toLowerCase();
+}
+
 
 function sendRecoveryNotice(channel, endpoint) {
   try {
@@ -782,12 +1045,16 @@ function enqueueHealthCheck() {
     'Log results to ~/zylos/logs/health.log.'
   ].join(' ');
 
-  const result = runC4Control([
+  const args = [
     'enqueue',
     '--content', content,
     '--priority', '3',
     '--ack-deadline', '600'
-  ]);
+  ];
+  if (INSTANCE_ID) {
+    args.push('--target-instance', INSTANCE_ID);
+  }
+  const result = runC4Control(args);
 
   if (!result.ok) {
     log(`Health check enqueue failed: ${result.output}`);
@@ -848,12 +1115,16 @@ function enqueueDailyUpgradeControl() {
   // Only applicable for Claude Code runtime — no equivalent upgrade skill for other runtimes.
   if (adapter.runtimeId !== 'claude') return false;
   const content = 'Daily upgrade. Use the upgrade-claude skill to upgrade Claude Code to the latest version.';
-  const result = runC4Control([
+  const args = [
     'enqueue',
     '--content', content,
     '--priority', '3',
     '--ack-deadline', '600'
-  ]);
+  ];
+  if (INSTANCE_ID) {
+    args.push('--target-instance', INSTANCE_ID);
+  }
+  const result = runC4Control(args);
 
   if (!result.ok) {
     log(`Daily upgrade enqueue failed: ${result.output}`);
@@ -1580,6 +1851,7 @@ async function monitorLoop() {
   const currentTimeHuman = new Date().toISOString().replace('T', ' ').substring(0, 19);
 
   checkDailyTruncate();
+  checkHealthAlert(engine.health);
 
   if (!tmuxHasSession()) {
     // Grace period: after starting Claude, wait for tmux session to appear
@@ -1607,12 +1879,32 @@ async function monitorLoop() {
       log('State: OFFLINE (tmux session not found)');
     }
 
+    // If instance is disabled in instances.json, skip restart
+    if (!isInstanceEnabled()) {
+      engine.processHeartbeat(false, currentTime);
+      memoryCommitScheduler.maybeTrigger();
+      lastState = state;
+      return;
+    }
+
+    // If suspended, don't auto-restart — let suspend manager check for wake signals
+    if (suspendMgr && suspendMgr.isSuspended()) {
+      suspendMgr.tick({ currentTime, idleSeconds: 0, claudeRunning: false, currentTimeHuman });
+      if (suspendMgr.isSuspended()) {
+        // Still suspended, skip guardian restart
+        engine.processHeartbeat(false, currentTime);
+        memoryCommitScheduler.maybeTrigger();
+        lastState = state;
+        return;
+      }
+      // Fell through: suspend manager cleared the flag → allow restart below
+      log('Guardian: Instance resumed from suspended state, starting Claude...');
+    }
+
     // Check for user message signal — clears auth suppression for immediate retry.
     maybeConsumeUserMessageSignal(currentTime);
 
     // Delegate restart permission to HeartbeatEngine (e.g. won't restart during rate_limited).
-    // Counter mutations (consecutiveRestarts, startupGrace, notRunningCount) are handled
-    // inside startAgent() after auth check passes — not here.
     const restartDelay = Math.min(BASE_RESTART_DELAY * Math.pow(2, consecutiveRestarts), MAX_RESTART_DELAY);
     if (engine.canRestart() && notRunningCount >= restartDelay) {
       if (Date.now() < authRetrySuppressedUntil) {
@@ -1620,6 +1912,7 @@ async function monitorLoop() {
       } else {
         log(`Guardian: Session not found for ${notRunningCount}s, attempting to start ${adapter.displayName}...`);
         startAgent();
+        engine.notifyColdStart(60);
       }
     }
 
@@ -1662,12 +1955,30 @@ async function monitorLoop() {
       log(`State: STOPPED (${adapter.displayName} not running in tmux session)`);
     }
 
+    // If instance is disabled in instances.json, skip restart
+    if (!isInstanceEnabled()) {
+      engine.processHeartbeat(false, currentTime);
+      memoryCommitScheduler.maybeTrigger();
+      lastState = state;
+      return;
+    }
+
+    // If suspended, check for wake signals before attempting restart
+    if (suspendMgr && suspendMgr.isSuspended()) {
+      suspendMgr.tick({ currentTime, idleSeconds: 0, claudeRunning: false, currentTimeHuman });
+      if (suspendMgr.isSuspended()) {
+        engine.processHeartbeat(false, currentTime);
+        memoryCommitScheduler.maybeTrigger();
+        lastState = state;
+        return;
+      }
+      log('Guardian: Instance resumed from suspended state (stopped branch), starting Claude...');
+    }
+
     // Check for user message signal — clears auth suppression for immediate retry.
     maybeConsumeUserMessageSignal(currentTime);
 
     // Delegate restart permission to HeartbeatEngine (e.g. won't restart during rate_limited).
-    // Counter mutations (consecutiveRestarts, startupGrace, notRunningCount) are handled
-    // inside startAgent() after auth check passes — not here.
     const restartDelay = Math.min(BASE_RESTART_DELAY * Math.pow(2, consecutiveRestarts), MAX_RESTART_DELAY);
     if (engine.canRestart() && notRunningCount >= restartDelay) {
       if (Date.now() < authRetrySuppressedUntil) {
@@ -1675,6 +1986,7 @@ async function monitorLoop() {
       } else {
         log(`Guardian: Agent not running for ${notRunningCount}s, attempting to start ${adapter.displayName}...`);
         startAgent();
+        engine.notifyColdStart(60);
       }
     }
 
@@ -1787,6 +2099,22 @@ async function monitorLoop() {
   // via the detectRateLimit dep callback (dual-signal: heartbeat failure + tmux text).
   // This eliminates false positives from conversation content matching rate-limit patterns.
 
+  // Auto-suspend: check if instance should be suspended due to idle timeout.
+  // Must run before stuck detection to avoid probing a deliberately-suspended instance.
+  if (suspendMgr && state === 'idle') {
+    suspendMgr.tick({
+      currentTime,
+      idleSeconds,
+      claudeRunning: true,
+      currentTimeHuman
+    });
+    // If we just suspended, skip the rest of this tick — next tick will see offline state.
+    if (suspendMgr.isSuspended()) {
+      lastState = state;
+      return;
+    }
+  }
+
   // User message triggered recovery: when a user sends a message while unavailable,
   // c4-receive writes a signal file. Read and consume it to trigger/accelerate recovery.
   if (engine.health !== 'ok') {
@@ -1832,7 +2160,7 @@ async function monitorLoop() {
 
   engine.processHeartbeat(true, currentTime);
   maybeEnqueueHealthCheck(true, currentTime);
-  if (engine.health === 'ok') {
+  if (engine.health === 'ok' && isPrimary()) {
     upgradeScheduler.maybeTrigger();
     upgradeCheckScheduler.maybeTrigger();
   }
@@ -1894,6 +2222,10 @@ function init() {
     engine.rateLimitResetTime = initialStatus.rate_limit_reset || '';
   }
 
+  // Cold-start grace: suppress heartbeats for 60s after AM starts.
+  // Prevents the heartbeat from killing a CC session that's still initializing.
+  engine.notifyColdStart(60);
+
   upgradeScheduler = new DailySchedule({
     getLocalHour,
     getLocalDate,
@@ -1941,6 +2273,25 @@ function init() {
   });
   if (getUsageProbeMode() !== 'legacy') {
     maybeCleanupUsageProbeSessions();
+  }
+
+  // Initialize suspend manager for auto-suspend/resume support (multi-session only)
+  if (INSTANCE_ID) {
+    suspendMgr = new SuspendManager({
+      log,
+      killTmuxSession,
+      startClaude: () => startAgent(),
+      writeStatusFile,
+      isClaudeRunning: () => adapter.isRunning(),
+      tmuxHasSession,
+    }, {
+      instanceId: INSTANCE_ID,
+      monitorDir: MONITOR_DIR,
+    });
+  }
+
+  if (initialHealth !== 'ok') {
+    log(`Startup with health=${initialHealth}; will verify immediately when Claude is running`);
   }
 
   // Start context monitor if the adapter provides one (Codex polling-based monitor).

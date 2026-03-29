@@ -5,10 +5,18 @@
  */
 
 import { execFileSync } from 'child_process';
-import { readFileSync, existsSync, statSync } from 'fs';
+import { readFileSync, existsSync, statSync, writeFileSync, mkdirSync } from 'fs';
+import path from 'path';
+import os from 'os';
 import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
+import { getSessionForInstance, getStatusFileForInstance, getDefaultInstance, getAllInstanceIds, getInstanceType, getInstanceDef, startWatcher } from './c4-instance-router.js';
+
+// Start the file watcher for hot-reload (long-running process)
+startWatcher();
 import {
   getNextPending,
+  getNextPendingForInstance,
+  getNextPendingForInstances,
   claimConversation,
   requeueConversation,
   markDelivered,
@@ -23,7 +31,9 @@ import {
   retryOrFailControl,
   ackControl,
   expireTimedOutControls,
-  cleanupControlQueue
+  cleanupControlQueue,
+  markRejected,
+  markControlRejected
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -55,6 +65,11 @@ let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
 
+// On-demand instance lifecycle tracking
+// Maps instanceId -> epoch ms of last message delivery (or startup time)
+const onDemandLastActivity = new Map();
+const ON_DEMAND_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
 function log(message) {
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
   console.log(`[${timestamp}] ${message}`);
@@ -80,19 +95,174 @@ export function readJsonFileWithRetry(filePath, attempts = 3) {
   throw lastErr;
 }
 
-function getAgentState() {
+const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+
+/**
+ * Write a wake-signal file for a suspended instance so the Activity Monitor
+ * knows to restart Claude Code.
+ *
+ * @param {string} instanceId
+ */
+function writeWakeSignal(instanceId) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    const statusFile = getStatusFileForInstance(instanceId);
+    const stateDir = statusFile
+      ? path.dirname(statusFile)
+      : path.join(ZYLOS_DIR, 'activity-monitor', instanceId);
+
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(path.join(stateDir, 'wake-signal'), new Date().toISOString());
+  } catch (err) {
+    log(`Warning: failed to write wake-signal for ${instanceId}: ${err.message}`);
+  }
+}
+
+/**
+ * Start an on_demand instance by creating a tmux session and launching Claude Code.
+ *
+ * @param {string} instanceId
+ * @returns {boolean} true if started successfully
+ */
+function startOnDemandInstance(instanceId) {
+  const def = getInstanceDef(instanceId);
+  if (!def) {
+    log(`Cannot start on_demand instance ${instanceId}: no instance definition found`);
+    return false;
+  }
+
+  const tmuxSession = def.tmux_session;
+  if (!tmuxSession) {
+    log(`Cannot start on_demand instance ${instanceId}: no tmux_session configured`);
+    return false;
+  }
+
+  // Check if tmux session already exists
+  try {
+    execFileSync('tmux', ['has-session', '-t', tmuxSession], { stdio: 'pipe', timeout: 15000 });
+    // Session already exists — treat as started
+    log(`On-demand instance ${instanceId}: tmux session ${tmuxSession} already exists`);
+    onDemandLastActivity.set(instanceId, Date.now());
+    return true;
+  } catch {
+    // Session doesn't exist — create it
+  }
+
+  try {
+    const configDir = def.config_dir
+      ? def.config_dir.replace(/^~/, os.homedir())
+      : null;
+
+    // Build tmux args with environment variable via -e flag (avoids shell injection)
+    const runtime = def.runtime || 'claude';
+    const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
+    if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
+    tmuxArgs.push(runtime);
+
+    // Create a detached tmux session running Claude Code
+    execFileSync('tmux', tmuxArgs, { stdio: 'pipe', timeout: 15000 });
+
+    log(`Started on-demand instance ${instanceId} in tmux session ${tmuxSession}`);
+    onDemandLastActivity.set(instanceId, Date.now());
+    return true;
+  } catch (err) {
+    log(`Failed to start on-demand instance ${instanceId}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Stop an on_demand instance by killing its tmux session.
+ *
+ * @param {string} instanceId
+ */
+function stopOnDemandInstance(instanceId) {
+  const def = getInstanceDef(instanceId);
+  if (!def || !def.tmux_session) return;
+
+  try {
+    execFileSync('tmux', ['kill-session', '-t', def.tmux_session], { stdio: 'pipe', timeout: 15000 });
+    log(`Stopped idle on-demand instance ${instanceId} (session ${def.tmux_session})`);
+  } catch {
+    // Session already gone — fine
+  }
+  onDemandLastActivity.delete(instanceId);
+}
+
+/**
+ * Check all on_demand instances for idle timeout and stop idle ones.
+ */
+function reapIdleOnDemandInstances() {
+  const now = Date.now();
+  for (const [instanceId, lastActivityMs] of onDemandLastActivity) {
+    if (getInstanceType(instanceId) !== 'on_demand') continue;
+    if ((now - lastActivityMs) >= ON_DEMAND_IDLE_TIMEOUT_MS) {
+      log(`On-demand instance ${instanceId} idle for ${Math.round((now - lastActivityMs) / 60000)}min, stopping`);
+      stopOnDemandInstance(instanceId);
+    }
+  }
+}
+
+/**
+ * Get the list of instance IDs that are currently online (status file is fresh
+ * and state is not offline/stopped). Returns null in legacy mode (no instances.json).
+ *
+ * @returns {string[]|null}
+ */
+function getOnlineInstanceIds() {
+  const allIds = getAllInstanceIds();
+  if (allIds.length === 0) return null; // legacy mode
+
+  const online = [];
+  for (const id of allIds) {
+    const statusFile = getStatusFileForInstance(id);
+    if (!statusFile) continue;
+    const state = getClaudeState(statusFile);
+    if (state.state !== 'offline' && state.state !== 'stopped') {
+      online.push(id);
+    }
+  }
+  return online;
+}
+
+/**
+ * Resolve the tmux session name for a given target_instance.
+ * Returns the legacy TMUX_SESSION if target_instance is null or unresolvable.
+ */
+function resolveSessionName(targetInstance) {
+  if (!targetInstance) return TMUX_SESSION;
+  const resolved = getSessionForInstance(targetInstance);
+  if (!resolved) {
+    log(`Warning: instance '${targetInstance}' has no tmux_session, falling back to ${TMUX_SESSION}`);
+  }
+  return resolved || TMUX_SESSION;
+}
+
+/**
+ * Resolve the agent-status.json path for a given target_instance.
+ * Returns the legacy CLAUDE_STATUS_FILE if target_instance is null or unresolvable.
+ */
+function resolveStatusFile(targetInstance) {
+  if (!targetInstance) return CLAUDE_STATUS_FILE;
+  const resolved = getStatusFileForInstance(targetInstance);
+  if (!resolved) {
+    log(`Warning: instance '${targetInstance}' has no status file config, falling back to default`);
+  }
+  return resolved || CLAUDE_STATUS_FILE;
+}
+
+function getClaudeState(statusFile = CLAUDE_STATUS_FILE) {
+  try {
+    if (!existsSync(statusFile)) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'missing' };
     }
 
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     const ageMs = Date.now() - stats.mtimeMs;
     if (ageMs > STALE_STATUS_THRESHOLD) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'stale' };
     }
 
-    const status = readJsonFileWithRetry(AGENT_STATUS_FILE);
+    const status = readJsonFileWithRetry(statusFile);
     let state = status.state;
 
     if (!state && typeof status.idle_seconds === 'number') {
@@ -144,12 +314,12 @@ function isAgentConfirmedActive() {
   }
 }
 
-function isAgentStatusFresh() {
+function isStatusFresh(statusFile = CLAUDE_STATUS_FILE) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(statusFile)) {
       return false;
     }
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     return (Date.now() - stats.mtimeMs) <= STALE_STATUS_THRESHOLD;
   } catch {
     return false;
@@ -265,28 +435,28 @@ export function isUsageOverlayCapture(capture) {
   return hasUsageHeader && hasEscHint;
 }
 
-async function dismissGhostTextAndCapture() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Space'], { stdio: 'pipe', timeout: 5000 });
+async function dismissGhostTextAndCapture(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Space'], { stdio: 'pipe', timeout: 15000 });
   await sleep(100);
 
-  const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+  const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
     encoding: 'utf8',
     stdio: 'pipe',
     timeout: 5000
   });
 
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'BSpace'], { stdio: 'pipe', timeout: 5000 });
+  execFileSync('tmux', ['send-keys', '-t', session, 'BSpace'], { stdio: 'pipe', timeout: 15000 });
   await sleep(100);
   return capture;
 }
 
-async function submitAndVerify() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+async function submitAndVerify(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 15000 });
   let lastState = 'indeterminate';
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
-    const capture = await dismissGhostTextAndCapture();
+    const capture = await dismissGhostTextAndCapture(session);
     const state = checkInputBox(capture);
     lastState = state;
 
@@ -308,28 +478,29 @@ async function submitAndVerify() {
     }
 
     log(`Enter verify attempt ${attempt + 1}: input box has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 15000 });
   }
 
   return { verified: false, state: lastState };
 }
 
 async function sendToTmux(message, options = {}) {
+  const session = options.session || TMUX_SESSION;
   const strictVerify = options.strictVerify === true;
   const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
   const delayMs = getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8'));
 
   try {
-    execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
-    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', TMUX_SESSION], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 15000 });
+    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 15000 });
   } catch (err) {
     log(`Error pasting to tmux: ${err.message}`);
     logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
     return 'paste_error';
   } finally {
     try {
-      execFileSync('tmux', ['delete-buffer', '-b', bufferName], { stdio: 'pipe', timeout: 5000 });
+      execFileSync('tmux', ['delete-buffer', '-b', bufferName], { stdio: 'pipe', timeout: 15000 });
     } catch {
       // Ignore buffer deletion errors.
     }
@@ -339,7 +510,7 @@ async function sendToTmux(message, options = {}) {
 
   let verifyResult = { verified: false, state: 'indeterminate' };
   try {
-    verifyResult = await submitAndVerify();
+    verifyResult = await submitAndVerify(session);
   } catch (err) {
     log(`Warning: Enter verification error: ${err.message}`);
   }
@@ -382,8 +553,8 @@ function hasAckSuffix(content = '') {
   return content.includes('---- ack via:');
 }
 
-async function handleConversationDeliveryFailure(msg) {
-  const channelHealthy = isAgentStatusFresh();
+async function handleConversationDeliveryFailure(msg, statusFile = CLAUDE_STATUS_FILE) {
+  const channelHealthy = isStatusFresh(statusFile);
 
   if (channelHealthy) {
     const currentCount = msg.retry_count || 0;
@@ -422,11 +593,11 @@ async function handleControlDeliveryFailure(control, reason) {
   log(`Retry ${transition.retry_count} for control id=${control.id}`);
 }
 
-async function waitForRequireIdleSettlement(msgId) {
+async function waitForRequireIdleSettlement(msgId, statusFile = CLAUDE_STATUS_FILE) {
   log(`require_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms before next dispatch`);
   await sleep(REQUIRE_IDLE_POST_SEND_HOLD_MS);
 
-  let state = getAgentState().state;
+  let state = getClaudeState(statusFile).state;
   if (state === 'offline' || state === 'stopped') {
     log(`require_idle item id=${msgId}: agent state=${state}, continuing`);
     return;
@@ -440,7 +611,7 @@ async function waitForRequireIdleSettlement(msgId) {
   const deadline = Date.now() + REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     await sleep(REQUIRE_IDLE_EXECUTION_POLL_MS);
-    state = getAgentState().state;
+    state = getClaudeState(statusFile).state;
     if (state === 'idle' || state === 'offline' || state === 'stopped') {
       log(`require_idle item id=${msgId}: settled with agent state=${state}`);
       return;
@@ -450,9 +621,13 @@ async function waitForRequireIdleSettlement(msgId) {
   log(`require_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem() {
+/**
+ * Claim the next item from the queue.
+ * @param {string[]|null} onlineInstanceIds - list of online instance IDs for per-instance filtering, or null for legacy mode
+ */
+function claimNextItem(onlineInstanceIds = null) {
   const current = nowSeconds();
-  const control = getNextPendingControl(current);
+  const control = getNextPendingControl(current, onlineInstanceIds);
   if (control) {
     if (claimControl(control.id)) {
       return { ...control, type: 'control' };
@@ -463,7 +638,12 @@ function claimNextItem() {
     return null;
   }
 
-  const msg = getNextPending();
+  // In multi-session mode, filter conversations to messages for online instances only.
+  // In legacy mode (onlineInstanceIds is null), fetch any pending message.
+  const msg = onlineInstanceIds
+    ? getNextPendingForInstances(onlineInstanceIds)
+    : getNextPending();
+
   if (msg && claimConversation(msg.id)) {
     return { ...msg, type: 'conversation' };
   }
@@ -492,8 +672,16 @@ async function processNextMessage() {
     log(`Control timeout sweep marked ${timedOut} record(s) as timeout`);
   }
 
-  const agentState = getAgentState();
-  if (agentState.state === 'offline' || agentState.state === 'stopped') {
+  // Reap idle on-demand instances periodically
+  reapIdleOnDemandInstances();
+
+  // Default state check — resolve correct status file in multi-session mode
+  const defaultInstanceId = getDefaultInstance();
+  const defaultStatusFile = defaultInstanceId
+    ? (getStatusFileForInstance(defaultInstanceId) || CLAUDE_STATUS_FILE)
+    : CLAUDE_STATUS_FILE;
+  const defaultState = getClaudeState(defaultStatusFile);
+  if (defaultState.state === 'offline' || defaultState.state === 'stopped') {
     tmuxMissingChecks += 1;
     if (tmuxMissingChecks === TMUX_MISSING_WARN_THRESHOLD) {
       log(`WARNING: Agent status stale/missing for ${TMUX_MISSING_WARN_THRESHOLD} consecutive checks`);
@@ -502,86 +690,148 @@ async function processNextMessage() {
     tmuxMissingChecks = 0;
   }
 
-  const item = claimNextItem();
-  if (!item) {
-    return { delivered: false, state: agentState.state };
-  }
+  // Compute online instance IDs for per-instance filtering (Fix 1).
+  // Returns null in legacy mode (no instances.json) — claimNextItem falls back to getNextPending.
+  const onlineInstanceIds = getOnlineInstanceIds();
 
-  const bypass = isBypassState(item);
-
-  if ((agentState.state === 'offline' || agentState.state === 'stopped') && !bypass) {
-    releaseItem(item);
-    return { delivered: false, state: agentState.state };
-  }
-
-  if (agentState.health !== 'ok' && !bypass) {
-    releaseItem(item);
-    return { delivered: false, state: agentState.state };
-  }
-
-  if (item.require_idle === 1 && (agentState.state !== 'idle' || agentState.idleSeconds < REQUIRE_IDLE_MIN_SECONDS)) {
-    releaseItem(item);
-    return { delivered: false, state: agentState.state };
-  }
-
-  // D1: heartbeat must not interrupt active generation.
-  // Auto-ack supports two paths:
-  //   1. It's a heartbeat (not other bypass controls like context rotation)
-  //   2. Agent state is not offline/stopped (proc-state can be stale for ~30s after crash)
-  //   3. /proc confirms process is alive (and idle path also requires not frozen)
-  //   4. Either:
-  //      - busy path: fresh hooks confirm active generation, or
-  //      - idle path: health=ok and idle_seconds >= sustained-idle minimum
-  // This preserves the existing busy auto-ack behavior while allowing a narrow
-  // idle auto-ack path on healthy, stable sessions.
-  if (bypass) {
-    const procState = readProcState();
-    const confirmed = isAgentConfirmedActive();
-    if (shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive: confirmed })) {
-      const phase = getHeartbeatPhase(item.content);
-      const reason = confirmed
-        ? `phase=${phase} /proc alive + active_tools>0 fresh (delta=${procState.lastDelta})`
-        : `phase=${phase} /proc alive + health=ok + idle_seconds=${agentState.idleSeconds}`;
-      log(`Auto-acking heartbeat id=${item.id}: ${reason}`);
-      ackControl(item.id);
-      return { delivered: true, state: agentState.state };
+  // Try up to MAX_SKIP_ATTEMPTS items — skip messages whose target instance is
+  // offline and try the next one instead of backing off the entire loop.
+  const MAX_SKIP_ATTEMPTS = 5;
+  for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
+    const item = claimNextItem(onlineInstanceIds);
+    if (!item) {
+      return { delivered: false, state: defaultState.state };
     }
-  }
 
-  log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
-  const deliveryContent = item.content || '';
-  const result = await sendToTmux(deliveryContent, {
-    strictVerify: item.type === 'conversation'
-  });
+    // Resolve per-instance tmux session and status file
+    const targetInstance = item.target_instance || null;
 
-  if (result === 'submitted') {
-    if (item.type === 'conversation') {
-      markDelivered(item.id);
-      log(`Conversation id=${item.id} delivered`);
-    } else {
-      if (hasAckSuffix(item.content || '')) {
-        log(`Control id=${item.id} submitted, waiting ack`);
-      } else {
-        ackControl(item.id);
-        log(`Control id=${item.id} submitted (no-ack mode), marked done`);
+    // Disabled instance check: drop messages silently (do NOT reroute to admin)
+    if (targetInstance) {
+      const instDef = getInstanceDef(targetInstance);
+      if (instDef && instDef.enabled === false) {
+        if (item.type === 'control') {
+          markControlRejected(item.id);
+        } else {
+          markRejected(item.id);
+        }
+        log(`Rejected ${item.type} id=${item.id} — target instance '${targetInstance}' is disabled`);
+        continue;
       }
     }
 
-    if (item.require_idle === 1) {
-      await waitForRequireIdleSettlement(item.id);
+    const targetSession = resolveSessionName(targetInstance);
+    const targetStatusFile = resolveStatusFile(targetInstance);
+
+    // Re-read state for the target instance (may differ from default)
+    const claudeState = (targetInstance && targetStatusFile !== CLAUDE_STATUS_FILE)
+      ? getClaudeState(targetStatusFile)
+      : defaultState;
+
+    const bypass = isBypassState(item);
+
+    // On-demand instance startup (Fix 3): if the target is an on_demand instance
+    // that's offline, attempt to start it before requeuing.
+    if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass && targetInstance) {
+      if (getInstanceType(targetInstance) === 'on_demand') {
+        const started = startOnDemandInstance(targetInstance);
+        if (started) {
+          // Requeue and let the next poll cycle pick it up once the instance is ready
+          releaseItem(item);
+          log(`On-demand instance ${targetInstance} started; requeued ${item.type} id=${item.id} for next cycle`);
+          continue;
+        }
+      }
     }
-    return { delivered: true, state: agentState.state };
+
+    // Instance offline/stopped: requeue and skip to next item
+    if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass) {
+      releaseItem(item);
+      if (targetInstance) {
+        // Multi-session: skip this item and try the next one
+        continue;
+      }
+      return { delivered: false, state: claudeState.state };
+    }
+
+    // Suspended instance: write wake-signal so the AM can restart CC, then skip
+    if (claudeState.state === 'suspended' && targetInstance && !bypass) {
+      writeWakeSignal(targetInstance);
+      releaseItem(item);
+      log(`Instance ${targetInstance} is suspended; wrote wake-signal and requeued ${item.type} id=${item.id}`);
+      continue;
+    }
+
+    if (claudeState.health !== 'ok' && !bypass) {
+      releaseItem(item);
+      return { delivered: false, state: claudeState.state };
+    }
+
+    if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < REQUIRE_IDLE_MIN_SECONDS)) {
+      releaseItem(item);
+      return { delivered: false, state: claudeState.state };
+    }
+
+    // D1: heartbeat must not interrupt active generation.
+    // Auto-ack supports two paths:
+    //   1. It's a heartbeat (not other bypass controls like context rotation)
+    //   2. Agent state is not offline/stopped (proc-state can be stale for ~30s after crash)
+    //   3. /proc confirms process is alive (and idle path also requires not frozen)
+    //   4. Either:
+    //      - busy path: fresh hooks confirm active generation, or
+    //      - idle path: health=ok and idle_seconds >= sustained-idle minimum
+    if (bypass) {
+      const procState = readProcState();
+      const confirmed = isAgentConfirmedActive();
+      if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed })) {
+        const phase = getHeartbeatPhase(item.content);
+        const reason = confirmed
+          ? `phase=${phase} /proc alive + active_tools>0 fresh (delta=${procState.lastDelta})`
+          : `phase=${phase} /proc alive + health=ok + idle_seconds=${claudeState.idleSeconds}`;
+        log(`Auto-acking heartbeat id=${item.id}: ${reason}`);
+        ackControl(item.id);
+        return { delivered: true, state: claudeState.state };
+      }
+    }
+
+    log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}${targetInstance ? ` → ${targetInstance}` : ''}`);
+    const deliveryContent = item.content || '';
+    const result = await sendToTmux(deliveryContent, {
+      session: targetSession,
+      strictVerify: item.type === 'conversation'
+    });
+
+    if (result === 'submitted') {
+      if (item.type === 'conversation') {
+        markDelivered(item.id);
+        log(`Conversation id=${item.id} delivered`);
+      } else {
+        log(`Control id=${item.id} submitted, waiting ack`);
+      }
+
+      // Track on-demand instance activity for idle timeout
+      if (targetInstance && getInstanceType(targetInstance) === 'on_demand') {
+        onDemandLastActivity.set(targetInstance, Date.now());
+      }
+
+      if (item.require_idle === 1) {
+        await waitForRequireIdleSettlement(item.id, targetStatusFile);
+      }
+      return { delivered: true, state: claudeState.state };
+    }
+
+    log(`Failed to paste ${item.type} id=${item.id} to tmux`);
+    logDeliveryFailure(item.type, item.id, 'TMUX_PASTE_FAILED');
+    if (item.type === 'control') {
+      await handleControlDeliveryFailure(item, 'TMUX_PASTE_FAILED');
+    } else {
+      await handleConversationDeliveryFailure(item, targetStatusFile);
+    }
+    return { delivered: false, state: claudeState.state };
   }
 
-  const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
-  log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
-  logDeliveryFailure(item.type, item.id, reason);
-  if (item.type === 'control') {
-    await handleControlDeliveryFailure(item, reason);
-  } else {
-    await handleConversationDeliveryFailure(item);
-  }
-  return { delivered: false, state: agentState.state };
+  // Exhausted skip attempts — all tried items had offline instances
+  return { delivered: false, state: defaultState.state };
 }
 
 async function dispatcherLoop() {

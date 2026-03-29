@@ -8,12 +8,16 @@ import { fileURLToPath } from 'node:url';
 
 const CLI_PATH = fileURLToPath(new URL('../c4-send.js', import.meta.url));
 
-function cli(args, env = {}) {
-  const result = spawnSync('node', [CLI_PATH, ...args], {
+function cli(args, env = {}, input = null) {
+  const opts = {
     env: { ...process.env, ...env },
     encoding: 'utf8',
     timeout: 5000
-  });
+  };
+  if (input !== null) {
+    opts.input = input;
+  }
+  const result = spawnSync('node', [CLI_PATH, ...args], opts);
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
 }
 
@@ -67,7 +71,7 @@ describe('c4-send basic', () => {
     withTmpDir(({ tmpDir, env }) => {
       const sentFile = setupMockChannel(tmpDir, 'mock-channel');
 
-      const { stdout, status } = cli(['mock-channel', 'Hello broadcast!'], env);
+      const { stdout, status } = cli(['mock-channel', '--stdin'], env, 'Hello broadcast!');
       assert.equal(status, 0);
       assert.ok(stdout.includes('Message sent via mock-channel'));
 
@@ -102,7 +106,7 @@ describe('c4-send validation', () => {
       const skillDir = path.join(tmpDir, '.claude', 'skills', 'fake-channel');
       fs.mkdirSync(skillDir, { recursive: true });
 
-      const { stderr, status } = cli(['fake-channel', 'Hello'], env);
+      const { stderr, status } = cli(['fake-channel', '--stdin'], env, 'Hello');
       assert.equal(status, 1);
       assert.ok(stderr.includes('Channel script not found'));
     });
@@ -118,7 +122,7 @@ describe('c4-send failed channel', () => {
       fs.mkdirSync(skillDir, { recursive: true });
       fs.writeFileSync(path.join(skillDir, 'send.js'), 'process.exit(1);');
 
-      const { stdout, status } = cli(['bad-channel', 'Hello'], env);
+      const { stdout, status } = cli(['bad-channel', '--stdin'], env, 'Hello');
       assert.equal(status, 1);
       assert.ok(stdout.includes('Failed to send'));
     });

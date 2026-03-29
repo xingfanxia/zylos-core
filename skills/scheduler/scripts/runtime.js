@@ -10,16 +10,41 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
-const STATUS_FILE = join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+const INSTANCES_FILE = join(ZYLOS_DIR, 'instances.json');
 
 /**
- * Read agent status from ~/zylos/activity-monitor/agent-status.json
+ * Resolve the status file path for the scheduler's target instance.
+ * Falls back to the legacy single-instance path.
+ */
+function resolveStatusFilePath() {
+  try {
+    if (!existsSync(INSTANCES_FILE)) {
+      return join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+    }
+    const config = JSON.parse(readFileSync(INSTANCES_FILE, 'utf-8'));
+    const targetId = config.scheduler_instance || config.default_instance;
+    if (!targetId || !config.instances?.[targetId]) {
+      return join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+    }
+    const inst = config.instances[targetId];
+    const stateDir = inst.state_dir
+      ? inst.state_dir.replace(/^~/, homedir())
+      : join(ZYLOS_DIR, 'activity-monitor', targetId);
+    return join(stateDir, 'agent-status.json');
+  } catch {
+    return join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+  }
+}
+
+/**
+ * Read agent status for the scheduler's target instance.
  * @returns {object|null} Status object or null if unavailable
  */
 export function readStatusFile() {
   try {
-    if (!existsSync(STATUS_FILE)) return null;
-    const content = readFileSync(STATUS_FILE, 'utf-8');
+    const statusFile = resolveStatusFilePath();
+    if (!existsSync(statusFile)) return null;
+    const content = readFileSync(statusFile, 'utf-8');
     return JSON.parse(content);
   } catch (error) {
     return null;
@@ -60,6 +85,7 @@ function findC4ReceivePath() {
  * @param {boolean} options.requireIdle - Whether to wait for idle state (default: false)
  * @param {string} options.replyChannel - Reply channel (e.g., 'telegram')
  * @param {string} options.replyEndpoint - Reply endpoint (e.g., user ID)
+ * @param {string} options.targetInstance - Target instance ID for multi-session routing
  * @returns {boolean} True if successful
  */
 export function sendViaC4(message, options = {}) {
@@ -67,7 +93,8 @@ export function sendViaC4(message, options = {}) {
     priority = 3,
     requireIdle = false,
     replyChannel = null,
-    replyEndpoint = null
+    replyEndpoint = null,
+    targetInstance = null
   } = options;
 
   try {
@@ -88,6 +115,10 @@ export function sendViaC4(message, options = {}) {
 
     if (requireIdle) {
       args.push('--require-idle');
+    }
+
+    if (targetInstance) {
+      args.push('--target-instance', targetInstance);
     }
 
     args.push('--priority', String(priority), '--content', message);

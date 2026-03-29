@@ -6,9 +6,11 @@
 
 import path from 'path';
 import fs from 'fs';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
-import { insertConversation, close } from './c4-db.js';
+import { insertConversation, getDb, close } from './c4-db.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { resolveInstance, getDefaultInstance, getSchedulerInstance, isEndpointRouted } from './c4-instance-router.js';
 import {
   FILE_SIZE_THRESHOLD,
   ATTACHMENTS_DIR,
@@ -18,17 +20,19 @@ import {
   USER_MESSAGE_SIGNAL_FILE,
   DATA_DIR
 } from './c4-config.js';
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--require-idle] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--require-idle] [--target-instance <id>] [--json] --content "<message>"');
   console.log('');
   console.log('Options:');
-  console.log('  --no-reply       Do not append "reply via" suffix (use for system messages)');
-  console.log('  --require-idle   Only deliver when Claude is idle');
-  console.log('  --json           Output structured JSON');
+  console.log('  --no-reply                  Do not append "reply via" suffix (use for system messages)');
+  console.log('  --require-idle              Only deliver when Claude is idle');
+  console.log('  --target-instance <id>      Override instance routing (deliver to specific instance)');
+  console.log('  --json                      Output structured JSON');
   console.log('');
   console.log('Priority levels:');
   console.log('  1 = Urgent (system messages)');
@@ -44,7 +48,8 @@ function parseArgs(args) {
     priority: 3,
     noReply: false,
     requireIdle: false,
-    json: false
+    json: false,
+    targetInstance: null
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -66,6 +71,9 @@ function parseArgs(args) {
         break;
       case '--json':
         result.json = true;
+        break;
+      case '--target-instance':
+        result.targetInstance = args[++i];
         break;
       case '--content':
         result.content = args[++i];
@@ -155,6 +163,76 @@ function emitSuccess(json, recordId) {
   console.log(`[C4] Message queued (id=${recordId})`);
 }
 
+/**
+ * Check if an unknown endpoint has already been notified by querying the DB
+ * for existing approval request system messages containing the chat_id.
+ * If not found, inject an approval request to the admin instance.
+ *
+ * Returns true if this is the first contact (triggers holding reply + approval request).
+ * Returns false if already tracked (subsequent messages just queue as pending_approval).
+ *
+ * @param {string} channel - The message channel (telegram, lark, etc.)
+ * @param {string} endpoint - The full endpoint identifier
+ * @param {string} chatId - The chat ID portion
+ * @param {string} content - The message content
+ * @returns {boolean} true if first contact, false if already known
+ */
+function recordUnknownEndpoint(channel, endpoint, chatId, content) {
+  try {
+    const db = getDb();
+
+    // DB-backed dedup: check for existing approval request or resolved messages for this chat_id.
+    // Also check if there are already pending_approval messages from this endpoint (prior message held).
+    const existing = db.prepare(`
+      SELECT id FROM conversations
+      WHERE direction = 'in' AND channel = 'system'
+        AND content LIKE '%[Instance Approval Required]%'
+        AND content LIKE ?
+      LIMIT 1
+    `).get(`%${chatId}%`);
+
+    if (existing) {
+      return false; // already notified admin — don't spam
+    }
+
+    // Also check if this chat_id already has pending_approval messages (from a previous c4-receive run)
+    const heldMsg = db.prepare(`
+      SELECT id FROM conversations
+      WHERE status = 'pending_approval' AND endpoint_id LIKE ?
+      LIMIT 1
+    `).get(`${chatId}%`);
+
+    if (heldMsg) {
+      return false; // messages already held, admin already notified in a prior invocation
+    }
+
+    // Extract sender name from message format: "[Channel DM] Name said:" or "[Channel Group] Name said:"
+    const nameMatch = content.match(/\]\s+(.+?)\s+said:/);
+    const senderName = nameMatch ? nameMatch[1] : null;
+    const asciiName = senderName ? senderName.toLowerCase().replace(/[^a-z0-9]/g, '') : '';
+    const suggestedId = asciiName
+      ? `user-${asciiName.substring(0, 20)}`
+      : `user-${chatId.slice(-8)}`;
+
+    // Inject an approval request to the admin instance
+    const userPreview = content.substring(0, 200);
+    const replyPath = `node ${path.join(__dirname, 'c4-send.js')} "${channel}" "${chatId}"`;
+    const notification = `[Instance Approval Required] ${senderName || 'Unknown user'} from ${channel} (chat_id: ${chatId}) sent their first message. Their messages are held as pending_approval.\n\n` +
+      `User's message: "${userPreview}"\n\n` +
+      `Suggested instance name: ${suggestedId}\n` +
+      `Reply path: ${replyPath}\n\n` +
+      `1. Reply to the user (in their language) via the reply path — tell them their environment is being set up.\n` +
+      `2. Then ask AX to approve: "approve ${chatId}" or "deny ${chatId}".`;
+
+    const defaultInstance = getDefaultInstance();
+    insertConversation('in', 'system', null, notification, 'pending', 2, false, defaultInstance);
+    return true;
+  } catch (err) {
+    console.error(`[C4] Warning: failed to record unknown endpoint (${err.message})`);
+    return false;
+  }
+}
+
 function emitError(json, code, message, exitCode = 1) {
   if (json) {
     console.log(JSON.stringify({
@@ -174,7 +252,7 @@ function main() {
     emitError(asJson, 'INVALID_ARGS', parsed.error);
   }
 
-  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json } = parsed;
+  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json, targetInstance: targetInstanceOverride } = parsed;
   let channel = rawChannel;
 
   if (!channel && noReply) {
@@ -254,8 +332,43 @@ function main() {
     dbContent = `${preview}${ellipsis}\n\n[C4] Full message (${sizeKB}KB) at: ${filePath}${replyViaSuffix}`;
   }
 
+  // Resolve target instance from endpoint routing (null = legacy single-instance).
+  // --target-instance flag overrides all routing logic (used by scheduler for multi-session dispatch).
+  // For system/scheduler messages (no endpoint), explicitly target the default instance
+  // so they don't rely on NULL fallback behavior in the dispatcher.
+  let targetInstance;
+  if (targetInstanceOverride) {
+    targetInstance = targetInstanceOverride;
+  } else {
+    targetInstance = resolveInstance(endpoint);
+    if (targetInstance === null && (channel === 'system' || channel === 'scheduler')) {
+      targetInstance = getSchedulerInstance();
+    }
+  }
+
+  // Detect unknown endpoints routed to default instance by fallback.
+  // Hold the message as pending_approval, reply to user, and notify admin.
+  if (endpoint && !noReply && !targetInstanceOverride && targetInstance === getDefaultInstance()) {
+    const chatId = String(endpoint).split('|')[0];
+    if (!isEndpointRouted(chatId, endpoint)) {
+      const isFirstContact = recordUnknownEndpoint(channel, endpoint, chatId, content);
+
+      // Store the user's message as pending_approval — dispatcher won't deliver it
+      // The admin instance will handle the reply in the user's language
+      try {
+        const record = insertConversation('in', channel, endpoint, dbContent, 'pending_approval', priority, requireIdle, targetInstance);
+        emitSuccess(json, record.id);
+      } catch (err) {
+        emitError(json, 'INTERNAL_ERROR', `failed to queue message: ${err.message}`);
+      } finally {
+        close();
+      }
+      return;
+    }
+  }
+
   try {
-    const record = insertConversation('in', channel, endpoint, dbContent, 'pending', priority, requireIdle);
+    const record = insertConversation('in', channel, endpoint, dbContent, 'pending', priority, requireIdle, targetInstance);
     emitSuccess(json, record.id);
   } catch (err) {
     emitError(json, 'INTERNAL_ERROR', `failed to queue message: ${err.message}`);

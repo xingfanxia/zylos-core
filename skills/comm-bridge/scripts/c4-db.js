@@ -14,6 +14,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const INIT_SQL_PATH = path.join(__dirname, '..', 'init-db.sql');
+const MIGRATIONS_DIR = path.join(__dirname, '..', 'migrations');
 
 let db = null;
 
@@ -35,6 +36,8 @@ export function getDb() {
 
     if (isNew) {
       initSchema();
+    } else {
+      runPendingMigrations();
     }
   }
   return db;
@@ -47,6 +50,43 @@ function initSchema() {
   const initSql = fs.readFileSync(INIT_SQL_PATH, 'utf8');
   db.exec(initSql);
   console.log('[C4-DB] Database initialized');
+}
+
+/**
+ * Run pending SQL migrations from the migrations/ directory.
+ * Tracks applied migrations in a _migrations table. Each .sql file is applied
+ * at most once, in sorted filename order.
+ */
+function runPendingMigrations() {
+  if (!fs.existsSync(MIGRATIONS_DIR)) return;
+
+  // Ensure tracking table exists
+  db.exec(`CREATE TABLE IF NOT EXISTS _migrations (
+    name TEXT PRIMARY KEY,
+    applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  const applied = new Set(
+    db.prepare('SELECT name FROM _migrations').all().map(r => r.name)
+  );
+
+  const files = fs.readdirSync(MIGRATIONS_DIR)
+    .filter(f => f.endsWith('.sql'))
+    .sort();
+
+  for (const file of files) {
+    if (applied.has(file)) continue;
+    try {
+      const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
+      db.exec(sql);
+      db.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
+      console.log(`[C4-DB] Applied migration: ${file}`);
+    } catch (err) {
+      console.error(`[C4-DB] Migration ${file} failed: ${err.message}`);
+      // Stop on first failure to avoid partial state
+      break;
+    }
+  }
 }
 
 function nowSeconds() {
@@ -64,7 +104,7 @@ function nowSeconds() {
  * @param {boolean} requireIdle - whether to wait for Claude idle state (default: false)
  * @returns {object} - inserted record with id
  */
-export function insertConversation(direction, channel, endpointId, content, status = null, priority = 3, requireIdle = false) {
+export function insertConversation(direction, channel, endpointId, content, status = null, priority = 3, requireIdle = false, targetInstance = null) {
   const db = getDb();
 
   // Default status: 'pending' for incoming, 'delivered' for outgoing
@@ -73,11 +113,11 @@ export function insertConversation(direction, channel, endpointId, content, stat
   const requireIdleVal = requireIdle ? 1 : 0;
 
   const stmt = db.prepare(`
-    INSERT INTO conversations (direction, channel, endpoint_id, content, status, priority, require_idle)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO conversations (direction, channel, endpoint_id, content, status, priority, require_idle, target_instance)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  const result = stmt.run(direction, channel, endpointId, content, finalStatus, priority, requireIdleVal);
+  const result = stmt.run(direction, channel, endpointId, content, finalStatus, priority, requireIdleVal, targetInstance);
 
   return {
     id: result.lastInsertRowid,
@@ -88,7 +128,8 @@ export function insertConversation(direction, channel, endpointId, content, stat
     status: finalStatus,
     priority,
     require_idle: requireIdleVal,
-    retry_count: 0
+    retry_count: 0,
+    target_instance: targetInstance
   };
 }
 
@@ -99,12 +140,65 @@ export function insertConversation(direction, channel, endpointId, content, stat
 export function getNextPending() {
   const db = getDb();
   return db.prepare(`
-    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count
+    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count, target_instance
     FROM conversations
     WHERE direction = 'in' AND status = 'pending'
     ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
     LIMIT 1
   `).get() || null;
+}
+
+/**
+ * Get next pending message for a specific instance (priority-based, then FIFO).
+ * Includes messages targeting the given instance OR legacy NULL target_instance.
+ * @param {string} instanceId - the instance ID to filter by
+ * @returns {object|null} - highest priority pending message for this instance, or null
+ */
+export function getNextPendingForInstance(instanceId) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count, target_instance
+    FROM conversations
+    WHERE direction = 'in' AND status = 'pending'
+      AND (target_instance = ? OR target_instance IS NULL)
+    ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
+    LIMIT 1
+  `).get(instanceId) || null;
+}
+
+/**
+ * Get next pending message filtered to a set of online instance IDs.
+ * Prefers messages explicitly targeting an online instance, then falls back to
+ * legacy NULL target_instance messages. Messages targeting offline instances are
+ * skipped entirely — they stay pending until the target comes online.
+ *
+ * @param {string[]} onlineInstanceIds - array of instance IDs currently online
+ * @returns {object|null} - highest priority pending message for any online instance, or null
+ */
+export function getNextPendingForInstances(onlineInstanceIds) {
+  const db = getDb();
+  if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
+    // No instances online — only return legacy NULL-targeted messages
+    return db.prepare(`
+      SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count, target_instance
+      FROM conversations
+      WHERE direction = 'in' AND status = 'pending'
+        AND target_instance IS NULL
+      ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
+      LIMIT 1
+    `).get() || null;
+  }
+
+  // Build parameterized IN clause
+  const placeholders = onlineInstanceIds.map(() => '?').join(', ');
+  return db.prepare(`
+    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count, target_instance
+    FROM conversations
+    WHERE direction = 'in' AND status = 'pending'
+      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)
+    ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
+    LIMIT 1
+  `).get(...onlineInstanceIds) || null;
 }
 
 /**
@@ -166,6 +260,24 @@ export function markFailed(id) {
 }
 
 /**
+ * Mark a message as rejected (disabled instance, dropped silently).
+ * @param {number} id - message id
+ */
+export function markRejected(id) {
+  const db = getDb();
+  db.prepare('UPDATE conversations SET status = ? WHERE id = ?').run('rejected', id);
+}
+
+/**
+ * Mark a control item as rejected (disabled instance, dropped silently).
+ * @param {number} id - control id
+ */
+export function markControlRejected(id) {
+  const db = getDb();
+  db.prepare('UPDATE control_queue SET status = ? WHERE id = ?').run('rejected', id);
+}
+
+/**
  * Get count of pending messages
  * @returns {number}
  */
@@ -206,7 +318,8 @@ export function insertControl(content, options = {}) {
     bypassState = false,
     ackDeadlineAt = null,
     availableAt = null,
-    appendAckSuffix = true
+    appendAckSuffix = true,
+    targetInstance = null
   } = options;
 
   const tx = database.transaction(() => {
@@ -214,9 +327,9 @@ export function insertControl(content, options = {}) {
     const insertStmt = database.prepare(`
       INSERT INTO control_queue (
         content, priority, require_idle, bypass_state, ack_deadline_at,
-        status, retry_count, available_at, last_error, created_at, updated_at
+        status, retry_count, available_at, last_error, created_at, updated_at, target_instance
       )
-      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+      VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?, ?)
     `);
 
     const result = insertStmt.run(
@@ -227,7 +340,8 @@ export function insertControl(content, options = {}) {
       ackDeadlineAt,
       availableAt,
       current,
-      current
+      current,
+      targetInstance
     );
 
     const id = Number(result.lastInsertRowid);
@@ -280,15 +394,30 @@ export function getControlById(id) {
 }
 
 /**
- * Get next pending control item by priority/FIFO order
+ * Get next pending control item by priority/FIFO order.
+ * In multi-session mode, filters to controls targeting online instances (or NULL target).
  * @param {number} current - unix seconds
+ * @param {string[]|null} onlineInstanceIds - online instance IDs, or null for legacy mode
  * @returns {object|null}
  */
-export function getNextPendingControl(current = nowSeconds()) {
+export function getNextPendingControl(current = nowSeconds(), onlineInstanceIds = null) {
   const database = getDb();
+  if (onlineInstanceIds && onlineInstanceIds.length > 0) {
+    const placeholders = onlineInstanceIds.map(() => '?').join(', ');
+    return database.prepare(`
+      SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
+             status, retry_count, available_at, last_error, created_at, updated_at, target_instance
+      FROM control_queue
+      WHERE status = 'pending'
+        AND (available_at IS NULL OR available_at <= ?)
+        AND (target_instance IS NULL OR target_instance IN (${placeholders}))
+      ORDER BY COALESCE(priority, 3) ASC, id ASC
+      LIMIT 1
+    `).get(current, ...onlineInstanceIds) || null;
+  }
   return database.prepare(`
     SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
-           status, retry_count, available_at, last_error, created_at, updated_at
+           status, retry_count, available_at, last_error, created_at, updated_at, target_instance
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
@@ -527,6 +656,53 @@ export function getUnsummarizedConversations(limit = null) {
 }
 
 /**
+ * Get range and count of unsummarized conversations for a specific instance.
+ * Includes conversations targeting this instance OR legacy NULL target_instance.
+ * @param {string} instanceId - the instance ID to filter by
+ * @returns {object} - { begin_id, end_id, count }
+ */
+export function getUnsummarizedRangeForInstance(instanceId) {
+  const db = getDb();
+  const lastCheckpoint = db.prepare(
+    'SELECT end_conversation_id FROM checkpoints ORDER BY id DESC LIMIT 1'
+  ).get();
+  const afterId = lastCheckpoint?.end_conversation_id || 0;
+  const result = db.prepare(
+    'SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count FROM conversations WHERE id > ? AND (target_instance = ? OR target_instance IS NULL)'
+  ).get(afterId, instanceId);
+  return {
+    begin_id: result?.begin_id || null,
+    end_id: result?.end_id || null,
+    count: result?.count || 0
+  };
+}
+
+/**
+ * Get unsummarized conversations for a specific instance.
+ * Includes conversations targeting this instance OR legacy NULL target_instance.
+ * @param {string} instanceId - the instance ID to filter by
+ * @param {number|null} limit - if set, return only the most recent N records
+ * @returns {array} - conversation records in chronological order
+ */
+export function getUnsummarizedConversationsForInstance(instanceId, limit = null) {
+  const db = getDb();
+  const lastCheckpoint = db.prepare(
+    'SELECT end_conversation_id FROM checkpoints ORDER BY id DESC LIMIT 1'
+  ).get();
+  const afterId = lastCheckpoint?.end_conversation_id || 0;
+
+  if (limit) {
+    return db.prepare(
+      'SELECT * FROM (SELECT * FROM conversations WHERE id > ? AND (target_instance = ? OR target_instance IS NULL) ORDER BY id DESC LIMIT ?) ORDER BY id ASC'
+    ).all(afterId, instanceId, limit);
+  }
+
+  return db.prepare(
+    'SELECT * FROM conversations WHERE id > ? AND (target_instance = ? OR target_instance IS NULL) ORDER BY id ASC'
+  ).all(afterId, instanceId);
+}
+
+/**
  * Get conversations by id range (inclusive)
  * @param {number} beginId - start conversation id
  * @param {number} endId - end conversation id
@@ -537,6 +713,21 @@ export function getConversationsByRange(beginId, endId) {
   return db.prepare(
     'SELECT * FROM conversations WHERE id >= ? AND id <= ? ORDER BY id ASC'
   ).all(beginId, endId);
+}
+
+/**
+ * Get conversations by id range for a specific instance (inclusive).
+ * Includes conversations targeting this instance OR legacy NULL target_instance.
+ * @param {number} beginId - start conversation id
+ * @param {number} endId - end conversation id
+ * @param {string} instanceId - the instance ID to filter by
+ * @returns {array} - conversation records in chronological order
+ */
+export function getConversationsByRangeForInstance(beginId, endId, instanceId) {
+  const db = getDb();
+  return db.prepare(
+    'SELECT * FROM conversations WHERE id >= ? AND id <= ? AND (target_instance = ? OR target_instance IS NULL) ORDER BY id ASC'
+  ).all(beginId, endId, instanceId);
 }
 
 /**

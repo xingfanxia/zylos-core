@@ -10,6 +10,58 @@ import { parse } from 'dotenv';
 export const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 export const MEMORY_DIR = path.join(ZYLOS_DIR, 'memory');
 export const SESSIONS_DIR = path.join(MEMORY_DIR, 'sessions');
+export const SHARED_DIR = path.join(MEMORY_DIR, 'shared');
+export const INSTANCES_DIR = path.join(MEMORY_DIR, 'instances');
+export const GROUPS_DIR = path.join(MEMORY_DIR, 'groups');
+
+/**
+ * Resolve a shared memory file path with backward compat.
+ * Checks shared/ first, falls back to flat layout.
+ * @param {string} filename - Relative filename (e.g. 'identity.md')
+ * @returns {string} Resolved absolute path
+ */
+export function resolveSharedFile(filename) {
+  const newPath = path.join(SHARED_DIR, filename);
+  if (fs.existsSync(newPath)) return newPath;
+  return path.join(MEMORY_DIR, filename); // legacy fallback
+}
+
+/**
+ * Resolve the instance directory for a given instance ID.
+ * Falls back to MEMORY_DIR when no instance ID is provided (legacy mode).
+ * @param {string|null} instanceId - Instance ID from ZYLOS_INSTANCE_ID env
+ * @returns {string} Resolved instance directory path
+ */
+export function resolveInstanceDir(instanceId) {
+  if (instanceId) {
+    return path.join(INSTANCES_DIR, instanceId);
+  }
+  return MEMORY_DIR; // legacy: flat layout
+}
+
+/**
+ * Resolve a per-instance file path.
+ * @param {string|null} instanceId - Instance ID from ZYLOS_INSTANCE_ID env
+ * @param {string} filename - Relative filename (e.g. 'state.md')
+ * @returns {string} Resolved absolute path
+ */
+export function resolveInstanceFile(instanceId, filename) {
+  const dir = resolveInstanceDir(instanceId);
+  return path.join(dir, filename);
+}
+
+/**
+ * Resolve the sessions directory for a given instance.
+ * Falls back to SESSIONS_DIR when no instance ID is provided (legacy mode).
+ * @param {string|null} instanceId - Instance ID from ZYLOS_INSTANCE_ID env
+ * @returns {string} Resolved sessions directory path
+ */
+export function resolveSessionsDir(instanceId) {
+  if (instanceId) {
+    return path.join(INSTANCES_DIR, instanceId, 'sessions');
+  }
+  return SESSIONS_DIR; // legacy: flat layout
+}
 
 export const BUDGETS = {
   'identity.md': 4096,
@@ -23,6 +75,19 @@ export const REFERENCE_FILES = [
   'reference/preferences.md',
   'reference/ideas.md'
 ];
+
+/**
+ * Returns resolved absolute paths for all reference files.
+ * Checks shared/ layout first, falls back to flat layout.
+ * @returns {string[]} Array of resolved file paths
+ */
+export function resolveReferenceFiles() {
+  return REFERENCE_FILES.map(f => {
+    const newPath = path.join(SHARED_DIR, f);
+    if (fs.existsSync(newPath)) return newPath;
+    return path.join(MEMORY_DIR, f);
+  });
+}
 
 /**
  * Load TZ from ~/zylos/.env and return it.

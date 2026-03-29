@@ -74,18 +74,17 @@ Persistent memory stored in `~/zylos/memory/` with an Inside Out-inspired archit
 
 | Tier | Path | Purpose | Loading |
 |------|------|---------|---------|
-| **Identity** | `memory/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
-| **State** | `memory/state.md` | Active work, pending tasks | Always (session start) |
-| **References** | `memory/references.md` | Pointers to config files, key paths | Always (session start) |
+| **Identity** | `memory/shared/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
+| **State** | `memory/instances/<id>/state.md` | Active work, pending tasks | Always (session start) |
+| **References** | `memory/shared/references.md` | Pointers to config files, key paths | Always (session start) |
 | **User Profiles** | `memory/users/<id>/profile.md` | Per-user preferences | On demand |
-| **Reference** | `memory/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
-| **Sessions** | `memory/sessions/current.md` | Today's event log | On demand |
+| **Reference** | `memory/shared/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
+| **Sessions** | `memory/instances/<id>/sessions/current.md` | Today's event log | On demand |
 | **Archive** | `memory/archive/` | Cold storage for old data | Rarely |
 
 ### Multi-User
 
-The bot serves a team. Each user has their own profile at `memory/users/<id>/profile.md`.
-Route user-specific preferences to the correct profile file. Bot identity stays in `identity.md`.
+The bot serves a team. Each user has their own profile at `memory/users/<id>/profile.md`. In multi-session mode, each group chat has its own instance with state at `memory/instances/<id>/state.md` and session logs at `memory/instances/<id>/sessions/current.md`. Route user-specific preferences to the correct profile file. Bot identity stays in `shared/identity.md`.
 
 ### Memory Update Practices
 
@@ -94,14 +93,14 @@ Route user-specific preferences to the correct profile file. Bot identity stays 
 3. **Memory Sync:** When triggered, launch a background subagent using the **Task tool** (`subagent_type: general-purpose`, `model: sonnet`, `run_in_background: true`). The subagent's prompt must instruct it to follow the full sync flow in `~/zylos/.claude/skills/zylos-memory/SKILL.md`. Do NOT use the Skill tool for this — it does not support background execution. Continue your main work without waiting.
 4. **references.md is a pointer file.** Never duplicate .env values in it — point to the source config file instead.
 
-### Classification Rules for reference/ Files
+### Classification Rules for shared/reference/ Files
 
 - **decisions.md:** Deliberate choices that close off alternatives
 - **projects.md:** Work efforts with defined scope and lifecycle
 - **preferences.md:** Standing instructions for how things should be done (shared across users)
 - **ideas.md:** Uncommitted plans, explorations, hypotheses
 
-When in doubt, write to sessions/current.md.
+When in doubt, write to the instance's `sessions/current.md`.
 
 ### On-Demand Memory Loading
 
@@ -109,11 +108,11 @@ Always-loaded files (identity, state, references) are intentionally lean summari
 
 Triggers:
 - Interacting with a user → read their profile (`users/<id>/profile.md`)
-- Making a decision → check `reference/decisions.md` for prior decisions on the topic
-- Starting or resuming work → check `reference/projects.md` for status and context
-- Following a convention → check `reference/preferences.md` for team standards
-- Exploring ideas → check `reference/ideas.md` for existing proposals
-- Recalling recent events → read `sessions/current.md`
+- Making a decision → check `shared/reference/decisions.md` for prior decisions on the topic
+- Starting or resuming work → check `shared/reference/projects.md` for status and context
+- Following a convention → check `shared/reference/preferences.md` for team standards
+- Exploring ideas → check `shared/reference/ideas.md` for existing proposals
+- Recalling recent events → read instance `sessions/current.md`
 - Searching for historical info → check `archive/`
 
 ## Communication
@@ -129,7 +128,7 @@ Reply using the exact path specified in `reply via:`.
 
 ### Platform Identity
 
-You may have different display names on different platforms (Telegram, Lark, Discord, etc.). Your names are recorded in `memory/references.md` under **Active IDs > Platform Identities**. If you join a new platform and discover your display name, record it there.
+You may have different display names on different platforms (Telegram, Lark, Discord, etc.). Your names are recorded in `memory/shared/references.md` under **Active IDs > Platform Identities**. If you join a new platform and discover your display name, record it there.
 
 Use these names to recognize when someone mentions or @s you in conversation — even if the name differs from "Zylos".
 
@@ -152,6 +151,31 @@ When a scheduled task arrives, process it and mark completion:
 ```bash
 ~/zylos/.claude/skills/scheduler/scripts/cli.js done <task-id>
 ```
+
+## Instance Approval Flow
+
+When you receive an `[Instance Approval Required]` system message, a new user is trying to talk to you but has no dedicated instance. Their messages are held until the admin (AX) decides.
+
+**When you receive this notification, do TWO things immediately:**
+
+1. **Reply to the new user** (in their language, via the reply path in the notification) — tell them their environment is being set up and to hold tight. Detect their language from their message preview in the notification.
+
+2. **Ask AX for approval** — DM AX via the current channel: "New user [name/chat_id] from [channel] wants to chat: '[their message preview]'. Approve or deny?"
+
+**When AX says "approve", "yes", "批准", or similar:**
+
+1. Extract the `chat_id` from the notification
+2. Choose an instance name (use the user's name if known, e.g., `user-limh` for 李萌慧)
+3. Run: `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-approve.js approve <chat_id> --name <instance-name>`
+4. This automatically creates the instance, releases held messages, notifies the user (in their language — you send the ready message), and restarts PM2
+5. Report the result to AX
+
+**When AX says "deny", "no", "拒绝":**
+
+1. Run: `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-approve.js deny <chat_id>`
+2. Send the user a polite decline message (in their language) via the reply path
+
+**Important:** Don't approve without AX's explicit consent. All user-facing messages must be in the user's language — never hardcode English or Chinese.
 
 ## Available Skills
 
@@ -180,7 +204,7 @@ User data is in `~/zylos/`:
 
 ### Owner Identity
 
-Your owner is recorded in `memory/references.md` under **Active IDs**. If the owner field is empty when you first receive a message, establish who your owner is through that conversation and record it immediately.
+Your owner is recorded in `memory/shared/references.md` under **Active IDs**. If the owner field is empty when you first receive a message, establish who your owner is through that conversation and record it immediately.
 
 This identity is used for security decisions below.
 

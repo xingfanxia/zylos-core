@@ -81,6 +81,9 @@ export class HeartbeatEngine {
 
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
+
+    this.downRetryInterval = options.downRetryInterval ?? 1800; // 30 min
+    this.warmupUntil = 0; // timestamp — suppress heartbeats until CC is warm
   }
 
   get health() {
@@ -191,9 +194,31 @@ export class HeartbeatEngine {
     return false;
   }
 
+  /**
+   * Signal that CC was just (re)started — suppress heartbeat probes and
+   * recovery for `seconds` to let CC fully initialize.
+   */
+  notifyColdStart(seconds = 60) {
+    this.warmupUntil = Math.floor(Date.now() / 1000) + seconds;
+    // Reset health to ok during grace — prevents stale 'recovering' from blocking dispatcher
+    if (this.healthState !== 'ok') {
+      this.setHealth('ok', 'cold_start_reset');
+      this.restartFailureCount = 0;
+    }
+    this.deps.log(`Heartbeat: cold-start grace ${seconds}s (heartbeats suppressed until warm)`);
+  }
+
   processHeartbeat(agentRunning, currentTime) {
     // Track agentRunning transitions for process signal acceleration
     this._trackAgentRunning(agentRunning, currentTime);
+
+    // Cold-start grace: don't probe or recover while CC is still initializing
+    if (this.warmupUntil > 0 && currentTime < this.warmupUntil) {
+      return;
+    }
+    if (this.warmupUntil > 0 && currentTime >= this.warmupUntil) {
+      this.warmupUntil = 0; // grace period expired
+    }
 
     const pending = this.deps.readHeartbeatPending();
     if (!this.heartbeatEnabled) {

@@ -15,6 +15,7 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
 const COMPONENTS_JSON = path.join(ZYLOS_DIR, '.zylos', 'components.json');
+const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
 
 function resolveCommBridgeScript(fileName) {
   const prodPath = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', fileName);
@@ -76,7 +77,7 @@ function getLatestTag(repo) {
 function runC4Control(args) {
   try {
     const output = execFileSync('node', [C4_CONTROL_PATH, ...args], {
-      encoding: 'utf8', stdio: 'pipe'
+      encoding: 'utf8', stdio: 'pipe', timeout: 15000
     }).trim();
     return { ok: true, output };
   } catch (err) {
@@ -86,7 +87,29 @@ function runC4Control(args) {
   }
 }
 
+/**
+ * Determine if this instance is the primary.  Upgrade checks should only
+ * run on the primary to avoid duplicate notifications.
+ */
+function isPrimaryInstance() {
+  const instanceId = process.env.ZYLOS_INSTANCE_ID;
+  if (!instanceId) return true; // legacy single-instance — always primary
+
+  try {
+    if (!fs.existsSync(INSTANCES_FILE)) return true; // no config → legacy mode
+    const config = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
+    return config?.instances?.[instanceId]?.primary === true;
+  } catch {
+    return true; // fail-open: run the check if we can't read config
+  }
+}
+
 function main() {
+  if (!isPrimaryInstance()) {
+    log('Upgrade check: skipped (not the primary instance)');
+    return;
+  }
+
   const upgrades = [];
   let failures = 0;
 

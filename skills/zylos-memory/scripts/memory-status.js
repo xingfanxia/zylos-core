@@ -6,7 +6,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR, BUDGETS, walkFiles } from './shared.js';
+import { MEMORY_DIR, BUDGETS, walkFiles, resolveSharedFile, resolveInstanceFile } from './shared.js';
+
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const INSTANCE_BUDGET_FILES = new Set(['state.md']);
 
 export function formatBytes(bytes) {
   if (bytes < 1024) {
@@ -36,7 +39,9 @@ function main() {
   let missingCount = 0;
 
   for (const [name, budget] of Object.entries(BUDGETS)) {
-    const info = fileInfo(path.join(MEMORY_DIR, name));
+    const info = fileInfo(INSTANCE_BUDGET_FILES.has(name)
+      ? resolveInstanceFile(INSTANCE_ID, name)
+      : resolveSharedFile(name));
     if (!info) {
       lines.push(`${name}: MISSING`);
       missingCount += 1;

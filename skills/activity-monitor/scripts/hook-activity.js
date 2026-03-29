@@ -16,8 +16,10 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { recordTokenUsage, closeDb } from './token-tracker.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
 /**
  * Get Claude's actual PID by reading the grandparent PID.
@@ -33,7 +35,19 @@ function getClaudePid() {
   } catch { /* best-effort */ }
   return process.ppid;
 }
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+
+// Monitor directory: reads state_dir from instances.json, falls back to convention
+function getMonitorDir() {
+  if (!INSTANCE_ID) return path.join(ZYLOS_DIR, 'activity-monitor');
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, 'instances.json'), 'utf8'));
+    const inst = config.instances?.[INSTANCE_ID];
+    if (inst?.state_dir) return inst.state_dir.replace(/^~/, os.homedir());
+  } catch { /* fall through to convention */ }
+  return path.join(ZYLOS_DIR, 'activity-monitor', INSTANCE_ID);
+}
+
+const MONITOR_DIR = getMonitorDir();
 const ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
 const STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
 const STATE_LOCK_FILE = `${STATE_FILE}.lock`;
@@ -42,10 +56,9 @@ const LOCK_RETRY_MS = 10;
 const LOCK_STALE_MS = 5000;
 
 function sleepMs(ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    // Best-effort short spin wait.
-  }
+  const sab = new SharedArrayBuffer(4);
+  const view = new Int32Array(sab);
+  Atomics.wait(view, 0, 0, ms);
 }
 
 function acquireStateLock() {
@@ -176,10 +189,32 @@ process.stdin.on('end', () => {
       });
 
       atomicWrite(STATE_FILE, state);
+
+      // Record token usage if available in the hook event payload.
+      // Claude Code Stop events may include usage data in stop_hook_data or
+      // top-level fields. PostToolUse may include tool-level usage.
+      if (INSTANCE_ID) {
+        const usage = hookData.usage || hookData.stop_hook_data?.usage || null;
+        if (usage && (usage.input_tokens || usage.output_tokens)) {
+          try {
+            recordTokenUsage(
+              INSTANCE_ID,
+              usage.input_tokens || 0,
+              usage.output_tokens || 0,
+              usage.model || hookData.model || null,
+              usage.cost_usd || 0
+            );
+          } catch {
+            // Best-effort — never interfere with Claude.
+          }
+        }
+      }
     } finally {
       if (hasLock) {
         releaseStateLock();
       }
+      // Close SQLite connection before process exits
+      closeDb();
     }
   } catch {
     // Best-effort — never interfere with Claude.
