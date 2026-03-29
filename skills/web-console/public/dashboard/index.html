@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zylos Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="dashboard">
+    <header>
+      <div class="header-left">
+        <h1>Zylos Dashboard</h1>
+        <div class="subtitle" id="system-subtitle">Loading...</div>
+      </div>
+      <div class="header-right">
+        <div class="refresh-indicator">
+          <span class="refresh-dot"></span>
+          <span>Live</span>
+        </div>
+        <a href="/" class="nav-link">Chat Console</a>
+      </div>
+    </header>
+
+    <!-- System Resources -->
+    <section class="grid grid-2" style="margin-bottom: 1.5rem;">
+      <div class="card">
+        <div class="card-header">
+          <h2>System Resources</h2>
+        </div>
+        <div class="card-body" id="system-resources">
+          <div class="loading">Loading...</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <h2>System Info</h2>
+        </div>
+        <div class="card-body" id="system-info">
+          <div class="loading">Loading...</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Pending Approvals -->
+    <section class="card" style="margin-bottom: 1.5rem; display: none;" id="pending-section">
+      <div class="card-header">
+        <h2>Pending Approvals</h2>
+        <span class="badge" id="pending-count" style="background: #facc15; color: #000;">0</span>
+      </div>
+      <div class="card-body" id="pending-users">
+      </div>
+    </section>
+
+    <!-- Instances -->
+    <section class="card" style="margin-bottom: 1.5rem;">
+      <div class="card-header">
+        <h2>Instances</h2>
+        <span class="badge" id="instance-count">0</span>
+      </div>
+      <div class="card-body">
+        <div class="instances-grid" id="instances-grid">
+          <div class="loading">Loading...</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Token Usage -->
+    <section class="card" style="margin-bottom: 1.5rem;">
+      <div class="card-header">
+        <h2>Token Usage</h2>
+        <div class="token-tabs" id="token-tabs">
+          <button class="token-tab active" data-days="7">7 Days</button>
+          <button class="token-tab" data-days="14">14 Days</button>
+          <button class="token-tab" data-days="30">30 Days</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div id="token-chart">
+          <div class="loading">Loading...</div>
+        </div>
+        <div id="token-table">
+        </div>
+      </div>
+    </section>
+
+    <!-- PM2 Processes -->
+    <section class="card">
+      <div class="card-header">
+        <h2>PM2 Processes</h2>
+        <span class="badge" id="pm2-count">0</span>
+      </div>
+      <div class="card-body" style="padding: 0;">
+        <div id="pm2-table">
+          <div class="loading">Loading...</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
