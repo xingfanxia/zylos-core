@@ -247,7 +247,13 @@ export function resolveStatusFile(targetInstance) {
  */
 export function multiSessionDispatch(item, helpers) {
   const { getClaudeState, isBypassState } = helpers;
-  const targetInstance = item.target_instance || null;
+  // In multi-session mode, null target_instance → route to default/primary instance
+  let targetInstance = item.target_instance || null;
+  if (!targetInstance) {
+    const all = getAllInstances();
+    const def = all.find(i => i.default === true) ?? all.find(i => i.primary === true);
+    if (def) targetInstance = def.id;
+  }
   const bypass = isBypassState(item);
 
   // 1. Disabled instance → reject (drop permanently).
@@ -361,9 +367,11 @@ export async function processWithMultiSession(helpers) {
   // Reap idle non-primary instances before processing.
   reapIdleInstances();
 
+
   // Compute online instance IDs.  Returns null in legacy mode — callers
   // should NOT invoke this function in legacy mode, but we handle it gracefully.
   const onlineIds = getOnlineInstanceIds(getAgentState);
+
   if (onlineIds === null) {
     // Fallback: caller should use the single-session processNextMessage instead.
     return { delivered: false, state: 'unknown' };
