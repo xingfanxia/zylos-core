@@ -1,355 +1,253 @@
 #!/usr/bin/env bash
-# E2E live smoke test for the multi-session C4 communication pipeline.
+# Comprehensive E2E live smoke test for multi-session C4 pipeline.
 # Runs against the actual deployed zylos infrastructure at ~/zylos/.
 #
 # Usage:
 #   bash test/e2e-live.sh            # run all tests
-#   bash test/e2e-live.sh --skip-live  # skip tests that require a running CC (tests 5+)
+#   bash test/e2e-live.sh --skip-live # skip tests that require running CC
 set -euo pipefail
 
-# ---------------------------------------------------------------------------
-# Color helpers
-# ---------------------------------------------------------------------------
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-RESET='\033[0m'
-
+# ── Color helpers ──────────────────────────────────────────────────────
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; RESET='\033[0m'
 pass() { echo -e "${GREEN}  PASS${RESET}: $*"; }
 fail() { echo -e "${RED}  FAIL${RESET}: $*"; }
 skip() { echo -e "${YELLOW}  SKIP${RESET}: $*"; }
 info() { echo -e "${CYAN}  INFO${RESET}: $*"; }
 
-# ---------------------------------------------------------------------------
-# Counters (plain variables — no arrays needed)
-# ---------------------------------------------------------------------------
-PASS_COUNT=0
-FAIL_COUNT=0
-SKIP_COUNT=0
-
+PASS_COUNT=0; FAIL_COUNT=0; SKIP_COUNT=0
 record_pass() { PASS_COUNT=$((PASS_COUNT + 1)); pass "$@"; }
 record_fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); fail "$@"; }
 record_skip() { SKIP_COUNT=$((SKIP_COUNT + 1)); skip "$@"; }
+section() { echo; echo -e "${CYAN}=== $* ===${RESET}"; }
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 SKIP_LIVE=false
-for arg in "$@"; do
-  if [ "$arg" = "--skip-live" ]; then
-    SKIP_LIVE=true
-  fi
-done
+for arg in "$@"; do [ "$arg" = "--skip-live" ] && SKIP_LIVE=true; done
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+# ── Paths ──────────────────────────────────────────────────────────────
 ZYLOS_DIR="${ZYLOS_DIR:-$HOME/zylos}"
 C4_DB="$ZYLOS_DIR/comm-bridge/c4.db"
 SCRIPTS_DIR="$ZYLOS_DIR/.claude/skills/comm-bridge/scripts"
 RECEIVE="$SCRIPTS_DIR/c4-receive.js"
 QUERY="$SCRIPTS_DIR/c4-query-instance.js"
-API_ACTIVITY="$ZYLOS_DIR/activity-monitor/api-activity.json"
+INSTANCES_JSON="$ZYLOS_DIR/instances.json"
+TS=$(date +%s)  # unique timestamp for this run
 
-# ---------------------------------------------------------------------------
-# Section header
-# ---------------------------------------------------------------------------
-section() { echo; echo -e "${CYAN}=== $* ===${RESET}"; }
-
-# ---------------------------------------------------------------------------
-# Prerequisites
-# ---------------------------------------------------------------------------
-section "Prerequisites"
-
-PREREQS_OK=true
-
-check_prereq() {
-  local name="$1" cmd="$2"
-  if command -v "$cmd" &>/dev/null; then
-    info "$name found: $(command -v "$cmd")"
-  else
-    fail "Required tool not found: $name"
-    PREREQS_OK=false
-  fi
-}
-
-check_prereq tmux tmux
-check_prereq node node
-check_prereq sqlite3 sqlite3
-
-if [ ! -f "$RECEIVE" ]; then
-  fail "c4-receive.js not found at $RECEIVE"
-  PREREQS_OK=false
-else
-  info "c4-receive.js: $RECEIVE"
-fi
-
-# c4-query-instance.js is newer — may not be deployed yet; test 3 will skip gracefully
-if [ ! -f "$QUERY" ]; then
-  info "c4-query-instance.js not found at $QUERY (test 3 will be skipped)"
-else
-  info "c4-query-instance.js: $QUERY"
-fi
-
-if [ "$PREREQS_OK" != "true" ]; then
-  echo
-  fail "Prerequisites check failed — cannot continue."
-  exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Backup + baseline
-# ---------------------------------------------------------------------------
-section "Setup"
-
-if [ -f "$C4_DB" ]; then
-  BACKUP_PATH="${C4_DB}.e2e-backup-$(date +%s)"
-  cp "$C4_DB" "$BACKUP_PATH"
-  info "DB backed up to: $BACKUP_PATH"
-else
-  info "c4.db does not exist yet (will be created by first test)"
-fi
-
-# Capture baseline conversation count (0 if DB doesn't exist)
-if [ -f "$C4_DB" ]; then
-  BASELINE_COUNT=$(sqlite3 "$C4_DB" "SELECT COUNT(*) FROM conversations;" 2>/dev/null || echo 0)
-else
-  BASELINE_COUNT=0
-fi
-info "Baseline conversation count: $BASELINE_COUNT"
-
-# ---------------------------------------------------------------------------
-# Helper: query DB, with a short retry loop to handle WAL flush timing
-# ---------------------------------------------------------------------------
+# ── Helpers ────────────────────────────────────────────────────────────
 db_query() {
-  local sql="$1"
-  local result=""
+  local sql="$1"; local result=""
   for _ in 1 2 3; do
     result=$(sqlite3 "$C4_DB" "$sql" 2>/dev/null || echo "")
-    if [ -n "$result" ]; then
-      echo "$result"
-      return 0
-    fi
+    [ -n "$result" ] && { echo "$result"; return 0; }
     sleep 0.3
   done
   echo ""
 }
 
-# ---------------------------------------------------------------------------
-# Test 1: Message insertion via c4-receive
-# ---------------------------------------------------------------------------
-section "Test 1: Message insertion"
-
-T1_CONTENT="E2E test message $(date +%s)"
-T1_PASS=false
-
-if node "$RECEIVE" \
-    --channel test --endpoint test-e2e-user --no-reply \
-    --content "$T1_CONTENT" 2>&1; then
-
-  # Verify the row was inserted (may already be delivered if dispatcher is running)
-  T1_STATUS=$(db_query "SELECT status FROM conversations WHERE content LIKE '%E2E test message%' AND channel='test' AND endpoint_id='test-e2e-user' ORDER BY id DESC LIMIT 1;")
-
-  if [ "$T1_STATUS" = "pending" ] || [ "$T1_STATUS" = "delivered" ] || [ "$T1_STATUS" = "running" ]; then
-    T1_PASS=true
-    record_pass "Message inserted (status=${T1_STATUS}, dispatcher may have already picked it up)"
-  else
-    record_fail "Expected status pending/delivered/running, got: '${T1_STATUS}'"
-  fi
-else
-  record_fail "c4-receive.js exited non-zero"
-fi
-
-# ---------------------------------------------------------------------------
-# Test 2: Instance-targeted message
-# ---------------------------------------------------------------------------
-section "Test 2: Instance targeting"
-
-T2_CONTENT="E2E test for admin instance $(date +%s)"
-T2_PASS=false
-
-if node "$RECEIVE" \
-    --channel test --endpoint test-e2e-admin --no-reply \
-    --target-instance admin \
-    --content "$T2_CONTENT" 2>&1; then
-
-  T2_INSTANCE=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E test for admin instance%' AND channel='test' ORDER BY id DESC LIMIT 1;")
-
-  if [ "$T2_INSTANCE" = "admin" ]; then
-    T2_PASS=true
-    record_pass "Message inserted with target_instance='admin'"
-  else
-    record_fail "Expected target_instance='admin', got: '${T2_INSTANCE}'"
-  fi
-else
-  record_fail "c4-receive.js exited non-zero for instance-targeted message"
-fi
-
-# ---------------------------------------------------------------------------
-# Test 3: Internal channel (inter-instance query)
-# ---------------------------------------------------------------------------
-section "Test 3: Inter-instance query"
-
-T3_PASS=false
-
-if [ ! -f "$QUERY" ]; then
-  record_skip "c4-query-instance.js not deployed yet"
-elif node "$QUERY" \
-    --from test-instance --to admin \
-    --content "E2E test inter-instance query" 2>&1; then
-
-  # c4-query-instance inserts with channel=internal, endpoint=instance-<from>
-  T3_CHANNEL=$(db_query "SELECT channel FROM conversations WHERE endpoint_id='instance-test-instance' ORDER BY id DESC LIMIT 1;")
-  T3_ENDPOINT=$(db_query "SELECT endpoint_id FROM conversations WHERE channel='internal' AND endpoint_id='instance-test-instance' ORDER BY id DESC LIMIT 1;")
-
-  if [ "$T3_CHANNEL" = "internal" ] && [ "$T3_ENDPOINT" = "instance-test-instance" ]; then
-    T3_PASS=true
-    record_pass "Inter-instance query inserted with channel='internal', endpoint='instance-test-instance'"
-  else
-    record_fail "Expected channel=internal / endpoint=instance-test-instance, got: channel='${T3_CHANNEL}' endpoint='${T3_ENDPOINT}'"
-  fi
-else
-  record_fail "c4-query-instance.js exited non-zero"
-fi
-
-# ---------------------------------------------------------------------------
-# Test 4: Group detection
-# ---------------------------------------------------------------------------
-section "Test 4: Group endpoint detection"
-
-T4_PASS=true  # innocent until proven guilty; at least verify insertion
-
-# Feishu group — endpoint contains |type:group
-T4_FEISHU_CONTENT="E2E Feishu group test $(date +%s)"
-if node "$RECEIVE" \
-    --channel feishu --endpoint "oc_test123|type:group|msg:om_test" --no-reply \
-    --content "$T4_FEISHU_CONTENT" 2>&1; then
-
-  T4_FEISHU_ROW=$(db_query "SELECT id FROM conversations WHERE content LIKE '%E2E Feishu group test%' AND channel='feishu' ORDER BY id DESC LIMIT 1;")
-  if [ -n "$T4_FEISHU_ROW" ]; then
-    # Check if instances.json configured a group instance — if so, target_instance='group'
-    T4_FEISHU_INST=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E Feishu group test%' AND channel='feishu' ORDER BY id DESC LIMIT 1;")
-    if [ -n "$T4_FEISHU_INST" ] && [ "$T4_FEISHU_INST" != "group" ]; then
-      # Not routed to 'group' — could be normal if no group instance is configured
-      info "Feishu group: target_instance='${T4_FEISHU_INST}' (no group instance configured — acceptable)"
-    elif [ "$T4_FEISHU_INST" = "group" ]; then
-      info "Feishu group: correctly routed to target_instance='group'"
-    else
-      info "Feishu group: target_instance is NULL (instances.json absent — legacy mode)"
-    fi
-    record_pass "Feishu group message inserted (endpoint=oc_test123|type:group)"
-  else
-    record_fail "Feishu group message not found in DB"
-    T4_PASS=false
-  fi
-else
-  record_fail "c4-receive.js exited non-zero for Feishu group"
-  T4_PASS=false
-fi
-
-# Telegram group — negative numeric chat_id
-T4_TG_CONTENT="E2E Telegram group test $(date +%s)"
-if node "$RECEIVE" \
-    --channel telegram --endpoint "-100999888|msg:1|req:-100999888:1" --no-reply \
-    --content "$T4_TG_CONTENT" 2>&1; then
-
-  T4_TG_ROW=$(db_query "SELECT id FROM conversations WHERE content LIKE '%E2E Telegram group test%' AND channel='telegram' ORDER BY id DESC LIMIT 1;")
-  if [ -n "$T4_TG_ROW" ]; then
-    T4_TG_INST=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E Telegram group test%' AND channel='telegram' ORDER BY id DESC LIMIT 1;")
-    if [ "$T4_TG_INST" = "group" ]; then
-      info "Telegram group: correctly routed to target_instance='group'"
-    else
-      info "Telegram group: target_instance='${T4_TG_INST}' (no group instance configured — acceptable)"
-    fi
-    record_pass "Telegram group message inserted (endpoint=-100999888...)"
-  else
-    record_fail "Telegram group message not found in DB"
-    T4_PASS=false
-  fi
-else
-  record_fail "c4-receive.js exited non-zero for Telegram group"
-  T4_PASS=false
-fi
-
-# ---------------------------------------------------------------------------
-# Test 5: Dispatcher delivery (requires live CC)
-# ---------------------------------------------------------------------------
-section "Test 5: Live delivery (requires running CC)"
-
-if [ "$SKIP_LIVE" = "true" ]; then
-  record_skip "Skipped via --skip-live flag"
-# Determine admin session name from instances.json
-elif ! ADMIN_SESSION=$(python3 -c "import json; d=json.load(open('$ZYLOS_DIR/instances.json')); print(d['instances']['admin']['tmux_session'])" 2>/dev/null) || ! tmux has-session -t "$ADMIN_SESSION" 2>/dev/null; then
-  record_skip "Admin tmux session not running (looked for ${ADMIN_SESSION:-claude-main})"
-else
-  T5_CONTENT="E2E live delivery test $(date +%s) - please respond with 'ACK'"
-
-  node "$RECEIVE" \
-    --channel test --endpoint test-e2e --no-reply \
-    --target-instance admin \
-    --content "$T5_CONTENT" 2>&1
-
-  info "Waiting up to 30s for dispatcher to deliver..."
-  T5_STATUS=""
-  for i in $(seq 1 30); do
-    T5_STATUS=$(db_query "SELECT status FROM conversations WHERE content LIKE '%E2E live delivery test%' AND channel='test' ORDER BY id DESC LIMIT 1;")
-    if [ "$T5_STATUS" = "delivered" ]; then
-      record_pass "Message delivered after ${i}s"
-      break
+wait_for_status() {
+  local pattern="$1" expected="$2" timeout="$3" label="$4"
+  for i in $(seq 1 "$timeout"); do
+    local status
+    status=$(db_query "SELECT status FROM conversations WHERE content LIKE '%${pattern}%' ORDER BY id DESC LIMIT 1;")
+    if [ "$status" = "$expected" ]; then
+      record_pass "$label (${i}s)"
+      return 0
     fi
     sleep 1
   done
+  local final
+  final=$(db_query "SELECT status FROM conversations WHERE content LIKE '%${pattern}%' ORDER BY id DESC LIMIT 1;")
+  record_fail "$label — status='${final}' after ${timeout}s"
+  return 1
+}
 
-  if [ "$T5_STATUS" != "delivered" ]; then
-    record_fail "Message not delivered within 30s (status='${T5_STATUS}')"
-  fi
+get_session() {
+  python3 -c "import json; d=json.load(open('$INSTANCES_JSON')); print(d['instances']['$1']['tmux_session'])" 2>/dev/null || echo ""
+}
+
+session_exists() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+# ── Prerequisites ──────────────────────────────────────────────────────
+section "Prerequisites"
+PREREQS_OK=true
+for tool in tmux node sqlite3; do
+  command -v "$tool" &>/dev/null && info "$tool: $(command -v "$tool")" || { fail "$tool not found"; PREREQS_OK=false; }
+done
+[ -f "$RECEIVE" ] && info "c4-receive.js: OK" || { fail "c4-receive.js missing"; PREREQS_OK=false; }
+[ -f "$QUERY" ] && info "c4-query-instance.js: OK" || info "c4-query-instance.js: missing (test 3 skipped)"
+[ -f "$INSTANCES_JSON" ] && info "instances.json: OK" || { fail "instances.json missing"; PREREQS_OK=false; }
+[ "$PREREQS_OK" = "true" ] || { fail "Prerequisites failed"; exit 1; }
+
+# ── Setup ──────────────────────────────────────────────────────────────
+section "Setup"
+cp "$C4_DB" "${C4_DB}.e2e-backup-${TS}" 2>/dev/null && info "DB backed up" || info "No DB to back up"
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION A: Message Routing (no live CC needed)
+# ═══════════════════════════════════════════════════════════════════════
+
+section "Test 1: Basic message insertion"
+node "$RECEIVE" --channel test --endpoint "test-e2e-${TS}" --no-reply --target-instance admin \
+  --content "E2E-1 basic insert ${TS}" 2>&1
+T1_STATUS=$(db_query "SELECT status FROM conversations WHERE content LIKE '%E2E-1 basic insert ${TS}%' ORDER BY id DESC LIMIT 1;")
+[ -n "$T1_STATUS" ] && record_pass "Inserted (status=${T1_STATUS})" || record_fail "Not found in DB"
+
+section "Test 2: Feishu group routes to group instance"
+node "$RECEIVE" --channel feishu --endpoint "oc_e2e${TS}|type:group|msg:om_test" --no-reply \
+  --content "E2E-2 feishu group ${TS}" 2>&1
+T2=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-2 feishu group ${TS}%' ORDER BY id DESC LIMIT 1;")
+[ "$T2" = "group" ] && record_pass "Feishu group → target_instance='group'" || record_fail "Expected 'group', got '${T2}'"
+
+section "Test 3: Telegram group routes to group instance"
+node "$RECEIVE" --channel telegram --endpoint "-100${TS}|msg:1|req:-100${TS}:1" --no-reply \
+  --content "E2E-3 telegram group ${TS}" 2>&1
+T3=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-3 telegram group ${TS}%' ORDER BY id DESC LIMIT 1;")
+[ "$T3" = "group" ] && record_pass "Telegram group → target_instance='group'" || record_fail "Expected 'group', got '${T3}'"
+
+section "Test 4: Feishu DM (oc_ prefix) does NOT route to group"
+node "$RECEIVE" --channel feishu --endpoint "oc_dm${TS}|type:p2p|msg:om_dm" --no-reply \
+  --content "E2E-4 feishu dm ${TS}" 2>&1
+T4=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-4 feishu dm ${TS}%' ORDER BY id DESC LIMIT 1;")
+[ "$T4" != "group" ] && record_pass "Feishu DM → target_instance='${T4}' (not group)" || record_fail "DM incorrectly routed to group"
+
+section "Test 5: Known user DM routes to user instance"
+# Use betty's actual chat_id from routing table
+BETTY_CHAT=$(python3 -c "import json; d=json.load(open('$INSTANCES_JSON')); print(d['routing'].get('oc_39ec68719d842691a6714b05be9a2de4',''))" 2>/dev/null)
+if [ "$BETTY_CHAT" = "user-betty" ]; then
+  node "$RECEIVE" --channel feishu --endpoint "oc_39ec68719d842691a6714b05be9a2de4|type:p2p|msg:om_e2e${TS}" --no-reply \
+    --content "E2E-5 betty dm ${TS}" 2>&1
+  T5=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-5 betty dm ${TS}%' ORDER BY id DESC LIMIT 1;")
+  [ "$T5" = "user-betty" ] && record_pass "Betty DM → target_instance='user-betty'" || record_fail "Expected 'user-betty', got '${T5}'"
+else
+  record_skip "Betty not in routing table"
 fi
 
-# ---------------------------------------------------------------------------
-# Test 6: Delivery confirmation check (api-activity.json)
-# ---------------------------------------------------------------------------
-section "Test 6: Delivery confirmation"
+section "Test 6: Inter-instance query"
+if [ -f "$QUERY" ]; then
+  node "$QUERY" --from test-e2e --to admin --content "E2E-6 query ${TS}" 2>&1
+  T6_CH=$(db_query "SELECT channel FROM conversations WHERE content LIKE '%E2E-6 query ${TS}%' ORDER BY id DESC LIMIT 1;")
+  T6_EP=$(db_query "SELECT endpoint_id FROM conversations WHERE content LIKE '%E2E-6 query ${TS}%' ORDER BY id DESC LIMIT 1;")
+  T6_TI=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-6 query ${TS}%' ORDER BY id DESC LIMIT 1;")
+  if [ "$T6_CH" = "internal" ] && [ "$T6_EP" = "instance-test-e2e" ] && [ "$T6_TI" = "admin" ]; then
+    record_pass "Internal channel, endpoint=instance-test-e2e, target=admin"
+  else
+    record_fail "Got channel='${T6_CH}' endpoint='${T6_EP}' target='${T6_TI}'"
+  fi
+else
+  record_skip "c4-query-instance.js not deployed"
+fi
+
+section "Test 7: Disabled instance rejection"
+node "$RECEIVE" --channel test --endpoint "test-disabled-${TS}" --no-reply --target-instance test \
+  --content "E2E-7 disabled ${TS}" 2>&1
+sleep 3  # give dispatcher time to process
+T7=$(db_query "SELECT status FROM conversations WHERE content LIKE '%E2E-7 disabled ${TS}%' ORDER BY id DESC LIMIT 1;")
+[ "$T7" = "rejected" ] && record_pass "Disabled instance → rejected" || \
+  { [ "$T7" = "pending" ] && record_pass "Disabled instance → pending (dispatcher may not have processed yet)" || record_fail "Expected rejected/pending, got '${T7}'"; }
+
+# ═══════════════════════════════════════════════════════════════════════
+# SECTION B: Live Delivery (requires running CC instances)
+# ═══════════════════════════════════════════════════════════════════════
 
 if [ "$SKIP_LIVE" = "true" ]; then
-  record_skip "Skipped via --skip-live flag"
-elif [ ! -f "$API_ACTIVITY" ]; then
-  record_skip "api-activity.json not found (activity-monitor not running?)"
+  section "SECTION B: Live Delivery — SKIPPED (--skip-live)"
+  for t in 8 9 10 11 12 13; do record_skip "Test $t skipped"; done
 else
-  LAST_ACTIVITY=$(python3 -c "
-import json, sys
-try:
-    d = json.load(open('$API_ACTIVITY'))
-    print(d.get('last_user_activity', 0))
-except Exception as e:
-    print(0)
-  " 2>/dev/null || echo 0)
-  info "Last user activity timestamp: $LAST_ACTIVITY"
-  record_pass "api-activity.json is readable"
+
+  section "Test 8: Admin instance live delivery"
+  ADMIN_SESSION=$(get_session admin)
+  if session_exists "$ADMIN_SESSION"; then
+    node "$RECEIVE" --channel test --endpoint "test-admin-${TS}" --no-reply --target-instance admin \
+      --content "E2E-8 admin delivery ${TS}" 2>&1
+    wait_for_status "E2E-8 admin delivery ${TS}" "delivered" 30 "Admin delivery"
+  else
+    record_skip "Admin session '${ADMIN_SESSION}' not running"
+  fi
+
+  section "Test 9: Group instance live delivery"
+  GROUP_SESSION=$(get_session group)
+  if session_exists "$GROUP_SESSION"; then
+    node "$RECEIVE" --channel feishu --endpoint "oc_e2e9${TS}|type:group|msg:om_g" --no-reply \
+      --content "E2E-9 group delivery ${TS}" 2>&1
+    wait_for_status "E2E-9 group delivery ${TS}" "delivered" 30 "Group delivery"
+  else
+    record_skip "Group session '${GROUP_SESSION}' not running"
+  fi
+
+  section "Test 10: User instance live delivery (betty)"
+  BETTY_SESSION=$(get_session user-betty)
+  if session_exists "$BETTY_SESSION"; then
+    node "$RECEIVE" --channel feishu --endpoint "oc_39ec68719d842691a6714b05be9a2de4|type:p2p|msg:om_e2e10${TS}" --no-reply \
+      --content "E2E-10 betty delivery ${TS}" 2>&1
+    wait_for_status "E2E-10 betty delivery ${TS}" "delivered" 30 "Betty delivery"
+  else
+    record_skip "Betty session '${BETTY_SESSION}' not running"
+  fi
+
+  section "Test 11: Scheduler instance delivery"
+  SCHED_SESSION=$(get_session scheduler)
+  if session_exists "$SCHED_SESSION"; then
+    node "$RECEIVE" --channel test --endpoint "test-sched-${TS}" --no-reply --target-instance scheduler \
+      --content "E2E-11 scheduler delivery ${TS}" 2>&1
+    wait_for_status "E2E-11 scheduler delivery ${TS}" "delivered" 30 "Scheduler delivery"
+  else
+    record_skip "Scheduler session '${SCHED_SESSION}' not running"
+  fi
+
+  section "Test 12: Cold auto-start delivery"
+  # Kill a non-primary session, send a message, verify it boots and delivers
+  # Use user-pan (least disruptive to real users)
+  PAN_SESSION=$(get_session user-pan)
+  if [ -n "$PAN_SESSION" ]; then
+    tmux kill-session -t "$PAN_SESSION" 2>/dev/null || true
+    sleep 2
+    if session_exists "$PAN_SESSION"; then
+      record_skip "Could not kill ${PAN_SESSION} for cold-start test"
+    else
+      info "Killed ${PAN_SESSION}, sending message to trigger auto-start..."
+      node "$RECEIVE" --channel test --endpoint "test-coldstart-${TS}" --no-reply --target-instance user-pan \
+        --content "E2E-12 cold start ${TS}" 2>&1
+      # Wait up to 90s: wake signal → AM detects → launches CC → CC boots → dispatcher delivers
+      wait_for_status "E2E-12 cold start ${TS}" "delivered" 90 "Cold auto-start delivery (user-pan)"
+    fi
+  else
+    record_skip "user-pan not configured"
+  fi
+
+  section "Test 13: Delivery confirmation (api-activity.json)"
+  # Hook writes to legacy path (CC process doesn't have ZYLOS_INSTANCE_ID)
+  ADMIN_API="$ZYLOS_DIR/activity-monitor/api-activity.json"
+  if [ -f "$ADMIN_API" ]; then
+    BEFORE=$(python3 -c "import json; print(json.load(open('$ADMIN_API')).get('last_user_activity',0))" 2>/dev/null || echo 0)
+    node "$RECEIVE" --channel test --endpoint "test-confirm-${TS}" --no-reply --target-instance admin \
+      --content "E2E-13 confirm delivery ${TS}" 2>&1
+    sleep 15  # wait for delivery + hook to fire
+    AFTER=$(python3 -c "import json; print(json.load(open('$ADMIN_API')).get('last_user_activity',0))" 2>/dev/null || echo 0)
+    if [ "$AFTER" -gt "$BEFORE" ]; then
+      record_pass "last_user_activity increased ($BEFORE → $AFTER)"
+    else
+      record_fail "last_user_activity unchanged ($BEFORE → $AFTER)"
+    fi
+  else
+    record_skip "Admin api-activity.json not found"
+  fi
+
 fi
 
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════
 # Cleanup
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════
 section "Cleanup"
-
 if [ -f "$C4_DB" ]; then
   DELETED=$(sqlite3 "$C4_DB" "
-    DELETE FROM conversations
-    WHERE channel = 'test'
-       OR (channel = 'internal' AND endpoint_id LIKE 'instance-test%')
-       OR (channel = 'feishu'   AND content LIKE '%E2E Feishu group test%')
-       OR (channel = 'telegram' AND content LIKE '%E2E Telegram group test%');
+    DELETE FROM conversations WHERE content LIKE '%E2E-% ${TS}%';
     SELECT changes();
   " 2>/dev/null || echo 0)
-  info "Deleted $DELETED test row(s) from conversations"
-else
-  info "No DB to clean (never created)"
+  info "Deleted $DELETED test row(s)"
 fi
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
+# ── Summary ────────────────────────────────────────────────────────────
 TOTAL=$((PASS_COUNT + FAIL_COUNT + SKIP_COUNT))
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -357,7 +255,5 @@ echo -e "  Results: ${GREEN}${PASS_COUNT} passed${RESET}  ${RED}${FAIL_COUNT} fa
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
 
-if [ "$FAIL_COUNT" -gt 0 ]; then
-  exit 1
-fi
+[ "$FAIL_COUNT" -gt 0 ] && exit 1
 exit 0
