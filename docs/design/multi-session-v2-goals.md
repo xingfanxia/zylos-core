@@ -1,4 +1,6 @@
-# Multi-Session v2 — Goals & Scope
+> **Superseded by [../multi-session.md](../multi-session.md)** — this was the pre-implementation goals doc. The implementation is complete (2026-03-30). See the parent doc for current architecture.
+
+# Multi-Session v2 — Goals & Scope (ARCHIVED)
 
 ## Architecture Goal
 Restructure multi-session as modular hooks on upstream, minimizing upstream file changes

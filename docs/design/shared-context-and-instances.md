@@ -1,4 +1,6 @@
-# Shared Context Layer & Instance Architecture — Design
+> **Superseded by [../multi-session.md](../multi-session.md)** — design implemented as described. See "Shared Knowledge System" section.
+
+# Shared Context Layer & Instance Architecture — Design (ARCHIVED)
 
 ## Problem
 

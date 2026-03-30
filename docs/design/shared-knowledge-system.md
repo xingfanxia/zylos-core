@@ -1,4 +1,6 @@
-# Shared Knowledge System — Design
+> **Superseded by [../multi-session.md](../multi-session.md)** — implemented as LLM-driven scheduled prompt. See "Shared Knowledge System" section.
+
+# Shared Knowledge System — Design (ARCHIVED)
 
 ## Problem
 
