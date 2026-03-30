@@ -247,9 +247,17 @@ export function resolveStatusFile(targetInstance) {
  */
 export function multiSessionDispatch(item, helpers) {
   const { getClaudeState, isBypassState } = helpers;
-  const targetInstance = item.target_instance || null;
+  let targetInstance = item.target_instance || null;
   if (!targetInstance) {
-    return { action: 'reject', reason: 'no target_instance (every message must be routed to an instance)' };
+    // Controls without target (heartbeats from adapter) → route to primary/default
+    if (item.type === 'control') {
+      const all = getAllInstances();
+      const primary = all.find(i => i.primary === true) ?? all[0];
+      if (primary) targetInstance = primary.id;
+    }
+    if (!targetInstance) {
+      return { action: 'reject', reason: 'no target_instance (every message must be routed to an instance)' };
+    }
   }
   const bypass = isBypassState(item);
 
