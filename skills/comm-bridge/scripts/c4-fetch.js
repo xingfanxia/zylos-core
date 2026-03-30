@@ -30,13 +30,20 @@ try {
 }
 
 function usage() {
-  console.error('Usage:\n  c4-fetch.js --unsummarized\n  c4-fetch.js --begin <id> --end <id>');
+  console.error([
+    'Usage:',
+    '  c4-fetch.js --unsummarized                 Fetch unsummarized conversations for this instance',
+    '  c4-fetch.js --unsummarized --all-instances  Fetch unsummarized conversations across ALL instances',
+    '  c4-fetch.js --begin <id> --end <id>         Fetch conversations in a specific range',
+    '  c4-fetch.js --begin <id> --end <id> --all-instances  Fetch range across ALL instances',
+  ].join('\n'));
   process.exit(1);
 }
 
-function outputConversations(beginId, endId) {
+function outputConversations(beginId, endId, { allInstances = false } = {}) {
   const checkpoint = getLastCheckpoint();
-  const conversations = (INSTANCE_ID && _getConversationsByRangeForInstance)
+  const useInstanceFilter = !allInstances && INSTANCE_ID && _getConversationsByRangeForInstance;
+  const conversations = useInstanceFilter
     ? _getConversationsByRangeForInstance(INSTANCE_ID, beginId, endId)
     : getConversationsByRange(beginId, endId);
   const lines = [];
@@ -59,10 +66,12 @@ function outputConversations(beginId, endId) {
 
 function main() {
   const args = process.argv.slice(2);
+  const allInstances = args.includes('--all-instances');
 
   if (args.includes('--unsummarized')) {
     try {
-      const range = (INSTANCE_ID && _getUnsummarizedRangeForInstance)
+      const useInstanceFilter = !allInstances && INSTANCE_ID && _getUnsummarizedRangeForInstance;
+      const range = useInstanceFilter
         ? _getUnsummarizedRangeForInstance(INSTANCE_ID)
         : getUnsummarizedRange();
       if (!range || range.count === 0) {
@@ -70,7 +79,7 @@ function main() {
         return;
       }
       console.log(`[Unsummarized Range] end_id=${range.end_id} count=${range.count}`);
-      outputConversations(range.begin_id, range.end_id);
+      outputConversations(range.begin_id, range.end_id, { allInstances });
     } catch (err) {
       console.error(`Error fetching unsummarized conversations: ${err.stack}`);
       process.exit(1);
@@ -95,7 +104,7 @@ function main() {
   }
 
   try {
-    outputConversations(beginId, endId);
+    outputConversations(beginId, endId, { allInstances });
   } catch (err) {
     console.error(`Error fetching conversations: ${err.stack}`);
     process.exit(1);

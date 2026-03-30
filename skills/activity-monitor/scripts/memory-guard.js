@@ -25,6 +25,24 @@ const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
 
 /**
+ * Check whether the current instance is the scheduler instance.
+ * The scheduler instance is allowed to write to shared/ for cross-instance
+ * knowledge sync (shared-knowledge-sync task).
+ *
+ * @returns {boolean}
+ */
+export function isSchedulerInstance() {
+  if (!INSTANCE_ID) return false;
+  try {
+    const config = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
+    const schedulerId = config.scheduler_instance ?? config.default_instance;
+    return schedulerId === INSTANCE_ID;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Check whether the current instance is the primary instance.
  * Returns true in legacy mode (no INSTANCE_ID set) or when instances.json
  * marks this instance as primary. Fails open if config cannot be read.
@@ -70,10 +88,10 @@ export function validateMemoryWrite(filePath) {
 
   // Check: writing to shared/
   if (segments[0] === 'shared') {
-    if (!isPrimary()) {
+    if (!isPrimary() && !isSchedulerInstance()) {
       return `Non-primary instance '${INSTANCE_ID}' cannot write to shared memory`;
     }
-    return null; // primary can write to shared
+    return null; // primary or scheduler instance can write to shared
   }
 
   // Check: writing to users/ -- allow for user profile writes
@@ -96,7 +114,7 @@ export function validateMemoryWrite(filePath) {
     const realPath = fs.realpathSync(absPath);
     // If the real path resolves to shared/, re-validate
     if (realPath.startsWith(path.join(MEMORY_DIR, 'shared') + path.sep)) {
-      if (!isPrimary()) {
+      if (!isPrimary() && !isSchedulerInstance()) {
         return `Non-primary instance '${INSTANCE_ID}' cannot write to shared memory (via symlink)`;
       }
       return null;
