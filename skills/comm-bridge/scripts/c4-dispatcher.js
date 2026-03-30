@@ -117,10 +117,11 @@ function getAgentState(statusFile = AGENT_STATUS_FILE) {
  * Read proc-state.json written by the activity monitor's ProcSampler.
  * Returns { alive, frozen, ... } or null if unavailable/stale (>30s).
  */
-function readProcState() {
+function readProcState(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(PROC_STATE_FILE)) return null;
-    const data = readJsonFileWithRetry(PROC_STATE_FILE);
+    const procFile = path.join(path.dirname(statusFile), 'proc-state.json');
+    if (!existsSync(procFile)) return null;
+    const data = readJsonFileWithRetry(procFile);
     const age = nowSeconds() - (data.lastSampleAt || 0);
     if (age > 30) return null;
     return data;
@@ -133,10 +134,11 @@ function readProcState() {
  * Check if agent is confirmed active: api-activity.json must show active_tools > 0
  * AND be fresh (updated within 60s). Prevents stale hook state from gating auto-ack.
  */
-function isAgentConfirmedActive() {
+function isAgentConfirmedActive(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(API_ACTIVITY_FILE)) return false;
-    const data = readJsonFileWithRetry(API_ACTIVITY_FILE);
+    const apiFile = path.join(path.dirname(statusFile), 'api-activity.json');
+    if (!existsSync(apiFile)) return false;
+    const data = readJsonFileWithRetry(apiFile);
     const updatedAt = data?.updated_at ? Math.floor(data.updated_at / 1000) : 0;
     const age = nowSeconds() - updatedAt;
     return (data?.active_tools ?? 0) > 0 && age < 60;
