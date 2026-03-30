@@ -5,6 +5,7 @@
  */
 
 import { execFileSync } from 'child_process';
+import path from 'path';
 import { readFileSync, existsSync, statSync } from 'fs';
 import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
 import {
@@ -47,7 +48,9 @@ import {
   PROC_STATE_FILE,
   API_ACTIVITY_FILE,
   STALE_STATUS_THRESHOLD,
-  TMUX_MISSING_WARN_THRESHOLD
+  TMUX_MISSING_WARN_THRESHOLD,
+  DELIVERY_CONFIRM_TIMEOUT_MS,
+  DELIVERY_CONFIRM_POLL_MS
 } from './c4-config.js';
 
 let isShuttingDown = false;
@@ -142,6 +145,53 @@ function isAgentConfirmedActive() {
   } catch {
     return false;
   }
+}
+
+/**
+ * Read the current last_user_activity timestamp from api-activity.json.
+ * Returns the timestamp (number) or null if the file doesn't exist / is unreadable.
+ */
+function readPreDeliveryTimestamp(statusFile = AGENT_STATUS_FILE) {
+  const apiActivityFile = path.join(path.dirname(statusFile), 'api-activity.json');
+  try {
+    if (!existsSync(apiActivityFile)) return null;
+    const data = JSON.parse(readFileSync(apiActivityFile, 'utf8'));
+    return data.last_user_activity ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Poll api-activity.json to confirm the agent consumed the delivered message.
+ * A new UserPromptSubmit event (last_user_activity > preDeliveryTimestamp) confirms delivery.
+ *
+ * Returns { confirmed: true } or { confirmed: false, reason: 'timeout' }.
+ * If api-activity.json doesn't exist (hook not installed), returns confirmed (fail-open).
+ */
+async function confirmDelivery(preDeliveryTimestamp, statusFile = AGENT_STATUS_FILE) {
+  const apiActivityFile = path.join(path.dirname(statusFile), 'api-activity.json');
+
+  // Fail-open: if there's no baseline timestamp (file didn't exist pre-delivery),
+  // skip confirmation — the hook isn't installed.
+  if (preDeliveryTimestamp === null) {
+    return { confirmed: true };
+  }
+
+  const deadline = Date.now() + DELIVERY_CONFIRM_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    try {
+      const data = JSON.parse(readFileSync(apiActivityFile, 'utf8'));
+      // Check if a new UserPromptSubmit event happened after our delivery
+      if (data.last_user_activity && data.last_user_activity > preDeliveryTimestamp) {
+        return { confirmed: true };
+      }
+    } catch { /* file may not exist yet */ }
+    await sleep(DELIVERY_CONFIRM_POLL_MS);
+  }
+
+  return { confirmed: false, reason: 'timeout' };
 }
 
 function isAgentStatusFresh(statusFile = AGENT_STATUS_FILE) {
@@ -518,6 +568,7 @@ async function processNextMessage() {
       markDelivered, ackControl, log, sleep, nowSeconds,
       getNextPendingForInstances, getNextPendingControlForInstances,
       markRejected, markControlRejected,
+      confirmDelivery, readPreDeliveryTimestamp,
     });
   } catch (e) {
     if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session error: ${e.message}`);
@@ -587,6 +638,10 @@ async function processNextMessage() {
   }
 
   log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
+
+  // Capture pre-delivery timestamp for conversation delivery confirmation
+  const preDeliveryTs = item.type === 'conversation' ? readPreDeliveryTimestamp() : null;
+
   const deliveryContent = item.content || '';
   const result = await sendToTmux(deliveryContent, {
     strictVerify: item.type === 'conversation'
@@ -594,8 +649,16 @@ async function processNextMessage() {
 
   if (result === 'submitted') {
     if (item.type === 'conversation') {
-      markDelivered(item.id);
-      log(`Conversation id=${item.id} delivered`);
+      // Confirm the agent actually consumed the message
+      const confirmation = await confirmDelivery(preDeliveryTs);
+      if (confirmation.confirmed) {
+        markDelivered(item.id);
+        log(`Conversation id=${item.id} delivered (confirmed)`);
+      } else {
+        log(`Conversation id=${item.id} submitted but unconfirmed (${confirmation.reason}), requeuing`);
+        await handleConversationDeliveryFailure(item);
+        return { delivered: false, state: agentState.state };
+      }
     } else {
       if (hasAckSuffix(item.content || '')) {
         log(`Control id=${item.id} submitted, waiting ack`);
@@ -679,7 +742,8 @@ export {
   getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
   releaseItem, handleConversationDeliveryFailure, handleControlDeliveryFailure,
   waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
-  markDelivered, ackControl, log, sleep, nowSeconds
+  markDelivered, ackControl, log, sleep, nowSeconds,
+  confirmDelivery, readPreDeliveryTimestamp
 };
 
 // PM2 sets argv[1] to its own ProcessContainerFork.js, so classic ESM

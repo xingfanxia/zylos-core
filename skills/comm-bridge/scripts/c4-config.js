@@ -57,3 +57,7 @@ export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by se
 
 export const STALE_STATUS_THRESHOLD = 5000; // ms
 export const TMUX_MISSING_WARN_THRESHOLD = 30;
+
+// Delivery confirmation: poll api-activity.json to verify the agent received the message.
+export const DELIVERY_CONFIRM_TIMEOUT_MS = 8000;
+export const DELIVERY_CONFIRM_POLL_MS = 500;
