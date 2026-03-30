@@ -236,12 +236,74 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
+# SECTION C: Memory isolation + shared context
+# ═══════════════════════════════════════════════════════════════════════
+
+section "Test 14: Shared memory accessible by all instances"
+SHARED_ID="$ZYLOS_DIR/memory/shared/identity.md"
+LEGACY_ID="$ZYLOS_DIR/memory/identity.md"
+if [ -f "$SHARED_ID" ]; then
+  record_pass "Shared identity.md exists at shared/ ($(wc -c < "$SHARED_ID") bytes)"
+elif [ -f "$LEGACY_ID" ]; then
+  record_pass "Shared identity.md exists at legacy path ($(wc -c < "$LEGACY_ID") bytes)"
+else
+  record_fail "No shared identity.md found"
+fi
+
+section "Test 15: Instance-specific state isolation"
+ADMIN_STATE="$ZYLOS_DIR/memory/instances/admin/state.md"
+BETTY_STATE="$ZYLOS_DIR/memory/instances/user-betty/state.md"
+if [ -f "$ADMIN_STATE" ] && [ -f "$BETTY_STATE" ]; then
+  ADMIN_INODE=$(stat -c %i "$ADMIN_STATE")
+  BETTY_INODE=$(stat -c %i "$BETTY_STATE")
+  if [ "$ADMIN_INODE" != "$BETTY_INODE" ]; then
+    record_pass "Admin and Betty have separate state.md files"
+  else
+    record_fail "Admin and Betty share the same state.md inode"
+  fi
+elif [ -f "$ADMIN_STATE" ]; then
+  record_pass "Admin has instance-specific state.md (betty may not exist yet)"
+else
+  record_skip "Instance state.md not yet created (needs memory sync)"
+fi
+
+section "Test 16: Inter-instance query delivered to admin"
+if [ "$SKIP_LIVE" = "true" ]; then
+  record_skip "Skipped via --skip-live"
+elif [ ! -f "$QUERY" ]; then
+  record_skip "c4-query-instance.js not deployed"
+else
+  QUERY_TS=$(date +%s%N)
+  node "$QUERY" --from e2e-roundtrip --to admin \
+    --content "E2E-16 roundtrip ${QUERY_TS}" 2>&1
+  sleep 2
+  RT_TARGET=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-16 roundtrip ${QUERY_TS}%' ORDER BY id DESC LIMIT 1;")
+  RT_CHANNEL=$(db_query "SELECT channel FROM conversations WHERE content LIKE '%E2E-16 roundtrip ${QUERY_TS}%' ORDER BY id DESC LIMIT 1;")
+  if [ "$RT_TARGET" = "admin" ] && [ "$RT_CHANNEL" = "internal" ]; then
+    RT_DELIVERED=false
+    for i in $(seq 1 30); do
+      RT_STATUS=$(db_query "SELECT status FROM conversations WHERE content LIKE '%E2E-16 roundtrip ${QUERY_TS}%' ORDER BY id DESC LIMIT 1;")
+      if [ "$RT_STATUS" = "delivered" ]; then
+        RT_DELIVERED=true
+        record_pass "Inter-instance query delivered to admin (${i}s)"
+        break
+      fi
+      sleep 1
+    done
+    [ "$RT_DELIVERED" = "false" ] && record_fail "Query not delivered (status=${RT_STATUS})"
+  else
+    record_fail "Routing wrong: target='${RT_TARGET}' channel='${RT_CHANNEL}'"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════
 # Cleanup
 # ═══════════════════════════════════════════════════════════════════════
 section "Cleanup"
 if [ -f "$C4_DB" ]; then
   DELETED=$(sqlite3 "$C4_DB" "
-    DELETE FROM conversations WHERE content LIKE '%E2E-% ${TS}%';
+    DELETE FROM conversations WHERE content LIKE '%E2E-% ${TS}%'
+       OR content LIKE '%E2E-16 roundtrip%';
     SELECT changes();
   " 2>/dev/null || echo 0)
   info "Deleted $DELETED test row(s)"
