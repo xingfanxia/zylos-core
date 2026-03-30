@@ -131,6 +131,24 @@ Triggers:
 - Recalling recent events → read `sessions/current.md`
 - Searching for historical info → check `archive/`
 
+## Inter-Instance Communication
+
+When you need context from another instance, you can query it directly via C4:
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-query-instance.js \
+  --from <your-instance-id> --to <target-instance> \
+  --content "What was discussed about <topic>?"
+```
+
+The target instance will auto-start if offline and receive your question.
+Its reply will be delivered back to your instance via C4.
+
+Use this for:
+- Asking the group instance about recent discussions
+- Requesting the admin for system status
+- Cross-referencing what another user discussed (the target instance decides what to share)
+
 ## Communication
 
 All external communication goes through C4 Communication Bridge.

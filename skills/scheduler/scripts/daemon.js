@@ -54,7 +54,7 @@ function isRuntimeAlive() {
 /**
  * Dispatch a task to Claude via C4 comm-bridge
  */
-function dispatchTask(task) {
+async function dispatchTask(task) {
   console.log(`[${new Date().toISOString()}] Dispatching task: ${task.id} (${task.name})`);
 
   // Atomically claim the task (only if still pending)
@@ -75,6 +75,20 @@ function dispatchTask(task) {
     VALUES (?, ?, 'started')
   `).run(task.id, now());
 
+  // Resolve target instance: explicit > scheduler_instance from config > null
+  let targetInstance = task.target_instance || null;
+  if (!targetInstance) {
+    try {
+      const { getSchedulerInstance } = await import('../../multi-session/instance-config.js');
+      const schedulerInst = getSchedulerInstance();
+      if (schedulerInst?.id) {
+        targetInstance = schedulerInst.id;
+      }
+    } catch {
+      // instance-config not available (single-session mode) — leave null
+    }
+  }
+
   // Build prompt with completion instruction
   const prompt = `[Scheduled Task: ${task.id}] ${task.prompt}
 
@@ -86,7 +100,7 @@ function dispatchTask(task) {
     requireIdle: task.require_idle === 1,
     replyChannel: task.reply_channel,
     replyEndpoint: task.reply_endpoint,
-    targetInstance: task.target_instance || null
+    targetInstance
   });
 
   if (!success) {
@@ -131,7 +145,7 @@ function processCompletedTasks() {
  * - Tasks overdue < miss_threshold: try to dispatch if runtime alive
  * - Tasks overdue > miss_threshold: skip to next scheduled time
  */
-function handleMissedTasks() {
+async function handleMissedTasks() {
   const currentTime = now();
   const recentMissedThreshold = currentTime - 300;   // 5 minutes
 
@@ -158,7 +172,7 @@ function handleMissedTasks() {
       // Within threshold: try to dispatch if runtime is alive
       if (isRuntimeAlive()) {
         console.log(`[${new Date().toISOString()}] Late-dispatching missed task ${task.id} (${task.name}), ${Math.round(overdueSeconds/60)}min overdue`);
-        dispatchTask(task);
+        await dispatchTask(task);
       }
       // If runtime not alive, leave it pending - will try again next check
     }
@@ -229,7 +243,7 @@ async function mainLoop() {
           }
         } else {
           // Within threshold: dispatch normally
-          dispatchTask(task);
+          await dispatchTask(task);
         }
       }
 
@@ -237,7 +251,7 @@ async function mainLoop() {
       processCompletedTasks();
 
       // Handle missed tasks
-      handleMissedTasks();
+      await handleMissedTasks();
 
       // Handle stale running tasks (orphaned due to compaction/crash)
       handleStaleRunningTasks();
