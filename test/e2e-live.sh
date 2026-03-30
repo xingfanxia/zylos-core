@@ -215,22 +215,17 @@ else
     record_skip "user-pan not configured"
   fi
 
-  section "Test 13: Delivery confirmation (api-activity.json)"
-  # Hook writes to legacy path (CC process doesn't have ZYLOS_INSTANCE_ID)
-  ADMIN_API="$ZYLOS_DIR/activity-monitor/api-activity.json"
-  if [ -f "$ADMIN_API" ]; then
-    BEFORE=$(python3 -c "import json; print(json.load(open('$ADMIN_API')).get('last_user_activity',0))" 2>/dev/null || echo 0)
-    node "$RECEIVE" --channel test --endpoint "test-confirm-${TS}" --no-reply --target-instance admin \
-      --content "E2E-13 confirm delivery ${TS}" 2>&1
-    sleep 15  # wait for delivery + hook to fire
-    AFTER=$(python3 -c "import json; print(json.load(open('$ADMIN_API')).get('last_user_activity',0))" 2>/dev/null || echo 0)
-    if [ "$AFTER" -gt "$BEFORE" ]; then
-      record_pass "last_user_activity increased ($BEFORE → $AFTER)"
+  section "Test 13: Agent status file freshness"
+  ADMIN_STATUS="$ZYLOS_DIR/activity-monitor/admin/agent-status.json"
+  if [ -f "$ADMIN_STATUS" ]; then
+    AGE_S=$(python3 -c "import os,time; print(int(time.time()-os.path.getmtime('$ADMIN_STATUS')))" 2>/dev/null || echo 999)
+    if [ "$AGE_S" -lt 5 ]; then
+      record_pass "Admin agent-status.json is fresh (${AGE_S}s old)"
     else
-      record_fail "last_user_activity unchanged ($BEFORE → $AFTER)"
+      record_fail "Admin agent-status.json is stale (${AGE_S}s old)"
     fi
   else
-    record_skip "Admin api-activity.json not found"
+    record_fail "Admin agent-status.json not found"
   fi
 
 fi

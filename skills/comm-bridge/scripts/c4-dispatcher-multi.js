@@ -367,8 +367,6 @@ export async function processWithMultiSession(helpers) {
     markControlRejected,
     getNextPendingForInstances,
     getNextPendingControlForInstances,
-    confirmDelivery,
-    readPreDeliveryTimestamp,
   } = helpers;
 
   // Reap idle non-primary instances before processing.
@@ -446,11 +444,6 @@ export async function processWithMultiSession(helpers) {
       (targetInstance ? ` -> ${targetInstance}` : '')
     );
 
-    // Capture pre-delivery timestamp for conversation delivery confirmation
-    const preDeliveryTs = item.type === 'conversation' && readPreDeliveryTimestamp
-      ? readPreDeliveryTimestamp(statusFile)
-      : null;
-
     const deliveryContent = item.content || '';
     const result = await sendToTmux(deliveryContent, {
       session,
@@ -459,18 +452,8 @@ export async function processWithMultiSession(helpers) {
 
     if (result === 'submitted') {
       if (item.type === 'conversation') {
-        // Confirm the agent actually consumed the message
-        const confirmation = confirmDelivery
-          ? await confirmDelivery(preDeliveryTs, statusFile)
-          : { confirmed: true };
-        if (confirmation.confirmed) {
-          markDelivered(item.id);
-          log(`Conversation id=${item.id} delivered (confirmed)`);
-        } else {
-          log(`Conversation id=${item.id} submitted but unconfirmed (${confirmation.reason}), requeuing`);
-          await handleConversationDeliveryFailure(item, statusFile);
-          return { delivered: false, state: claudeState.state };
-        }
+        markDelivered(item.id);
+        log(`Conversation id=${item.id} delivered`);
       } else {
         const hasAck = (item.content || '').includes('---- ack via:');
         if (hasAck) {
