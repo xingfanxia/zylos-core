@@ -69,6 +69,12 @@ export function writeWakeSignal(instanceId, zylosDir) {
 /** Tracks last delivery time per instance for idle reaping. */
 const lastDeliveryAt = new Map();
 
+/** Tracks auto-start timestamps to prevent requeue loops during CC boot. */
+const autoStartedAt = new Map();
+
+/** Grace period after auto-start before retrying delivery (CC needs time to boot). */
+const AUTO_START_GRACE_MS = 60 * 1000;
+
 /** Default idle timeout before auto-stopping a non-primary instance (30 min). */
 const IDLE_REAP_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -80,7 +86,7 @@ const IDLE_REAP_TIMEOUT_MS = 30 * 60 * 1000;
  * @param {object} instDef - Instance definition from instances.json.
  * @param {string} instDef.id
  * @param {string} instDef.tmux_session
- * @returns {boolean} true if session was started.
+ * @returns {'started'|'already_running'|false}
  */
 export function autoStartInstance(instDef) {
   const session = instDef.tmux_session;
@@ -89,7 +95,7 @@ export function autoStartInstance(instDef) {
   try {
     // Check if session already exists
     execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe', timeout: 3000 });
-    return true; // already running
+    return 'already_running';
   } catch {
     // Session doesn't exist — create it
   }
@@ -103,7 +109,8 @@ export function autoStartInstance(instDef) {
     ], { stdio: 'pipe', timeout: 10000 });
     console.log(`[dispatcher-multi] Auto-started session '${session}' for instance '${instDef.id}'`);
     lastDeliveryAt.set(instDef.id, Date.now());
-    return true;
+    autoStartedAt.set(instDef.id, Date.now());
+    return 'started';
   } catch (err) {
     console.error(`[dispatcher-multi] Failed to auto-start '${session}': ${err.message}`);
     return false;
@@ -275,10 +282,20 @@ export function multiSessionDispatch(item, helpers) {
   if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass) {
     const def = targetInstance ? getInstanceDef(targetInstance) : null;
     if (def && !def.primary) {
+      // Check if we recently auto-started this instance — don't spam requeues during boot
+      const startedTs = autoStartedAt.get(targetInstance);
+      if (startedTs && (Date.now() - startedTs) < AUTO_START_GRACE_MS) {
+        // Still in grace period — skip silently, will retry on next poll cycle
+        return { action: 'skip', reason: `instance '${targetInstance}' booting (grace period)` };
+      }
       // Non-primary instance: auto-start and requeue so it has time to boot.
-      const started = autoStartInstance({ ...def, id: targetInstance });
-      if (started) {
+      const startResult = autoStartInstance({ ...def, id: targetInstance });
+      if (startResult === 'started') {
         return { action: 'requeue', reason: `auto-started instance '${targetInstance}', requeueing for delivery after boot` };
+      }
+      // already_running but offline = CC not ready yet, skip
+      if (startResult === 'already_running') {
+        return { action: 'skip', reason: `instance '${targetInstance}' session exists but CC not online yet` };
       }
     }
     return { action: 'skip', reason: `instance target offline (state=${claudeState.state})` };
@@ -475,8 +492,11 @@ export async function processWithMultiSession(helpers) {
         await waitForRequireIdleSettlement(item.id, statusFile);
       }
 
-      // Track delivery time for idle reaping of non-primary instances.
-      if (targetInstance) lastDeliveryAt.set(targetInstance, Date.now());
+      // Track delivery time for idle reaping; clear boot grace period.
+      if (targetInstance) {
+        lastDeliveryAt.set(targetInstance, Date.now());
+        autoStartedAt.delete(targetInstance);
+      }
 
       return { delivered: true, state: claudeState.state };
     }

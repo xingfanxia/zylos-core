@@ -75,9 +75,8 @@ function loadInstanceMonitors() {
     const apps = [];
 
     for (const [id, def] of Object.entries(instances)) {
-      // Skip disabled or on-demand instances
-      if (def.status !== 'enabled' && def.status !== 'active') continue;
-      if (def.on_demand) continue;
+      // Skip disabled instances
+      if (def.enabled === false) continue;
 
       const pm2Name = `activity-monitor-${id}`;
       const monitorDir = (def.state_dir || '').replace(/^~/, HOME)
