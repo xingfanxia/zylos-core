@@ -112,7 +112,7 @@ export function getSystemHealth() {
         : path.join(ZYLOS_DIR, 'activity-monitor', id);
 
       const tmuxAlive = tmuxSessionExists(tmuxSession);
-      const statusFile = path.join(stateDir, 'claude-status.json');
+      const statusFile = path.join(stateDir, 'agent-status.json');
       const statusData = readStatusFile(statusFile);
 
       // Determine effective status

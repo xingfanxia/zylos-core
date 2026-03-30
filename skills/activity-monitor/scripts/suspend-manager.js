@@ -60,7 +60,7 @@ export class SuspendManager {
    * @param {function} deps.log - Logging function
    * @param {function} deps.killTmuxSession - Kill the tmux session
    * @param {function} deps.startClaude - Start CC
-   * @param {function} deps.writeStatusFile - Write claude-status.json
+   * @param {function} deps.writeStatusFile - Write agent-status.json
    * @param {function} deps.isClaudeRunning - Check if CC is running
    * @param {function} deps.tmuxHasSession - Check if tmux session exists
    * @param {object} opts
@@ -81,11 +81,11 @@ export class SuspendManager {
     this._configCache = null;
     this._configLoadedAt = 0;
 
-    // Restore suspend state from claude-status.json to survive AM restarts
+    // Restore suspend state from agent-status.json to survive AM restarts
     this.suspended = false;
     this.suspendedAt = 0;
     try {
-      const statusPath = path.join(opts.monitorDir, 'claude-status.json');
+      const statusPath = path.join(opts.monitorDir, 'agent-status.json');
       if (fs.existsSync(statusPath)) {
         const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
         if (status.state === 'suspended') {

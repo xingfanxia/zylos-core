@@ -78,7 +78,7 @@ function tmuxSessionExists(session) {
 }
 
 /**
- * Read the status from an instance's claude-status.json file.
+ * Read the status from an instance's agent-status.json file.
  * Returns a string: 'running', 'suspended', 'stopped', or 'unknown'.
  */
 function readInstanceStatus(instanceId) {
@@ -424,7 +424,7 @@ function cmdSuspend(id) {
 
   // Write suspended status to state file
   const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-  const statusFile = path.join(stateDir, 'claude-status.json');
+  const statusFile = path.join(stateDir, 'agent-status.json');
   fs.mkdirSync(stateDir, { recursive: true });
 
   const statusData = {
@@ -476,7 +476,7 @@ function cmdResume(id) {
 
   // Clear suspended status
   const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-  const statusFile = path.join(stateDir, 'claude-status.json');
+  const statusFile = path.join(stateDir, 'agent-status.json');
   try {
     const statusData = {
       state: 'idle',
@@ -587,7 +587,7 @@ function cmdSuspendAll() {
 
     // Write suspended status
     const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-    const statusFile = path.join(stateDir, 'claude-status.json');
+    const statusFile = path.join(stateDir, 'agent-status.json');
     fs.mkdirSync(stateDir, { recursive: true });
     const statusData = {
       state: 'suspended',
@@ -666,7 +666,7 @@ function cmdResumeAll() {
 
     // Clear suspended status
     const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-    const statusFile = path.join(stateDir, 'claude-status.json');
+    const statusFile = path.join(stateDir, 'agent-status.json');
     try {
       const statusData = {
         state: 'idle',

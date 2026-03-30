@@ -229,7 +229,7 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
 
       // Write suspended status
       const stateDir = resolveTilde(inst.state_dir) || path.join(zylosDir, 'activity-monitor', id);
-      const statusFile = path.join(stateDir, 'claude-status.json');
+      const statusFile = path.join(stateDir, 'agent-status.json');
       fs.mkdirSync(stateDir, { recursive: true });
       fs.writeFileSync(statusFile, JSON.stringify({
         state: 'suspended',
@@ -283,7 +283,7 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
 
       // Clear suspended status
       const stateDir = resolveTilde(inst.state_dir) || path.join(zylosDir, 'activity-monitor', id);
-      const stateStatusFile = path.join(stateDir, 'claude-status.json');
+      const stateStatusFile = path.join(stateDir, 'agent-status.json');
       try {
         fs.writeFileSync(stateStatusFile, JSON.stringify({
           state: 'idle',

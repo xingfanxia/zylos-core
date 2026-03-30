@@ -152,10 +152,10 @@ export function getSessionForInstance(instanceId) {
 }
 
 /**
- * Get the claude-status.json path for an instance.
+ * Get the agent-status.json path for an instance.
  *
  * @param {string} instanceId
- * @returns {string|null} Absolute path to claude-status.json, or null
+ * @returns {string|null} Absolute path to agent-status.json, or null
  */
 export function getStatusFileForInstance(instanceId) {
   loadConfig();
@@ -168,7 +168,7 @@ export function getStatusFileForInstance(instanceId) {
     ? instance.state_dir.replace(/^~/, os.homedir())
     : path.join(ZYLOS_DIR, 'activity-monitor', instanceId);
 
-  return path.join(stateDir, 'claude-status.json');
+  return path.join(stateDir, 'agent-status.json');
 }
 
 /**

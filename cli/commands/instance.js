@@ -137,7 +137,7 @@ function listInstances() {
     } else {
       // Check for suspended state
       const stateDir = resolveDir(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-      const statusFile = path.join(stateDir, 'claude-status.json');
+      const statusFile = path.join(stateDir, 'agent-status.json');
       try {
         const s = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
         status = s.state === 'suspended' ? yellow('suspended') : red('stopped');
@@ -464,8 +464,8 @@ function showInstanceStatus(id) {
   const pm2Status = pm2ProcessStatus(pm2Name);
   console.log(`  PM2 process:   ${pm2Status ? (pm2Status === 'online' ? green(pm2Status) : yellow(pm2Status)) : dim('not registered')}`);
 
-  // Read claude-status.json
-  const statusFile = path.join(stateDir, 'claude-status.json');
+  // Read agent-status.json
+  const statusFile = path.join(stateDir, 'agent-status.json');
   try {
     const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
     console.log(`  Agent state:   ${status.state || 'unknown'}`);
@@ -492,7 +492,7 @@ function showInstanceStatus(id) {
 }
 
 function readStatusState(stateDir) {
-  const statusFile = path.join(stateDir, 'claude-status.json');
+  const statusFile = path.join(stateDir, 'agent-status.json');
   try {
     const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
     return status.state || 'unknown';
@@ -565,7 +565,7 @@ function suspendInstance(id) {
   // Write suspended status
   const stateDir = resolveDir(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
   fs.mkdirSync(stateDir, { recursive: true });
-  const statusFile = path.join(stateDir, 'claude-status.json');
+  const statusFile = path.join(stateDir, 'agent-status.json');
   fs.writeFileSync(statusFile, JSON.stringify({
     state: 'suspended',
     suspended_at: Date.now(),
@@ -616,7 +616,7 @@ function resumeInstance(id) {
   }
 
   // Clear suspended status
-  const statusFile = path.join(stateDir, 'claude-status.json');
+  const statusFile = path.join(stateDir, 'agent-status.json');
   try {
     fs.writeFileSync(statusFile, JSON.stringify({
       state: 'idle',
@@ -658,7 +658,7 @@ function suspendAllInstances() {
 
     const stateDir = resolveDir(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
     fs.mkdirSync(stateDir, { recursive: true });
-    const statusFile = path.join(stateDir, 'claude-status.json');
+    const statusFile = path.join(stateDir, 'agent-status.json');
     fs.writeFileSync(statusFile, JSON.stringify({
       state: 'suspended',
       suspended_at: Date.now(),
@@ -713,7 +713,7 @@ function resumeAllInstances() {
     }
 
     // Clear suspended status
-    const statusFile = path.join(stateDir, 'claude-status.json');
+    const statusFile = path.join(stateDir, 'agent-status.json');
     try {
       fs.writeFileSync(statusFile, JSON.stringify({
         state: 'idle',
