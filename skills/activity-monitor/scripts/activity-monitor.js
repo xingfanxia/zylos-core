@@ -140,6 +140,13 @@ import { acquireUsageProbeLock, releaseUsageProbeLock } from './usage-probe-lock
 import { shouldStartUsageCheck } from './usage-check-engine.js';
 import { getInitialUsageCheckAt } from './usage-check-init.js';
 import { isRuntimeHeartbeatEnabled } from './heartbeat-config.js';
+
+// Multi-session support (optional)
+let instanceConfig = null;
+try {
+  instanceConfig = await import('../../multi-session/instance-config.js');
+} catch { /* multi-session not available */ }
+
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
 // the deployed path — the CLI lives in the globally installed zylos npm package.
@@ -176,23 +183,44 @@ const __dirname = path.dirname(__filename);
 
 // Core runtime config
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
-const STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
-const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
-const HEALTH_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'health-check-state.json');
-const DAILY_UPGRADE_STATE_FILE = path.join(MONITOR_DIR, 'daily-upgrade-state.json');
-const DAILY_MEMORY_COMMIT_STATE_FILE = path.join(MONITOR_DIR, 'daily-memory-commit-state.json');
-const UPGRADE_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'upgrade-check-state.json');
-const PENDING_CHANNELS_FILE = path.join(MONITOR_DIR, 'pending-channels.jsonl');
-const USER_MESSAGE_SIGNAL_FILE = path.join(MONITOR_DIR, 'user-message-signal.json');
-const USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
-const USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
-const USAGE_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-probe.lock');
-const USAGE_CODEX_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-codex-probe.lock');
+let MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+let STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
+let LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
+let HEALTH_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'health-check-state.json');
+let DAILY_UPGRADE_STATE_FILE = path.join(MONITOR_DIR, 'daily-upgrade-state.json');
+let DAILY_MEMORY_COMMIT_STATE_FILE = path.join(MONITOR_DIR, 'daily-memory-commit-state.json');
+let UPGRADE_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'upgrade-check-state.json');
+let PENDING_CHANNELS_FILE = path.join(MONITOR_DIR, 'pending-channels.jsonl');
+let USER_MESSAGE_SIGNAL_FILE = path.join(MONITOR_DIR, 'user-message-signal.json');
+let USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
+let USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
+let USAGE_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-probe.lock');
+let USAGE_CODEX_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-codex-probe.lock');
 
 // API activity file — written by hook-activity.js (Claude Code hooks)
-const API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
-const HOOK_STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
+let API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
+let HOOK_STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
+
+// Multi-session: override paths for instance-specific state directory
+const INSTANCE_ID = instanceConfig?.getInstanceId() ?? null;
+if (INSTANCE_ID && instanceConfig) {
+  MONITOR_DIR = instanceConfig.getMonitorDir(INSTANCE_ID);
+  // Re-derive all dependent paths from MONITOR_DIR
+  STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
+  LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
+  HEALTH_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'health-check-state.json');
+  DAILY_UPGRADE_STATE_FILE = path.join(MONITOR_DIR, 'daily-upgrade-state.json');
+  DAILY_MEMORY_COMMIT_STATE_FILE = path.join(MONITOR_DIR, 'daily-memory-commit-state.json');
+  UPGRADE_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'upgrade-check-state.json');
+  PENDING_CHANNELS_FILE = path.join(MONITOR_DIR, 'pending-channels.jsonl');
+  USER_MESSAGE_SIGNAL_FILE = path.join(MONITOR_DIR, 'user-message-signal.json');
+  USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
+  USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
+  USAGE_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-probe.lock');
+  USAGE_CODEX_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-codex-probe.lock');
+  API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
+  HOOK_STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
+}
 
 // Conversation directory - auto-detect based on working directory
 const ZYLOS_PATH = ZYLOS_DIR.replace(/\//g, '-');
@@ -304,6 +332,7 @@ let adapter;         // initialized in init() via getActiveAdapter()
 let engine;          // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
 let procSampler;     // initialized in init()
+let suspendMgr;      // initialized in init() for multi-session instances
 
 // Usage monitoring state machine: 'idle' → 'sent' → 'waiting' → 'capture' → 'idle'
 let usageCheckPhase = 'idle';
@@ -468,14 +497,16 @@ function hasStartupHook() {
 
 function enqueueStartupControl() {
   const content = 'reply to your human partner if they are waiting for your reply, then continue your ongoing tasks using the startup memory and C4 context already injected in this session, and do not query c4.db for recent conversations unless explicitly required.';
-  const result = runC4Control([
+  const args = [
     'enqueue',
     '--content', content,
     '--priority', '3',
     '--require-idle',
     '--available-in', '3',
     '--no-ack-suffix'
-  ]);
+  ];
+  if (INSTANCE_ID) args.push('--target-instance', INSTANCE_ID);
+  const result = runC4Control(args);
   if (result.ok) {
     const match = result.output.match(/control\s+(\d+)/i);
     log(`Startup control enqueued (fallback) id=${match?.[1] ?? '?'}`);
@@ -782,12 +813,14 @@ function enqueueHealthCheck() {
     'Log results to ~/zylos/logs/health.log.'
   ].join(' ');
 
-  const result = runC4Control([
+  const args = [
     'enqueue',
     '--content', content,
     '--priority', '3',
     '--ack-deadline', '600'
-  ]);
+  ];
+  if (INSTANCE_ID) args.push('--target-instance', INSTANCE_ID);
+  const result = runC4Control(args);
 
   if (!result.ok) {
     log(`Health check enqueue failed: ${result.output}`);
@@ -848,12 +881,14 @@ function enqueueDailyUpgradeControl() {
   // Only applicable for Claude Code runtime — no equivalent upgrade skill for other runtimes.
   if (adapter.runtimeId !== 'claude') return false;
   const content = 'Daily upgrade. Use the upgrade-claude skill to upgrade Claude Code to the latest version.';
-  const result = runC4Control([
+  const args = [
     'enqueue',
     '--content', content,
     '--priority', '3',
     '--ack-deadline', '600'
-  ]);
+  ];
+  if (INSTANCE_ID) args.push('--target-instance', INSTANCE_ID);
+  const result = runC4Control(args);
 
   if (!result.ok) {
     log(`Daily upgrade enqueue failed: ${result.output}`);
@@ -1610,23 +1645,54 @@ async function monitorLoop() {
     // Check for user message signal — clears auth suppression for immediate retry.
     maybeConsumeUserMessageSignal(currentTime);
 
+    // Multi-session: skip restart if this instance is disabled
+    if (INSTANCE_ID && instanceConfig && !instanceConfig.isInstanceEnabled(INSTANCE_ID)) {
+      writeStatusFile({ state, health: engine.health, thinking: false, last_activity: 0, idle_seconds: 0 });
+      engine.processHeartbeat(false, currentTime);
+      lastState = state;
+      return;
+    }
+
+    // Multi-session: skip restart if suspended
+    if (suspendMgr?.isSuspended()) {
+      engine.processHeartbeat(false, currentTime);
+      lastState = state;
+      return;
+    }
+
+    // Check for wake signal — skip backoff for immediate restart (message waiting)
+    const wakeSignalPath = path.join(MONITOR_DIR, 'wake-signal');
+    let wakeRequested = false;
+    try {
+      if (fs.existsSync(wakeSignalPath)) {
+        fs.unlinkSync(wakeSignalPath);
+        wakeRequested = true;
+        log('Guardian: Wake signal detected — immediate restart (message waiting)');
+        consecutiveRestarts = 0;
+      }
+    } catch { /* ignore */ }
+
     // Delegate restart permission to HeartbeatEngine (e.g. won't restart during rate_limited).
     // Counter mutations (consecutiveRestarts, startupGrace, notRunningCount) are handled
     // inside startAgent() after auth check passes — not here.
-    const restartDelay = Math.min(BASE_RESTART_DELAY * Math.pow(2, consecutiveRestarts), MAX_RESTART_DELAY);
+    const restartDelay = wakeRequested ? 0 : Math.min(BASE_RESTART_DELAY * Math.pow(2, consecutiveRestarts), MAX_RESTART_DELAY);
     if (engine.canRestart() && notRunningCount >= restartDelay) {
       if (Date.now() < authRetrySuppressedUntil) {
         if (notRunningCount % 60 === 0) log(`Guardian: auth retry suppressed for ${Math.ceil((authRetrySuppressedUntil - Date.now()) / 1000)}s`);
       } else {
-        log(`Guardian: Session not found for ${notRunningCount}s, attempting to start ${adapter.displayName}...`);
+        log(`Guardian: ${wakeRequested ? 'Wake: ' : ''}Session not found for ${notRunningCount}s, attempting to start ${adapter.displayName}...`);
         startAgent();
       }
     }
 
     engine.processHeartbeat(false, currentTime);
-    maybeEnqueueHealthCheck(false, currentTime);
+    if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+      maybeEnqueueHealthCheck(false, currentTime);
+    }
 
-    memoryCommitScheduler.maybeTrigger();
+    if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+      memoryCommitScheduler.maybeTrigger();
+    }
     lastState = state;
     return;
   }
@@ -1665,6 +1731,21 @@ async function monitorLoop() {
     // Check for user message signal — clears auth suppression for immediate retry.
     maybeConsumeUserMessageSignal(currentTime);
 
+    // Multi-session: skip restart if this instance is disabled
+    if (INSTANCE_ID && instanceConfig && !instanceConfig.isInstanceEnabled(INSTANCE_ID)) {
+      writeStatusFile({ state, health: engine.health, thinking: false, last_activity: 0, idle_seconds: 0 });
+      engine.processHeartbeat(false, currentTime);
+      lastState = state;
+      return;
+    }
+
+    // Multi-session: skip restart if suspended
+    if (suspendMgr?.isSuspended()) {
+      engine.processHeartbeat(false, currentTime);
+      lastState = state;
+      return;
+    }
+
     // Delegate restart permission to HeartbeatEngine (e.g. won't restart during rate_limited).
     // Counter mutations (consecutiveRestarts, startupGrace, notRunningCount) are handled
     // inside startAgent() after auth check passes — not here.
@@ -1679,9 +1760,13 @@ async function monitorLoop() {
     }
 
     engine.processHeartbeat(false, currentTime);
-    maybeEnqueueHealthCheck(false, currentTime);
+    if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+      maybeEnqueueHealthCheck(false, currentTime);
+    }
 
-    memoryCommitScheduler.maybeTrigger();
+    if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+      memoryCommitScheduler.maybeTrigger();
+    }
     lastState = state;
     return;
   }
@@ -1783,6 +1868,9 @@ async function monitorLoop() {
     }
   }
 
+  // Multi-session: tick suspend manager with current idle duration
+  suspendMgr?.tick(idleSeconds);
+
   // Rate-limit detection is now handled inside HeartbeatEngine.onHeartbeatFailure
   // via the detectRateLimit dep callback (dual-signal: heartbeat failure + tmux text).
   // This eliminates false positives from conversation content matching rate-limit patterns.
@@ -1831,19 +1919,25 @@ async function monitorLoop() {
   }
 
   engine.processHeartbeat(true, currentTime);
-  maybeEnqueueHealthCheck(true, currentTime);
-  if (engine.health === 'ok') {
-    upgradeScheduler.maybeTrigger();
-    upgradeCheckScheduler.maybeTrigger();
+  if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+    maybeEnqueueHealthCheck(true, currentTime);
   }
-  memoryCommitScheduler.maybeTrigger();
+  if (engine.health === 'ok') {
+    if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+      upgradeScheduler.maybeTrigger();
+      upgradeCheckScheduler.maybeTrigger();
+    }
+  }
+  if (!INSTANCE_ID || instanceConfig?.isPrimary(INSTANCE_ID)) {
+    memoryCommitScheduler.maybeTrigger();
+  }
   if (engine.health === 'ok') {
     maybeCheckUsage(state, idleSeconds, currentTime, apiActivity);
   }
   lastState = state;
 }
 
-function init() {
+async function init() {
   // Strip stale TMUX env var — PM2 dump can carry over the old tmux session
   // reference from before a reboot, causing child tmux commands to fail with
   // "error creating /tmp/tmux-<uid>/default (No such file or directory)".
@@ -1892,6 +1986,25 @@ function init() {
   if (initialHealth === 'rate_limited' && initialStatus.cooldown_until) {
     engine.cooldownUntil = initialStatus.cooldown_until;
     engine.rateLimitResetTime = initialStatus.rate_limit_reset || '';
+  }
+
+  // Multi-session: initialize suspend manager for auto-suspend/resume
+  suspendMgr = null;
+  if (INSTANCE_ID) {
+    try {
+      const { SuspendManager } = await import('./suspend-manager.js');
+      suspendMgr = new SuspendManager(
+        {
+          log,
+          killTmuxSession: () => adapter.stop(),
+          startClaude: () => adapter.launch(),
+          writeStatusFile,
+          isClaudeRunning: () => adapter.isRunning(),
+          tmuxHasSession,
+        },
+        { instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR }
+      );
+    } catch { /* suspend manager not available */ }
   }
 
   upgradeScheduler = new DailySchedule({
@@ -1976,7 +2089,7 @@ function init() {
 }
 
 try {
-  init();
+  await init();
 } catch (err) {
   // init() failure (e.g. unknown runtime in config.json) must not crash the PM2 process
   // into a tight restart loop. Log and exit cleanly so PM2 backs off via its restart policy.

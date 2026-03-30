@@ -5,6 +5,7 @@
  */
 
 import { execFileSync } from 'child_process';
+import path from 'path';
 import { readFileSync, existsSync, statSync } from 'fs';
 import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
 import {
@@ -47,7 +48,9 @@ import {
   PROC_STATE_FILE,
   API_ACTIVITY_FILE,
   STALE_STATUS_THRESHOLD,
-  TMUX_MISSING_WARN_THRESHOLD
+  TMUX_MISSING_WARN_THRESHOLD,
+  DELIVERY_CONFIRM_TIMEOUT_MS,
+  DELIVERY_CONFIRM_POLL_MS
 } from './c4-config.js';
 
 let isShuttingDown = false;
@@ -80,19 +83,19 @@ export function readJsonFileWithRetry(filePath, attempts = 3) {
   throw lastErr;
 }
 
-function getAgentState() {
+function getAgentState(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(statusFile)) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'missing' };
     }
 
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     const ageMs = Date.now() - stats.mtimeMs;
     if (ageMs > STALE_STATUS_THRESHOLD) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'stale' };
     }
 
-    const status = readJsonFileWithRetry(AGENT_STATUS_FILE);
+    const status = readJsonFileWithRetry(statusFile);
     let state = status.state;
 
     if (!state && typeof status.idle_seconds === 'number') {
@@ -144,12 +147,59 @@ function isAgentConfirmedActive() {
   }
 }
 
-function isAgentStatusFresh() {
+/**
+ * Read the current last_user_activity timestamp from api-activity.json.
+ * Returns the timestamp (number) or null if the file doesn't exist / is unreadable.
+ */
+function readPreDeliveryTimestamp(statusFile = AGENT_STATUS_FILE) {
+  const apiActivityFile = path.join(path.dirname(statusFile), 'api-activity.json');
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(apiActivityFile)) return null;
+    const data = JSON.parse(readFileSync(apiActivityFile, 'utf8'));
+    return data.last_user_activity ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Poll api-activity.json to confirm the agent consumed the delivered message.
+ * A new UserPromptSubmit event (last_user_activity > preDeliveryTimestamp) confirms delivery.
+ *
+ * Returns { confirmed: true } or { confirmed: false, reason: 'timeout' }.
+ * If api-activity.json doesn't exist (hook not installed), returns confirmed (fail-open).
+ */
+async function confirmDelivery(preDeliveryTimestamp, statusFile = AGENT_STATUS_FILE) {
+  const apiActivityFile = path.join(path.dirname(statusFile), 'api-activity.json');
+
+  // Fail-open: if there's no baseline timestamp (file didn't exist pre-delivery),
+  // skip confirmation — the hook isn't installed.
+  if (preDeliveryTimestamp === null) {
+    return { confirmed: true };
+  }
+
+  const deadline = Date.now() + DELIVERY_CONFIRM_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    try {
+      const data = JSON.parse(readFileSync(apiActivityFile, 'utf8'));
+      // Check if a new UserPromptSubmit event happened after our delivery
+      if (data.last_user_activity && data.last_user_activity > preDeliveryTimestamp) {
+        return { confirmed: true };
+      }
+    } catch { /* file may not exist yet */ }
+    await sleep(DELIVERY_CONFIRM_POLL_MS);
+  }
+
+  return { confirmed: false, reason: 'timeout' };
+}
+
+function isAgentStatusFresh(statusFile = AGENT_STATUS_FILE) {
+  try {
+    if (!existsSync(statusFile)) {
       return false;
     }
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     return (Date.now() - stats.mtimeMs) <= STALE_STATUS_THRESHOLD;
   } catch {
     return false;
@@ -265,28 +315,28 @@ export function isUsageOverlayCapture(capture) {
   return hasUsageHeader && hasEscHint;
 }
 
-async function dismissGhostTextAndCapture() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Space'], { stdio: 'pipe', timeout: 5000 });
+async function dismissGhostTextAndCapture(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Space'], { stdio: 'pipe', timeout: 5000 });
   await sleep(100);
 
-  const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+  const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
     encoding: 'utf8',
     stdio: 'pipe',
     timeout: 5000
   });
 
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'BSpace'], { stdio: 'pipe', timeout: 5000 });
+  execFileSync('tmux', ['send-keys', '-t', session, 'BSpace'], { stdio: 'pipe', timeout: 5000 });
   await sleep(100);
   return capture;
 }
 
-async function submitAndVerify() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+async function submitAndVerify(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   let lastState = 'indeterminate';
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
-    const capture = await dismissGhostTextAndCapture();
+    const capture = await dismissGhostTextAndCapture(session);
     const state = checkInputBox(capture);
     lastState = state;
 
@@ -302,13 +352,13 @@ async function submitAndVerify() {
       // pasted user messages can be submitted normally.
       if (isUsageOverlayCapture(capture)) {
         log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-        execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'], { stdio: 'pipe', timeout: 5000 });
+        execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
       }
       continue;
     }
 
     log(`Enter verify attempt ${attempt + 1}: input box has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   }
 
   return { verified: false, state: lastState };
@@ -316,13 +366,14 @@ async function submitAndVerify() {
 
 async function sendToTmux(message, options = {}) {
   const strictVerify = options.strictVerify === true;
+  const session = options.session || TMUX_SESSION;
   const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
   const delayMs = getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8'));
 
   try {
     execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
-    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', TMUX_SESSION], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
   } catch (err) {
     log(`Error pasting to tmux: ${err.message}`);
     logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
@@ -339,7 +390,7 @@ async function sendToTmux(message, options = {}) {
 
   let verifyResult = { verified: false, state: 'indeterminate' };
   try {
-    verifyResult = await submitAndVerify();
+    verifyResult = await submitAndVerify(session);
   } catch (err) {
     log(`Warning: Enter verification error: ${err.message}`);
   }
@@ -382,8 +433,8 @@ function hasAckSuffix(content = '') {
   return content.includes('---- ack via:');
 }
 
-async function handleConversationDeliveryFailure(msg) {
-  const channelHealthy = isAgentStatusFresh();
+async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_FILE) {
+  const channelHealthy = isAgentStatusFresh(statusFile);
 
   if (channelHealthy) {
     const currentCount = msg.retry_count || 0;
@@ -422,11 +473,11 @@ async function handleControlDeliveryFailure(control, reason) {
   log(`Retry ${transition.retry_count} for control id=${control.id}`);
 }
 
-async function waitForRequireIdleSettlement(msgId) {
+async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FILE) {
   log(`require_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms before next dispatch`);
   await sleep(REQUIRE_IDLE_POST_SEND_HOLD_MS);
 
-  let state = getAgentState().state;
+  let state = getAgentState(statusFile).state;
   if (state === 'offline' || state === 'stopped') {
     log(`require_idle item id=${msgId}: agent state=${state}, continuing`);
     return;
@@ -440,7 +491,7 @@ async function waitForRequireIdleSettlement(msgId) {
   const deadline = Date.now() + REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     await sleep(REQUIRE_IDLE_EXECUTION_POLL_MS);
-    state = getAgentState().state;
+    state = getAgentState(statusFile).state;
     if (state === 'idle' || state === 'offline' || state === 'stopped') {
       log(`require_idle item id=${msgId}: settled with agent state=${state}`);
       return;
@@ -450,8 +501,27 @@ async function waitForRequireIdleSettlement(msgId) {
   log(`require_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem() {
+function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances } = {}) {
   const current = nowSeconds();
+
+  // When multi-session provides instance IDs, use instance-filtered queries.
+  if (onlineInstanceIds !== null && getNextPendingControlForInstances && getNextPendingForInstances) {
+    const control = getNextPendingControlForInstances(current, onlineInstanceIds);
+    if (control) {
+      if (claimControl(control.id)) {
+        return { ...control, type: 'control' };
+      }
+      return null;
+    }
+
+    const msg = getNextPendingForInstances(onlineInstanceIds);
+    if (msg && claimConversation(msg.id)) {
+      return { ...msg, type: 'conversation' };
+    }
+
+    return null;
+  }
+
   const control = getNextPendingControl(current);
   if (control) {
     if (claimControl(control.id)) {
@@ -486,6 +556,25 @@ function maybeCleanupControlQueue() {
 }
 
 async function processNextMessage() {
+  // Multi-session dispatch hook
+  try {
+    const { processWithMultiSession } = await import('./c4-dispatcher-multi.js');
+    const { getNextPendingForInstances, getNextPendingControlForInstances, markRejected, markControlRejected } = await import('./c4-db-multi.js');
+    return await processWithMultiSession({
+      getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+      releaseItem, isBypassState, shouldAutoAckHeartbeat,
+      handleConversationDeliveryFailure, handleControlDeliveryFailure,
+      waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+      markDelivered, ackControl, log, sleep, nowSeconds,
+      getNextPendingForInstances, getNextPendingControlForInstances,
+      markRejected, markControlRejected,
+      confirmDelivery, readPreDeliveryTimestamp,
+    });
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session error: ${e.message}`);
+    // Fall through to single-session logic below
+  }
+
   maybeCleanupControlQueue();
   const timedOut = expireTimedOutControls();
   if (timedOut > 0) {
@@ -549,6 +638,10 @@ async function processNextMessage() {
   }
 
   log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
+
+  // Capture pre-delivery timestamp for conversation delivery confirmation
+  const preDeliveryTs = item.type === 'conversation' ? readPreDeliveryTimestamp() : null;
+
   const deliveryContent = item.content || '';
   const result = await sendToTmux(deliveryContent, {
     strictVerify: item.type === 'conversation'
@@ -556,8 +649,16 @@ async function processNextMessage() {
 
   if (result === 'submitted') {
     if (item.type === 'conversation') {
-      markDelivered(item.id);
-      log(`Conversation id=${item.id} delivered`);
+      // Confirm the agent actually consumed the message
+      const confirmation = await confirmDelivery(preDeliveryTs);
+      if (confirmation.confirmed) {
+        markDelivered(item.id);
+        log(`Conversation id=${item.id} delivered (confirmed)`);
+      } else {
+        log(`Conversation id=${item.id} submitted but unconfirmed (${confirmation.reason}), requeuing`);
+        await handleConversationDeliveryFailure(item);
+        return { delivered: false, state: agentState.state };
+      }
     } else {
       if (hasAckSuffix(item.content || '')) {
         log(`Control id=${item.id} submitted, waiting ack`);
@@ -636,6 +737,14 @@ async function main() {
   close();
   process.exit(0);
 }
+
+export {
+  getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+  releaseItem, handleConversationDeliveryFailure, handleControlDeliveryFailure,
+  waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+  markDelivered, ackControl, log, sleep, nowSeconds,
+  confirmDelivery, readPreDeliveryTimestamp
+};
 
 // PM2 sets argv[1] to its own ProcessContainerFork.js, so classic ESM
 // isMainModule checks are unreliable here. Keep the default auto-start

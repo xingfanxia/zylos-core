@@ -18,7 +18,7 @@ import {
 
 function usage() {
   console.error('Usage: c4-control.js <enqueue|get|ack> [options]');
-  console.error('  enqueue --content "<text>" [--priority 3] [--require-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]');
+  console.error('  enqueue --content "<text>" [--priority 3] [--require-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]');
   console.error('  get --id <control_id>');
   console.error('  ack --id <control_id>');
 }
@@ -89,13 +89,16 @@ function handleEnqueue(args) {
   const ackDeadlineAt = ackDeadlineSeconds !== null ? now + ackDeadlineSeconds : null;
   const availableAt = availableInSeconds !== null ? now + availableInSeconds : null;
 
+  const targetInstance = parseStringArg(args, '--target-instance');
+
   const record = insertControl(content, {
     priority: priority ?? 3,
     requireIdle: hasFlag(args, '--require-idle'),
     bypassState: hasFlag(args, '--bypass-state'),
     appendAckSuffix: !hasFlag(args, '--no-ack-suffix'),
     ackDeadlineAt,
-    availableAt
+    availableAt,
+    targetInstance
   });
 
   console.log(`OK: enqueued control ${record.id}`);

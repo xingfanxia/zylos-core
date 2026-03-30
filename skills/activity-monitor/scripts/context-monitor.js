@@ -21,7 +21,16 @@ import path from 'path';
 import os from 'os';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const AM_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+// Instance-aware activity-monitor directory
+let AM_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+if (INSTANCE_ID) {
+  try {
+    const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+    AM_DIR = getMonitorDir(INSTANCE_ID);
+  } catch { /* use default */ }
+}
 const STATUS_FILE = path.join(AM_DIR, 'statusline.json');
 const STATE_FILE = path.join(AM_DIR, 'context-monitor-state.json');
 const COST_LOG_FILE = path.join(AM_DIR, 'cost-log.jsonl');
@@ -85,12 +94,14 @@ function main(raw) {
   let enqueued = false;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      execFileSync('node', [C4_CONTROL, 'enqueue',
+      const enqueueArgs = [C4_CONTROL, 'enqueue',
         '--content', `Context usage at ${usedPct}%, exceeding 70% threshold. Use the new-session skill to start a fresh session.`,
         '--priority', '1',
         '--bypass-state',
         '--ack-deadline', '300'
-      ], { encoding: 'utf8', stdio: 'pipe' });
+      ];
+      if (INSTANCE_ID) enqueueArgs.push('--target-instance', INSTANCE_ID);
+      execFileSync('node', enqueueArgs, { encoding: 'utf8', stdio: 'pipe' });
 
       enqueued = true;
       log(`Triggered new-session: context at ${usedPct}%`);

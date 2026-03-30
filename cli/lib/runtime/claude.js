@@ -27,7 +27,8 @@ import { ZYLOS_DIR } from '../config.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'claude-main';
+// Multi-session: allow ZYLOS_TMUX_SESSION env var to override the default
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'claude-main';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 // When CLAUDE_BYPASS_PERMISSIONS=false, skip --dangerously-skip-permissions.
@@ -64,7 +65,7 @@ function _parseEnvValue(content, key) {
 export class ClaudeAdapter extends RuntimeAdapter {
   get displayName() { return 'Claude Code'; }
   get runtimeId() { return 'claude'; }
-  get sessionName()  { return 'claude-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 

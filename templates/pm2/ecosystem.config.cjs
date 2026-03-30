@@ -62,6 +62,52 @@ try {
   }
 } catch { /* ZYLOS_PACKAGE_ROOT stays empty — activity-monitor uses relative path fallback */ }
 
+/**
+ * Load instances.json and generate one PM2 activity-monitor app per enabled,
+ * non-on-demand instance. Falls back to empty array when instances.json is
+ * absent (single-session mode).
+ */
+function loadInstanceMonitors() {
+  const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
+  try {
+    const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
+    const instances = config.instances || {};
+    const apps = [];
+
+    for (const [id, def] of Object.entries(instances)) {
+      // Skip disabled instances
+      if (def.enabled === false) continue;
+
+      const pm2Name = `activity-monitor-${id}`;
+      const monitorDir = (def.state_dir || '').replace(/^~/, HOME)
+        || path.join(ZYLOS_DIR, 'activity-monitor', id);
+
+      apps.push({
+        name: pm2Name,
+        script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
+        cwd: HOME,
+        env: {
+          PATH: ENHANCED_PATH,
+          NODE_ENV: 'production',
+          ZYLOS_INSTANCE_ID: id,
+          ZYLOS_TMUX_SESSION: def.tmux_session || `claude-${id}`,
+          CLAUDE_BYPASS_PERMISSIONS,
+          CODEX_BYPASS_PERMISSIONS,
+          ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+        },
+        autorestart: true,
+        max_restarts: 10,
+        min_uptime: '10s',
+      });
+    }
+
+    return apps;
+  } catch {
+    // instances.json missing or malformed — single-session mode
+    return [];
+  }
+}
+
 // Core service names — components must not collide with these
 const CORE_SERVICE_NAMES = new Set([
   'scheduler', 'web-console', 'c4-dispatcher', 'activity-monitor', 'caddy',
@@ -223,21 +269,27 @@ module.exports = {
       max_restarts: 10,
       min_uptime: '10s'
     },
-    {
-      name: 'activity-monitor',
-      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
-      cwd: HOME,
-      env: {
-        PATH: ENHANCED_PATH,
-        NODE_ENV: 'production',
-        CLAUDE_BYPASS_PERMISSIONS,
-        CODEX_BYPASS_PERMISSIONS,
-        ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
-      },
-      autorestart: true,
-      max_restarts: 10,
-      min_uptime: '10s'
-    },
+    // Activity monitors: per-instance when instances.json exists, single fallback otherwise
+    ...(() => {
+      const instanceMonitors = loadInstanceMonitors();
+      if (instanceMonitors.length > 0) return instanceMonitors;
+      // Fallback: single activity-monitor (single-session mode)
+      return [{
+        name: 'activity-monitor',
+        script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
+        cwd: HOME,
+        env: {
+          PATH: ENHANCED_PATH,
+          NODE_ENV: 'production',
+          CLAUDE_BYPASS_PERMISSIONS,
+          CODEX_BYPASS_PERMISSIONS,
+          ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+        },
+        autorestart: true,
+        max_restarts: 10,
+        min_uptime: '10s'
+      }];
+    })(),
     // Caddy web server (only if set up via `zylos init`)
     ...(fs.existsSync(path.join(BIN_DIR, 'caddy')) && fs.existsSync(path.join(HTTP_DIR, 'Caddyfile'))
       ? [{

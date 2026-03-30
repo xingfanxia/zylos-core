@@ -23,13 +23,15 @@ CREATE TABLE IF NOT EXISTS conversations (
     status TEXT DEFAULT 'pending',  -- 'pending' | 'delivered' | 'failed' (for direction='in' queue)
     priority INTEGER DEFAULT 3,     -- 1=urgent, 2=high, 3=normal
     require_idle INTEGER DEFAULT 0, -- 1=wait for Claude idle state, 0=deliver immediately
-    retry_count INTEGER DEFAULT 0   -- delivery retries for incoming queue
+    retry_count INTEGER DEFAULT 0,  -- delivery retries for incoming queue
+    target_instance TEXT DEFAULT NULL -- target zylos instance for multi-session routing
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversations_timestamp ON conversations(timestamp);
 CREATE INDEX IF NOT EXISTS idx_conversations_channel ON conversations(channel);
 CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
 CREATE INDEX IF NOT EXISTS idx_conversations_priority ON conversations(priority);
+CREATE INDEX IF NOT EXISTS idx_conversations_target_instance ON conversations(target_instance, status, priority);
 
 -- Control queue table (heartbeat/system control plane)
 CREATE TABLE IF NOT EXISTS control_queue (
@@ -44,7 +46,8 @@ CREATE TABLE IF NOT EXISTS control_queue (
     available_at INTEGER,
     last_error TEXT,
     created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
+    updated_at INTEGER NOT NULL,
+    target_instance TEXT DEFAULT NULL -- target zylos instance for multi-session routing
 );
 
 CREATE INDEX IF NOT EXISTS idx_control_queue_status_priority_time
@@ -55,6 +58,8 @@ CREATE INDEX IF NOT EXISTS idx_control_queue_ack_deadline
   ON control_queue(ack_deadline_at);
 CREATE INDEX IF NOT EXISTS idx_control_queue_updated_at
   ON control_queue(updated_at);
+CREATE INDEX IF NOT EXISTS idx_control_queue_target_instance
+  ON control_queue(target_instance, status, priority);
 
 -- Create initial checkpoint
 INSERT INTO checkpoints (summary) VALUES ('initial');

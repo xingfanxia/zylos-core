@@ -19,12 +19,27 @@ import {
 import { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } from './c4-config.js';
 import { logHookTiming } from './c4-diagnostic.js';
 
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+// Instance-scoped query overrides (loaded lazily, graceful degradation)
+let _getUnsummarizedRangeForInstance = null;
+let _getUnsummarizedConversationsForInstance = null;
+try {
+  const multiMod = await import('./c4-db-multi.js');
+  _getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
+  _getUnsummarizedConversationsForInstance = multiMod.getUnsummarizedConversationsForInstance;
+} catch {
+  // c4-db-multi.js not available — instance-scoped queries disabled
+}
+
 const startMs = Date.now();
 
 function main() {
   try {
     const checkpoint = getLastCheckpoint();
-    const range = getUnsummarizedRange();
+    const range = (INSTANCE_ID && _getUnsummarizedRangeForInstance)
+      ? _getUnsummarizedRangeForInstance(INSTANCE_ID)
+      : getUnsummarizedRange();
     const lines = [];
 
     // Always output last checkpoint summary
@@ -42,9 +57,12 @@ function main() {
     const needsSync = range.count > CHECKPOINT_THRESHOLD;
 
     // Get conversations: all if under threshold, last N if over
+    const getConvos = (INSTANCE_ID && _getUnsummarizedConversationsForInstance)
+      ? (limit) => _getUnsummarizedConversationsForInstance(INSTANCE_ID, limit)
+      : getUnsummarizedConversations;
     const conversations = needsSync
-      ? getUnsummarizedConversations(SESSION_INIT_RECENT_COUNT)
-      : getUnsummarizedConversations();
+      ? getConvos(SESSION_INIT_RECENT_COUNT)
+      : getConvos();
 
     lines.push('[Recent Conversations]');
     lines.push(formatConversations(conversations));

@@ -7,8 +7,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR } from './shared.js';
+import { MEMORY_DIR, resolveSharedFile, resolveInstanceFile } from './shared.js';
 
 const startMs = Date.now();
 let diagnosticModule;
@@ -60,11 +61,34 @@ function section(label, filePath) {
 }
 
 function main() {
+  const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
   const parts = [
-    section('BOT IDENTITY', path.join(MEMORY_DIR, 'identity.md')),
-    section('ACTIVE STATE', path.join(MEMORY_DIR, 'state.md')),
-    section('REFERENCES', path.join(MEMORY_DIR, 'references.md'))
+    section('BOT IDENTITY', resolveSharedFile('identity.md')),
+    section('ACTIVE STATE', INSTANCE_ID
+      ? resolveInstanceFile(INSTANCE_ID, 'state.md')
+      : path.join(MEMORY_DIR, 'state.md')),
+    section('REFERENCES', resolveSharedFile('references.md'))
   ];
+
+  // Shared context digest (cross-instance awareness)
+  const digestPath = resolveSharedFile('recent-activity.md');
+  const digestResult = readFileSafe(digestPath);
+  if (digestResult.ok && digestResult.content.trim()) {
+    parts.push(section('CROSS-INSTANCE CONTEXT', digestPath));
+  }
+
+  // Per-instance CLAUDE.md injection (multi-session)
+  if (INSTANCE_ID) {
+    const instanceClaudeMd = path.join(
+      process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
+      'instances', INSTANCE_ID, 'CLAUDE.md'
+    );
+    const result = readFileSafe(instanceClaudeMd);
+    if (result.ok && result.content && result.content.trim().length > 0) {
+      parts.push(`=== INSTANCE INSTRUCTIONS ===\n${result.content.trim()}`);
+    }
+  }
 
   process.stdout.write(`${parts.join('\n\n')}\n`);
 }
