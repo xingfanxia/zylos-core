@@ -1660,15 +1660,27 @@ async function monitorLoop() {
       return;
     }
 
+    // Check for wake signal — skip backoff for immediate restart (message waiting)
+    const wakeSignalPath = path.join(MONITOR_DIR, 'wake-signal');
+    let wakeRequested = false;
+    try {
+      if (fs.existsSync(wakeSignalPath)) {
+        fs.unlinkSync(wakeSignalPath);
+        wakeRequested = true;
+        log('Guardian: Wake signal detected — immediate restart (message waiting)');
+        consecutiveRestarts = 0;
+      }
+    } catch { /* ignore */ }
+
     // Delegate restart permission to HeartbeatEngine (e.g. won't restart during rate_limited).
     // Counter mutations (consecutiveRestarts, startupGrace, notRunningCount) are handled
     // inside startAgent() after auth check passes — not here.
-    const restartDelay = Math.min(BASE_RESTART_DELAY * Math.pow(2, consecutiveRestarts), MAX_RESTART_DELAY);
+    const restartDelay = wakeRequested ? 0 : Math.min(BASE_RESTART_DELAY * Math.pow(2, consecutiveRestarts), MAX_RESTART_DELAY);
     if (engine.canRestart() && notRunningCount >= restartDelay) {
       if (Date.now() < authRetrySuppressedUntil) {
         if (notRunningCount % 60 === 0) log(`Guardian: auth retry suppressed for ${Math.ceil((authRetrySuppressedUntil - Date.now()) / 1000)}s`);
       } else {
-        log(`Guardian: Session not found for ${notRunningCount}s, attempting to start ${adapter.displayName}...`);
+        log(`Guardian: ${wakeRequested ? 'Wake: ' : ''}Session not found for ${notRunningCount}s, attempting to start ${adapter.displayName}...`);
         startAgent();
       }
     }

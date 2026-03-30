@@ -90,6 +90,7 @@ function loadInstanceMonitors() {
           PATH: ENHANCED_PATH,
           NODE_ENV: 'production',
           ZYLOS_INSTANCE_ID: id,
+          ZYLOS_TMUX_SESSION: def.tmux_session || `claude-${id}`,
           CLAUDE_BYPASS_PERMISSIONS,
           CODEX_BYPASS_PERMISSIONS,
           ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),

@@ -14,7 +14,6 @@
  */
 
 import { writeFileSync, mkdirSync, existsSync } from 'fs';
-import { execFileSync } from 'child_process';
 import path from 'path';
 import os from 'os';
 
@@ -79,57 +78,48 @@ const AUTO_START_GRACE_MS = 60 * 1000;
 const IDLE_REAP_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
- * Start a tmux session for an offline non-primary instance so it can
- * receive messages.  Uses the instance's configured runtime (claude/codex)
- * or defaults to claude.
+ * Signal the Activity Monitor to start a non-primary instance.
+ *
+ * The dispatcher does NOT launch CC directly — the AM's RuntimeAdapter
+ * handles auth, env vars, cwd, bypass permissions, instruction files, etc.
+ * We just write a wake-signal file that the AM picks up on its next tick.
  *
  * @param {object} instDef - Instance definition from instances.json.
  * @param {string} instDef.id
- * @param {string} instDef.tmux_session
- * @returns {'started'|'already_running'|false}
+ * @returns {boolean} true if signal was written (AM should pick it up within 1-2s)
  */
-export function autoStartInstance(instDef) {
-  const session = instDef.tmux_session;
-  if (!session) return false;
+export function requestInstanceStart(instDef) {
+  if (!instDef?.id) return false;
 
-  try {
-    // Check if session already exists
-    execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe', timeout: 3000 });
-    return 'already_running';
-  } catch {
-    // Session doesn't exist — create it
+  // Check if we already requested a start recently (grace period)
+  const startedTs = autoStartedAt.get(instDef.id);
+  if (startedTs && (Date.now() - startedTs) < AUTO_START_GRACE_MS) {
+    return false; // already requested, waiting for boot
   }
 
-  try {
-    const runtime = instDef.runtime || 'claude';
-    const cmd = runtime === 'codex' ? 'codex' : 'claude';
-    execFileSync('tmux', [
-      'new-session', '-d', '-s', session, '-x', '220', '-y', '50',
-      cmd,
-    ], { stdio: 'pipe', timeout: 10000 });
-    console.log(`[dispatcher-multi] Auto-started session '${session}' for instance '${instDef.id}'`);
-    lastDeliveryAt.set(instDef.id, Date.now());
-    autoStartedAt.set(instDef.id, Date.now());
-    return 'started';
-  } catch (err) {
-    console.error(`[dispatcher-multi] Failed to auto-start '${session}': ${err.message}`);
-    return false;
-  }
+  writeWakeSignal(instDef.id);
+  autoStartedAt.set(instDef.id, Date.now());
+  console.log(`[dispatcher-multi] Requested start for instance '${instDef.id}' via wake signal`);
+  return true;
 }
 
 /**
- * Stop the tmux session for an idle non-primary instance.
+ * Write a suspend signal for an idle non-primary instance.
+ * The AM picks this up and gracefully stops CC + kills the tmux session.
  *
  * @param {string} instanceId
- * @param {string} session - tmux session name
  */
-export function autoStopInstance(instanceId, session) {
+export function requestInstanceStop(instanceId) {
   try {
-    execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'pipe', timeout: 5000 });
+    const monDir = getMonitorDir(instanceId);
+    const dir = monDir || path.join(ZYLOS_DIR, 'activity-monitor', instanceId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'suspend-signal'), new Date().toISOString());
     lastDeliveryAt.delete(instanceId);
-    console.log(`[dispatcher-multi] Auto-stopped idle session '${session}' (instance '${instanceId}')`);
-  } catch {
-    // Session may already be dead — ignore.
+    autoStartedAt.delete(instanceId);
+    console.log(`[dispatcher-multi] Requested stop for idle instance '${instanceId}' via suspend signal`);
+  } catch (err) {
+    console.error(`[dispatcher-multi] Failed to write suspend signal for '${instanceId}': ${err.message}`);
   }
 }
 
@@ -148,7 +138,7 @@ export function reapIdleInstances() {
     const session = def.tmux_session;
     if (!session) continue;
 
-    autoStopInstance(instanceId, session);
+    requestInstanceStop(instanceId);
   }
 }
 
@@ -282,21 +272,9 @@ export function multiSessionDispatch(item, helpers) {
   if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass) {
     const def = targetInstance ? getInstanceDef(targetInstance) : null;
     if (def && !def.primary) {
-      // Check if we recently auto-started this instance — don't spam requeues during boot
-      const startedTs = autoStartedAt.get(targetInstance);
-      if (startedTs && (Date.now() - startedTs) < AUTO_START_GRACE_MS) {
-        // Still in grace period — skip silently, will retry on next poll cycle
-        return { action: 'skip', reason: `instance '${targetInstance}' booting (grace period)` };
-      }
-      // Non-primary instance: auto-start and requeue so it has time to boot.
-      const startResult = autoStartInstance({ ...def, id: targetInstance });
-      if (startResult === 'started') {
-        return { action: 'requeue', reason: `auto-started instance '${targetInstance}', requeueing for delivery after boot` };
-      }
-      // already_running but offline = CC not ready yet, skip
-      if (startResult === 'already_running') {
-        return { action: 'skip', reason: `instance '${targetInstance}' session exists but CC not online yet` };
-      }
+      // Signal the AM to start this instance, then skip (message retried on next poll)
+      requestInstanceStart({ ...def, id: targetInstance });
+      return { action: 'skip', reason: `instance '${targetInstance}' offline, wake signal sent` };
     }
     return { action: 'skip', reason: `instance target offline (state=${claudeState.state})` };
   }
