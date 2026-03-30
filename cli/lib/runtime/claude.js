@@ -273,11 +273,19 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     if (_tmuxHasSession()) {
       // Existing session — send command via tmux
-      const cmd = `cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New tmux session
       const tmuxArgs = ['new-session', '-d', '-s', SESSION, '-e', `PATH=${process.env.PATH}`];
+      // Pass instance identity to CC process so hooks write to the correct paths
+      if (process.env.ZYLOS_INSTANCE_ID) tmuxArgs.push('-e', `ZYLOS_INSTANCE_ID=${process.env.ZYLOS_INSTANCE_ID}`);
+      if (process.env.ZYLOS_TMUX_SESSION) tmuxArgs.push('-e', `ZYLOS_TMUX_SESSION=${process.env.ZYLOS_TMUX_SESSION}`);
       if (process.getuid?.() === 0) tmuxArgs.push('-e', 'IS_SANDBOX=1');
 
       let shellCmd;

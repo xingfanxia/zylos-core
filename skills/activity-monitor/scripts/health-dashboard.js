@@ -126,17 +126,15 @@ export function getSystemHealth() {
       }
 
       // Read last user activity (UserPromptSubmit only, not heartbeats)
-      // Check instance path first, then legacy path (CC hook writes to legacy)
       let lastActivity = null;
-      for (const dir of [stateDir, path.join(stateDir, '..')]) {
-        try {
-          const apiFile = path.join(dir, 'api-activity.json');
-          if (!fs.existsSync(apiFile)) continue;
+      try {
+        const apiFile = path.join(stateDir, 'api-activity.json');
+        if (fs.existsSync(apiFile)) {
           const api = JSON.parse(fs.readFileSync(apiFile, 'utf8'));
           const ts = api.last_user_activity || api.updated_at;
-          if (ts) { lastActivity = new Date(ts).toISOString(); break; }
-        } catch { /* try next */ }
-      }
+          if (ts) lastActivity = new Date(ts).toISOString();
+        }
+      } catch { /* best-effort */ }
 
       // Find matching PM2 process uptime
       const pm2Name = `activity-monitor-${id}`;
