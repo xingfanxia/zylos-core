@@ -223,8 +223,21 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // 1. Build instruction file before launching
     await this.buildInstructionFile();
 
+    // 1b. Resolve per-instance working directory (token tracking isolation)
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+      } catch (err) {
+        console.error(`[ClaudeAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
     // 2. Pre-accept onboarding/trust dialogs (all auth methods)
     _ensureOnboardingComplete(ZYLOS_DIR);
+    if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
 
     // 3. Detect auth method to avoid "Auth conflict" errors
     const useCredentialsFile = _hasCredentialsFile();
@@ -278,7 +291,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
-      const cmd = `${envPrefix}cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New tmux session
@@ -300,9 +313,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
         if (baseUrlValue) envParts.push(`ANTHROPIC_BASE_URL='${baseUrlValue}'`);
         tmpEnv = path.join(os.tmpdir(), `.zylos-env-${process.pid}-${Date.now()}`);
         fs.writeFileSync(tmpEnv, envParts.join('\n') + '\n', { mode: 0o600 });
-        shellCmd = `set -a; . "${tmpEnv}"; set +a; rm -f "${tmpEnv}"; cd "${ZYLOS_DIR}" && ${claudeCmd}; ${exitLogSnippet}`;
+        shellCmd = `set -a; . "${tmpEnv}"; set +a; rm -f "${tmpEnv}"; cd "${instanceCwd}" && ${claudeCmd}; ${exitLogSnippet}`;
       } else {
-        shellCmd = `cd "${ZYLOS_DIR}" && ${claudeCmd}; ${exitLogSnippet}`;
+        shellCmd = `cd "${instanceCwd}" && ${claudeCmd}; ${exitLogSnippet}`;
       }
 
       tmuxArgs.push('--', shellCmd);

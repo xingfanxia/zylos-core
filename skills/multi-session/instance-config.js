@@ -238,6 +238,66 @@ export function getDefaultInstance() {
 }
 
 /**
+ * Ensure the per-instance working directory exists with correct symlinks.
+ *
+ * Creates `~/zylos/instances/<instanceId>/` and sets up symlinks to shared
+ * resources (.claude, CLAUDE.md, .env, memory) so CC launches from an
+ * isolated cwd while sharing auth, skills, config, and memory.
+ *
+ * Safe to call repeatedly — only creates missing dirs/links, updates stale ones.
+ *
+ * @param {string} instanceId
+ * @returns {string} Absolute path to the instance working directory
+ */
+export function ensureInstanceCwd(instanceId) {
+  if (!instanceId) throw new Error('ensureInstanceCwd: instanceId required');
+
+  const instanceDir = path.join(ZYLOS_DIR, 'instances', instanceId);
+  fs.mkdirSync(instanceDir, { recursive: true });
+
+  const symlinks = [
+    ['.claude', '../../.claude'],
+    ['CLAUDE.md', '../../CLAUDE.md'],
+    ['.env', '../../.env'],
+    ['memory', '../../memory'],
+  ];
+
+  for (const [name, target] of symlinks) {
+    const linkPath = path.join(instanceDir, name);
+    try {
+      const existing = fs.readlinkSync(linkPath);
+      if (existing === target) continue; // already correct
+      fs.unlinkSync(linkPath);
+    } catch {
+      // Doesn't exist or not a symlink — remove if it's a regular file/dir
+      try { fs.unlinkSync(linkPath); } catch { /* fine */ }
+    }
+    try {
+      fs.symlinkSync(target, linkPath);
+    } catch { /* best effort */ }
+  }
+
+  return instanceDir;
+}
+
+/**
+ * Resolve the working directory for an instance.
+ *
+ * Returns `~/zylos/instances/<instanceId>/` for multi-session mode,
+ * or `ZYLOS_DIR` for single-session fallback.
+ *
+ * Does NOT create the directory — use ensureInstanceCwd() for that.
+ *
+ * @param {string} [instanceId] - defaults to getInstanceId()
+ * @returns {string}
+ */
+export function getInstanceCwd(instanceId) {
+  const id = instanceId ?? getInstanceId();
+  if (!id) return ZYLOS_DIR;
+  return path.join(ZYLOS_DIR, 'instances', id);
+}
+
+/**
  * Return the instance that should receive scheduled tasks.
  *
  * Resolution order:

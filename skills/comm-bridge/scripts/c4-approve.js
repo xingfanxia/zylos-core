@@ -77,6 +77,15 @@ function approveUser(chatId, name) {
     process.exit(1);
   }
 
+  // 1b. Create per-instance working directory with symlinks (token tracking isolation)
+  try {
+    const { ensureInstanceCwd } = await import('../../multi-session/instance-config.js');
+    const cwdPath = ensureInstanceCwd(instanceName);
+    console.log(`Instance cwd created: ${cwdPath}`);
+  } catch (err) {
+    console.error(`Warning: failed to create instance cwd (${err.message})`);
+  }
+
   // 1c. Set auto_suspend + idle_timeout (CLI doesn't have these flags)
   try {
     const instancesFile = path.join(ZYLOS_DIR, 'instances.json');

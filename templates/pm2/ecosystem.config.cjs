@@ -290,6 +290,19 @@ module.exports = {
         min_uptime: '10s'
       }];
     })(),
+    // Token cache updater — runs ccusage hourly, writes per-instance data for dashboard
+    {
+      name: 'token-cache-updater',
+      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'update-token-cache.js'),
+      cwd: HOME,
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+      },
+      cron_restart: '0 * * * *',   // hourly
+      autorestart: false,           // cron-only, don't restart on exit
+      max_restarts: 0,
+    },
     // Caddy web server (only if set up via `zylos init`)
     ...(fs.existsSync(path.join(BIN_DIR, 'caddy')) && fs.existsSync(path.join(HTTP_DIR, 'Caddyfile'))
       ? [{

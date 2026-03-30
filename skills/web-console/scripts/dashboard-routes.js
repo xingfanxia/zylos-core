@@ -83,18 +83,35 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
   });
 
   // ----- Token usage (reads cached ccusage output) -----
+  // Cache updated by: node skills/activity-monitor/scripts/update-token-cache.js
   app.get('/api/dashboard/tokens', (req, res) => {
-    // ccusage is too slow for real-time (6K+ JSONL files). Read from a cached
-    // JSON file that's updated hourly by a scheduled task:
-    //   ccusage daily --json --since YYYYMMDD > ~/zylos/activity-monitor/token-cache.json
     const cacheFile = path.join(zylosDir, 'activity-monitor', 'token-cache.json');
     try {
       if (!fs.existsSync(cacheFile)) {
-        return res.json({ daily: [], totals: null, error: 'No token data yet (run: ccusage daily --json > token-cache.json)' });
+        return res.json({ daily: [], totals: null, instances: {}, error: 'No token data yet (run: node update-token-cache.js)' });
       }
       const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
       const cacheAge = Math.floor((Date.now() - fs.statSync(cacheFile).mtimeMs) / 60000);
       res.json({ ...cached, cache_age_minutes: cacheAge });
+    } catch (err) {
+      res.json({ daily: [], totals: null, instances: {}, error: err.message });
+    }
+  });
+
+  // ----- Per-instance token usage -----
+  app.get('/api/dashboard/tokens/:instanceId', (req, res) => {
+    const cacheFile = path.join(zylosDir, 'activity-monitor', 'token-cache.json');
+    try {
+      if (!fs.existsSync(cacheFile)) {
+        return res.json({ daily: [], totals: null, error: 'No token data yet' });
+      }
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      const instanceData = cached.instances?.[req.params.instanceId];
+      if (!instanceData) {
+        return res.json({ daily: [], totals: null, error: `No data for instance "${req.params.instanceId}"` });
+      }
+      const cacheAge = Math.floor((Date.now() - fs.statSync(cacheFile).mtimeMs) / 60000);
+      res.json({ ...instanceData, cache_age_minutes: cacheAge });
     } catch (err) {
       res.json({ daily: [], totals: null, error: err.message });
     }

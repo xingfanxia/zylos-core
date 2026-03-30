@@ -216,12 +216,23 @@ function cmdCreate(id, flags) {
 
   // Create directories
   const resolvedStateDir = resolveTilde(stateDir);
-  const resolvedConfigDir = resolveTilde(configDir);
   const resolvedMemoryDir = resolveTilde(memoryDir);
 
   fs.mkdirSync(resolvedStateDir, { recursive: true });
-  fs.mkdirSync(resolvedConfigDir, { recursive: true });
   fs.mkdirSync(resolvedMemoryDir, { recursive: true });
+
+  // Create per-instance working directory with symlinks (token tracking isolation)
+  let instanceCwdPath = null;
+  try {
+    const instanceConfigPath = candidatePaths.find(p =>
+      fs.existsSync(p.replace('comm-bridge/scripts/c4-instance-router.js', 'multi-session/instance-config.js'))
+    );
+    if (instanceConfigPath) {
+      const configModPath = instanceConfigPath.replace('comm-bridge/scripts/c4-instance-router.js', 'multi-session/instance-config.js');
+      const { ensureInstanceCwd } = await import(configModPath);
+      instanceCwdPath = ensureInstanceCwd(id);
+    }
+  } catch { /* best effort */ }
 
   if (jsonMode) {
     console.log(JSON.stringify({ ok: true, instance: { id, ...instanceDef } }, null, 2));
@@ -229,9 +240,9 @@ function cmdCreate(id, flags) {
     console.log(`Created instance "${id}"`);
     console.log(`  Type:       ${type}`);
     console.log(`  Session:    ${tmuxSession}`);
-    console.log(`  Config dir: ${resolvedConfigDir}`);
     console.log(`  State dir:  ${resolvedStateDir}`);
     console.log(`  Memory dir: ${resolvedMemoryDir}`);
+    if (instanceCwdPath) console.log(`  Instance cwd: ${instanceCwdPath}`);
     if (flags.chatIds) {
       console.log(`  Chat IDs:   ${flags.chatIds.join(', ')}`);
     }
