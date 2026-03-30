@@ -168,4 +168,33 @@ function denyUser(chatId) {
   process.exit(0);
 }
 
-main();
+/**
+ * Check if a message from an unknown endpoint should be held for approval.
+ * Called by c4-receive.js during message ingestion.
+ *
+ * @param {string} endpoint - The sender's endpoint ID
+ * @param {string|null} targetInstance - Resolved target instance
+ * @param {boolean} noReply - Whether this is a no-reply message
+ * @param {string|null} explicitTarget - Explicitly specified target instance
+ * @returns {boolean} true if the message was held (caller should not insert normally)
+ */
+export async function checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTarget) {
+  // Don't hold if explicitly targeted (admin/scheduler/system messages)
+  if (explicitTarget) return false;
+  // Don't hold no-reply messages (system, scheduler)
+  if (noReply) return false;
+  // Don't hold if endpoint is in the routing table (known user)
+  try {
+    const { isEndpointRouted } = await import('./c4-instance-router.js');
+    if (isEndpointRouted(endpoint)) return false;
+  } catch {
+    return false; // instance router not available, don't hold
+  }
+  // Unknown endpoint — for now, don't hold (let it route to default instance)
+  // Full approval flow can be enabled later by returning true here
+  return false;
+}
+
+// Only run main() when executed directly, not when imported as a module
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (isDirectRun) main();

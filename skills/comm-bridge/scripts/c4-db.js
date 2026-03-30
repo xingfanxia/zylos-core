@@ -15,13 +15,32 @@ const __dirname = path.dirname(__filename);
 
 const INIT_SQL_PATH = path.join(__dirname, '..', 'init-db.sql');
 
-// Lazy-load multi-session migration runner (graceful degradation if module not available)
-let _runPendingMigrations = null;
-try {
-  const multiMod = await import('./c4-db-multi.js');
-  _runPendingMigrations = multiMod.runPendingMigrations;
-} catch {
-  // c4-db-multi.js not available yet — multi-session migrations disabled
+// Run pending SQL migrations from the migrations/ directory (sync, inline)
+function _runMigrations(database) {
+  const migrationsDir = path.join(__dirname, '..', 'migrations');
+  if (!fs.existsSync(migrationsDir)) return;
+
+  try {
+    database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
+      name TEXT PRIMARY KEY,
+      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    const files = fs.readdirSync(migrationsDir)
+      .filter(f => f.endsWith('.sql'))
+      .sort();
+
+    for (const file of files) {
+      const applied = database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(file);
+      if (applied) continue;
+
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      database.exec(sql);
+      database.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
+    }
+  } catch (err) {
+    console.error(`[c4-db] Migration error: ${err.message}`);
+  }
 }
 
 let db = null;
@@ -45,10 +64,8 @@ export function getDb() {
     if (isNew) {
       initSchema();
     } else {
-      // Run pending migrations for existing databases (e.g., adding new columns)
-      if (_runPendingMigrations) {
-        _runPendingMigrations(db);
-      }
+      // Run pending migrations for existing databases (e.g., adding target_instance column)
+      _runMigrations(db);
     }
   }
   return db;

@@ -246,7 +246,7 @@ async function main() {
   // Check if unknown endpoint should be held for approval
   try {
     const { checkAndHoldForApproval } = await import('./c4-approve.js');
-    const held = checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
+    const held = await checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
     if (held) return; // message held for approval, don't insert normally
   } catch { /* approval module not available */ }
 
