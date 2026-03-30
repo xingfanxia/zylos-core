@@ -66,7 +66,7 @@ function approveUser(chatId, name) {
     const result = execFileSync('node', [
       cliPath, 'create', instanceName,
       '--chat-ids', chatId,
-      '--type', 'dedicated',
+      '--type', 'user',
       '--description', `Auto-provisioned for ${chatId}`,
       '--json'
     ], { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
