@@ -247,12 +247,9 @@ export function resolveStatusFile(targetInstance) {
  */
 export function multiSessionDispatch(item, helpers) {
   const { getClaudeState, isBypassState } = helpers;
-  // In multi-session mode, null target_instance → route to default/primary instance
-  let targetInstance = item.target_instance || null;
+  const targetInstance = item.target_instance || null;
   if (!targetInstance) {
-    const all = getAllInstances();
-    const def = all.find(i => i.default === true) ?? all.find(i => i.primary === true);
-    if (def) targetInstance = def.id;
+    return { action: 'reject', reason: 'no target_instance (every message must be routed to an instance)' };
   }
   const bypass = isBypassState(item);
 
