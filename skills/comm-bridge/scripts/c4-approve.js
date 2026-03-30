@@ -13,20 +13,14 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 
 // Import DB functions
-const dbMod = await import('./c4-db.js');
-const { close } = dbMod;
-
-function getDb() {
-  // Access the internal db via a query
-  return dbMod;
-}
+import { getDb, close } from './c4-db.js';
 
 function usage() {
   console.log('Usage:');
@@ -99,7 +93,7 @@ function approveUser(chatId, name) {
 
   // 2. Release held messages: update pending_approval → pending with new target_instance
   try {
-    const db = dbMod.getDb ? dbMod.getDb() : null;
+    const db = getDb();
     if (!db) {
       console.error('Could not access database');
       process.exit(1);
@@ -130,15 +124,17 @@ function approveUser(chatId, name) {
 
   // 3. Start ONLY the new instance's AM process (don't restart everything)
   // Note: user notification is handled by the admin Claude instance (in the user's language)
-  // Use shell exec with ZYLOS_INSTANCE_ID as env prefix — execFileSync's env option
-  // replaces the entire environment which breaks PM2.
   try {
     const amScript = path.join(os.homedir(), 'zylos', '.claude', 'skills', 'activity-monitor', 'scripts', 'activity-monitor.js');
-    execSync(
-      `ZYLOS_INSTANCE_ID=${instanceName} pm2 start "${amScript}" --name "activity-monitor-${instanceName}"`,
-      { timeout: 30000, stdio: 'pipe' }
-    );
-    execSync('pm2 save', { timeout: 15000, stdio: 'pipe' });
+    execFileSync('pm2', [
+      'start', amScript,
+      '--name', `activity-monitor-${instanceName}`,
+    ], {
+      timeout: 30000,
+      stdio: 'pipe',
+      env: { ...process.env, ZYLOS_INSTANCE_ID: instanceName },
+    });
+    execFileSync('pm2', ['save'], { timeout: 15000, stdio: 'pipe' });
     console.log(`PM2: started activity-monitor-${instanceName}`);
   } catch (err) {
     console.error(`Warning: PM2 start failed (${err.message}). Run manually: ZYLOS_INSTANCE_ID=${instanceName} pm2 start <am-script> --name activity-monitor-${instanceName}`);
@@ -153,7 +149,7 @@ function denyUser(chatId) {
   console.log(`Denying and dropping held messages for chat_id "${chatId}"...`);
 
   try {
-    const db = dbMod.getDb ? dbMod.getDb() : null;
+    const db = getDb();
     if (db) {
       const result = db.prepare(`
         UPDATE conversations SET status = 'rejected'

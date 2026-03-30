@@ -1981,7 +1981,17 @@ async function init() {
   if (INSTANCE_ID) {
     try {
       const { SuspendManager } = await import('./suspend-manager.js');
-      suspendMgr = new SuspendManager({ instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR, log });
+      suspendMgr = new SuspendManager(
+        {
+          log,
+          killTmuxSession: () => adapter.stop(),
+          startClaude: () => adapter.launch(),
+          writeStatusFile,
+          isClaudeRunning: () => adapter.isRunning(),
+          tmuxHasSession,
+        },
+        { instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR }
+      );
     } catch { /* suspend manager not available */ }
   }
 

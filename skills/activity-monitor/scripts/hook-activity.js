@@ -207,7 +207,19 @@ process.stdin.on('end', async () => {
         try {
           const { recordTokenUsage, closeDb } = await import('./token-tracker.js');
           const usage = hookData.usage || null;
-          if (usage) recordTokenUsage(INSTANCE_ID, usage);
+          if (usage) {
+            recordTokenUsage(
+              INSTANCE_ID,
+              usage.input_tokens || 0,
+              usage.output_tokens || 0,
+              usage.model || null,
+              usage.cost_usd || 0,
+              {
+                cacheReadTokens: usage.cache_read_tokens || 0,
+                cacheWriteTokens: usage.cache_write_tokens || 0,
+              }
+            );
+          }
           closeDb();
         } catch { /* token tracker not available */ }
       }

@@ -36,8 +36,6 @@ const OUTPUT_DIR = fs.existsSync(SHARED_DIR) ? SHARED_DIR : MEMORY_DIR;
 const OUTPUT_FILE = path.join(OUTPUT_DIR, 'recent-activity.md');
 
 const LOOKBACK_HOURS = 24;
-const MAX_CONTENT_CHARS = 100; // chars per message for keyword extraction
-const MAX_KEYWORDS_PER_INSTANCE = 10;
 
 // ── Database ───────────────────────────────────────────────────────────
 
@@ -63,7 +61,7 @@ function openDb() {
 /**
  * Query recent inbound conversations grouped by target_instance.
  * @param {Database.Database} db
- * @returns {Array<{target_instance: string, channel: string, endpoint_id: string, content: string, timestamp: string}>}
+ * @returns {Array<{target_instance: string, channel: string}>}
  */
 function queryRecentConversations(db) {
   const cutoff = new Date(Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000)
@@ -71,98 +69,33 @@ function queryRecentConversations(db) {
     .replace('T', ' ')
     .replace(/\.\d{3}Z$/, '');
 
-  const stmt = db.prepare(`
-    SELECT target_instance, channel, endpoint_id, content, timestamp
+  return db.prepare(`
+    SELECT target_instance, channel
     FROM conversations
     WHERE direction = 'in'
       AND timestamp > ?
     ORDER BY timestamp DESC
-  `);
-
-  return stmt.all(cutoff);
+  `).all(cutoff);
 }
 
 // ── Analysis ───────────────────────────────────────────────────────────
 
 /**
- * Extract simple keywords from a message snippet.
- * Strips common noise words and returns meaningful tokens.
- * @param {string} text
- * @returns {string[]}
- */
-function extractKeywords(text) {
-  if (!text) return [];
-  const snippet = text.slice(0, MAX_CONTENT_CHARS);
-  // Remove URLs, mentions, common punctuation
-  const cleaned = snippet
-    .replace(/https?:\/\/\S+/g, '')
-    .replace(/@\S+/g, '')
-    .replace(/[^\w\s\u4e00-\u9fff\u3400-\u4dbf]/g, ' ')
-    .trim();
-
-  // Split on whitespace, filter short/noise words
-  const noiseWords = new Set([
-    'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
-    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
-    'could', 'should', 'may', 'might', 'can', 'shall',
-    'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-    'and', 'or', 'but', 'not', 'no', 'so', 'if', 'then',
-    'this', 'that', 'it', 'its', 'my', 'your', 'his', 'her',
-    'we', 'they', 'you', 'i', 'me', 'us', 'them',
-    'said', 'just', 'like', 'also', 'very', 'really',
-    'de', 'la', 'le', 'les', 'des', 'du', 'un', 'une',
-    // Chinese particles
-    '的', '了', '在', '是', '我', '你', '他', '她', '它',
-    '们', '这', '那', '有', '和', '就', '不', '也', '都',
-    '会', '能', '可以', '要', '吗', '呢', '啊', '吧'
-  ]);
-
-  const tokens = cleaned.split(/\s+/).filter(t =>
-    t.length > 1 && !noiseWords.has(t.toLowerCase())
-  );
-
-  return [...new Set(tokens)];
-}
-
-/**
- * Group conversations by target_instance and generate per-instance summaries.
- * @param {Array} rows - query results
- * @returns {Map<string, {count: number, channels: Set<string>, keywords: string[]}>}
+ * Group conversations by target_instance, counting messages and collecting channels.
+ * @param {Array<{target_instance: string, channel: string}>} rows
+ * @returns {Map<string, {count: number, channels: Set<string>}>}
  */
 function groupByInstance(rows) {
-  /** @type {Map<string, {count: number, channels: Set<string>, allKeywords: string[]}>} */
   const groups = new Map();
 
   for (const row of rows) {
     const instance = row.target_instance || 'admin';
     if (!groups.has(instance)) {
-      groups.set(instance, { count: 0, channels: new Set(), allKeywords: [] });
+      groups.set(instance, { count: 0, channels: new Set() });
     }
     const group = groups.get(instance);
     group.count += 1;
-
-    // Track channel names (use endpoint_id for more descriptive names)
-    const channelLabel = row.channel || 'unknown';
-    group.channels.add(channelLabel);
-
-    // Collect keywords from message content
-    const kws = extractKeywords(row.content);
-    group.allKeywords.push(...kws);
-  }
-
-  // Deduplicate and limit keywords per instance
-  for (const [, group] of groups) {
-    // Count keyword frequency, take top N
-    const freq = new Map();
-    for (const kw of group.allKeywords) {
-      freq.set(kw, (freq.get(kw) || 0) + 1);
-    }
-    const sorted = [...freq.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, MAX_KEYWORDS_PER_INSTANCE)
-      .map(([kw]) => kw);
-    group.keywords = sorted;
-    delete group.allKeywords;
+    group.channels.add(row.channel || 'unknown');
   }
 
   return groups;
@@ -172,7 +105,7 @@ function groupByInstance(rows) {
 
 /**
  * Generate the markdown digest from grouped instance data.
- * @param {Map<string, object>} groups
+ * @param {Map<string, {count: number, channels: Set<string>}>} groups
  * @returns {string}
  */
 function generateDigest(groups) {
@@ -204,14 +137,7 @@ function generateDigest(groups) {
     const isPrimary = instanceId === 'admin';
     const label = isPrimary ? `${instanceId} (primary)` : instanceId;
     lines.push(`## ${label}`);
-
-    const channelList = [...data.channels].join(', ');
-    lines.push(`- ${data.count} messages via ${channelList}`);
-
-    if (data.keywords.length > 0) {
-      lines.push(`- Topics: ${data.keywords.join(', ')}`);
-    }
-
+    lines.push(`${data.count} messages via ${[...data.channels].join(', ')}`);
     lines.push('');
   }
 
@@ -241,7 +167,6 @@ function writeAtomic(filePath, content) {
 function main() {
   const db = openDb();
   if (!db) {
-    // No database — write an empty digest so the file exists but is benign
     writeAtomic(OUTPUT_FILE, '# Cross-Instance Activity Digest\nNo data available (database not found).\n');
     console.log('[shared-context] No database found, wrote empty digest.');
     process.exit(0);

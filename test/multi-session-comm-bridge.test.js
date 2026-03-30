@@ -479,12 +479,7 @@ function multiSessionDispatch(item, helpers, instanceDefs = {}) {
     return { action: 'skip', reason: `instance unhealthy (health=${claudeState.health})` };
   }
 
-  // 5. Busy (idle-gating) -> skip
-  if (claudeState.state === 'busy' && !bypass) {
-    return { action: 'skip', reason: 'instance busy (idle-gating)' };
-  }
-
-  // 6. Deliverable
+  // 5. Deliverable
   return { action: 'deliver', session, statusFile, claudeState };
 }
 
@@ -543,7 +538,7 @@ describe('c4-dispatcher-multi — multiSessionDispatch() routing', () => {
     expect(result.reason).toContain('offline');
   });
 
-  it("returns {action: 'skip'} for busy instance (idle-gating)", () => {
+  it("returns {action: 'deliver'} for busy instance (no idle-gating)", () => {
     const item = makeItem({ target_instance: 'busy-bee' });
     const helpers = makeHelpers({
       getClaudeState: () => ({ state: 'busy', health: 'ok' }),
@@ -551,8 +546,7 @@ describe('c4-dispatcher-multi — multiSessionDispatch() routing', () => {
     const defs = { 'busy-bee': { enabled: true } };
 
     const result = multiSessionDispatch(item, helpers, defs);
-    expect(result.action).toBe('skip');
-    expect(result.reason).toContain('busy');
+    expect(result.action).toBe('deliver');
   });
 
   it("returns {action: 'deliver'} for idle healthy instance", () => {

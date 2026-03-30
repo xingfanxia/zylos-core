@@ -13,7 +13,6 @@
  * ESM-only, Node 20+.
  */
 
-import { execFileSync } from 'child_process';
 import { writeFileSync, mkdirSync } from 'fs';
 import path from 'path';
 import os from 'os';
@@ -35,22 +34,11 @@ import {
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 
-/** Default idle timeout before reaping on-demand instances (30 minutes). */
-const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
-
 /**
  * Maximum items to attempt per processWithMultiSession call before giving up.
  * Prevents unbounded looping when every claimed item is for an offline instance.
  */
 const MAX_SKIP_ATTEMPTS = 5;
-
-// ── On-demand instance tracking (module-scoped) ────────────────────────
-
-/**
- * Maps instanceId -> epoch ms of last message delivery (or startup time).
- * @type {Map<string, number>}
- */
-const onDemandLastActivity = new Map();
 
 // ─────────────────────────────────────────────────────────────────────────
 // Lifecycle functions
@@ -72,95 +60,6 @@ export function writeWakeSignal(instanceId, zylosDir) {
   } catch (err) {
     // Best-effort — log but do not throw.
     console.error(`[dispatcher-multi] Failed to write wake-signal for ${instanceId}: ${err.message}`);
-  }
-}
-
-/**
- * Create a detached tmux session for an on-demand instance and launch its
- * runtime (Claude Code / Codex).
- *
- * @param {{ id: string, tmux_session?: string, config_dir?: string, runtime?: string }} instDef
- *   Instance definition object (must include `id`).
- * @returns {boolean} true if the session was created (or already existed).
- */
-export function startOnDemandInstance(instDef) {
-  if (!instDef) return false;
-
-  const instanceId = instDef.id;
-  const tmuxSession = instDef.tmux_session || getSessionName(instanceId);
-  if (!tmuxSession) {
-    console.error(`[dispatcher-multi] Cannot start on-demand ${instanceId}: no tmux session`);
-    return false;
-  }
-
-  // Check if session already exists.
-  try {
-    execFileSync('tmux', ['has-session', '-t', tmuxSession], { stdio: 'pipe', timeout: 15_000 });
-    onDemandLastActivity.set(instanceId, Date.now());
-    return true;
-  } catch {
-    // Session absent — create it below.
-  }
-
-  try {
-    const configDir = instDef.config_dir
-      ? instDef.config_dir.replace(/^~/, os.homedir())
-      : null;
-
-    const runtime = instDef.runtime || 'claude';
-    const args = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
-    if (configDir) args.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
-    args.push(runtime);
-
-    execFileSync('tmux', args, { stdio: 'pipe', timeout: 15_000 });
-    onDemandLastActivity.set(instanceId, Date.now());
-    return true;
-  } catch (err) {
-    console.error(`[dispatcher-multi] Failed to start on-demand ${instanceId}: ${err.message}`);
-    return false;
-  }
-}
-
-/**
- * Kill the tmux session for an on-demand instance.
- *
- * @param {string} instanceId
- */
-export function stopOnDemandInstance(instanceId) {
-  const instDef = getInstanceDef(instanceId);
-  const tmuxSession = instDef?.tmux_session || getSessionName(instanceId);
-  if (!tmuxSession) return;
-
-  try {
-    execFileSync('tmux', ['kill-session', '-t', tmuxSession], { stdio: 'pipe', timeout: 15_000 });
-  } catch {
-    // Session already gone — fine.
-  }
-  onDemandLastActivity.delete(instanceId);
-}
-
-/**
- * Sweep on-demand instances that have been idle longer than `idleTimeoutMs`
- * and shut them down.
- *
- * @param {number} [idleTimeoutMs=1800000] - Idle threshold in ms (default 30 min).
- */
-export function reapIdleOnDemandInstances(idleTimeoutMs) {
-  const timeout = idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
-  const now = Date.now();
-
-  for (const [instanceId, lastMs] of onDemandLastActivity) {
-    const def = getInstanceDef(instanceId);
-    const instanceType = def?.type ?? 'dedicated';
-    if (instanceType !== 'on_demand') continue;
-
-    if (now - lastMs >= timeout) {
-      console.log(
-        `[dispatcher-multi] On-demand ${instanceId} idle for ` +
-        `${Math.round((now - lastMs) / 60_000)}min — stopping`
-      );
-      stopOnDemandInstance(instanceId);
-    }
   }
 }
 
@@ -290,21 +189,7 @@ export function multiSessionDispatch(item, helpers) {
     return { action: 'requeue', reason: `instance '${targetInstance}' is suspended — wake signal written` };
   }
 
-  // 3. On-demand instance offline → start + requeue.
-  if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass && targetInstance) {
-    const def = getInstanceDef(targetInstance);
-    const instanceType = def?.type ?? 'dedicated';
-    if (instanceType === 'on_demand') {
-      const instWithId = def ? { id: targetInstance, ...def } : null;
-      const started = instWithId ? startOnDemandInstance(instWithId) : false;
-      if (started) {
-        return { action: 'requeue', reason: `on-demand '${targetInstance}' started — requeued for next cycle` };
-      }
-      return { action: 'skip', reason: `on-demand '${targetInstance}' failed to start` };
-    }
-  }
-
-  // 4. Offline / stopped → skip (let the loop try the next item).
+  // 3. Offline / stopped → skip (let the loop try the next item).
   if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass) {
     return { action: 'skip', reason: `instance target offline (state=${claudeState.state})` };
   }
@@ -314,15 +199,7 @@ export function multiSessionDispatch(item, helpers) {
     return { action: 'skip', reason: `instance unhealthy (health=${claudeState.health})` };
   }
 
-  // 6. **P0 idle-gating** — if the target is busy, release the item so it can
-  //    be retried on the next poll.  This prevents messages from piling up in
-  //    the tmux paste buffer while CC is mid-generation.
-  //    bypass_state items (heartbeats, context rotation) are exempt.
-  if (claudeState.state === 'busy' && !bypass) {
-    return { action: 'skip', reason: `instance busy (idle-gating)` };
-  }
-
-  // 7. Deliverable.
+  // 6. Deliverable.
   return { action: 'deliver', session, statusFile, claudeState };
 }
 
@@ -395,9 +272,6 @@ export async function processWithMultiSession(helpers) {
     confirmDelivery,
     readPreDeliveryTimestamp,
   } = helpers;
-
-  // Reap idle on-demand instances at the start of each cycle.
-  reapIdleOnDemandInstances();
 
   // Compute online instance IDs.  Returns null in legacy mode — callers
   // should NOT invoke this function in legacy mode, but we handle it gracefully.
@@ -501,14 +375,6 @@ export async function processWithMultiSession(helpers) {
         } else {
           ackControl(item.id);
           log(`Control id=${item.id} submitted (no-ack mode), marked done`);
-        }
-      }
-
-      // Track on-demand activity for idle reaping.
-      if (targetInstance) {
-        const def = getInstanceDef(targetInstance);
-        if (def?.type === 'on_demand') {
-          onDemandLastActivity.set(targetInstance, Date.now());
         }
       }
 
