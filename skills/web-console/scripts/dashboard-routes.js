@@ -82,85 +82,21 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
     }
   });
 
-  // ----- Token usage -----
+  // ----- Token usage (reads cached ccusage output) -----
   app.get('/api/dashboard/tokens', (req, res) => {
-    const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
-    const TOKEN_DB_PATH = path.join(zylosDir, 'activity-monitor', 'token-usage.db');
-
-    let tokenDb = null;
+    // ccusage is too slow for real-time (6K+ JSONL files). Read from a cached
+    // JSON file that's updated hourly by a scheduled task:
+    //   ccusage daily --json --since YYYYMMDD > ~/zylos/activity-monitor/token-cache.json
+    const cacheFile = path.join(zylosDir, 'activity-monitor', 'token-cache.json');
     try {
-      if (!fs.existsSync(TOKEN_DB_PATH)) {
-        return res.json({ daily: [], per_instance: [], totals: null });
+      if (!fs.existsSync(cacheFile)) {
+        return res.json({ daily: [], totals: null, error: 'No token data yet (run: ccusage daily --json > token-cache.json)' });
       }
-
-      // Resolve better-sqlite3 — try multiple candidate paths
-      let DbCtor = null;
-      const candidates = [
-        path.join(zylosDir, '.claude', 'skills', 'comm-bridge'),
-        path.join(zylosDir, '.claude', 'skills', 'scheduler'),
-        path.join(skillRoot, '..', 'comm-bridge'),
-        path.join(skillRoot, '..', 'scheduler'),
-      ];
-      for (const base of candidates) {
-        try {
-          const require = createRequire(path.join(base, 'package.json'));
-          DbCtor = require('better-sqlite3');
-          break;
-        } catch { /* try next */ }
-      }
-
-      // Fall back to the already-imported Database constructor
-      if (!DbCtor) DbCtor = Database;
-
-      tokenDb = new DbCtor(TOKEN_DB_PATH, { readonly: true });
-
-      // Daily per-instance breakdown
-      const daily = tokenDb.prepare(`
-        SELECT date, instance_id,
-          COALESCE(SUM(input_tokens), 0) as input_tokens,
-          COALESCE(SUM(output_tokens), 0) as output_tokens,
-          COALESCE(SUM(cache_read_tokens), 0) as cache_read,
-          COALESCE(SUM(cache_write_tokens), 0) as cache_write,
-          COALESCE(SUM(cost_usd), 0) as cost_usd
-        FROM token_usage
-        WHERE date > date('now', ? || ' days')
-        GROUP BY date, instance_id
-        ORDER BY date DESC, instance_id
-      `).all(`-${days}`);
-
-      // Per-instance totals for the period
-      const per_instance = tokenDb.prepare(`
-        SELECT instance_id,
-          COALESCE(SUM(input_tokens), 0) as input_tokens,
-          COALESCE(SUM(output_tokens), 0) as output_tokens,
-          COALESCE(SUM(cache_read_tokens), 0) as cache_read,
-          COALESCE(SUM(cache_write_tokens), 0) as cache_write,
-          COALESCE(SUM(cost_usd), 0) as cost_usd
-        FROM token_usage
-        WHERE date > date('now', ? || ' days')
-        GROUP BY instance_id
-        ORDER BY instance_id
-      `).all(`-${days}`);
-
-      // Grand totals
-      const totals = tokenDb.prepare(`
-        SELECT
-          COALESCE(SUM(input_tokens), 0) as input_tokens,
-          COALESCE(SUM(output_tokens), 0) as output_tokens,
-          COALESCE(SUM(cache_read_tokens), 0) as cache_read,
-          COALESCE(SUM(cache_write_tokens), 0) as cache_write,
-          COALESCE(SUM(cost_usd), 0) as cost_usd
-        FROM token_usage
-        WHERE date > date('now', ? || ' days')
-      `).get(`-${days}`);
-
-      res.json({ daily, per_instance, totals, days });
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      const cacheAge = Math.floor((Date.now() - fs.statSync(cacheFile).mtimeMs) / 60000);
+      res.json({ ...cached, cache_age_minutes: cacheAge });
     } catch (err) {
-      res.status(500).json({ error: err.message });
-    } finally {
-      if (tokenDb) {
-        try { tokenDb.close(); } catch { /* best-effort */ }
-      }
+      res.json({ daily: [], totals: null, error: err.message });
     }
   });
 
