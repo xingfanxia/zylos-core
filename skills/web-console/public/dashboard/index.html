@@ -4,13 +4,15 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Zylos Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/style.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-mono/style.min.css">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="dashboard">
     <header>
       <div class="header-left">
-        <h1>Zylos Dashboard</h1>
+        <h1>Zylos</h1>
         <div class="subtitle" id="system-subtitle">Loading...</div>
       </div>
       <div class="header-right">
@@ -18,84 +20,90 @@
           <span class="refresh-dot"></span>
           <span>Live</span>
         </div>
-        <a href="/" class="nav-link">Chat Console</a>
+        <a href="/" class="nav-link">Console</a>
       </div>
     </header>
 
-    <!-- System Resources -->
-    <section class="grid grid-2" style="margin-bottom: 1.5rem;">
-      <div class="card">
-        <div class="card-header">
-          <h2>System Resources</h2>
-        </div>
-        <div class="card-body" id="system-resources">
-          <div class="loading">Loading...</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-header">
-          <h2>System Info</h2>
-        </div>
-        <div class="card-body" id="system-info">
-          <div class="loading">Loading...</div>
-        </div>
-      </div>
-    </section>
+    <!-- Tab bar -->
+    <nav class="tab-bar" id="tab-bar">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="instances">Instances</button>
+      <button class="tab" data-tab="usage">Usage</button>
+      <button class="tab" data-tab="schedule">Schedule</button>
+      <button class="tab" data-tab="processes">Processes</button>
+    </nav>
 
-    <!-- Pending Approvals -->
-    <section class="card" style="margin-bottom: 1.5rem; display: none;" id="pending-section">
-      <div class="card-header">
-        <h2>Pending Approvals</h2>
-        <span class="badge" id="pending-count" style="background: #facc15; color: #000;">0</span>
-      </div>
-      <div class="card-body" id="pending-users">
-      </div>
-    </section>
+    <!-- Pending approvals banner -->
+    <div class="approval-banner" id="pending-section" style="display:none">
+      <span class="approval-dot"></span>
+      <span><span id="pending-count">0</span> pending approval(s)</span>
+      <div id="pending-users"></div>
+    </div>
 
-    <!-- Instances -->
-    <section class="card" style="margin-bottom: 1.5rem;">
-      <div class="card-header">
-        <h2>Instances</h2>
-        <span class="badge" id="instance-count">0</span>
+    <!-- Tab panels -->
+    <div class="tab-panel active" id="panel-overview">
+      <div class="stat-cards" id="system-stats">
+        <div class="skeleton" style="height:72px"></div>
+        <div class="skeleton" style="height:72px"></div>
+        <div class="skeleton" style="height:72px"></div>
       </div>
-      <div class="card-body">
-        <div class="instances-grid" id="instances-grid">
-          <div class="loading">Loading...</div>
+      <div class="section-block">
+        <div class="section-title">Instance status</div>
+        <div id="overview-instances">
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
         </div>
       </div>
-    </section>
+    </div>
 
-    <!-- Token Usage -->
-    <section class="card" style="margin-bottom: 1.5rem;">
-      <div class="card-header">
-        <h2>Token Usage</h2>
+    <div class="tab-panel" id="panel-instances">
+      <div class="instances-grid" id="instances-grid">
+        <div class="skeleton" style="height:160px"></div>
+        <div class="skeleton" style="height:160px"></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-usage">
+      <div class="usage-controls">
         <div class="token-tabs" id="token-tabs">
-          <button class="token-tab active" data-days="7">7 Days</button>
-          <button class="token-tab" data-days="14">14 Days</button>
-          <button class="token-tab" data-days="30">30 Days</button>
+          <button class="token-tab active" data-days="7">7d</button>
+          <button class="token-tab" data-days="14">14d</button>
+          <button class="token-tab" data-days="30">30d</button>
         </div>
+        <label class="system-toggle">
+          <input type="checkbox" id="include-system"> Include system usage
+        </label>
       </div>
-      <div class="card-body">
-        <div id="token-chart">
-          <div class="loading">Loading...</div>
-        </div>
-        <div id="token-table">
-        </div>
+      <div id="token-chart">
+        <div class="skeleton" style="height:200px"></div>
       </div>
-    </section>
+      <div class="section-block">
+        <div class="section-title">Daily Usage (90 days)</div>
+        <div id="token-calendar"></div>
+      </div>
+      <div id="token-pie" style="margin-top:24px"></div>
+      <div id="token-table" style="margin-top:24px"></div>
+    </div>
 
-    <!-- PM2 Processes -->
-    <section class="card">
-      <div class="card-header">
-        <h2>PM2 Processes</h2>
-        <span class="badge" id="pm2-count">0</span>
-      </div>
-      <div class="card-body" style="padding: 0;">
-        <div id="pm2-table">
-          <div class="loading">Loading...</div>
+    <div class="tab-panel" id="panel-schedule">
+      <div id="schedule-calendar"></div>
+      <div class="section-block" style="margin-top:24px">
+        <div class="section-title">All tasks</div>
+        <div id="schedule-table">
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
         </div>
       </div>
-    </section>
+    </div>
+
+    <div class="tab-panel" id="panel-processes">
+      <div id="pm2-table">
+        <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+        <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+        <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+      </div>
+    </div>
   </div>
 
   <script src="app.js"></script>

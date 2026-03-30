@@ -1,15 +1,22 @@
 /**
  * Zylos Dashboard — frontend application.
  * Vanilla JS, no dependencies. Auto-refreshes every 5 seconds.
+ * Geist/Vercel design system.
  */
 
 class Dashboard {
   constructor() {
     this.data = null;
     this.tokenData = null;
+    this.scheduleData = null;
+    this.scheduleMonth = new Date(); // current month view
     this.tokenDays = 7;
+    this.showSystem = false;
+    this.activeTab = 'overview';
     this.refreshInterval = null;
     this.tokenRefreshInterval = null;
+    this.sortColumn = null;
+    this.sortAsc = true;
 
     this.init();
   }
@@ -19,6 +26,7 @@ class Dashboard {
     await this.fetchAll();
     this.refreshInterval = setInterval(() => { this.fetchDashboard(); this.fetchPendingUsers(); }, 5000);
     this.tokenRefreshInterval = setInterval(() => this.fetchTokens(), 30000);
+    this.scheduleRefreshInterval = setInterval(() => this.fetchSchedule(), 60000);
   }
 
   async fetchAll() {
@@ -26,6 +34,7 @@ class Dashboard {
       this.fetchDashboard(),
       this.fetchTokens(),
       this.fetchPendingUsers(),
+      this.fetchSchedule(),
     ]);
   }
 
@@ -53,20 +62,17 @@ class Dashboard {
     const activeEl = document.activeElement;
     if (activeEl && activeEl.classList.contains('approve-name-input')) return;
     container.innerHTML = pending.map(p => `
-      <div class="pending-card" style="display: flex; justify-content: space-between; align-items: flex-start; padding: 1rem; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 0.75rem;">
-        <div style="flex: 1;">
-          <div style="font-weight: 600; margin-bottom: 0.25rem;">${this.esc(p.user_name || p.chat_id)}</div>
-          <div style="font-size: 0.85rem; color: var(--text-secondary);">${this.esc(p.channel)} &middot; ${this.esc(p.chat_id)} &middot; ${p.msg_count || '?'} held message(s)</div>
-          <div style="font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.5rem; font-style: italic;">"${this.esc((p.preview || '').substring(0, 100))}"</div>
+      <div class="pending-card">
+        <div class="pending-info">
+          <div class="pending-name">${this.esc(p.user_name || p.chat_id)}</div>
+          <div class="pending-detail">${this.esc(p.channel)} &middot; ${this.esc(p.chat_id)} &middot; ${p.msg_count || '?'} held message(s)</div>
+          <div class="pending-preview">"${this.esc((p.preview || '').substring(0, 100))}"</div>
         </div>
-        <div style="display: flex; gap: 0.5rem; margin-left: 1rem;">
+        <div class="pending-actions">
           <input type="text" placeholder="instance name" value="${this.esc(p.suggested_id || (p.user_name ? 'user-' + p.user_name.toLowerCase().replace(/\s+/g, '') : ''))}"
-            style="padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-primary); color: var(--text-primary); width: 140px; font-size: 0.85rem;"
             data-chat-id="${this.esc(p.chat_id)}" class="approve-name-input">
-          <button class="btn btn-approve" data-action="approve" data-chat-id="${this.esc(p.chat_id)}"
-            style="padding: 0.4rem 0.8rem; background: #16a34a; color: white; border: none; border-radius: 4px; cursor: pointer;">Approve</button>
-          <button class="btn btn-deny" data-action="deny" data-chat-id="${this.esc(p.chat_id)}"
-            style="padding: 0.4rem 0.8rem; background: #dc2626; color: white; border: none; border-radius: 4px; cursor: pointer;">Deny</button>
+          <button class="btn-approve" data-action="approve" data-chat-id="${this.esc(p.chat_id)}">Approve</button>
+          <button class="btn-deny" data-action="deny" data-chat-id="${this.esc(p.chat_id)}">Deny</button>
         </div>
       </div>
     `).join('');
@@ -113,7 +119,7 @@ class Dashboard {
 
   async fetchTokens() {
     try {
-      const res = await fetch(`/api/dashboard/tokens?days=${this.tokenDays}`);
+      const res = await fetch(`/api/dashboard/tokens?days=90`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       this.tokenData = await res.json();
       this.renderTokens();
@@ -122,8 +128,29 @@ class Dashboard {
     }
   }
 
+  async fetchSchedule() {
+    try {
+      const res = await fetch('/api/dashboard/scheduler');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      this.scheduleData = await res.json();
+      if (this.activeTab === 'schedule') this.renderSchedule();
+    } catch (err) {
+      console.error('Schedule fetch error:', err);
+    }
+  }
+
   bindActions() {
-    // Token tab clicks
+    // Tab navigation
+    const tabBar = document.getElementById('tab-bar');
+    if (tabBar) {
+      tabBar.addEventListener('click', (e) => {
+        const tab = e.target.closest('.tab');
+        if (!tab) return;
+        this.switchTab(tab.dataset.tab);
+      });
+    }
+
+    // Token tab clicks (day filter)
     const tabs = document.getElementById('token-tabs');
     if (tabs) {
       tabs.addEventListener('click', (e) => {
@@ -135,13 +162,22 @@ class Dashboard {
         tabs.querySelectorAll('.token-tab').forEach(t => t.classList.remove('active'));
         tab.classList.add('active');
         this.tokenDays = days;
-        this.fetchTokens();
+        this.renderTokens();
+      });
+    }
+
+    // System toggle
+    const systemCheckbox = document.getElementById('include-system');
+    if (systemCheckbox) {
+      systemCheckbox.addEventListener('change', () => {
+        this.showSystem = systemCheckbox.checked;
+        this.renderTokens();
       });
     }
 
     // Instance action buttons (delegated)
     document.addEventListener('click', async (e) => {
-      const btn = e.target.closest('.btn[data-action]');
+      const btn = e.target.closest('[data-action]');
       if (!btn) return;
 
       const action = btn.dataset.action;
@@ -170,7 +206,6 @@ class Dashboard {
         if (!res.ok) {
           alert(result.error || 'Action failed');
         }
-        // Refresh immediately
         await this.fetchDashboard();
       } catch (err) {
         alert('Request failed: ' + err.message);
@@ -178,6 +213,50 @@ class Dashboard {
         btn.disabled = false;
       }
     });
+  }
+
+  switchTab(tabId) {
+    this.activeTab = tabId;
+
+    // Update tab bar
+    document.querySelectorAll('.tab').forEach(t => {
+      t.classList.toggle('active', t.dataset.tab === tabId);
+    });
+
+    // Update panels
+    document.querySelectorAll('.tab-panel').forEach(p => {
+      p.classList.toggle('active', p.id === `panel-${tabId}`);
+    });
+
+    // Render content for the active tab
+    this.renderActiveTab();
+  }
+
+  renderActiveTab() {
+    switch (this.activeTab) {
+      case 'overview':
+        if (this.data) this.renderOverview();
+        break;
+      case 'instances':
+        if (this.data) this.renderInstances();
+        break;
+      case 'usage':
+        this.renderTokens();
+        break;
+      case 'schedule':
+        this.renderSchedule();
+        break;
+      case 'processes':
+        if (this.data) this.renderPm2();
+        break;
+    }
+  }
+
+  renderSkeleton(count) {
+    if (count === undefined) count = 3;
+    return Array(count).fill('').map(function() {
+      return '<div class="skeleton" style="height: 20px; margin-bottom: 8px;"></div>';
+    }).join('');
   }
 
   // ---------------------------------------------------------------------------
@@ -188,10 +267,18 @@ class Dashboard {
     if (!this.data) return;
 
     this.renderSubtitle();
-    this.renderSystemResources();
-    this.renderSystemInfo();
-    this.renderInstances();
-    this.renderPm2();
+
+    switch (this.activeTab) {
+      case 'overview':
+        this.renderOverview();
+        break;
+      case 'instances':
+        this.renderInstances();
+        break;
+      case 'processes':
+        this.renderPm2();
+        break;
+    }
   }
 
   renderSubtitle() {
@@ -201,298 +288,957 @@ class Dashboard {
     el.textContent = `${s.hostname} | ${s.platform} | ${s.cpu.cores} cores | uptime ${this.formatHours(s.uptime_hours)}`;
   }
 
-  renderSystemResources() {
-    const el = document.getElementById('system-resources');
+  // ---------------------------------------------------------------------------
+  // Overview tab
+  // ---------------------------------------------------------------------------
+
+  renderOverview() {
+    if (!this.data || !this.data.system) return;
+
+    this.renderStatCards();
+    this.renderOverviewInstances();
+  }
+
+  renderStatCards() {
+    const el = document.getElementById('system-stats');
     if (!el || !this.data.system) return;
 
     const { memory, disk, cpu } = this.data.system;
 
-    let html = '';
-
-    // Memory
-    html += this.renderResourceBar(
-      'Memory',
-      `${memory.used_mb} MB / ${memory.total_mb} MB`,
-      memory.used_percent
-    );
-
-    // Disk
-    if (disk) {
-      const diskPct = parseInt(disk.used_percent) || 0;
-      html += this.renderResourceBar(
-        'Disk',
-        `${disk.used} / ${disk.total}`,
-        diskPct
-      );
-    }
-
-    // CPU Load
-    const loadPct = Math.min(100, Math.round((cpu.load_1m / cpu.cores) * 100));
-    html += this.renderResourceBar(
-      'CPU Load (1m)',
-      `${cpu.load_1m.toFixed(2)} / ${cpu.cores} cores`,
-      loadPct
-    );
-
-    el.innerHTML = html;
-  }
-
-  renderResourceBar(name, value, percent) {
-    const level = percent > 85 ? 'high' : percent > 60 ? 'medium' : 'low';
-    return `
-      <div class="resource-item">
-        <div class="resource-label">
-          <span class="name">${this.esc(name)}</span>
-          <span class="value">${this.esc(value)} (${percent}%)</span>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill ${level}" style="width: ${percent}%"></div>
-        </div>
-      </div>
-    `;
-  }
-
-  renderSystemInfo() {
-    const el = document.getElementById('system-info');
-    if (!el || !this.data.system) return;
-
-    const s = this.data.system;
-    const { cpu } = s;
+    const cpuPct = Math.min(100, Math.round((cpu.load_1m / cpu.cores) * 100));
+    const memPct = memory.used_percent;
+    const diskPct = disk ? (parseInt(disk.used_percent) || 0) : 0;
 
     el.innerHTML = `
-      <div class="instance-meta" style="font-size: 0.85rem;">
-        <span class="label">Hostname</span>
-        <span>${s.hostname}</span>
-        <span class="label">Platform</span>
-        <span>${s.platform}</span>
-        <span class="label">CPU Cores</span>
-        <span>${cpu.cores}</span>
-        <span class="label">Load (1m/5m/15m)</span>
-        <span>${cpu.load_1m.toFixed(2)} / ${cpu.load_5m.toFixed(2)} / ${cpu.load_15m.toFixed(2)}</span>
-        <span class="label">Uptime</span>
-        <span>${this.formatHours(s.uptime_hours)}</span>
-        <span class="label">Memory</span>
-        <span>${s.memory.used_mb} MB used / ${s.memory.total_mb} MB total</span>
-        <span class="label">Disk</span>
-        <span>${s.disk ? `${s.disk.used} / ${s.disk.total} (${s.disk.used_percent})` : 'N/A'}</span>
-        <span class="label">Timestamp</span>
-        <span>${this.formatTime(this.data.timestamp)}</span>
-      </div>
+      ${this._statCard('CPU Load', cpuPct + '%', cpu.load_1m.toFixed(2) + ' / ' + cpu.cores + ' cores', cpuPct)}
+      ${this._statCard('Memory', memPct + '%', memory.used_mb + ' / ' + memory.total_mb + ' MB', memPct)}
+      ${this._statCard('Disk', diskPct + '%', disk ? disk.used + ' / ' + disk.total : 'N/A', diskPct)}
     `;
   }
+
+  _statCard(label, value, detail, percent) {
+    var level = percent > 85 ? 'high' : percent > 60 ? 'medium' : 'low';
+    return '<div class="stat-card">' +
+      '<div class="stat-label">' + this.esc(label) + '</div>' +
+      '<div class="stat-value">' + this.esc(value) + '</div>' +
+      '<div class="stat-detail">' + this.esc(detail) + '</div>' +
+      '<div class="progress-bar"><div class="progress-fill ' + level + '" style="width: ' + percent + '%"></div></div>' +
+    '</div>';
+  }
+
+  renderOverviewInstances() {
+    const el = document.getElementById('overview-instances');
+    if (!el) return;
+
+    const instances = this.data.instances || [];
+    if (instances.length === 0) {
+      el.innerHTML = '<div class="empty-state">No instances configured</div>';
+      return;
+    }
+
+    var rows = instances.map(function(inst) {
+      var statusClass = this.getStatusClass(inst.status);
+      var statusLabel = inst.status || 'unknown';
+      var typeClass = inst.type === 'on_demand' ? 'on_demand' : 'dedicated';
+      var typeLabel = inst.type || 'dedicated';
+      var lastActivity = inst.last_activity ? this.formatTime(inst.last_activity) : '-';
+      var idle = inst.idle_seconds != null ? this.formatDuration(inst.idle_seconds * 1000) : '-';
+      var primaryMark = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
+
+      return '<tr>' +
+        '<td style="width:20px"><span class="status-dot ' + statusClass + '"></span></td>' +
+        '<td class="instance-name-cell">' + this.esc(inst.id) + primaryMark + '</td>' +
+        '<td><span class="type-badge ' + typeClass + '">' + this.esc(typeLabel) + '</span></td>' +
+        '<td>' + this.esc(statusLabel) + '</td>' +
+        '<td>' + lastActivity + '</td>' +
+        '<td>' + idle + '</td>' +
+      '</tr>';
+    }.bind(this)).join('');
+
+    el.innerHTML = '<table class="overview-table">' +
+      '<thead><tr>' +
+        '<th></th>' +
+        '<th>Name</th>' +
+        '<th>Type</th>' +
+        '<th>Status</th>' +
+        '<th>Last Activity</th>' +
+        '<th>Idle</th>' +
+      '</tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+    '</table>';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Instances tab
+  // ---------------------------------------------------------------------------
 
   renderInstances() {
     const grid = document.getElementById('instances-grid');
-    const countBadge = document.getElementById('instance-count');
     if (!grid) return;
 
     const instances = this.data.instances || [];
-    if (countBadge) countBadge.textContent = instances.length;
 
     if (instances.length === 0) {
       grid.innerHTML = '<div class="empty-state">No instances configured</div>';
       return;
     }
 
-    grid.innerHTML = instances.map(inst => this.renderInstanceCard(inst)).join('');
+    grid.innerHTML = instances.map(function(inst) { return this.renderInstanceCard(inst); }.bind(this)).join('');
   }
 
   renderInstanceCard(inst) {
-    const statusClass = this.getStatusClass(inst.status);
-    const statusLabel = inst.status || 'unknown';
-    const typeClass = inst.type === 'on_demand' ? 'on_demand' : 'dedicated';
-    const primaryBadge = inst.primary ? ' <span style="color: var(--yellow); font-size: 0.7rem;">(primary)</span>' : '';
+    var statusClass = this.getStatusClass(inst.status);
+    var statusLabel = inst.status || 'unknown';
+    var typeClass = inst.type === 'on_demand' ? 'on_demand' : 'dedicated';
+    var primaryBadge = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
 
     // Determine available actions
-    let actions = '';
+    var actions = '';
     if (inst.enabled) {
       if (inst.status === 'suspended') {
-        actions += `<button class="btn btn-success" data-action="resume" data-id="${this.esc(inst.id)}">Resume</button>`;
+        actions += '<button class="btn btn-success" data-action="resume" data-id="' + this.esc(inst.id) + '">Resume</button>';
       } else if (inst.status === 'running' || inst.status === 'idle' || inst.status === 'busy') {
         if (!inst.primary) {
-          actions += `<button class="btn btn-warning" data-action="suspend" data-id="${this.esc(inst.id)}">Suspend</button>`;
+          actions += '<button class="btn btn-warning" data-action="suspend" data-id="' + this.esc(inst.id) + '">Suspend</button>';
         }
       }
       if (!inst.primary) {
-        actions += `<button class="btn btn-danger" data-action="disable" data-id="${this.esc(inst.id)}">Disable</button>`;
+        actions += '<button class="btn btn-danger" data-action="disable" data-id="' + this.esc(inst.id) + '">Disable</button>';
       }
     } else {
-      actions += `<button class="btn btn-success" data-action="enable" data-id="${this.esc(inst.id)}">Enable</button>`;
+      actions += '<button class="btn btn-success" data-action="enable" data-id="' + this.esc(inst.id) + '">Enable</button>';
     }
 
-    return `
-      <div class="instance-card">
-        <div class="instance-header">
-          <div class="instance-name">
-            <span class="status-dot ${statusClass}"></span>
-            ${this.esc(inst.id)}${primaryBadge}
-          </div>
-          <span class="instance-type ${typeClass}">${this.esc(inst.type || 'dedicated')}</span>
-        </div>
-        <div class="instance-meta">
-          <span class="label">Status</span>
-          <span>${this.esc(statusLabel)}</span>
-          <span class="label">Enabled</span>
-          <span>${inst.enabled ? 'Yes' : 'No'}</span>
-          <span class="label">Tmux</span>
-          <span>${inst.tmux_alive ? 'alive' : 'dead'}</span>
-          ${inst.last_activity ? `<span class="label">Last Activity</span><span>${this.formatTime(inst.last_activity)}</span>` : ''}
-          ${inst.uptime_ms ? `<span class="label">Uptime</span><span>${this.formatDuration(inst.uptime_ms)}</span>` : ''}
-          ${inst.idle_seconds != null ? `<span class="label">Idle</span><span>${this.formatDuration(inst.idle_seconds * 1000)}</span>` : ''}
-        </div>
-        <div class="instance-actions">
-          ${actions}
-        </div>
-      </div>
-    `;
+    return '<div class="instance-card">' +
+      '<div class="instance-header">' +
+        '<div class="instance-name">' +
+          '<span class="status-dot ' + statusClass + '"></span>' +
+          this.esc(inst.id) + primaryBadge +
+        '</div>' +
+        '<span class="type-badge ' + typeClass + '">' + this.esc(inst.type || 'dedicated') + '</span>' +
+      '</div>' +
+      '<div class="instance-meta">' +
+        '<span class="label">Status</span><span class="value">' + this.esc(statusLabel) + '</span>' +
+        '<span class="label">Enabled</span><span class="value">' + (inst.enabled ? 'Yes' : 'No') + '</span>' +
+        '<span class="label">Tmux</span><span class="value">' + (inst.tmux_alive ? 'alive' : 'dead') + '</span>' +
+        (inst.last_activity ? '<span class="label">Last Activity</span><span class="value">' + this.formatTime(inst.last_activity) + '</span>' : '') +
+        (inst.uptime_ms ? '<span class="label">Uptime</span><span class="value">' + this.formatDuration(inst.uptime_ms) + '</span>' : '') +
+        (inst.idle_seconds != null ? '<span class="label">Idle</span><span class="value">' + this.formatDuration(inst.idle_seconds * 1000) + '</span>' : '') +
+      '</div>' +
+      '<div class="instance-actions">' + actions + '</div>' +
+    '</div>';
   }
 
+  // ---------------------------------------------------------------------------
+  // Token/Usage tab
+  // ---------------------------------------------------------------------------
+
   renderTokens() {
+    if (this.activeTab !== 'usage') return;
     this.renderTokenChart();
+    this.renderTokenCalendar();
+    this.renderTokenDonut();
     this.renderTokenTable();
   }
 
+  // ---------------------------------------------------------------------------
+  // Token helpers: date filtering and instance color assignment
+  // ---------------------------------------------------------------------------
+
+  /** Return a cutoff date string (YYYY-MM-DD) for the last N days. */
+  _tokenCutoffDate(days) {
+    var d = new Date();
+    d.setDate(d.getDate() - (days || this.tokenDays));
+    return d.toISOString().slice(0, 10);
+  }
+
+  /** Filter an array of {date, ...} rows to only those within the window. */
+  _filterDaily(rows, days) {
+    if (!rows) return [];
+    var cutoff = this._tokenCutoffDate(days);
+    return rows.filter(function(r) { return r.date > cutoff; });
+  }
+
+  /** Sum token fields across an array of daily rows. */
+  _sumRows(rows) {
+    var out = { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_write: 0, cost_usd: 0 };
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      out.input_tokens += r.input_tokens || 0;
+      out.output_tokens += r.output_tokens || 0;
+      out.cache_read += r.cache_read || 0;
+      out.cache_write += r.cache_write || 0;
+      out.cost_usd += r.cost_usd || 0;
+    }
+    out.total_tokens = out.input_tokens + out.output_tokens + out.cache_read + out.cache_write;
+    return out;
+  }
+
+  /** Consistent color palette for instance IDs. */
+  _instanceColor(id) {
+    var named = {
+      admin: '#3b82f6',
+      scheduler: '#8b5cf6',
+      group: '#f59e0b',
+      system: '#6b7280',
+    };
+    if (named[id]) return named[id];
+    var cycle = ['#10b981', '#ec4899', '#06b6d4', '#f97316', '#a855f7', '#14b8a6', '#e11d48', '#84cc16'];
+    var hash = 0;
+    for (var i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) | 0;
+    return cycle[Math.abs(hash) % cycle.length];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Token chart — stacked bars with Y-axis gridlines
+  // ---------------------------------------------------------------------------
+
   renderTokenChart() {
-    const el = document.getElementById('token-chart');
+    var el = document.getElementById('token-chart');
     if (!el || !this.tokenData) return;
 
-    const { daily } = this.tokenData;
-    if (!daily || daily.length === 0) {
+    var filteredDaily = this._filterDaily(this.tokenData.daily);
+    if (filteredDaily.length === 0) {
       el.innerHTML = '<div class="empty-state">No token usage data</div>';
       return;
     }
 
-    // Group by date, sum per date
-    const dateMap = new Map();
-    for (const row of daily) {
-      const total = (row.input_tokens || 0) + (row.output_tokens || 0) +
-                    (row.cache_read || 0) + (row.cache_write || 0);
-      dateMap.set(row.date, (dateMap.get(row.date) || 0) + total);
+    var instances = this.tokenData.instances || {};
+    var instanceIds = Object.keys(instances).sort();
+
+    // Build per-date totals from aggregate daily
+    var dateTotals = new Map();
+    for (var i = 0; i < filteredDaily.length; i++) {
+      var row = filteredDaily[i];
+      var t = (row.input_tokens || 0) + (row.output_tokens || 0) +
+              (row.cache_read || 0) + (row.cache_write || 0);
+      dateTotals.set(row.date, (dateTotals.get(row.date) || 0) + t);
     }
 
-    // Sort chronologically
-    const sortedDates = [...dateMap.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-    const maxVal = Math.max(...sortedDates.map(([, v]) => v), 1);
+    // Build per-date per-instance totals
+    var dateInstanceTotals = new Map();
+    for (var j = 0; j < instanceIds.length; j++) {
+      var id = instanceIds[j];
+      var instDaily = this._filterDaily(instances[id]?.daily);
+      for (var k = 0; k < instDaily.length; k++) {
+        var r = instDaily[k];
+        if (!dateInstanceTotals.has(r.date)) dateInstanceTotals.set(r.date, new Map());
+        var tt = (r.input_tokens || 0) + (r.output_tokens || 0) +
+                (r.cache_read || 0) + (r.cache_write || 0);
+        var m = dateInstanceTotals.get(r.date);
+        m.set(id, (m.get(id) || 0) + tt);
+      }
+    }
 
-    let barsHtml = sortedDates.map(([date, total], i) => {
-      const pct = Math.max(2, (total / maxVal) * 100);
-      const label = date.substring(5); // MM-DD
-      const colorIdx = i % 5;
-      return `
-        <div class="bar-group">
-          <div class="bar-value">${this.formatTokens(total)}</div>
-          <div class="bar color-${colorIdx}" style="height: ${pct}%"></div>
-          <div class="bar-label">${label}</div>
-        </div>
-      `;
+    var sortedDates = Array.from(dateTotals.keys()).sort();
+    var self = this;
+    var maxVal = Math.max.apply(null, sortedDates.map(function(d) {
+      var total = dateTotals.get(d) || 0;
+      if (self.showSystem) return total;
+      var instMap = dateInstanceTotals.get(d);
+      if (!instMap) return 0;
+      var sum = 0;
+      instMap.forEach(function(v) { sum += v; });
+      return sum;
+    }).concat([1]));
+
+    // Y-axis labels (4 gridlines)
+    var yLabels = [];
+    for (var g = 0; g < 5; g++) {
+      yLabels.push(this.formatTokens(Math.round(maxVal * (1 - g / 4))));
+    }
+
+    var showEveryOther = sortedDates.length > 14;
+
+    var barsHtml = sortedDates.map(function(date, idx) {
+      var dayTotal = dateTotals.get(date) || 0;
+      var instMap = dateInstanceTotals.get(date) || new Map();
+
+      var instanceSum = 0;
+      var segments = [];
+      for (var n = 0; n < instanceIds.length; n++) {
+        var iid = instanceIds[n];
+        var val = instMap.get(iid) || 0;
+        if (val <= 0) continue;
+        instanceSum += val;
+        segments.push({ id: iid, val: val });
+      }
+
+      var systemVal = Math.max(0, dayTotal - instanceSum);
+      if (self.showSystem && systemVal > 0) {
+        segments.push({ id: 'system', val: systemVal });
+      }
+
+      var barTotal = self.showSystem ? dayTotal : instanceSum;
+      var pct = maxVal > 0 ? Math.max(1, (barTotal / maxVal) * 100) : 1;
+      var label = date.substring(5);
+
+      var segmentsHtml = '';
+      if (barTotal > 0) {
+        for (var s = 0; s < segments.length; s++) {
+          var seg = segments[s];
+          var segPct = (seg.val / barTotal) * 100;
+          if (segPct < 0.1) continue;
+          var isLast = s === segments.length - 1;
+          segmentsHtml += '<div class="bar-segment" style="height: ' + segPct + '%; background: ' + self._instanceColor(seg.id) + ';' + (isLast ? ' border-radius: 2px 2px 0 0;' : '') + '" title="' + self.esc(seg.id) + ': ' + self.formatTokens(seg.val) + '"></div>';
+        }
+      }
+
+      var showLabel = !showEveryOther || idx % 2 === 0;
+
+      return '<div class="bar-group">' +
+        '<div class="bar" style="height: ' + pct + '%;">' + segmentsHtml + '</div>' +
+        '<div class="bar-label">' + (showLabel ? label : '') + '</div>' +
+      '</div>';
     }).join('');
 
-    el.innerHTML = `<div class="bar-chart">${barsHtml}</div>`;
+    // Legend
+    var legendHtml = instanceIds.map(function(iid) {
+      return '<span class="legend-item"><span class="legend-swatch" style="background: ' + self._instanceColor(iid) + '"></span>' + self.esc(iid) + '</span>';
+    });
+    if (this.showSystem) {
+      legendHtml.push('<span class="legend-item"><span class="legend-swatch" style="background: ' + this._instanceColor('system') + '"></span>system</span>');
+    }
+
+    // Y-axis HTML
+    var yAxisHtml = '<div class="bar-chart-y-axis">' +
+      yLabels.map(function(l) { return '<span class="y-label">' + l + '</span>'; }).join('') +
+    '</div>';
+
+    var gridlinesHtml = '<div class="bar-chart-gridlines">' +
+      '<div class="gridline"></div><div class="gridline"></div><div class="gridline"></div><div class="gridline"></div><div class="gridline"></div>' +
+    '</div>';
+
+    el.innerHTML =
+      '<div class="chart-legend">' + legendHtml.join('') + '</div>' +
+      '<div class="bar-chart-wrapper">' +
+        yAxisHtml +
+        '<div class="bar-chart-area">' +
+          gridlinesHtml +
+          '<div class="bar-chart">' + barsHtml + '</div>' +
+        '</div>' +
+      '</div>';
   }
 
-  renderTokenTable() {
-    const el = document.getElementById('token-table');
+  // ---------------------------------------------------------------------------
+  // Calendar heatmap — 90-day GitHub-style contribution grid
+  // ---------------------------------------------------------------------------
+
+  renderTokenCalendar() {
+    var el = document.getElementById('token-calendar');
     if (!el || !this.tokenData) return;
 
-    const { per_instance, totals } = this.tokenData;
-    if (!per_instance || per_instance.length === 0) {
+    var daily = this.tokenData.daily || [];
+    var instances = this.tokenData.instances || {};
+
+    // Build date->cost map for the last 90 days
+    var costByDate = new Map();
+    var tokensByDate = new Map();
+
+    if (this.showSystem) {
+      for (var i = 0; i < daily.length; i++) {
+        var r = daily[i];
+        costByDate.set(r.date, (costByDate.get(r.date) || 0) + (r.cost_usd || 0));
+        var tok = (r.input_tokens || 0) + (r.output_tokens || 0) + (r.cache_read || 0) + (r.cache_write || 0);
+        tokensByDate.set(r.date, (tokensByDate.get(r.date) || 0) + tok);
+      }
+    } else {
+      var instanceIds = Object.keys(instances);
+      for (var j = 0; j < instanceIds.length; j++) {
+        var instDaily = instances[instanceIds[j]]?.daily || [];
+        for (var k = 0; k < instDaily.length; k++) {
+          var ir = instDaily[k];
+          costByDate.set(ir.date, (costByDate.get(ir.date) || 0) + (ir.cost_usd || 0));
+          var itok = (ir.input_tokens || 0) + (ir.output_tokens || 0) + (ir.cache_read || 0) + (ir.cache_write || 0);
+          tokensByDate.set(ir.date, (tokensByDate.get(ir.date) || 0) + itok);
+        }
+      }
+    }
+
+    // Generate last 90 days
+    var today = new Date();
+    today.setHours(0, 0, 0, 0);
+    var days = [];
+    for (var d = 89; d >= 0; d--) {
+      var dt = new Date(today);
+      dt.setDate(dt.getDate() - d);
+      var dateStr = dt.toISOString().slice(0, 10);
+      days.push({
+        date: dateStr,
+        day: dt.getDay(),
+        cost: costByDate.get(dateStr) || 0,
+        tokens: tokensByDate.get(dateStr) || 0,
+        monthDay: dt.getDate(),
+        month: dt.getMonth(),
+        dateObj: dt,
+      });
+    }
+
+    // Compute percentile thresholds for intensity levels
+    var nonZeroCosts = days.filter(function(x) { return x.cost > 0; }).map(function(x) { return x.cost; }).sort(function(a, b) { return a - b; });
+
+    var thresholds = [0, 0, 0, 0];
+    if (nonZeroCosts.length > 0) {
+      thresholds[0] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.01)] || nonZeroCosts[0];
+      thresholds[1] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.25)] || nonZeroCosts[0];
+      thresholds[2] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.50)] || nonZeroCosts[0];
+      thresholds[3] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.75)] || nonZeroCosts[0];
+    }
+
+    var self = this;
+    function getLevel(cost) {
+      if (cost <= 0) return 0;
+      if (cost <= thresholds[1]) return 1;
+      if (cost <= thresholds[2]) return 2;
+      if (cost <= thresholds[3]) return 3;
+      return 4;
+    }
+
+    // Organize into weeks (columns)
+    // Pad the first week to start on Monday (day 1)
+    var weeks = [];
+    var currentWeek = [];
+
+    // Pad first week
+    var firstDay = days[0].day;
+    var mondayOffset = (firstDay + 6) % 7; // convert Sun=0 to Mon=0
+    for (var p = 0; p < mondayOffset; p++) {
+      currentWeek.push(null);
+    }
+
+    for (var di = 0; di < days.length; di++) {
+      var dayItem = days[di];
+      var mondayIdx = (dayItem.day + 6) % 7;
+      if (mondayIdx === 0 && currentWeek.length > 0) {
+        weeks.push(currentWeek);
+        currentWeek = [];
+      }
+      currentWeek.push(dayItem);
+    }
+    if (currentWeek.length > 0) {
+      while (currentWeek.length < 7) currentWeek.push(null);
+      weeks.push(currentWeek);
+    }
+
+    // Month labels
+    var monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    var monthLabels = [];
+    var lastMonth = -1;
+    for (var wi = 0; wi < weeks.length; wi++) {
+      var firstRealDay = null;
+      for (var ci = 0; ci < weeks[wi].length; ci++) {
+        if (weeks[wi][ci]) { firstRealDay = weeks[wi][ci]; break; }
+      }
+      if (firstRealDay && firstRealDay.month !== lastMonth) {
+        monthLabels.push({ weekIdx: wi, label: monthNames[firstRealDay.month] });
+        lastMonth = firstRealDay.month;
+      }
+    }
+
+    // Build month header (positioned above week columns)
+    var monthHeaderHtml = '<div class="calendar-months" style="position: relative; height: 14px; margin-bottom: 4px; padding-left: 28px;">';
+    for (var mi = 0; mi < monthLabels.length; mi++) {
+      var ml = monthLabels[mi];
+      var leftPos = ml.weekIdx * 14; // 12px cell + 2px gap
+      monthHeaderHtml += '<span style="position: absolute; left: ' + leftPos + 'px;">' + ml.label + '</span>';
+    }
+    monthHeaderHtml += '</div>';
+
+    // Day labels
+    var dayLabelsHtml = '<div class="calendar-day-labels">' +
+      '<div class="calendar-day-label">Mon</div>' +
+      '<div class="calendar-day-label"></div>' +
+      '<div class="calendar-day-label">Wed</div>' +
+      '<div class="calendar-day-label"></div>' +
+      '<div class="calendar-day-label">Fri</div>' +
+      '<div class="calendar-day-label"></div>' +
+      '<div class="calendar-day-label"></div>' +
+    '</div>';
+
+    // Build weeks
+    var weeksHtml = weeks.map(function(week) {
+      var cellsHtml = week.map(function(dayData) {
+        if (!dayData) return '<div class="calendar-day" style="visibility: hidden;"></div>';
+        var level = getLevel(dayData.cost);
+        var tooltipText = dayData.date.slice(5) + ': $' + dayData.cost.toFixed(2) + ' (' + self.formatTokens(dayData.tokens) + ' tokens)';
+        return '<div class="calendar-day" data-level="' + level + '">' +
+          '<div class="calendar-tooltip">' + tooltipText + '</div>' +
+        '</div>';
+      }).join('');
+      return '<div class="calendar-week">' + cellsHtml + '</div>';
+    }).join('');
+
+    // Color scale legend
+    var scaleHtml = '<div class="calendar-scale">' +
+      '<span>Less</span>' +
+      '<div class="calendar-scale-cell" style="background: var(--bg-200);"></div>' +
+      '<div class="calendar-scale-cell" style="background: #0c2d48;"></div>' +
+      '<div class="calendar-scale-cell" style="background: #0a4a7a;"></div>' +
+      '<div class="calendar-scale-cell" style="background: #0070f3;"></div>' +
+      '<div class="calendar-scale-cell" style="background: #3291ff;"></div>' +
+      '<span>More</span>' +
+    '</div>';
+
+    el.innerHTML = '<div class="calendar-container">' +
+      '<div class="calendar-header">' +
+        '<span></span>' +
+        scaleHtml +
+      '</div>' +
+      monthHeaderHtml +
+      '<div class="calendar-body">' +
+        dayLabelsHtml +
+        '<div class="calendar-heatmap">' + weeksHtml + '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Token donut chart — cost breakdown by instance
+  // ---------------------------------------------------------------------------
+
+  renderTokenDonut() {
+    var el = document.getElementById('token-pie');
+    if (!el || !this.tokenData) return;
+
+    var instances = this.tokenData.instances || {};
+    var instanceIds = Object.keys(instances).sort();
+    var filteredDaily = this._filterDaily(this.tokenData.daily);
+    var filteredTotals = this._sumRows(filteredDaily);
+
+    if (filteredTotals.cost_usd <= 0) {
+      el.innerHTML = '';
+      return;
+    }
+
+    // Compute per-instance costs
+    var slices = [];
+    var instanceCostSum = 0;
+    for (var i = 0; i < instanceIds.length; i++) {
+      var id = instanceIds[i];
+      var instData = instances[id];
+      var t = this._sumRows(this._filterDaily(instData?.daily));
+      if (t.cost_usd > 0.001) {
+        slices.push({ id: id, cost: t.cost_usd });
+        instanceCostSum += t.cost_usd;
+      }
+    }
+
+    // System slice
+    var systemCost = Math.max(0, filteredTotals.cost_usd - instanceCostSum);
+    if (this.showSystem && systemCost > 0.001) {
+      slices.push({ id: 'system', cost: systemCost });
+    }
+
+    var totalCost = this.showSystem ? filteredTotals.cost_usd : instanceCostSum;
+    if (totalCost <= 0) { el.innerHTML = ''; return; }
+
+    // Sort by cost descending
+    slices.sort(function(a, b) { return b.cost - a.cost; });
+
+    // Build conic-gradient stops
+    var angle = 0;
+    var gradientStops = [];
+    for (var s = 0; s < slices.length; s++) {
+      var slice = slices[s];
+      var pct = (slice.cost / totalCost) * 100;
+      var color = this._instanceColor(slice.id);
+      gradientStops.push(color + ' ' + angle + 'deg ' + (angle + pct * 3.6) + 'deg');
+      slice.pct = pct;
+      angle += pct * 3.6;
+    }
+
+    var gradient = 'conic-gradient(' + gradientStops.join(', ') + ')';
+
+    // Legend with mini bars
+    var self = this;
+    var maxSlicePct = slices.length > 0 ? slices[0].pct : 1;
+    var legendHtml = slices.map(function(sl) {
+      var barWidth = Math.max(2, (sl.pct / maxSlicePct) * 100);
+      return '<div class="donut-legend-item">' +
+        '<span class="donut-legend-swatch" style="background: ' + self._instanceColor(sl.id) + '"></span>' +
+        '<span class="donut-legend-name">' + self.esc(sl.id) + '</span>' +
+        '<span class="donut-legend-value">' + self.formatUsd(sl.cost) + '</span>' +
+        '<span class="donut-legend-pct">' + sl.pct.toFixed(1) + '%</span>' +
+        '<div class="donut-legend-bar-track"><div class="donut-legend-bar-fill" style="width: ' + barWidth + '%; background: ' + self._instanceColor(sl.id) + '"></div></div>' +
+      '</div>';
+    }).join('');
+
+    el.innerHTML = '<div class="section-title">Cost breakdown (' + this.tokenDays + 'd)</div>' +
+      '<div class="donut-container">' +
+        '<div class="donut-ring" style="background: ' + gradient + ';">' +
+          '<div class="donut-hole">' +
+            '<div class="donut-total">' + this.formatUsd(totalCost) + '</div>' +
+            '<div class="donut-total-label">' + this.tokenDays + ' days</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="donut-legend">' + legendHtml + '</div>' +
+      '</div>';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Token table — sortable columns
+  // ---------------------------------------------------------------------------
+
+  renderTokenTable() {
+    var el = document.getElementById('token-table');
+    if (!el || !this.tokenData) return;
+
+    var instances = this.tokenData.instances || {};
+    var instanceIds = Object.keys(instances).sort();
+
+    if (instanceIds.length === 0 && (!this.tokenData.daily || this.tokenData.daily.length === 0)) {
       el.innerHTML = '<div class="empty-state">No usage data for this period</div>';
       return;
     }
 
-    let rows = per_instance.map(row => {
-      const total = (row.input_tokens || 0) + (row.output_tokens || 0) +
-                    (row.cache_read || 0) + (row.cache_write || 0);
-      return `
-        <tr>
-          <td>${this.esc(row.instance_id)}</td>
-          <td class="num">${this.formatNum(row.input_tokens)}</td>
-          <td class="num">${this.formatNum(row.output_tokens)}</td>
-          <td class="num">${this.formatNum(row.cache_read)}</td>
-          <td class="num">${this.formatNum(row.cache_write)}</td>
-          <td class="num">${this.formatNum(total)}</td>
-          <td class="num">${this.formatUsd(row.cost_usd)}</td>
-        </tr>
-      `;
-    }).join('');
+    // Filtered aggregate totals
+    var filteredDaily = this._filterDaily(this.tokenData.daily);
+    var filteredTotals = this._sumRows(filteredDaily);
 
-    // Totals row
-    if (totals) {
-      const grandTotal = (totals.input_tokens || 0) + (totals.output_tokens || 0) +
-                         (totals.cache_read || 0) + (totals.cache_write || 0);
-      rows += `
-        <tr class="total-row">
-          <td>Total</td>
-          <td class="num">${this.formatNum(totals.input_tokens)}</td>
-          <td class="num">${this.formatNum(totals.output_tokens)}</td>
-          <td class="num">${this.formatNum(totals.cache_read)}</td>
-          <td class="num">${this.formatNum(totals.cache_write)}</td>
-          <td class="num">${this.formatNum(grandTotal)}</td>
-          <td class="num">${this.formatUsd(totals.cost_usd)}</td>
-        </tr>
-      `;
+    // Per-instance filtered totals
+    var instanceRows = [];
+    var instanceSumTotals = { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_write: 0, cost_usd: 0, total_tokens: 0 };
+    for (var i = 0; i < instanceIds.length; i++) {
+      var id = instanceIds[i];
+      var instFiltered = this._filterDaily(instances[id]?.daily);
+      var t = this._sumRows(instFiltered);
+      instanceRows.push({ id: id, input_tokens: t.input_tokens, output_tokens: t.output_tokens, cache_read: t.cache_read, cache_write: t.cache_write, cost_usd: t.cost_usd, total_tokens: t.total_tokens });
+      instanceSumTotals.input_tokens += t.input_tokens;
+      instanceSumTotals.output_tokens += t.output_tokens;
+      instanceSumTotals.cache_read += t.cache_read;
+      instanceSumTotals.cache_write += t.cache_write;
+      instanceSumTotals.cost_usd += t.cost_usd;
+      instanceSumTotals.total_tokens += t.total_tokens;
     }
 
-    el.innerHTML = `
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Instance</th>
-            <th class="num">Input</th>
-            <th class="num">Output</th>
-            <th class="num">Cache Read</th>
-            <th class="num">Cache Write</th>
-            <th class="num">Total</th>
-            <th class="num">Cost</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    `;
+    // System row
+    var systemRow = {
+      id: 'system',
+      input_tokens: Math.max(0, filteredTotals.input_tokens - instanceSumTotals.input_tokens),
+      output_tokens: Math.max(0, filteredTotals.output_tokens - instanceSumTotals.output_tokens),
+      cache_read: Math.max(0, filteredTotals.cache_read - instanceSumTotals.cache_read),
+      cache_write: Math.max(0, filteredTotals.cache_write - instanceSumTotals.cache_write),
+      cost_usd: Math.max(0, filteredTotals.cost_usd - instanceSumTotals.cost_usd),
+    };
+    systemRow.total_tokens = systemRow.input_tokens + systemRow.output_tokens + systemRow.cache_read + systemRow.cache_write;
+    var hasSystem = systemRow.cost_usd > 0.001 || systemRow.total_tokens > 0;
+
+    // Sort rows if a column is selected
+    if (this.sortColumn) {
+      var sortCol = this.sortColumn;
+      var sortAsc = this.sortAsc;
+      instanceRows.sort(function(a, b) {
+        var aVal = sortCol === 'id' ? a.id : (a[sortCol] || 0);
+        var bVal = sortCol === 'id' ? b.id : (b[sortCol] || 0);
+        if (sortCol === 'id') {
+          return sortAsc ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+        }
+        return sortAsc ? aVal - bVal : bVal - aVal;
+      });
+    }
+
+    // Display totals
+    var displayTotals = this.showSystem ? filteredTotals : instanceSumTotals;
+
+    var self = this;
+
+    // Build header with sort arrows
+    var columns = [
+      { key: 'id', label: 'Instance', cls: '' },
+      { key: 'input_tokens', label: 'Input', cls: 'num' },
+      { key: 'output_tokens', label: 'Output', cls: 'num' },
+      { key: 'cache_read', label: 'Cache Read', cls: 'num' },
+      { key: 'cache_write', label: 'Cache Write', cls: 'num' },
+      { key: 'total_tokens', label: 'Total', cls: 'num' },
+      { key: 'cost_usd', label: 'Cost', cls: 'num' },
+    ];
+
+    var headerHtml = columns.map(function(col) {
+      var arrow = '';
+      if (self.sortColumn === col.key) {
+        arrow = ' <span class="sort-arrow active">' + (self.sortAsc ? '\u25B2' : '\u25BC') + '</span>';
+      } else {
+        arrow = ' <span class="sort-arrow">\u25B2</span>';
+      }
+      return '<th class="' + col.cls + '" data-sort="' + col.key + '">' + col.label + arrow + '</th>';
+    }).join('');
+
+    // Build rows
+    var rowsHtml = instanceRows.map(function(row) {
+      return '<tr>' +
+        '<td><span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ' + self._instanceColor(row.id) + '; margin-right: 6px; vertical-align: middle;"></span>' + self.esc(row.id) + '</td>' +
+        '<td class="num">' + self.formatNum(row.input_tokens) + '</td>' +
+        '<td class="num">' + self.formatNum(row.output_tokens) + '</td>' +
+        '<td class="num">' + self.formatNum(row.cache_read) + '</td>' +
+        '<td class="num">' + self.formatNum(row.cache_write) + '</td>' +
+        '<td class="num">' + self.formatNum(row.total_tokens) + '</td>' +
+        '<td class="num">' + self.formatUsd(row.cost_usd) + '</td>' +
+      '</tr>';
+    }).join('');
+
+    // System row
+    if (hasSystem && this.showSystem) {
+      rowsHtml += '<tr style="color: var(--text-muted); font-style: italic;">' +
+        '<td><span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ' + this._instanceColor('system') + '; margin-right: 6px; vertical-align: middle;"></span>system</td>' +
+        '<td class="num">' + this.formatNum(systemRow.input_tokens) + '</td>' +
+        '<td class="num">' + this.formatNum(systemRow.output_tokens) + '</td>' +
+        '<td class="num">' + this.formatNum(systemRow.cache_read) + '</td>' +
+        '<td class="num">' + this.formatNum(systemRow.cache_write) + '</td>' +
+        '<td class="num">' + this.formatNum(systemRow.total_tokens) + '</td>' +
+        '<td class="num">' + this.formatUsd(systemRow.cost_usd) + '</td>' +
+      '</tr>';
+    }
+
+    // Totals row
+    rowsHtml += '<tr class="total-row">' +
+      '<td>Total</td>' +
+      '<td class="num">' + this.formatNum(displayTotals.input_tokens) + '</td>' +
+      '<td class="num">' + this.formatNum(displayTotals.output_tokens) + '</td>' +
+      '<td class="num">' + this.formatNum(displayTotals.cache_read) + '</td>' +
+      '<td class="num">' + this.formatNum(displayTotals.cache_write) + '</td>' +
+      '<td class="num">' + this.formatNum(displayTotals.total_tokens) + '</td>' +
+      '<td class="num">' + this.formatUsd(displayTotals.cost_usd) + '</td>' +
+    '</tr>';
+
+    el.innerHTML = '<div class="section-title">Token breakdown (' + this.tokenDays + 'd)</div>' +
+      '<table class="data-table">' +
+        '<thead><tr>' + headerHtml + '</tr></thead>' +
+        '<tbody>' + rowsHtml + '</tbody>' +
+      '</table>';
+
+    // Bind sort clicks
+    var ths = el.querySelectorAll('th[data-sort]');
+    for (var si = 0; si < ths.length; si++) {
+      ths[si].addEventListener('click', function(e) {
+        var col = e.currentTarget.dataset.sort;
+        if (self.sortColumn === col) {
+          self.sortAsc = !self.sortAsc;
+        } else {
+          self.sortColumn = col;
+          self.sortAsc = col === 'id' ? true : false; // default descending for numbers
+        }
+        self.renderTokenTable();
+      });
+    }
   }
 
+  // ---------------------------------------------------------------------------
+  // Schedule tab — calendar view + task list
+  // ---------------------------------------------------------------------------
+
+  renderSchedule() {
+    this.renderScheduleCalendar();
+    this.renderScheduleTable();
+  }
+
+  renderScheduleCalendar() {
+    var el = document.getElementById('schedule-calendar');
+    if (!el) return;
+    if (!this.scheduleData) {
+      el.innerHTML = this.renderSkeleton(5);
+      return;
+    }
+
+    var month = this.scheduleMonth;
+    var year = month.getFullYear();
+    var m = month.getMonth();
+    var monthName = month.toLocaleString('en', { month: 'long', year: 'numeric' });
+
+    // Build map of date → tasks
+    var tasksByDate = {};
+    var tasks = this.scheduleData.tasks || [];
+    var upcoming = this.scheduleData.upcoming || [];
+
+    // Map upcoming scheduled events to dates
+    upcoming.forEach(function(t) {
+      if (!t.date) return;
+      if (!tasksByDate[t.date]) tasksByDate[t.date] = [];
+      tasksByDate[t.date].push(t);
+    });
+
+    // Also map pending one-time tasks by their next_run date
+    tasks.forEach(function(t) {
+      if (t.status !== 'pending' || !t.next_run_human) return;
+      var date = t.next_run_human.slice(0, 10);
+      if (!tasksByDate[date]) tasksByDate[date] = [];
+      // Avoid duplicates
+      var exists = tasksByDate[date].some(function(x) { return x.name === t.name; });
+      if (!exists) {
+        tasksByDate[date].push({
+          date: date,
+          time: t.next_run_human.slice(11, 16),
+          name: t.name,
+          type: t.type,
+          priority: t.priority,
+          target_instance: t.target_instance,
+        });
+      }
+    });
+
+    // Calendar grid
+    var firstDay = new Date(year, m, 1).getDay(); // 0=Sun
+    var daysInMonth = new Date(year, m + 1, 0).getDate();
+    var today = new Date().toISOString().slice(0, 10);
+
+    var dayHeaders = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    var headerHtml = dayHeaders.map(function(d) {
+      return '<div class="cal-header">' + d + '</div>';
+    }).join('');
+
+    var cellsHtml = '';
+    // Empty cells before first day
+    for (var i = 0; i < firstDay; i++) {
+      cellsHtml += '<div class="cal-cell cal-empty"></div>';
+    }
+
+    var self = this;
+    for (var d = 1; d <= daysInMonth; d++) {
+      var dateStr = year + '-' + String(m + 1).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+      var dayTasks = tasksByDate[dateStr] || [];
+      var isToday = dateStr === today;
+      var hasRecurring = dayTasks.some(function(t) { return t.type === 'recurring' || t.type === 'interval'; });
+      var hasOneTime = dayTasks.some(function(t) { return t.type === 'one-time'; });
+
+      var dotHtml = '';
+      if (hasRecurring) dotHtml += '<span class="cal-dot cal-dot-recurring"></span>';
+      if (hasOneTime) dotHtml += '<span class="cal-dot cal-dot-onetime"></span>';
+
+      var tooltipLines = dayTasks.map(function(t) {
+        return t.time + ' ' + self.esc(t.name) + (t.target_instance ? ' [' + t.target_instance + ']' : '');
+      });
+      var tooltip = tooltipLines.join('&#10;');
+
+      cellsHtml += '<div class="cal-cell' + (isToday ? ' cal-today' : '') + (dayTasks.length ? ' cal-has-tasks' : '') + '"'
+        + (tooltip ? ' title="' + tooltip + '"' : '') + '>'
+        + '<span class="cal-day-num">' + d + '</span>'
+        + (dotHtml ? '<div class="cal-dots">' + dotHtml + '</div>' : '')
+        + '</div>';
+    }
+
+    el.innerHTML = '<div class="schedule-calendar-wrap">'
+      + '<div class="cal-nav">'
+      + '<button class="btn cal-prev" data-cal-nav="prev">&larr;</button>'
+      + '<span class="cal-month">' + monthName + '</span>'
+      + '<button class="btn cal-next" data-cal-nav="next">&rarr;</button>'
+      + '</div>'
+      + '<div class="cal-grid">' + headerHtml + cellsHtml + '</div>'
+      + '<div class="cal-legend">'
+      + '<span class="cal-legend-item"><span class="cal-dot cal-dot-recurring"></span> Recurring</span>'
+      + '<span class="cal-legend-item"><span class="cal-dot cal-dot-onetime"></span> One-time</span>'
+      + '</div>'
+      + '</div>';
+
+    // Bind nav buttons
+    el.querySelectorAll('[data-cal-nav]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var dir = btn.dataset.calNav === 'prev' ? -1 : 1;
+        self.scheduleMonth = new Date(year, m + dir, 1);
+        self.renderScheduleCalendar();
+      });
+    });
+  }
+
+  renderScheduleTable() {
+    var el = document.getElementById('schedule-table');
+    if (!el) return;
+    if (!this.scheduleData) {
+      el.innerHTML = this.renderSkeleton(4);
+      return;
+    }
+
+    var tasks = this.scheduleData.tasks || [];
+    // Show pending + recent completed (last 10)
+    var pending = tasks.filter(function(t) { return t.status === 'pending'; });
+    var completed = tasks.filter(function(t) { return t.status === 'completed'; }).slice(-10).reverse();
+    var display = pending.concat(completed);
+
+    if (!display.length) {
+      el.innerHTML = '<div class="empty-state">No scheduled tasks</div>';
+      return;
+    }
+
+    var self = this;
+    var rows = display.map(function(t) {
+      var statusClass = t.status === 'pending' ? 'sched-pending' : 'sched-completed';
+      var typeLabel = t.type === 'recurring' ? t.cron_expression || 'cron'
+        : t.type === 'interval' ? self.formatInterval(t.interval_seconds)
+        : 'one-time';
+      var nextRun = t.next_run_human ? self.formatDateTime(t.next_run_human) : '-';
+      var target = t.target_instance || 'admin';
+
+      return '<tr>'
+        + '<td><span class="sched-status ' + statusClass + '">' + t.status + '</span></td>'
+        + '<td>' + self.esc(t.name) + '</td>'
+        + '<td class="mono">' + self.esc(typeLabel) + '</td>'
+        + '<td class="mono">' + nextRun + '</td>'
+        + '<td>' + self.esc(target) + '</td>'
+        + '<td>P' + (t.priority || 3) + '</td>'
+        + '</tr>';
+    }).join('');
+
+    el.innerHTML = '<table class="data-table">'
+      + '<thead><tr>'
+      + '<th>Status</th><th>Name</th><th>Schedule</th><th>Next Run</th><th>Target</th><th>Pri</th>'
+      + '</tr></thead>'
+      + '<tbody>' + rows + '</tbody>'
+      + '</table>';
+  }
+
+  formatInterval(seconds) {
+    if (!seconds) return '-';
+    if (seconds >= 3600) return Math.floor(seconds / 3600) + 'h';
+    return Math.floor(seconds / 60) + 'm';
+  }
+
+  formatDateTime(isoStr) {
+    if (!isoStr) return '-';
+    var d = new Date(isoStr);
+    var month = String(d.getMonth() + 1).padStart(2, '0');
+    var day = String(d.getDate()).padStart(2, '0');
+    var h = String(d.getHours()).padStart(2, '0');
+    var min = String(d.getMinutes()).padStart(2, '0');
+    return month + '-' + day + ' ' + h + ':' + min;
+  }
+
+  // ---------------------------------------------------------------------------
+  // PM2 Processes tab
+  // ---------------------------------------------------------------------------
+
   renderPm2() {
-    const tableEl = document.getElementById('pm2-table');
-    const countBadge = document.getElementById('pm2-count');
+    var tableEl = document.getElementById('pm2-table');
     if (!tableEl) return;
 
-    const processes = this.data.pm2_processes || [];
-    if (countBadge) countBadge.textContent = processes.length;
+    var processes = this.data.pm2_processes || [];
 
     if (processes.length === 0) {
       tableEl.innerHTML = '<div class="empty-state">No PM2 processes</div>';
       return;
     }
 
-    const rows = processes.map(proc => {
-      const statusClass = `pm2-${proc.status}`;
-      return `
-        <tr>
-          <td>${this.esc(proc.name)}</td>
-          <td><span class="${statusClass}">${proc.status}</span></td>
-          <td>${proc.uptime_ms ? this.formatDuration(proc.uptime_ms) : '-'}</td>
-          <td class="num">${proc.restarts}</td>
-          <td class="num">${this.formatBytes(proc.memory)}</td>
-          <td class="num">${proc.cpu}%</td>
-        </tr>
-      `;
+    var self = this;
+    var rows = processes.map(function(proc) {
+      var statusClass = 'pm2-' + proc.status;
+      return '<tr>' +
+        '<td>' + self.esc(proc.name) + '</td>' +
+        '<td><span class="' + statusClass + '">' + proc.status + '</span></td>' +
+        '<td>' + (proc.uptime_ms ? self.formatDuration(proc.uptime_ms) : '-') + '</td>' +
+        '<td class="num">' + proc.restarts + '</td>' +
+        '<td class="num">' + self.formatBytes(proc.memory) + '</td>' +
+        '<td class="num">' + proc.cpu + '%</td>' +
+      '</tr>';
     }).join('');
 
-    tableEl.innerHTML = `
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Status</th>
-            <th>Uptime</th>
-            <th class="num">Restarts</th>
-            <th class="num">Memory</th>
-            <th class="num">CPU</th>
-          </tr>
-        </thead>
-        <tbody>${rows}</tbody>
-      </table>
-    `;
+    tableEl.innerHTML = '<table class="data-table">' +
+      '<thead><tr>' +
+        '<th>Name</th>' +
+        '<th>Status</th>' +
+        '<th>Uptime</th>' +
+        '<th class="num">Restarts</th>' +
+        '<th class="num">Memory</th>' +
+        '<th class="num">CPU</th>' +
+      '</tr></thead>' +
+      '<tbody>' + rows + '</tbody>' +
+    '</table>';
   }
 
   // ---------------------------------------------------------------------------
@@ -513,7 +1259,7 @@ class Dashboard {
   formatTime(isoStr) {
     if (!isoStr) return '-';
     try {
-      const d = new Date(isoStr);
+      var d = new Date(isoStr);
       return d.toLocaleString();
     } catch {
       return isoStr;
@@ -522,31 +1268,31 @@ class Dashboard {
 
   formatDuration(ms) {
     if (!ms || ms < 0) return '-';
-    const secs = Math.floor(ms / 1000);
-    if (secs < 60) return `${secs}s`;
-    const mins = Math.floor(secs / 60);
-    if (mins < 60) return `${mins}m ${secs % 60}s`;
-    const hours = Math.floor(mins / 60);
-    if (hours < 24) return `${hours}h ${mins % 60}m`;
-    const days = Math.floor(hours / 24);
-    return `${days}d ${hours % 24}h`;
+    var secs = Math.floor(ms / 1000);
+    if (secs < 60) return secs + 's';
+    var mins = Math.floor(secs / 60);
+    if (mins < 60) return mins + 'm ' + (secs % 60) + 's';
+    var hours = Math.floor(mins / 60);
+    if (hours < 24) return hours + 'h ' + (mins % 60) + 'm';
+    var days = Math.floor(hours / 24);
+    return days + 'd ' + (hours % 24) + 'h';
   }
 
   formatHours(h) {
     if (!h) return '-';
-    if (h < 1) return `${Math.round(h * 60)}m`;
-    if (h < 24) return `${h.toFixed(1)}h`;
-    const days = Math.floor(h / 24);
-    const rem = (h % 24).toFixed(0);
-    return `${days}d ${rem}h`;
+    if (h < 1) return Math.round(h * 60) + 'm';
+    if (h < 24) return h.toFixed(1) + 'h';
+    var days = Math.floor(h / 24);
+    var rem = (h % 24).toFixed(0);
+    return days + 'd ' + rem + 'h';
   }
 
   formatBytes(bytes) {
     if (!bytes) return '0 B';
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB';
   }
 
   formatNum(n) {
@@ -556,8 +1302,9 @@ class Dashboard {
 
   formatTokens(n) {
     if (!n) return '0';
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    if (n >= 1000000000) return (n / 1000000000).toFixed(1) + 'B';
+    if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+    if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
     return String(n);
   }
 
@@ -568,13 +1315,13 @@ class Dashboard {
 
   esc(str) {
     if (!str) return '';
-    const div = document.createElement('div');
+    var div = document.createElement('div');
     div.textContent = String(str);
     return div.innerHTML;
   }
 }
 
 // Initialize on DOM ready
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', function() {
   new Dashboard();
 });

@@ -344,6 +344,105 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
     }
   });
 
+  // -------------------------------------------------------------------
+  // Scheduler: task list + calendar data
+  // -------------------------------------------------------------------
+
+  app.get('/api/dashboard/scheduler', (req, res) => {
+    const DB_PATH = path.join(zylosDir, 'scheduler', 'scheduler.db');
+    if (!fs.existsSync(DB_PATH)) {
+      return res.json({ tasks: [], calendar: [] });
+    }
+    try {
+      const db = new Database(DB_PATH, { readonly: true });
+      try {
+        const tasks = db.prepare(`
+          SELECT id, name, type, status, priority, cron_expression, interval_seconds,
+                 next_run_at, last_run_at, target_instance, created_at, updated_at,
+                 substr(prompt, 1, 120) as prompt_preview
+          FROM tasks
+          ORDER BY next_run_at ASC
+        `).all();
+
+        // Build calendar data: group completed tasks by day for the last 90 days
+        const ninetyDaysAgo = Math.floor(Date.now() / 1000) - 90 * 86400;
+        const calendarRows = db.prepare(`
+          SELECT date(updated_at, 'unixepoch') as date,
+                 COUNT(*) as count,
+                 GROUP_CONCAT(name, ', ') as names
+          FROM tasks
+          WHERE status = 'completed' AND updated_at > ?
+          GROUP BY date(updated_at, 'unixepoch')
+          ORDER BY date ASC
+        `).all(ninetyDaysAgo);
+
+        // Upcoming tasks (next 30 days)
+        const thirtyDaysAhead = Math.floor(Date.now() / 1000) + 30 * 86400;
+        const upcoming = tasks.filter(t =>
+          t.status === 'pending' && t.next_run_at && t.next_run_at <= thirtyDaysAhead
+        );
+
+        // Build month calendar data for upcoming recurring tasks
+        const monthCalendar = [];
+        for (const task of tasks) {
+          if (task.status !== 'pending') continue;
+          if (task.type === 'one-time' && task.next_run_at) {
+            monthCalendar.push({
+              date: new Date(task.next_run_at * 1000).toISOString().slice(0, 10),
+              time: new Date(task.next_run_at * 1000).toISOString().slice(11, 16),
+              name: task.name,
+              type: task.type,
+              priority: task.priority,
+              target_instance: task.target_instance,
+            });
+          } else if (task.type === 'recurring' && task.cron_expression) {
+            // For recurring, show next 30 occurrences
+            const nextRun = task.next_run_at;
+            if (nextRun) {
+              monthCalendar.push({
+                date: new Date(nextRun * 1000).toISOString().slice(0, 10),
+                time: new Date(nextRun * 1000).toISOString().slice(11, 16),
+                name: task.name,
+                type: task.type,
+                cron: task.cron_expression,
+                priority: task.priority,
+                target_instance: task.target_instance,
+              });
+            }
+          } else if (task.type === 'interval' && task.interval_seconds) {
+            // Show next occurrence
+            const nextRun = task.next_run_at;
+            if (nextRun) {
+              monthCalendar.push({
+                date: new Date(nextRun * 1000).toISOString().slice(0, 10),
+                time: new Date(nextRun * 1000).toISOString().slice(11, 16),
+                name: task.name,
+                type: task.type,
+                interval: task.interval_seconds,
+                priority: task.priority,
+                target_instance: task.target_instance,
+              });
+            }
+          }
+        }
+
+        res.json({
+          tasks: tasks.map(t => ({
+            ...t,
+            next_run_human: t.next_run_at ? new Date(t.next_run_at * 1000).toISOString() : null,
+            last_run_human: t.last_run_at ? new Date(t.last_run_at * 1000).toISOString() : null,
+          })),
+          history: calendarRows,
+          upcoming: monthCalendar,
+        });
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ----- Dashboard static files -----
   app.use('/dashboard', express.static(path.join(skillRoot, 'public', 'dashboard')));
 }
