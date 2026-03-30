@@ -340,7 +340,7 @@ export function multiSessionDispatch(item, helpers) {
  */
 export async function processWithMultiSession(helpers) {
   const {
-    getClaudeState,
+    getAgentState,
     isStatusFresh,
     sendToTmux,
     claimNextItem,
@@ -368,7 +368,7 @@ export async function processWithMultiSession(helpers) {
 
   // Compute online instance IDs.  Returns null in legacy mode — callers
   // should NOT invoke this function in legacy mode, but we handle it gracefully.
-  const onlineIds = getOnlineInstanceIds(getClaudeState);
+  const onlineIds = getOnlineInstanceIds(getAgentState);
   if (onlineIds === null) {
     // Fallback: caller should use the single-session processNextMessage instead.
     return { delivered: false, state: 'unknown' };
@@ -381,7 +381,7 @@ export async function processWithMultiSession(helpers) {
       return { delivered: false, state: 'idle' };
     }
 
-    const decision = multiSessionDispatch(item, { getClaudeState, isStatusFresh, isBypassState });
+    const decision = multiSessionDispatch(item, { getClaudeState: getAgentState, isStatusFresh, isBypassState });
 
     // ── reject ──
     if (decision.action === 'reject') {

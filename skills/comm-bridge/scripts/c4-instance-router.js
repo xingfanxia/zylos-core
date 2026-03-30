@@ -323,7 +323,8 @@ export function isEndpointRouted(chatId, endpointId) {
  * Detect whether an endpoint represents a group chat.
  *
  * Heuristics:
- *  - Feishu/Lark: chat_id starts with 'oc_' or endpoint contains '|type:group'
+ *  - Feishu/Lark: endpoint contains '|type:group' (oc_ prefix is NOT reliable —
+ *    Feishu uses oc_ for both group and p2p DM chats)
  *  - Telegram: negative numeric chat_id indicates group/supergroup
  *
  * @param {string} chatId - The chat ID (part before first "|")
@@ -331,8 +332,7 @@ export function isEndpointRouted(chatId, endpointId) {
  * @returns {boolean}
  */
 export function isGroupEndpoint(chatId, endpointId) {
-  // Feishu: chat_id starts with 'oc_' or endpoint contains '|type:group'
-  if (chatId.startsWith('oc_')) return true;
+  // Feishu: only |type:group is reliable (oc_ prefix used for both groups and DMs)
   if (endpointId.includes('|type:group')) return true;
   // Telegram: negative numeric chat_id = group/supergroup
   const num = Number(chatId);

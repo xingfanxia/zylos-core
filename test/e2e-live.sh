@@ -279,8 +279,9 @@ section "Test 5: Live delivery (requires running CC)"
 
 if [ "$SKIP_LIVE" = "true" ]; then
   record_skip "Skipped via --skip-live flag"
-elif ! tmux has-session -t claude-main 2>/dev/null; then
-  record_skip "claude-main tmux session not running"
+# Determine admin session name from instances.json
+elif ! ADMIN_SESSION=$(python3 -c "import json; d=json.load(open('$ZYLOS_DIR/instances.json')); print(d['instances']['admin']['tmux_session'])" 2>/dev/null) || ! tmux has-session -t "$ADMIN_SESSION" 2>/dev/null; then
+  record_skip "Admin tmux session not running (looked for ${ADMIN_SESSION:-claude-main})"
 else
   T5_CONTENT="E2E live delivery test $(date +%s) - please respond with 'ACK'"
 

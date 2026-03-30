@@ -187,8 +187,9 @@ function getAllUnsummarizedConversations(db) {
 // -- Routing helpers (replicate production logic from c4-instance-router.js) -
 
 function isGroupEndpoint(chatId, endpointId) {
-  if (chatId.startsWith('oc_')) return true;
+  // Feishu: only |type:group is reliable (oc_ prefix used for both groups and DMs)
   if (endpointId.includes('|type:group')) return true;
+  // Telegram: negative numeric chat_id = group/supergroup
   const num = Number(chatId);
   if (!isNaN(num) && num < 0) return true;
   return false;
@@ -975,8 +976,8 @@ describe('Edge cases: routing detection', () => {
     instanceConfig = makeTestInstanceConfig();
   });
 
-  it('Feishu oc_ prefix detects group', () => {
-    expect(isGroupEndpoint('oc_abc123', 'oc_abc123|msg:om_xyz')).toBe(true);
+  it('Feishu oc_ prefix alone does NOT detect group (used for DMs too)', () => {
+    expect(isGroupEndpoint('oc_abc123', 'oc_abc123|msg:om_xyz')).toBe(false);
   });
 
   it('Feishu |type:group suffix detects group', () => {

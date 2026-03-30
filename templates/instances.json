@@ -4,7 +4,7 @@
   "scheduler_instance": "scheduler",
   "instances": {
     "admin": {
-      "tmux_session": "claude-admin",
+      "tmux_session": "claude-main",
       "runtime": "claude",
       "enabled": true,
       "type": "dedicated",

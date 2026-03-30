@@ -292,8 +292,7 @@ describe('Group chat routing (c4-instance-router logic)', () => {
   // ── isGroupEndpoint replica ─────────────────────────────────────
 
   function isGroupEndpoint(chatId, endpointId) {
-    // Feishu: chat_id starts with 'oc_' or endpoint contains '|type:group'
-    if (chatId.startsWith('oc_')) return true;
+    // Feishu: only |type:group is reliable (oc_ prefix used for both groups and DMs)
     if (endpointId.includes('|type:group')) return true;
     // Telegram: negative numeric chat_id = group/supergroup
     const num = Number(chatId);
@@ -328,8 +327,8 @@ describe('Group chat routing (c4-instance-router logic)', () => {
 
   // ── isGroupEndpoint tests ──────────────────────────────────────
 
-  it('isGroupEndpoint() detects Feishu groups (oc_ prefix)', () => {
-    expect(isGroupEndpoint('oc_abc123', 'oc_abc123|feishu')).toBe(true);
+  it('isGroupEndpoint() does NOT detect oc_ prefix alone as group (Feishu uses oc_ for DMs too)', () => {
+    expect(isGroupEndpoint('oc_abc123', 'oc_abc123|type:p2p')).toBe(false);
   });
 
   it('isGroupEndpoint() detects Feishu groups (|type:group in endpoint)', () => {
@@ -344,8 +343,8 @@ describe('Group chat routing (c4-instance-router logic)', () => {
     expect(isGroupEndpoint('123456789', '123456789|telegram')).toBe(false);
   });
 
-  it('isGroupEndpoint() returns false for non-oc_ Feishu DM ID', () => {
-    expect(isGroupEndpoint('ou_abc123', 'ou_abc123|feishu')).toBe(false);
+  it('isGroupEndpoint() returns false for Feishu DM (oc_ prefix with type:p2p)', () => {
+    expect(isGroupEndpoint('oc_abc123', 'oc_abc123|type:p2p|msg:om_xyz')).toBe(false);
   });
 
   it('isGroupEndpoint() returns false for alphanumeric non-group IDs', () => {
@@ -369,7 +368,7 @@ describe('Group chat routing (c4-instance-router logic)', () => {
     expect(result1).toBe('group-handler');
 
     // Feishu group
-    const result2 = resolveInstance('oc_feishu123|feishu', config);
+    const result2 = resolveInstance('oc_feishu123|type:group|msg:om_xyz', config);
     expect(result2).toBe('group-handler');
   });
 
