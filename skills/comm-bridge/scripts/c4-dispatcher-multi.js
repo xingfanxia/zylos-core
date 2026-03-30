@@ -357,6 +357,8 @@ export async function processWithMultiSession(helpers) {
     nowSeconds,
     markRejected,
     markControlRejected,
+    getNextPendingForInstances,
+    getNextPendingControlForInstances,
     confirmDelivery,
     readPreDeliveryTimestamp,
   } = helpers;
@@ -376,7 +378,7 @@ export async function processWithMultiSession(helpers) {
 
   // Skip-loop: try up to MAX_SKIP_ATTEMPTS items.
   for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
-    const item = claimNextItem(onlineIds);
+    const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
     if (!item) {
       return { delivered: false, state: 'idle' };
     }
