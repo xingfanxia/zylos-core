@@ -71,6 +71,13 @@ function main() {
     section('REFERENCES', resolveSharedFile('references.md'))
   ];
 
+  // Shared context digest (cross-instance awareness)
+  const digestPath = resolveSharedFile('recent-activity.md');
+  const digestResult = readFileSafe(digestPath);
+  if (digestResult.ok && digestResult.content.trim()) {
+    parts.push(section('CROSS-INSTANCE CONTEXT', digestPath));
+  }
+
   // Per-instance CLAUDE.md injection (multi-session)
   if (INSTANCE_ID) {
     const instanceClaudeMd = path.join(

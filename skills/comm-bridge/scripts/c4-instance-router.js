@@ -11,6 +11,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { getAllInstances } from '../../multi-session/instance-config.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -102,6 +103,13 @@ export function resolveInstance(endpointId) {
   if (endpointId && config.routing) {
     // Extract chat_id: the part before the first "|"
     const chatId = String(endpointId).split('|')[0];
+
+    // Detect group chats and route to group instance
+    const isGroup = isGroupEndpoint(chatId, endpointId);
+    if (isGroup) {
+      const groupInstance = getGroupInstance();
+      if (groupInstance) return groupInstance.id;
+    }
 
     if (chatId && config.routing[chatId]) {
       return config.routing[chatId];
@@ -305,5 +313,41 @@ export function isEndpointRouted(chatId, endpointId) {
   }
 
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Group chat routing helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect whether an endpoint represents a group chat.
+ *
+ * Heuristics:
+ *  - Feishu/Lark: chat_id starts with 'oc_' or endpoint contains '|type:group'
+ *  - Telegram: negative numeric chat_id indicates group/supergroup
+ *
+ * @param {string} chatId - The chat ID (part before first "|")
+ * @param {string} endpointId - The full endpoint identifier
+ * @returns {boolean}
+ */
+export function isGroupEndpoint(chatId, endpointId) {
+  // Feishu: chat_id starts with 'oc_' or endpoint contains '|type:group'
+  if (chatId.startsWith('oc_')) return true;
+  if (endpointId.includes('|type:group')) return true;
+  // Telegram: negative numeric chat_id = group/supergroup
+  const num = Number(chatId);
+  if (!isNaN(num) && num < 0) return true;
+  return false;
+}
+
+/**
+ * Find the first instance with type === 'group'.
+ * Uses getAllInstances() from instance-config.js.
+ *
+ * @returns {{ id: string } & object | null}
+ */
+function getGroupInstance() {
+  const instances = getAllInstances();
+  return instances.find(inst => inst.type === 'group') || null;
 }
 
