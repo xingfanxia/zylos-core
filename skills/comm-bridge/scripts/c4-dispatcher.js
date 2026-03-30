@@ -152,14 +152,20 @@ function isAgentConfirmedActive() {
  * Returns the timestamp (number) or null if the file doesn't exist / is unreadable.
  */
 function readPreDeliveryTimestamp(statusFile = AGENT_STATUS_FILE) {
-  const apiActivityFile = path.join(path.dirname(statusFile), 'api-activity.json');
-  try {
-    if (!existsSync(apiActivityFile)) return null;
-    const data = JSON.parse(readFileSync(apiActivityFile, 'utf8'));
-    return data.last_user_activity ?? null;
-  } catch {
-    return null;
+  // Try instance-specific path first, then legacy path.
+  // CC's hook writes to the legacy path (doesn't have ZYLOS_INSTANCE_ID),
+  // so the instance path may not have last_user_activity.
+  const instanceDir = path.dirname(statusFile);
+  const legacyDir = path.join(instanceDir, '..');
+  for (const dir of [instanceDir, legacyDir]) {
+    try {
+      const f = path.join(dir, 'api-activity.json');
+      if (!existsSync(f)) continue;
+      const data = JSON.parse(readFileSync(f, 'utf8'));
+      if (data.last_user_activity != null) return data.last_user_activity;
+    } catch { /* try next */ }
   }
+  return null;
 }
 
 /**
@@ -170,24 +176,31 @@ function readPreDeliveryTimestamp(statusFile = AGENT_STATUS_FILE) {
  * If api-activity.json doesn't exist (hook not installed), returns confirmed (fail-open).
  */
 async function confirmDelivery(preDeliveryTimestamp, statusFile = AGENT_STATUS_FILE) {
-  const apiActivityFile = path.join(path.dirname(statusFile), 'api-activity.json');
-
   // Fail-open: if there's no baseline timestamp (file didn't exist pre-delivery),
   // skip confirmation — the hook isn't installed.
   if (preDeliveryTimestamp === null) {
     return { confirmed: true };
   }
 
+  // Check both instance-specific and legacy paths (CC hook writes to legacy)
+  const instanceDir = path.dirname(statusFile);
+  const legacyDir = path.join(instanceDir, '..');
+  const candidates = [
+    path.join(instanceDir, 'api-activity.json'),
+    path.join(legacyDir, 'api-activity.json'),
+  ];
+
   const deadline = Date.now() + DELIVERY_CONFIRM_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    try {
-      const data = JSON.parse(readFileSync(apiActivityFile, 'utf8'));
-      // Check if a new UserPromptSubmit event happened after our delivery
-      if (data.last_user_activity && data.last_user_activity > preDeliveryTimestamp) {
-        return { confirmed: true };
-      }
-    } catch { /* file may not exist yet */ }
+    for (const f of candidates) {
+      try {
+        const data = JSON.parse(readFileSync(f, 'utf8'));
+        if (data.last_user_activity && data.last_user_activity > preDeliveryTimestamp) {
+          return { confirmed: true };
+        }
+      } catch { /* try next */ }
+    }
     await sleep(DELIVERY_CONFIRM_POLL_MS);
   }
 

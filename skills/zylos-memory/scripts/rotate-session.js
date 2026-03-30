@@ -71,4 +71,4 @@ function main() {
   console.log(`Created fresh current.md for ${today}`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) main();
