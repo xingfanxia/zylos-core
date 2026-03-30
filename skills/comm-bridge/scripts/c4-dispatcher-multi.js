@@ -13,7 +13,8 @@
  * ESM-only, Node 20+.
  */
 
-import { writeFileSync, mkdirSync } from 'fs';
+import { writeFileSync, mkdirSync, existsSync } from 'fs';
+import { execFileSync } from 'child_process';
 import path from 'path';
 import os from 'os';
 
@@ -60,6 +61,87 @@ export function writeWakeSignal(instanceId, zylosDir) {
   } catch (err) {
     // Best-effort — log but do not throw.
     console.error(`[dispatcher-multi] Failed to write wake-signal for ${instanceId}: ${err.message}`);
+  }
+}
+
+// ── Auto-start / auto-stop for non-primary instances ──────────────────
+
+/** Tracks last delivery time per instance for idle reaping. */
+const lastDeliveryAt = new Map();
+
+/** Default idle timeout before auto-stopping a non-primary instance (30 min). */
+const IDLE_REAP_TIMEOUT_MS = 30 * 60 * 1000;
+
+/**
+ * Start a tmux session for an offline non-primary instance so it can
+ * receive messages.  Uses the instance's configured runtime (claude/codex)
+ * or defaults to claude.
+ *
+ * @param {object} instDef - Instance definition from instances.json.
+ * @param {string} instDef.id
+ * @param {string} instDef.tmux_session
+ * @returns {boolean} true if session was started.
+ */
+export function autoStartInstance(instDef) {
+  const session = instDef.tmux_session;
+  if (!session) return false;
+
+  try {
+    // Check if session already exists
+    execFileSync('tmux', ['has-session', '-t', session], { stdio: 'pipe', timeout: 3000 });
+    return true; // already running
+  } catch {
+    // Session doesn't exist — create it
+  }
+
+  try {
+    const runtime = instDef.runtime || 'claude';
+    const cmd = runtime === 'codex' ? 'codex' : 'claude';
+    execFileSync('tmux', [
+      'new-session', '-d', '-s', session, '-x', '220', '-y', '50',
+      cmd,
+    ], { stdio: 'pipe', timeout: 10000 });
+    console.log(`[dispatcher-multi] Auto-started session '${session}' for instance '${instDef.id}'`);
+    lastDeliveryAt.set(instDef.id, Date.now());
+    return true;
+  } catch (err) {
+    console.error(`[dispatcher-multi] Failed to auto-start '${session}': ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Stop the tmux session for an idle non-primary instance.
+ *
+ * @param {string} instanceId
+ * @param {string} session - tmux session name
+ */
+export function autoStopInstance(instanceId, session) {
+  try {
+    execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'pipe', timeout: 5000 });
+    lastDeliveryAt.delete(instanceId);
+    console.log(`[dispatcher-multi] Auto-stopped idle session '${session}' (instance '${instanceId}')`);
+  } catch {
+    // Session may already be dead — ignore.
+  }
+}
+
+/**
+ * Reap non-primary instances that haven't received a message in IDLE_REAP_TIMEOUT_MS.
+ * Called once per dispatch cycle.
+ */
+export function reapIdleInstances() {
+  const now = Date.now();
+  for (const [instanceId, lastTs] of lastDeliveryAt) {
+    if (now - lastTs < IDLE_REAP_TIMEOUT_MS) continue;
+
+    const def = getInstanceDef(instanceId);
+    if (!def || def.primary) continue; // never reap primary
+
+    const session = def.tmux_session;
+    if (!session) continue;
+
+    autoStopInstance(instanceId, session);
   }
 }
 
@@ -189,8 +271,16 @@ export function multiSessionDispatch(item, helpers) {
     return { action: 'requeue', reason: `instance '${targetInstance}' is suspended — wake signal written` };
   }
 
-  // 3. Offline / stopped → skip (let the loop try the next item).
+  // 3. Offline / stopped → auto-start non-primary, skip primary.
   if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass) {
+    const def = targetInstance ? getInstanceDef(targetInstance) : null;
+    if (def && !def.primary) {
+      // Non-primary instance: auto-start and requeue so it has time to boot.
+      const started = autoStartInstance({ ...def, id: targetInstance });
+      if (started) {
+        return { action: 'requeue', reason: `auto-started instance '${targetInstance}', requeueing for delivery after boot` };
+      }
+    }
     return { action: 'skip', reason: `instance target offline (state=${claudeState.state})` };
   }
 
@@ -272,6 +362,9 @@ export async function processWithMultiSession(helpers) {
     confirmDelivery,
     readPreDeliveryTimestamp,
   } = helpers;
+
+  // Reap idle non-primary instances before processing.
+  reapIdleInstances();
 
   // Compute online instance IDs.  Returns null in legacy mode — callers
   // should NOT invoke this function in legacy mode, but we handle it gracefully.
@@ -381,6 +474,9 @@ export async function processWithMultiSession(helpers) {
       if (item.require_idle === 1) {
         await waitForRequireIdleSettlement(item.id, statusFile);
       }
+
+      // Track delivery time for idle reaping of non-primary instances.
+      if (targetInstance) lastDeliveryAt.set(targetInstance, Date.now());
 
       return { delivered: true, state: claudeState.state };
     }
