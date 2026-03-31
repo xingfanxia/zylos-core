@@ -336,6 +336,8 @@ class Dashboard {
       return;
     }
 
+    var convCounts = this.data.conversation_counts || {};
+
     var rows = instances.map(function(inst) {
       var statusClass = this.getStatusClass(inst.status);
       var statusLabel = inst.status || 'unknown';
@@ -344,12 +346,15 @@ class Dashboard {
       var lastActivity = inst.last_activity ? this.formatTime(inst.last_activity) : '-';
       var idle = inst.idle_seconds != null ? this.formatDuration(inst.idle_seconds * 1000) : '-';
       var primaryMark = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
+      var conv = convCounts[inst.id] || { total: 0, today: 0 };
+      var convLabel = this.formatNum(conv.total) + (conv.today > 0 ? ' <span style="color:var(--accent)">(' + conv.today + ' today)</span>' : '');
 
       return '<tr>' +
         '<td style="width:20px"><span class="status-dot ' + statusClass + '"></span></td>' +
         '<td class="instance-name-cell">' + this.esc(inst.id) + primaryMark + '</td>' +
         '<td><span class="type-badge ' + typeClass + '">' + this.esc(typeLabel) + '</span></td>' +
         '<td>' + this.esc(statusLabel) + '</td>' +
+        '<td class="mono">' + convLabel + '</td>' +
         '<td>' + lastActivity + '</td>' +
         '<td>' + idle + '</td>' +
       '</tr>';
@@ -361,6 +366,7 @@ class Dashboard {
         '<th>Name</th>' +
         '<th>Type</th>' +
         '<th>Status</th>' +
+        '<th>Conversations</th>' +
         '<th>Last Activity</th>' +
         '<th>Idle</th>' +
       '</tr></thead>' +
@@ -391,6 +397,8 @@ class Dashboard {
     var statusLabel = inst.status || 'unknown';
     var typeClass = inst.type === 'on_demand' ? 'on_demand' : 'dedicated';
     var primaryBadge = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
+    var convCounts = this.data.conversation_counts || {};
+    var conv = convCounts[inst.id] || { total: 0, today: 0 };
 
     // Determine available actions
     var actions = '';
@@ -420,6 +428,7 @@ class Dashboard {
       '<div class="instance-meta">' +
         '<span class="label">Status</span><span class="value">' + this.esc(statusLabel) + '</span>' +
         '<span class="label">Enabled</span><span class="value">' + (inst.enabled ? 'Yes' : 'No') + '</span>' +
+        '<span class="label">Conversations</span><span class="value mono">' + this.formatNum(conv.total) + (conv.today > 0 ? ' <span style="color:var(--accent)">(' + conv.today + ' today)</span>' : '') + '</span>' +
         '<span class="label">Tmux</span><span class="value">' + (inst.tmux_alive ? 'alive' : 'dead') + '</span>' +
         (inst.last_activity ? '<span class="label">Last Activity</span><span class="value">' + this.formatTime(inst.last_activity) + '</span>' : '') +
         (inst.uptime_ms ? '<span class="label">Uptime</span><span class="value">' + this.formatDuration(inst.uptime_ms) + '</span>' : '') +

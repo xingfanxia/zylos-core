@@ -76,6 +76,35 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
   app.get('/api/dashboard', (req, res) => {
     try {
       const health = getSystemHealth();
+
+      // Enrich with per-instance conversation counts
+      const DB_PATH = path.join(zylosDir, 'comm-bridge', 'c4.db');
+      if (fs.existsSync(DB_PATH)) {
+        try {
+          const db = new Database(DB_PATH, { readonly: true });
+          const counts = db.prepare(`
+            SELECT target_instance, COUNT(*) as total,
+              SUM(CASE WHEN date(timestamp) = date('now') THEN 1 ELSE 0 END) as today
+            FROM conversations WHERE direction = 'in' AND status = 'delivered'
+            GROUP BY target_instance
+          `).all();
+          db.close();
+
+          const convMap = {};
+          for (const row of counts) {
+            convMap[row.target_instance || 'admin'] = { total: row.total, today: row.today };
+          }
+          // Merge null target into admin
+          if (convMap['null']) {
+            convMap['admin'] = convMap['admin'] || { total: 0, today: 0 };
+            convMap['admin'].total += convMap['null'].total;
+            convMap['admin'].today += convMap['null'].today;
+            delete convMap['null'];
+          }
+          health.conversation_counts = convMap;
+        } catch { /* best-effort */ }
+      }
+
       res.json(health);
     } catch (err) {
       res.status(500).json({ error: err.message });
