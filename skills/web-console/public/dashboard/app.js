@@ -586,7 +586,18 @@ class Dashboard {
 
       var showLabel = !showEveryOther || idx % 2 === 0;
 
+      // Build tooltip content
+      var tooltipLines = segments.map(function(seg) {
+        return '<span style="color:' + self._instanceColor(seg.id) + '">●</span> ' + self.esc(seg.id) + ': ' + self.formatTokens(seg.val);
+      });
+      tooltipLines.unshift('<strong>' + date + '</strong> — ' + self.formatTokens(barTotal));
+      if (!self.showSystem && systemVal > 0) {
+        tooltipLines.push('<span style="color:#666">+ ' + self.formatTokens(systemVal) + ' system</span>');
+      }
+      var tooltipHtml = '<div class="bar-tooltip">' + tooltipLines.join('<br>') + '</div>';
+
       return '<div class="bar-group">' +
+        tooltipHtml +
         '<div class="bar" style="height: ' + pct + '%;">' + segmentsHtml + '</div>' +
         '<div class="bar-label">' + (showLabel ? label : '') + '</div>' +
       '</div>';
@@ -1049,24 +1060,31 @@ class Dashboard {
     var tasks = this.scheduleData.tasks || [];
     var upcoming = this.scheduleData.upcoming || [];
 
-    // Map upcoming scheduled events to dates
+    // Map upcoming scheduled events to dates (convert UTC date to local)
     upcoming.forEach(function(t) {
-      if (!t.date) return;
-      if (!tasksByDate[t.date]) tasksByDate[t.date] = [];
-      tasksByDate[t.date].push(t);
+      if (!t.date || !t.time) return;
+      // t.date and t.time are UTC — convert to local
+      var utcDate = new Date(t.date + 'T' + t.time + ':00Z');
+      var localDate = utcDate.getFullYear() + '-' + String(utcDate.getMonth() + 1).padStart(2, '0') + '-' + String(utcDate.getDate()).padStart(2, '0');
+      var localTime = String(utcDate.getHours()).padStart(2, '0') + ':' + String(utcDate.getMinutes()).padStart(2, '0');
+      var localEntry = Object.assign({}, t, { date: localDate, time: localTime });
+      if (!tasksByDate[localDate]) tasksByDate[localDate] = [];
+      tasksByDate[localDate].push(localEntry);
     });
 
-    // Also map pending one-time tasks by their next_run date
+    // Also map pending one-time tasks by their next_run date (local time)
     tasks.forEach(function(t) {
       if (t.status !== 'pending' || !t.next_run_human) return;
-      var date = t.next_run_human.slice(0, 10);
+      // Convert UTC ISO to local date/time
+      var local = new Date(t.next_run_human);
+      var date = local.getFullYear() + '-' + String(local.getMonth() + 1).padStart(2, '0') + '-' + String(local.getDate()).padStart(2, '0');
+      var time = String(local.getHours()).padStart(2, '0') + ':' + String(local.getMinutes()).padStart(2, '0');
       if (!tasksByDate[date]) tasksByDate[date] = [];
-      // Avoid duplicates
       var exists = tasksByDate[date].some(function(x) { return x.name === t.name; });
       if (!exists) {
         tasksByDate[date].push({
           date: date,
-          time: t.next_run_human.slice(11, 16),
+          time: time,
           name: t.name,
           type: t.type,
           priority: t.priority,
@@ -1075,10 +1093,11 @@ class Dashboard {
       }
     });
 
-    // Calendar grid
+    // Calendar grid (local time)
     var firstDay = new Date(year, m, 1).getDay(); // 0=Sun
     var daysInMonth = new Date(year, m + 1, 0).getDate();
-    var today = new Date().toISOString().slice(0, 10);
+    var now = new Date();
+    var today = now.getFullYear() + '-' + String(now.getMonth() + 1).padStart(2, '0') + '-' + String(now.getDate()).padStart(2, '0');
 
     var dayHeaders = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
     var headerHtml = dayHeaders.map(function(d) {

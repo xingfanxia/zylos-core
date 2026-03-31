@@ -659,15 +659,48 @@ header {
   min-height: 1px;
   display: flex;
   flex-direction: column-reverse;
-  overflow: hidden;
 }
 
 .bar-segment {
   width: 100%;
+  position: relative;
+  cursor: pointer;
 }
 
 .bar-segment:last-child {
   border-radius: 2px 2px 0 0;
+}
+
+.bar-segment:hover {
+  opacity: 0.85;
+}
+
+/* Tooltip on hover */
+.bar-group {
+  position: relative;
+}
+
+.bar-group .bar-tooltip {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #222;
+  color: var(--text-primary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  padding: 6px 10px;
+  border-radius: 4px;
+  white-space: nowrap;
+  z-index: 100;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+  line-height: 1.5;
+}
+
+.bar-group:hover .bar-tooltip {
+  display: block;
 }
 
 .bar-label {
@@ -1070,14 +1103,16 @@ header {
   background: var(--bg-card);
   box-shadow: 0 0 0 1px var(--border);
   border-radius: 8px;
-  padding: 16px;
+  padding: 12px 16px;
+  max-width: 460px;
 }
 
 .cal-nav {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
+  max-width: 420px;
 }
 
 .cal-month {
@@ -1095,28 +1130,28 @@ header {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
   gap: 2px;
+  max-width: 420px;
 }
 
 .cal-header {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   color: var(--text-muted);
   text-align: center;
-  padding: 4px 0 8px;
+  padding: 2px 0 4px;
   font-family: var(--font-mono);
 }
 
 .cal-cell {
-  aspect-ratio: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  border-radius: 6px;
+  border-radius: 4px;
   background: var(--bg-200);
   position: relative;
   cursor: default;
-  min-height: 40px;
+  height: 32px;
 }
 
 .cal-cell.cal-empty {
@@ -1133,7 +1168,7 @@ header {
 }
 
 .cal-day-num {
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 400;
   color: var(--text-secondary);
   font-family: var(--font-mono);
