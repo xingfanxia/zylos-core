@@ -66,14 +66,27 @@
 
     <div class="tab-panel" id="panel-usage">
       <div class="usage-controls">
-        <div class="token-tabs" id="token-tabs">
-          <button class="token-tab active" data-days="7">7d</button>
-          <button class="token-tab" data-days="14">14d</button>
-          <button class="token-tab" data-days="30">30d</button>
+        <div class="usage-filter-groups">
+          <div class="token-tabs" id="token-tabs">
+            <button class="token-tab active" data-days="7">7d</button>
+            <button class="token-tab" data-days="14">14d</button>
+            <button class="token-tab" data-days="30">30d</button>
+          </div>
+          <div class="token-tabs" id="token-runtime-tabs">
+            <button class="token-tab active" data-runtime="all">All</button>
+            <button class="token-tab" data-runtime="claude">Claude</button>
+            <button class="token-tab" data-runtime="codex">Codex</button>
+          </div>
         </div>
         <label class="system-toggle">
           <input type="checkbox" id="include-system"> Include system usage
         </label>
+      </div>
+      <div class="section-block">
+        <div class="section-title">Runtime Usage</div>
+        <div id="usage-windows">
+          <div class="skeleton" style="height:140px"></div>
+        </div>
       </div>
       <div id="token-chart">
         <div class="skeleton" style="height:200px"></div>

@@ -11,6 +11,7 @@ class Dashboard {
     this.scheduleData = null;
     this.scheduleMonth = new Date(); // current month view
     this.tokenDays = 7;
+    this.tokenRuntimeFilter = 'all';
     this.showSystem = false;
     this.activeTab = 'overview';
     this.refreshInterval = null;
@@ -166,6 +167,29 @@ class Dashboard {
       });
     }
 
+    const runtimeTabs = document.getElementById('token-runtime-tabs');
+    if (runtimeTabs) {
+      runtimeTabs.addEventListener('click', (e) => {
+        const tab = e.target.closest('.token-tab');
+        if (!tab) return;
+        const runtime = tab.dataset.runtime;
+        if (!runtime || runtime === this.tokenRuntimeFilter) return;
+
+        runtimeTabs.querySelectorAll('.token-tab').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        this.tokenRuntimeFilter = runtime;
+
+        const systemCheckbox = document.getElementById('include-system');
+        if (systemCheckbox && runtime !== 'all') {
+          systemCheckbox.checked = false;
+          this.showSystem = false;
+        }
+        if (systemCheckbox) systemCheckbox.disabled = runtime !== 'all';
+
+        this.renderTokens();
+      });
+    }
+
     // System toggle
     const systemCheckbox = document.getElementById('include-system');
     if (systemCheckbox) {
@@ -181,6 +205,7 @@ class Dashboard {
       if (!btn) return;
 
       const action = btn.dataset.action;
+      const runtime = btn.dataset.runtime;
 
       // Handle approve/deny for pending users
       const chatId = btn.dataset.chatId;
@@ -191,6 +216,29 @@ class Dashboard {
         return;
       }
 
+      if (action === 'switch-all-runtime' && runtime) {
+        btn.disabled = true;
+        btn.textContent = '...';
+        try {
+          const res = await fetch('/api/dashboard/runtime/switch-all', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ runtime: runtime }),
+          });
+          const result = await res.json();
+          if (!res.ok) {
+            alert(result.error || 'Action failed');
+          }
+          await this.fetchDashboard();
+        } catch (err) {
+          alert('Request failed: ' + err.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = runtime === 'codex' ? 'All Codex' : 'All Claude';
+        }
+        return;
+      }
+
       const id = btn.dataset.id;
       if (!action || !id) return;
 
@@ -198,9 +246,17 @@ class Dashboard {
       btn.textContent = '...';
 
       try {
-        const res = await fetch(`/api/dashboard/instances/${encodeURIComponent(id)}/${action}`, {
+        var url = `/api/dashboard/instances/${encodeURIComponent(id)}/${action}`;
+        var body = null;
+        if (action === 'set-runtime' && runtime) {
+          url = `/api/dashboard/instances/${encodeURIComponent(id)}/runtime`;
+          body = JSON.stringify({ runtime: runtime });
+        }
+
+        const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          body,
         });
         const result = await res.json();
         if (!res.ok) {
@@ -277,6 +333,9 @@ class Dashboard {
         break;
       case 'processes':
         this.renderPm2();
+        break;
+      case 'usage':
+        this.renderTokens();
         break;
     }
   }
@@ -389,7 +448,24 @@ class Dashboard {
       return;
     }
 
-    grid.innerHTML = instances.map(function(inst) { return this.renderInstanceCard(inst); }.bind(this)).join('');
+    var runtimeSummary = instances.reduce(function(out, inst) {
+      var runtime = inst.runtime || 'claude';
+      out[runtime] = (out[runtime] || 0) + 1;
+      return out;
+    }, {});
+
+    var toolbar = '<div class="runtime-toolbar">' +
+      '<div class="runtime-toolbar-copy">' +
+        '<div class="runtime-toolbar-title">Runtime Controls</div>' +
+        '<div class="runtime-toolbar-meta">Claude: ' + (runtimeSummary.claude || 0) + ' &middot; Codex: ' + (runtimeSummary.codex || 0) + '</div>' +
+      '</div>' +
+      '<div class="runtime-toolbar-actions">' +
+        '<button class="btn" data-action="switch-all-runtime" data-runtime="claude">All Claude</button>' +
+        '<button class="btn" data-action="switch-all-runtime" data-runtime="codex">All Codex</button>' +
+      '</div>' +
+    '</div>';
+
+    grid.innerHTML = toolbar + instances.map(function(inst) { return this.renderInstanceCard(inst); }.bind(this)).join('');
   }
 
   renderInstanceCard(inst) {
@@ -399,10 +475,12 @@ class Dashboard {
     var primaryBadge = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
     var convCounts = this.data.conversation_counts || {};
     var conv = convCounts[inst.id] || { total: 0, today: 0 };
+    var runtime = inst.runtime || 'claude';
 
     // Determine available actions
     var actions = '';
     if (inst.enabled) {
+      actions += '<button class="btn" data-action="set-runtime" data-id="' + this.esc(inst.id) + '" data-runtime="' + this.esc(runtime === 'codex' ? 'claude' : 'codex') + '">Use ' + (runtime === 'codex' ? 'Claude' : 'Codex') + '</button>';
       if (inst.status === 'suspended') {
         actions += '<button class="btn btn-success" data-action="resume" data-id="' + this.esc(inst.id) + '">Resume</button>';
       } else if (inst.status === 'running' || inst.status === 'idle' || inst.status === 'busy') {
@@ -427,6 +505,7 @@ class Dashboard {
       '</div>' +
       '<div class="instance-meta">' +
         '<span class="label">Status</span><span class="value">' + this.esc(statusLabel) + '</span>' +
+        '<span class="label">Runtime</span><span class="value runtime-badge">' + this.esc(runtime) + '</span>' +
         '<span class="label">Enabled</span><span class="value">' + (inst.enabled ? 'Yes' : 'No') + '</span>' +
         '<span class="label">Conversations</span><span class="value mono">' + this.formatNum(conv.total) + (conv.today > 0 ? ' <span style="color:var(--accent)">(' + conv.today + ' today)</span>' : '') + '</span>' +
         '<span class="label">Tmux</span><span class="value">' + (inst.tmux_alive ? 'alive' : 'dead') + '</span>' +
@@ -444,6 +523,9 @@ class Dashboard {
 
   renderTokens() {
     if (this.activeTab !== 'usage') return;
+    var systemCheckbox = document.getElementById('include-system');
+    if (systemCheckbox) systemCheckbox.disabled = this.tokenRuntimeFilter !== 'all';
+    this.renderUsageWindows();
     this.renderTokenChart();
     this.renderTokenCalendar();
     this.renderTokenDonut();
@@ -498,6 +580,259 @@ class Dashboard {
     return cycle[Math.abs(hash) % cycle.length];
   }
 
+  _matchesRuntimeFilter(runtime) {
+    return this.tokenRuntimeFilter === 'all' || (runtime || 'claude') === this.tokenRuntimeFilter;
+  }
+
+  _canShowSystemUsage() {
+    return this.showSystem && this.tokenRuntimeFilter === 'all';
+  }
+
+  _aggregateDailyRows(instances) {
+    var byDate = new Map();
+    var ids = Object.keys(instances || {});
+    for (var i = 0; i < ids.length; i++) {
+      var rows = instances[ids[i]]?.daily || [];
+      for (var j = 0; j < rows.length; j++) {
+        var row = rows[j];
+        if (!byDate.has(row.date)) {
+          byDate.set(row.date, {
+            date: row.date,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 0,
+            cost_usd: 0,
+          });
+        }
+        var target = byDate.get(row.date);
+        target.input_tokens += row.input_tokens || 0;
+        target.output_tokens += row.output_tokens || 0;
+        target.cache_read += row.cache_read || 0;
+        target.cache_write += row.cache_write || 0;
+        target.total_tokens += row.total_tokens || 0;
+        target.cost_usd += row.cost_usd || 0;
+      }
+    }
+    return Array.from(byDate.values()).sort(function(a, b) { return a.date.localeCompare(b.date); });
+  }
+
+  _getTokenView() {
+    var allInstances = this.tokenData?.instances || {};
+    var runtimeBuckets = this.tokenData?.runtimes || {};
+    if (this.tokenRuntimeFilter !== 'all') {
+      var filteredInstances = {};
+      var ids = Object.keys(allInstances);
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        var instanceData = allInstances[id];
+        var runtimeData = instanceData?.runtimes?.[this.tokenRuntimeFilter];
+        if (!runtimeData || !runtimeData.daily || runtimeData.daily.length === 0) continue;
+        filteredInstances[id] = {
+          ...instanceData,
+          daily: runtimeData.daily,
+          totals: runtimeData.totals,
+        };
+      }
+
+      var runtimeDaily = runtimeBuckets[this.tokenRuntimeFilter]?.daily || this._aggregateDailyRows(filteredInstances);
+      return {
+        instances: filteredInstances,
+        visibleDaily: runtimeDaily,
+        allDaily: this.tokenData?.daily || [],
+      };
+    }
+
+    var visibleInstances = {};
+    var ids = Object.keys(allInstances);
+
+    for (var i = 0; i < ids.length; i++) {
+      var id = ids[i];
+      var instanceData = allInstances[id];
+      visibleInstances[id] = instanceData;
+    }
+
+    return {
+      instances: visibleInstances,
+      visibleDaily: this._aggregateDailyRows(visibleInstances),
+      allDaily: this.tokenData?.daily || [],
+    };
+  }
+
+  _getInstanceTokenWindows(instanceId) {
+    var instanceData = this.tokenData?.instances?.[instanceId] || {};
+    var rows = this.tokenRuntimeFilter !== 'all'
+      ? (instanceData.runtimes?.[this.tokenRuntimeFilter]?.daily || [])
+      : (instanceData.daily || []);
+    var todayStr = new Date().toISOString().slice(0, 10);
+    var todayRows = rows.filter(function(r) { return r.date === todayStr; });
+    var weekRows = this._filterDaily(rows, 7);
+    return {
+      today: this._sumRows(todayRows),
+      week: this._sumRows(weekRows),
+    };
+  }
+
+  _getRuntimeTokenWindows(runtime) {
+    var rows = this.tokenData?.runtimes?.[runtime]?.daily || [];
+    var todayStr = new Date().toISOString().slice(0, 10);
+    var todayRows = rows.filter(function(r) { return r.date === todayStr; });
+    var weekRows = this._filterDaily(rows, 7);
+    return {
+      today: this._sumRows(todayRows),
+      week: this._sumRows(weekRows),
+    };
+  }
+
+  _getRuntimeUsageWindow(runtime) {
+    var providerUsage = this.data?.provider_usage?.providers?.[runtime];
+    if (providerUsage && providerUsage.available) {
+      return {
+        usage: {
+          runtime: runtime,
+          available: providerUsage.available,
+          session: runtime === 'claude' && providerUsage.primary ? {
+            percent: providerUsage.primary.used_percent,
+            resets: providerUsage.primary.reset_description,
+          } : null,
+          fiveHour: runtime === 'codex' && providerUsage.primary ? {
+            percent: providerUsage.primary.used_percent,
+            resets: providerUsage.primary.reset_description,
+          } : null,
+          weeklyAll: providerUsage.secondary ? {
+            percent: providerUsage.secondary.used_percent,
+            resets: providerUsage.secondary.reset_description,
+          } : null,
+          weeklySonnet: runtime === 'claude' && providerUsage.tertiary ? {
+            percent: providerUsage.tertiary.used_percent,
+            resets: providerUsage.tertiary.reset_description,
+          } : null,
+          tier: null,
+          lastCheck: providerUsage.fetched_at || this.data?.provider_usage?.updated_at || null,
+        },
+        instanceCount: (this.data?.instances || []).filter(function(inst) {
+          return (inst.runtime || 'claude') === runtime;
+        }).length,
+      };
+    }
+
+    var instances = this.data?.instances || [];
+    var usageWindows = this.data?.usage_windows || {};
+    var matching = instances.filter(function(inst) {
+      return (inst.runtime || 'claude') === runtime;
+    });
+
+    for (var i = 0; i < matching.length; i++) {
+      var usage = usageWindows[matching[i].id];
+      if (usage && usage.available) {
+        return {
+          usage: usage,
+          instanceCount: matching.length,
+        };
+      }
+    }
+
+    return {
+      usage: {
+        runtime: runtime,
+        available: false,
+        session: null,
+        fiveHour: null,
+        weeklyAll: null,
+        weeklySonnet: null,
+        tier: null,
+        lastCheck: null,
+      },
+      instanceCount: matching.length,
+    };
+  }
+
+  _formatUsagePrimary(metric) {
+    if (!metric || metric.percent === null || metric.percent === undefined) return 'n/a';
+    return metric.percent + '%';
+  }
+
+  _formatUsageMeta(metric) {
+    if (!metric || !metric.resets) return '';
+    return 'resets ' + metric.resets;
+  }
+
+  renderUsageWindows() {
+    var el = document.getElementById('usage-windows');
+    if (!el) return;
+
+    var runtimes = this.tokenRuntimeFilter === 'all'
+      ? ['claude', 'codex']
+      : [this.tokenRuntimeFilter];
+
+    var cards = runtimes.map(function(runtime) {
+      var summary = this._getRuntimeUsageWindow(runtime);
+      var usage = summary.usage || {};
+      var tokenWindows = this._getRuntimeTokenWindows(runtime);
+      var sessionPrimary = this._formatUsagePrimary(usage.session);
+      var fiveHourPrimary = this._formatUsagePrimary(usage.fiveHour);
+      var weeklyPrimary = this._formatUsagePrimary(usage.weeklyAll);
+      var sonnetPrimary = this._formatUsagePrimary(usage.weeklySonnet);
+      var tierClass = usage.tier ? ' usage-tier-' + usage.tier : '';
+      var lastCheck = usage.lastCheck ? this.formatTime(usage.lastCheck) : 'no live sample';
+      var todayPrimary = this.formatUsd(tokenWindows.today.cost_usd || 0);
+      var todayMeta = this.formatTokens(tokenWindows.today.total_tokens || 0);
+      var weeklyMeta = this.esc(this._formatUsageMeta(usage.weeklyAll));
+      var runtimeLabel = runtime === 'claude' ? 'Claude' : 'Codex';
+      var primaryMetric = runtime === 'codex'
+        ? '<div class="usage-metric">' +
+            '<div class="usage-metric-label">5h</div>' +
+            '<div class="usage-metric-value">' + fiveHourPrimary + '</div>' +
+            '<div class="usage-metric-meta">' + this.esc(this._formatUsageMeta(usage.fiveHour)) + '</div>' +
+          '</div>'
+        : '<div class="usage-metric">' +
+            '<div class="usage-metric-label">Session</div>' +
+            '<div class="usage-metric-value">' + sessionPrimary + '</div>' +
+            '<div class="usage-metric-meta">' + this.esc(this._formatUsageMeta(usage.session)) + '</div>' +
+          '</div>';
+
+      var secondaryMetric = runtime === 'codex'
+        ? ''
+        : '<div class="usage-metric">' +
+            '<div class="usage-metric-label">Opus Week</div>' +
+            '<div class="usage-metric-value">' + sonnetPrimary + '</div>' +
+            '<div class="usage-metric-meta">' + this.esc(this._formatUsageMeta(usage.weeklySonnet)) + '</div>' +
+          '</div>';
+
+      var footerMeta = runtime === 'codex'
+        ? 'CodexBar CLI'
+        : 'CodexBar CLI';
+
+      return '<div class="usage-window-card' + tierClass + '">' +
+        '<div class="usage-window-header">' +
+          '<div>' +
+            '<div class="usage-window-name">' + runtimeLabel + '</div>' +
+            '<div class="usage-window-runtime">' + summary.instanceCount + ' active instance' + (summary.instanceCount === 1 ? '' : 's') + '</div>' +
+          '</div>' +
+          (usage.tier ? '<div class="usage-window-tier">' + this.esc(usage.tier) + '</div>' : '') +
+        '</div>' +
+        '<div class="usage-metrics-grid">' +
+          primaryMetric +
+          '<div class="usage-metric">' +
+            '<div class="usage-metric-label">Week</div>' +
+            '<div class="usage-metric-value">' + weeklyPrimary + '</div>' +
+            '<div class="usage-metric-meta">' + weeklyMeta + '</div>' +
+          '</div>' +
+          '<div class="usage-metric">' +
+            '<div class="usage-metric-label">Day Usage</div>' +
+            '<div class="usage-metric-value">' + todayPrimary + '</div>' +
+            '<div class="usage-metric-meta">' + this.esc(todayMeta) + '</div>' +
+          '</div>' +
+          secondaryMetric +
+        '</div>' +
+        '<div class="usage-window-footer">Last check: ' + this.esc(lastCheck) + (footerMeta ? ' · ' + this.esc(footerMeta) : '') + '</div>' +
+      '</div>';
+    }.bind(this)).join('');
+
+    el.innerHTML = '<div class="usage-window-grid">' + cards + '</div>';
+  }
+
   // ---------------------------------------------------------------------------
   // Token chart — stacked bars with Y-axis gridlines
   // ---------------------------------------------------------------------------
@@ -506,19 +841,21 @@ class Dashboard {
     var el = document.getElementById('token-chart');
     if (!el || !this.tokenData) return;
 
-    var filteredDaily = this._filterDaily(this.tokenData.daily);
-    if (filteredDaily.length === 0) {
+    var tokenView = this._getTokenView();
+    var visibleDaily = this._filterDaily(tokenView.visibleDaily);
+    var totalDaily = this._canShowSystemUsage() ? this._filterDaily(tokenView.allDaily) : visibleDaily;
+    if (visibleDaily.length === 0) {
       el.innerHTML = '<div class="empty-state">No token usage data</div>';
       return;
     }
 
-    var instances = this.tokenData.instances || {};
+    var instances = tokenView.instances || {};
     var instanceIds = Object.keys(instances).sort();
 
     // Build per-date totals from aggregate daily
     var dateTotals = new Map();
-    for (var i = 0; i < filteredDaily.length; i++) {
-      var row = filteredDaily[i];
+    for (var i = 0; i < totalDaily.length; i++) {
+      var row = totalDaily[i];
       var t = (row.input_tokens || 0) + (row.output_tokens || 0) +
               (row.cache_read || 0) + (row.cache_write || 0);
       dateTotals.set(row.date, (dateTotals.get(row.date) || 0) + t);
@@ -543,7 +880,7 @@ class Dashboard {
     var self = this;
     var maxVal = Math.max.apply(null, sortedDates.map(function(d) {
       var total = dateTotals.get(d) || 0;
-      if (self.showSystem) return total;
+      if (self._canShowSystemUsage()) return total;
       var instMap = dateInstanceTotals.get(d);
       if (!instMap) return 0;
       var sum = 0;
@@ -574,11 +911,11 @@ class Dashboard {
       }
 
       var systemVal = Math.max(0, dayTotal - instanceSum);
-      if (self.showSystem && systemVal > 0) {
+      if (self._canShowSystemUsage() && systemVal > 0) {
         segments.push({ id: 'system', val: systemVal });
       }
 
-      var barTotal = self.showSystem ? dayTotal : instanceSum;
+      var barTotal = self._canShowSystemUsage() ? dayTotal : instanceSum;
       var pct = maxVal > 0 ? Math.max(1, (barTotal / maxVal) * 100) : 1;
       var label = date.substring(5);
 
@@ -600,7 +937,7 @@ class Dashboard {
         return '<span style="color:' + self._instanceColor(seg.id) + '">●</span> ' + self.esc(seg.id) + ': ' + self.formatTokens(seg.val);
       });
       tooltipLines.unshift('<strong>' + date + '</strong> — ' + self.formatTokens(barTotal));
-      if (!self.showSystem && systemVal > 0) {
+      if (!self._canShowSystemUsage() && systemVal > 0) {
         tooltipLines.push('<span style="color:#666">+ ' + self.formatTokens(systemVal) + ' system</span>');
       }
       var tooltipHtml = '<div class="bar-tooltip">' + tooltipLines.join('<br>') + '</div>';
@@ -616,7 +953,7 @@ class Dashboard {
     var legendHtml = instanceIds.map(function(iid) {
       return '<span class="legend-item"><span class="legend-swatch" style="background: ' + self._instanceColor(iid) + '"></span>' + self.esc(iid) + '</span>';
     });
-    if (this.showSystem) {
+    if (this._canShowSystemUsage()) {
       legendHtml.push('<span class="legend-item"><span class="legend-swatch" style="background: ' + this._instanceColor('system') + '"></span>system</span>');
     }
 
@@ -648,14 +985,15 @@ class Dashboard {
     var el = document.getElementById('token-calendar');
     if (!el || !this.tokenData) return;
 
-    var daily = this.tokenData.daily || [];
-    var instances = this.tokenData.instances || {};
+    var tokenView = this._getTokenView();
+    var daily = this._canShowSystemUsage() ? (tokenView.allDaily || []) : [];
+    var instances = tokenView.instances || {};
 
     // Build date->cost map for the last 90 days
     var costByDate = new Map();
     var tokensByDate = new Map();
 
-    if (this.showSystem) {
+    if (this._canShowSystemUsage()) {
       for (var i = 0; i < daily.length; i++) {
         var r = daily[i];
         costByDate.set(r.date, (costByDate.get(r.date) || 0) + (r.cost_usd || 0));
@@ -820,10 +1158,12 @@ class Dashboard {
     var el = document.getElementById('token-pie');
     if (!el || !this.tokenData) return;
 
-    var instances = this.tokenData.instances || {};
+    var tokenView = this._getTokenView();
+    var instances = tokenView.instances || {};
     var instanceIds = Object.keys(instances).sort();
-    var filteredDaily = this._filterDaily(this.tokenData.daily);
-    var filteredTotals = this._sumRows(filteredDaily);
+    var visibleDaily = this._filterDaily(tokenView.visibleDaily);
+    var totalDaily = this._canShowSystemUsage() ? this._filterDaily(tokenView.allDaily) : visibleDaily;
+    var filteredTotals = this._sumRows(totalDaily);
 
     if (filteredTotals.cost_usd <= 0) {
       el.innerHTML = '';
@@ -845,11 +1185,11 @@ class Dashboard {
 
     // System slice
     var systemCost = Math.max(0, filteredTotals.cost_usd - instanceCostSum);
-    if (this.showSystem && systemCost > 0.001) {
+    if (this._canShowSystemUsage() && systemCost > 0.001) {
       slices.push({ id: 'system', cost: systemCost });
     }
 
-    var totalCost = this.showSystem ? filteredTotals.cost_usd : instanceCostSum;
+    var totalCost = this._canShowSystemUsage() ? filteredTotals.cost_usd : instanceCostSum;
     if (totalCost <= 0) { el.innerHTML = ''; return; }
 
     // Sort by cost descending
@@ -903,17 +1243,19 @@ class Dashboard {
     var el = document.getElementById('token-table');
     if (!el || !this.tokenData) return;
 
-    var instances = this.tokenData.instances || {};
+    var tokenView = this._getTokenView();
+    var instances = tokenView.instances || {};
     var instanceIds = Object.keys(instances).sort();
 
-    if (instanceIds.length === 0 && (!this.tokenData.daily || this.tokenData.daily.length === 0)) {
+    if (instanceIds.length === 0 && (!tokenView.visibleDaily || tokenView.visibleDaily.length === 0)) {
       el.innerHTML = '<div class="empty-state">No usage data for this period</div>';
       return;
     }
 
     // Filtered aggregate totals
-    var filteredDaily = this._filterDaily(this.tokenData.daily);
-    var filteredTotals = this._sumRows(filteredDaily);
+    var filteredDaily = this._filterDaily(tokenView.visibleDaily);
+    var totalDaily = this._canShowSystemUsage() ? this._filterDaily(tokenView.allDaily) : filteredDaily;
+    var filteredTotals = this._sumRows(totalDaily);
 
     // Per-instance filtered totals
     var instanceRows = [];
@@ -958,7 +1300,7 @@ class Dashboard {
     }
 
     // Display totals
-    var displayTotals = this.showSystem ? filteredTotals : instanceSumTotals;
+    var displayTotals = this._canShowSystemUsage() ? filteredTotals : instanceSumTotals;
 
     var self = this;
 
@@ -997,7 +1339,7 @@ class Dashboard {
     }).join('');
 
     // System row
-    if (hasSystem && this.showSystem) {
+    if (hasSystem && this._canShowSystemUsage()) {
       rowsHtml += '<tr style="color: var(--text-muted); font-style: italic;">' +
         '<td><span style="display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: ' + this._instanceColor('system') + '; margin-right: 6px; vertical-align: middle;"></span>system</td>' +
         '<td class="num">' + this.formatNum(systemRow.input_tokens) + '</td>' +

@@ -89,6 +89,7 @@ function loadInstanceMonitors() {
         env: {
           PATH: ENHANCED_PATH,
           NODE_ENV: 'production',
+          ZYLOS_DIR,
           ZYLOS_INSTANCE_ID: id,
           ZYLOS_TMUX_SESSION: def.tmux_session || `claude-${id}`,
           CLAUDE_BYPASS_PERMISSIONS,
@@ -278,13 +279,14 @@ module.exports = {
         name: 'activity-monitor',
         script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
         cwd: HOME,
-        env: {
-          PATH: ENHANCED_PATH,
-          NODE_ENV: 'production',
-          CLAUDE_BYPASS_PERMISSIONS,
-          CODEX_BYPASS_PERMISSIONS,
-          ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
-        },
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+        CLAUDE_BYPASS_PERMISSIONS,
+        CODEX_BYPASS_PERMISSIONS,
+        ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+      },
         autorestart: true,
         max_restarts: 10,
         min_uptime: '10s'
@@ -294,14 +296,35 @@ module.exports = {
     {
       name: 'token-cache-updater',
       script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'update-token-cache.js'),
+      args: '--daemon',
       cwd: HOME,
       env: {
         PATH: ENHANCED_PATH,
         NODE_ENV: 'production',
+        ZYLOS_DIR,
+        TOKEN_CACHE_INTERVAL_MS: String(60 * 60 * 1000),
+        TOKEN_CACHE_RETRY_MS: String(10 * 60 * 1000),
       },
-      cron_restart: '0 * * * *',   // hourly
-      autorestart: false,           // cron-only, don't restart on exit
-      max_restarts: 0,
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+    },
+    {
+      name: 'provider-usage-updater',
+      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'update-provider-usage.js'),
+      args: '--daemon',
+      cwd: HOME,
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+        CODEXBAR_BIN: path.join(BIN_DIR, 'codexbar'),
+        PROVIDER_USAGE_INTERVAL_MS: String(5 * 60 * 1000),
+        PROVIDER_USAGE_RETRY_MS: String(60 * 1000),
+      },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
     },
     // Caddy web server (only if set up via `zylos init`)
     ...(fs.existsSync(path.join(BIN_DIR, 'caddy')) && fs.existsSync(path.join(HTTP_DIR, 'Caddyfile'))

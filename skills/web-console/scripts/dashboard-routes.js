@@ -11,7 +11,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import express from 'express';
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import Database from 'better-sqlite3';
 import { createRequire } from 'module';
 
@@ -23,6 +23,12 @@ import {
   getStatusFileForInstance,
   startWatcher,
 } from '../../comm-bridge/scripts/c4-instance-router.js';
+import {
+  annotateTokenCacheWithRuntimes,
+  buildUsageWindows,
+  loadInstancesConfig,
+  readProviderUsage,
+} from './dashboard-data.js';
 
 // ---------------------------------------------------------------------------
 // Private helpers
@@ -69,6 +75,107 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
   // Start instance config watcher for hot-reload
   startWatcher();
 
+  const CONFIG_FILE = path.join(zylosDir, '.zylos', 'config.json');
+  const ACTIVITY_MONITOR_SCRIPT = path.join(skillsDir, 'activity-monitor', 'scripts', 'activity-monitor.js');
+  const SUPPORTED_RUNTIMES = new Set(['claude', 'codex']);
+  const ZYLOS_PACKAGE_ROOT = (() => {
+    if (process.env.ZYLOS_PACKAGE_ROOT) return process.env.ZYLOS_PACKAGE_ROOT;
+    try {
+      const zylosBin = execFileSync('bash', ['-lc', 'command -v zylos 2>/dev/null || true'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 15000,
+      }).trim();
+      if (!zylosBin) return '';
+      const realPath = fs.realpathSync(zylosBin);
+      return path.dirname(path.dirname(realPath));
+    } catch {
+      return '';
+    }
+  })();
+
+  function normalizeRuntime(raw) {
+    const runtime = String(raw || '').trim().toLowerCase();
+    return SUPPORTED_RUNTIMES.has(runtime) ? runtime : null;
+  }
+
+  function writeJsonAtomic(filePath, value) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const tmpPath = `${filePath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2) + '\n');
+    fs.renameSync(tmpPath, filePath);
+  }
+
+  function updateGlobalRuntime(runtime) {
+    let cfg = {};
+    try { cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch { /* empty config */ }
+    cfg.runtime = runtime;
+    writeJsonAtomic(CONFIG_FILE, cfg);
+  }
+
+  function getPm2ProcessStatus(name) {
+    try {
+      const raw = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8', timeout: 15000 });
+      const list = JSON.parse(raw);
+      const proc = list.find((entry) => entry.name === name);
+      return proc?.pm2_env?.status || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function requestWake(instanceId, inst) {
+    const stateDir = resolveTilde(inst?.state_dir) || path.join(zylosDir, 'activity-monitor', instanceId);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'wake-signal'), new Date().toISOString());
+  }
+
+  function readStatusSnapshot(instanceId) {
+    const statusFile = getStatusFileForInstance(instanceId);
+    if (!statusFile || !fs.existsSync(statusFile)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    } catch {
+      return null;
+    }
+  }
+
+  function killTmuxSessionIfExists(session) {
+    if (!session || !tmuxSessionExists(session)) return false;
+    execFileSync('tmux', ['kill-session', '-t', session], { stdio: 'pipe', timeout: 15000 });
+    return true;
+  }
+
+  function ensureInstanceMonitorRunning(instanceId, inst) {
+    const pm2Name = `activity-monitor-${instanceId}`;
+    const currentStatus = getPm2ProcessStatus(pm2Name);
+    const env = {
+      ...process.env,
+      ZYLOS_DIR: zylosDir,
+      ZYLOS_INSTANCE_ID: instanceId,
+      ZYLOS_TMUX_SESSION: inst.tmux_session || `claude-${instanceId}`,
+      ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+    };
+
+    if (currentStatus === 'online' || currentStatus === 'launching') {
+      execFileSync('pm2', ['restart', pm2Name], { stdio: 'pipe', timeout: 30000, env });
+      return 'restarted';
+    }
+
+    execFileSync('pm2', [
+      'start',
+      ACTIVITY_MONITOR_SCRIPT,
+      '--name',
+      pm2Name,
+      '--restart-delay',
+      '5000',
+      '--max-restarts',
+      '10',
+    ], { stdio: 'pipe', timeout: 30000, env });
+    execFileSync('pm2', ['save'], { stdio: 'pipe', timeout: 15000, env });
+    return 'started';
+  }
+
   // ----- Root redirect -----
   app.get('/', (req, res) => res.redirect('/dashboard/'));
 
@@ -76,6 +183,7 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
   app.get('/api/dashboard', (req, res) => {
     try {
       const health = getSystemHealth();
+      const instancesConfig = loadInstancesConfig(zylosDir);
 
       // Enrich with per-instance conversation counts
       const DB_PATH = path.join(zylosDir, 'comm-bridge', 'c4.db');
@@ -105,6 +213,9 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         } catch { /* best-effort */ }
       }
 
+      health.usage_windows = buildUsageWindows(instancesConfig, zylosDir);
+      health.provider_usage = readProviderUsage(zylosDir);
+
       res.json(health);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -120,8 +231,10 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         return res.json({ daily: [], totals: null, instances: {}, error: 'No token data yet (run: node update-token-cache.js)' });
       }
       const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      const instancesConfig = loadInstancesConfig(zylosDir);
+      const enriched = annotateTokenCacheWithRuntimes(cached, instancesConfig);
       const cacheAge = Math.floor((Date.now() - fs.statSync(cacheFile).mtimeMs) / 60000);
-      res.json({ ...cached, cache_age_minutes: cacheAge });
+      res.json({ ...enriched, cache_age_minutes: cacheAge });
     } catch (err) {
       res.json({ daily: [], totals: null, instances: {}, error: err.message });
     }
@@ -135,7 +248,9 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         return res.json({ daily: [], totals: null, error: 'No token data yet' });
       }
       const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-      const instanceData = cached.instances?.[req.params.instanceId];
+      const instancesConfig = loadInstancesConfig(zylosDir);
+      const enriched = annotateTokenCacheWithRuntimes(cached, instancesConfig);
+      const instanceData = enriched.instances?.[req.params.instanceId];
       if (!instanceData) {
         return res.json({ daily: [], totals: null, error: `No data for instance "${req.params.instanceId}"` });
       }
@@ -250,32 +365,107 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         return res.status(400).json({ error: `tmux session "${tmuxSession}" already exists` });
       }
 
-      // Launch Claude Code in new tmux session
-      const configDir = inst.config_dir ? resolveTilde(inst.config_dir) : null;
-      const runtime = inst.runtime || 'claude';
-      const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
-      if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
-      tmuxArgs.push(runtime);
+      const pm2Action = ensureInstanceMonitorRunning(id, inst);
+      requestWake(id, inst);
 
-      try {
-        execFileSync('tmux', tmuxArgs, { stdio: 'pipe', timeout: 15000 });
-      } catch (err) {
-        return res.status(500).json({ error: `Failed to create tmux session: ${err.message}` });
+      res.json({ ok: true, id, status: 'resume_requested', session: tmuxSession, pm2_action: pm2Action });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /** Change the runtime for a single instance */
+  app.post('/api/dashboard/instances/:id/runtime', (req, res) => {
+    const { id } = req.params;
+    const runtime = normalizeRuntime(req.body?.runtime);
+    if (!runtime) {
+      return res.status(400).json({ error: 'runtime is required and must be "claude" or "codex"' });
+    }
+
+    try {
+      const inst = getInstanceDef(id);
+      if (!inst) return res.status(404).json({ error: `Instance "${id}" not found` });
+
+      const currentRuntime = inst.runtime || 'claude';
+      if (currentRuntime === runtime) {
+        return res.json({ ok: true, id, runtime, changed: false });
       }
 
-      // Clear suspended status
-      const stateDir = resolveTilde(inst.state_dir) || path.join(zylosDir, 'activity-monitor', id);
-      const stateStatusFile = path.join(stateDir, 'agent-status.json');
-      try {
-        fs.writeFileSync(stateStatusFile, JSON.stringify({
-          state: 'idle',
-          resumed_at: Date.now(),
-          resumed_by: 'dashboard',
-          last_check_human: new Date().toISOString(),
-        }, null, 2) + '\n');
-      } catch { /* best-effort */ }
+      updateInstancesConfig((cfg) => {
+        if (!cfg) return null;
+        cfg.instances[id] = { ...cfg.instances[id], runtime };
+        return cfg;
+      });
 
-      res.json({ ok: true, id, status: 'resumed', session: tmuxSession });
+      const updatedInst = getInstanceDef(id) || { ...inst, runtime };
+      const status = readStatusSnapshot(id);
+      const isSuspended = status?.state === 'suspended';
+      const tmuxSession = updatedInst.tmux_session || `claude-${id}`;
+
+      try { killTmuxSessionIfExists(tmuxSession); } catch { /* best effort */ }
+
+      let pm2Action = 'skipped';
+      if (updatedInst.enabled !== false) {
+        pm2Action = ensureInstanceMonitorRunning(id, updatedInst);
+      }
+
+      res.json({
+        ok: true,
+        id,
+        runtime,
+        changed: true,
+        suspended: isSuspended,
+        pm2_action: pm2Action,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  /** Change the runtime for all configured instances and update the global default runtime */
+  app.post('/api/dashboard/runtime/switch-all', (req, res) => {
+    const runtime = normalizeRuntime(req.body?.runtime);
+    if (!runtime) {
+      return res.status(400).json({ error: 'runtime is required and must be "claude" or "codex"' });
+    }
+
+    try {
+      const updates = [];
+      updateInstancesConfig((cfg) => {
+        if (!cfg) return null;
+        for (const [id, inst] of Object.entries(cfg.instances || {})) {
+          cfg.instances[id] = { ...inst, runtime };
+          updates.push(id);
+        }
+        return cfg;
+      });
+      updateGlobalRuntime(runtime);
+
+      const results = [];
+      for (const id of updates) {
+        const inst = getInstanceDef(id);
+        if (!inst) continue;
+
+        const status = readStatusSnapshot(id);
+        const isSuspended = status?.state === 'suspended';
+        const tmuxSession = inst.tmux_session || `claude-${id}`;
+
+        try { killTmuxSessionIfExists(tmuxSession); } catch { /* best effort */ }
+
+        let pm2Action = 'skipped';
+        if (inst.enabled !== false) {
+          pm2Action = ensureInstanceMonitorRunning(id, inst);
+        }
+
+        results.push({
+          id,
+          runtime,
+          suspended: isSuspended,
+          pm2_action: pm2Action,
+        });
+      }
+
+      res.json({ ok: true, runtime, updated: results.length, results });
     } catch (err) {
       res.status(500).json({ error: err.message });
     }
