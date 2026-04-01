@@ -120,6 +120,193 @@ export function buildUsageWindows(instancesConfig, zylosDir) {
   return windows;
 }
 
+export function readContextWindowSnapshot({
+  instanceId,
+  instanceDef,
+  zylosDir,
+  existsSync = fs.existsSync,
+  readFileSync = fs.readFileSync,
+  statSync = fs.statSync,
+} = {}) {
+  const stateDir = resolveTilde(instanceDef?.state_dir) || path.join(zylosDir, 'activity-monitor', instanceId);
+  const filePath = path.join(stateDir, 'context-window.json');
+  if (!existsSync(filePath)) {
+    return {
+      available: false,
+      observed_at: null,
+      age_minutes: null,
+      source: null,
+      used_tokens: null,
+      ceiling_tokens: null,
+      percent_used: null,
+      percent_remaining: null,
+      threshold_percent: null,
+      rollout_path: null,
+    };
+  }
+
+  try {
+    const data = JSON.parse(readFileSync(filePath, 'utf8'));
+    return {
+      ...data,
+      available: true,
+      age_minutes: Math.floor((Date.now() - statSync(filePath).mtimeMs) / 60000),
+    };
+  } catch {
+    return {
+      available: false,
+      observed_at: null,
+      age_minutes: null,
+      source: null,
+      used_tokens: null,
+      ceiling_tokens: null,
+      percent_used: null,
+      percent_remaining: null,
+      threshold_percent: null,
+      rollout_path: null,
+    };
+  }
+}
+
+export function buildContextWindows(instancesConfig, zylosDir) {
+  const windows = {};
+  for (const [id, inst] of Object.entries(instancesConfig?.instances || {})) {
+    windows[id] = readContextWindowSnapshot({
+      instanceId: id,
+      instanceDef: inst,
+      zylosDir,
+    });
+  }
+  return windows;
+}
+
+export function readLastContextHandoff({
+  instanceId,
+  instanceDef,
+  zylosDir,
+  existsSync = fs.existsSync,
+  readFileSync = fs.readFileSync,
+  statSync = fs.statSync,
+} = {}) {
+  const stateDir = resolveTilde(instanceDef?.state_dir) || path.join(zylosDir, 'activity-monitor', instanceId);
+  const filePath = path.join(stateDir, 'last-context-handoff.json');
+  if (!existsSync(filePath)) {
+    return {
+      available: false,
+      triggered_at: null,
+      age_minutes: null,
+      source: null,
+      used_tokens: null,
+      ceiling_tokens: null,
+      percent_used: null,
+      threshold_percent: null,
+      enqueue_ok: null,
+      rollout_path: null,
+    };
+  }
+
+  try {
+    const data = JSON.parse(readFileSync(filePath, 'utf8'));
+    return {
+      ...data,
+      available: true,
+      age_minutes: Math.floor((Date.now() - statSync(filePath).mtimeMs) / 60000),
+    };
+  } catch {
+    return {
+      available: false,
+      triggered_at: null,
+      age_minutes: null,
+      source: null,
+      used_tokens: null,
+      ceiling_tokens: null,
+      percent_used: null,
+      threshold_percent: null,
+      enqueue_ok: null,
+      rollout_path: null,
+    };
+  }
+}
+
+export function buildLastContextHandoffs(instancesConfig, zylosDir) {
+  const handoffs = {};
+  for (const [id, inst] of Object.entries(instancesConfig?.instances || {})) {
+    handoffs[id] = readLastContextHandoff({
+      instanceId: id,
+      instanceDef: inst,
+      zylosDir,
+    });
+  }
+  return handoffs;
+}
+
+function emptyTokenTotals() {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read: 0,
+    cache_write: 0,
+    total_tokens: 0,
+    cost_usd: 0,
+  };
+}
+
+function sumDailyRows(rows) {
+  const out = emptyTokenTotals();
+  for (const row of rows || []) {
+    out.input_tokens += row.input_tokens || 0;
+    out.output_tokens += row.output_tokens || 0;
+    out.cache_read += row.cache_read || 0;
+    out.cache_write += row.cache_write || 0;
+    out.cost_usd += row.cost_usd || 0;
+    out.total_tokens += row.total_tokens || (
+      (row.input_tokens || 0) +
+      (row.output_tokens || 0) +
+      (row.cache_read || 0) +
+      (row.cache_write || 0)
+    );
+  }
+  return out;
+}
+
+function filterRowsSince(rows, sinceDate) {
+  return (rows || []).filter((row) => row.date >= sinceDate);
+}
+
+export function buildInstanceTokenBurnMap(tokenCache) {
+  const today = new Date().toISOString().slice(0, 10);
+  const weekDate = new Date();
+  weekDate.setDate(weekDate.getDate() - 6);
+  const sinceWeek = weekDate.toISOString().slice(0, 10);
+
+  const result = {};
+  for (const [instanceId, data] of Object.entries(tokenCache?.instances || {})) {
+    const rows = Array.isArray(data?.daily) ? data.daily : [];
+    result[instanceId] = {
+      today: sumDailyRows(rows.filter((row) => row.date === today)),
+      week: sumDailyRows(filterRowsSince(rows, sinceWeek)),
+    };
+  }
+  return result;
+}
+
+export function enrichInstancesForDashboard(instances = [], {
+  tokenCache = null,
+  contextWindows = {},
+  lastContextHandoffs = {},
+} = {}) {
+  const tokenBurn = buildInstanceTokenBurnMap(tokenCache);
+  return (instances || []).map((inst) => ({
+    ...inst,
+    token_burn: tokenBurn[inst.id] || {
+      today: emptyTokenTotals(),
+      week: emptyTokenTotals(),
+    },
+    context_window: contextWindows?.[inst.id] || null,
+    last_context_handoff: lastContextHandoffs?.[inst.id] || null,
+  }));
+}
+
 export function readProviderUsage(zylosDir, {
   existsSync = fs.existsSync,
   readFileSync = fs.readFileSync,

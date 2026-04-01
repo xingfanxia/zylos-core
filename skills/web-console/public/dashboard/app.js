@@ -407,6 +407,10 @@ class Dashboard {
       var primaryMark = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
       var conv = convCounts[inst.id] || { total: 0, today: 0 };
       var convLabel = this.formatNum(conv.total) + (conv.today > 0 ? ' <span style="color:var(--accent)">(' + conv.today + ' today)</span>' : '');
+      var burnToday = this._formatBurnCell(inst.token_burn?.today);
+      var burnWeek = this._formatBurnCell(inst.token_burn?.week);
+      var contextLabel = this._formatContextCell(inst.context_window);
+      var handoffLabel = this._formatHandoffCell(inst.last_context_handoff);
 
       return '<tr>' +
         '<td style="width:20px"><span class="status-dot ' + statusClass + '"></span></td>' +
@@ -414,6 +418,10 @@ class Dashboard {
         '<td><span class="type-badge ' + typeClass + '">' + this.esc(typeLabel) + '</span></td>' +
         '<td>' + this.esc(statusLabel) + '</td>' +
         '<td class="mono">' + convLabel + '</td>' +
+        '<td class="mono">' + burnToday + '</td>' +
+        '<td class="mono">' + burnWeek + '</td>' +
+        '<td class="mono">' + contextLabel + '</td>' +
+        '<td class="mono">' + handoffLabel + '</td>' +
         '<td>' + lastActivity + '</td>' +
         '<td>' + idle + '</td>' +
       '</tr>';
@@ -426,6 +434,10 @@ class Dashboard {
         '<th>Type</th>' +
         '<th>Status</th>' +
         '<th>Conversations</th>' +
+        '<th>Today</th>' +
+        '<th>7d</th>' +
+        '<th>Context</th>' +
+        '<th>Last Handoff</th>' +
         '<th>Last Activity</th>' +
         '<th>Idle</th>' +
       '</tr></thead>' +
@@ -476,6 +488,9 @@ class Dashboard {
     var convCounts = this.data.conversation_counts || {};
     var conv = convCounts[inst.id] || { total: 0, today: 0 };
     var runtime = inst.runtime || 'claude';
+    var contextWindow = inst.context_window || null;
+    var lastContextHandoff = inst.last_context_handoff || null;
+    var tokenBurn = inst.token_burn || {};
 
     // Determine available actions
     var actions = '';
@@ -508,6 +523,10 @@ class Dashboard {
         '<span class="label">Runtime</span><span class="value runtime-badge">' + this.esc(runtime) + '</span>' +
         '<span class="label">Enabled</span><span class="value">' + (inst.enabled ? 'Yes' : 'No') + '</span>' +
         '<span class="label">Conversations</span><span class="value mono">' + this.formatNum(conv.total) + (conv.today > 0 ? ' <span style="color:var(--accent)">(' + conv.today + ' today)</span>' : '') + '</span>' +
+        '<span class="label">Today Burn</span><span class="value mono">' + this._formatBurnCell(tokenBurn.today) + '</span>' +
+        '<span class="label">7d Burn</span><span class="value mono">' + this._formatBurnCell(tokenBurn.week) + '</span>' +
+        '<span class="label">Context</span><span class="value mono">' + this._formatContextCell(contextWindow) + '</span>' +
+        '<span class="label">Last Handoff</span><span class="value mono">' + this._formatHandoffCell(lastContextHandoff) + '</span>' +
         '<span class="label">Tmux</span><span class="value">' + (inst.tmux_alive ? 'alive' : 'dead') + '</span>' +
         (inst.last_activity ? '<span class="label">Last Activity</span><span class="value">' + this.formatTime(inst.last_activity) + '</span>' : '') +
         (inst.uptime_ms ? '<span class="label">Uptime</span><span class="value">' + this.formatDuration(inst.uptime_ms) + '</span>' : '') +
@@ -731,6 +750,40 @@ class Dashboard {
   _formatUsageMeta(metric) {
     if (!metric || !metric.resets) return '';
     return 'resets ' + metric.resets;
+  }
+
+  _contextSourceLabel(source) {
+    if (!source) return 'n/a';
+    if (source === 'claude_statusline') return 'statusline';
+    if (source === 'rollout_token_count') return 'rollout';
+    if (source === 'sqlite_fallback') return 'sqlite';
+    return source;
+  }
+
+  _formatBurnCell(burn) {
+    if (!burn || (!burn.total_tokens && !burn.cost_usd)) return '-';
+    return this.formatUsd(burn.cost_usd || 0) + ' · ' + this.formatTokens(burn.total_tokens || 0);
+  }
+
+  _formatContextCell(contextWindow) {
+    if (!contextWindow || !contextWindow.available || contextWindow.percent_used === null || contextWindow.percent_used === undefined) {
+      return '-';
+    }
+    var used = this.formatTokens(contextWindow.used_tokens || 0);
+    var ceiling = this.formatTokens(contextWindow.ceiling_tokens || 0);
+    var source = this._contextSourceLabel(contextWindow.source);
+    var age = contextWindow.age_minutes === null || contextWindow.age_minutes === undefined || contextWindow.age_minutes < 2
+      ? ''
+      : ' · ' + contextWindow.age_minutes + 'm';
+    return contextWindow.percent_used + '% · ' + used + ' / ' + ceiling + ' · ' + source + age;
+  }
+
+  _formatHandoffCell(handoff) {
+    if (!handoff || !handoff.available || !handoff.triggered_at) return '-';
+    var enqueue = handoff.enqueue_ok === false ? ' failed' : '';
+    var used = this.formatTokens(handoff.used_tokens || 0);
+    var ceiling = this.formatTokens(handoff.ceiling_tokens || 0);
+    return handoff.percent_used + '% · ' + used + ' / ' + ceiling + ' · ' + this._contextSourceLabel(handoff.source) + ' · ' + this.formatTime(handoff.triggered_at) + enqueue;
   }
 
   renderUsageWindows() {

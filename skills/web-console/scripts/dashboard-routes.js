@@ -25,8 +25,12 @@ import {
 } from '../../comm-bridge/scripts/c4-instance-router.js';
 import {
   annotateTokenCacheWithRuntimes,
+  buildContextWindows,
+  buildInstanceTokenBurnMap,
+  buildLastContextHandoffs,
   buildUsageWindows,
   buildRuntimeUsage,
+  enrichInstancesForDashboard,
   loadInstancesConfig,
   readProviderUsage,
 } from './dashboard-data.js';
@@ -215,11 +219,33 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
       }
 
       health.usage_windows = buildUsageWindows(instancesConfig, zylosDir);
+      health.context_windows = buildContextWindows(instancesConfig, zylosDir);
+      health.last_context_handoffs = buildLastContextHandoffs(instancesConfig, zylosDir);
       health.provider_usage = readProviderUsage(zylosDir);
       health.runtime_usage = buildRuntimeUsage({
         instancesConfig,
         usageWindows: health.usage_windows,
         providerUsage: health.provider_usage,
+      });
+
+      const cacheFile = path.join(zylosDir, 'activity-monitor', 'token-cache.json');
+      let enrichedTokenCache = null;
+      if (fs.existsSync(cacheFile)) {
+        try {
+          const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+          enrichedTokenCache = annotateTokenCacheWithRuntimes(cached, instancesConfig);
+          health.token_burn = buildInstanceTokenBurnMap(enrichedTokenCache);
+        } catch {
+          health.token_burn = {};
+        }
+      } else {
+        health.token_burn = {};
+      }
+
+      health.instances = enrichInstancesForDashboard(health.instances, {
+        tokenCache: enrichedTokenCache,
+        contextWindows: health.context_windows,
+        lastContextHandoffs: health.last_context_handoffs,
       });
 
       res.json(health);

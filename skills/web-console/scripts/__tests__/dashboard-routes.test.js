@@ -8,7 +8,11 @@ const tmpDirs = [];
 
 const {
   annotateTokenCacheWithRuntimes,
+  buildContextWindows,
+  buildInstanceTokenBurnMap,
+  buildLastContextHandoffs,
   buildRuntimeUsage,
+  enrichInstancesForDashboard,
   readUsageWindowSnapshot,
 } = await import('../dashboard-data.js');
 
@@ -86,6 +90,84 @@ describe('readUsageWindowSnapshot', () => {
     assert.equal(snapshot.runtime, 'claude');
     assert.equal(snapshot.available, false);
     assert.equal(snapshot.source_file, 'usage.json');
+  });
+});
+
+describe('context observability helpers', () => {
+  it('reads context window and last handoff snapshots per instance', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-dashboard-context-test-'));
+    tmpDirs.push(zylosDir);
+    const stateDir = path.join(zylosDir, 'activity-monitor', 'admin');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, 'context-window.json'), JSON.stringify({
+      observed_at: '2026-04-01T10:00:00.000Z',
+      source: 'rollout_token_count',
+      used_tokens: 250000,
+      ceiling_tokens: 950000,
+      percent_used: 26,
+      percent_remaining: 74,
+      threshold_percent: 75,
+    }, null, 2));
+    fs.writeFileSync(path.join(stateDir, 'last-context-handoff.json'), JSON.stringify({
+      triggered_at: '2026-04-01T09:30:00.000Z',
+      source: 'sqlite_fallback',
+      used_tokens: 800000,
+      ceiling_tokens: 950000,
+      percent_used: 84,
+      threshold_percent: 75,
+      enqueue_ok: true,
+    }, null, 2));
+
+    const instancesConfig = {
+      instances: {
+        admin: { runtime: 'codex', state_dir: stateDir },
+      },
+    };
+
+    const windows = buildContextWindows(instancesConfig, zylosDir);
+    const handoffs = buildLastContextHandoffs(instancesConfig, zylosDir);
+    assert.equal(windows.admin.available, true);
+    assert.equal(windows.admin.source, 'rollout_token_count');
+    assert.equal(windows.admin.percent_used, 26);
+    assert.equal(handoffs.admin.available, true);
+    assert.equal(handoffs.admin.source, 'sqlite_fallback');
+    assert.equal(handoffs.admin.percent_used, 84);
+  });
+});
+
+describe('instance burn enrichment', () => {
+  it('adds today/7d token burn and context observability to instance rows', () => {
+    const tokenCache = {
+      instances: {
+        admin: {
+          daily: [
+            { date: '2026-03-30', total_tokens: 100, cost_usd: 1 },
+            { date: '2026-04-01', total_tokens: 200, cost_usd: 2, input_tokens: 50, output_tokens: 50, cache_read: 100, cache_write: 0 },
+          ],
+        },
+      },
+    };
+
+    const burn = buildInstanceTokenBurnMap(tokenCache);
+    assert.equal(burn.admin.today.total_tokens, 200);
+    assert.equal(burn.admin.week.total_tokens, 300);
+
+    const rows = enrichInstancesForDashboard([
+      { id: 'admin', runtime: 'codex' },
+    ], {
+      tokenCache,
+      contextWindows: {
+        admin: { available: true, percent_used: 20, source: 'rollout_token_count' },
+      },
+      lastContextHandoffs: {
+        admin: { available: true, percent_used: 80, source: 'sqlite_fallback', triggered_at: '2026-04-01T09:00:00.000Z' },
+      },
+    });
+
+    assert.equal(rows[0].token_burn.today.total_tokens, 200);
+    assert.equal(rows[0].token_burn.week.total_tokens, 300);
+    assert.equal(rows[0].context_window.percent_used, 20);
+    assert.equal(rows[0].last_context_handoff.percent_used, 80);
   });
 });
 
