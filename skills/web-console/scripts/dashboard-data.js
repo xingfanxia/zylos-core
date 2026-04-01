@@ -44,9 +44,11 @@ export function annotateTokenCacheWithRuntimes(cached, instancesConfig) {
   for (const [id, inst] of Object.entries(instancesConfig?.instances || {})) {
     runtimeByInstance[id] = inst?.runtime || 'claude';
   }
+  const knownIds = new Set(Object.keys(runtimeByInstance));
 
   const instances = {};
   for (const [id, data] of Object.entries(cached?.instances || {})) {
+    if (knownIds.size > 0 && !knownIds.has(id)) continue;
     instances[id] = {
       ...data,
       runtime: runtimeByInstance[id] || 'claude',
@@ -57,7 +59,7 @@ export function annotateTokenCacheWithRuntimes(cached, instancesConfig) {
     ? cached.per_instance.map((row) => ({
         ...row,
         runtime: runtimeByInstance[row.instance_id] || 'claude',
-      }))
+      })).filter((row) => knownIds.size === 0 || knownIds.has(row.instance_id))
     : [];
 
   return {

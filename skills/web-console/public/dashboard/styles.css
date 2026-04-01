@@ -939,7 +939,7 @@ header {
 
 .calendar-months-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-template-columns: 1fr;
   gap: 14px;
 }
 
@@ -949,6 +949,7 @@ header {
   box-shadow: 0 0 0 1px var(--border);
   padding: 14px;
   min-width: 0;
+  width: 100%;
 }
 
 .calendar-month-card-header {
@@ -983,7 +984,7 @@ header {
 }
 
 .calendar-month-cell {
-  min-height: 54px;
+  min-height: 78px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--bg-200);
@@ -995,6 +996,8 @@ header {
   padding: 7px 8px;
   transition: transform 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
   position: relative;
+  min-width: 0;
+  overflow: hidden;
 }
 
 button.calendar-month-cell {
@@ -1024,13 +1027,37 @@ button.calendar-month-cell {
   font-size: 12px;
   font-weight: 600;
   font-family: var(--font-mono);
+  line-height: 1;
+}
+
+.calendar-month-metrics {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  min-width: 0;
+}
+
+.calendar-month-tokens,
+.calendar-month-cost {
+  display: block;
+  width: 100%;
+  font-family: var(--font-mono);
+  line-height: 1.1;
+  opacity: 0.95;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .calendar-month-tokens {
   font-size: 11px;
-  font-family: var(--font-mono);
-  line-height: 1.1;
-  opacity: 0.95;
+  font-weight: 600;
+}
+
+.calendar-month-cost {
+  font-size: 10px;
+  opacity: 0.88;
 }
 
 .usage-breakdown-shell {
@@ -1171,6 +1198,15 @@ button.calendar-month-cell {
   cursor: pointer;
 }
 
+.trend-stack-hit {
+  fill: transparent;
+  cursor: pointer;
+}
+
+.trend-stack-hit:hover {
+  fill: rgba(255,255,255,0.04);
+}
+
 .trend-gridline {
   stroke: var(--border);
   stroke-width: 1;
@@ -1213,6 +1249,30 @@ button.calendar-month-cell {
   font-size: 11px;
   color: var(--text-secondary);
   font-family: var(--font-mono);
+}
+
+.trend-tooltip-breakdown-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-top: 6px;
+}
+
+.trend-tooltip-breakdown-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.trend-tooltip-breakdown-value,
+.trend-tooltip-breakdown-pct {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  white-space: nowrap;
 }
 
 /* Donut chart */
@@ -1439,10 +1499,6 @@ button.calendar-month-cell {
     align-items: flex-start;
   }
 
-  .calendar-months-grid {
-    grid-template-columns: 1fr;
-  }
-
   .usage-breakdown-grid {
     grid-template-columns: 1fr;
   }
@@ -1476,12 +1532,16 @@ button.calendar-month-cell {
   }
 
   .calendar-month-cell {
-    min-height: 46px;
+    min-height: 58px;
     padding: 6px;
   }
 
   .calendar-month-tokens {
     font-size: 10px;
+  }
+
+  .calendar-month-cost {
+    font-size: 9px;
   }
 }
 

@@ -905,6 +905,97 @@ class Dashboard {
     '</div>';
   }
 
+  _renderStackedAreaSvg(seriesList, breakdownDays, opts) {
+    var width = opts.width || 980;
+    var height = opts.height || 280;
+    var padLeft = 56;
+    var padRight = 18;
+    var padTop = 18;
+    var padBottom = 32;
+    var innerWidth = width - padLeft - padRight;
+    var innerHeight = height - padTop - padBottom;
+    var dates = breakdownDays.map(function(day) { return day.date; });
+    if (!dates.length || !seriesList.length) {
+      return '<div class="empty-state">No usage data</div>';
+    }
+
+    var totals = breakdownDays.map(function(day) { return day.total_tokens || 0; });
+    var maxVal = Math.max.apply(null, totals.concat([1]));
+
+    function xFor(index) {
+      if (dates.length === 1) return padLeft + innerWidth / 2;
+      return padLeft + (innerWidth * index) / (dates.length - 1);
+    }
+
+    function yFor(value) {
+      if (maxVal <= 0) return padTop + innerHeight;
+      return padTop + innerHeight - (value / maxVal) * innerHeight;
+    }
+
+    var yTicks = [];
+    for (var i = 0; i < 5; i++) {
+      var ratio = i / 4;
+      yTicks.push({
+        value: Math.round(maxVal * (1 - ratio)),
+        y: padTop + innerHeight * ratio,
+      });
+    }
+
+    var grid = yTicks.map(function(tick) {
+      return '<line x1="' + padLeft + '" y1="' + tick.y + '" x2="' + (width - padRight) + '" y2="' + tick.y + '" class="trend-gridline"></line>' +
+        '<text x="' + (padLeft - 10) + '" y="' + (tick.y + 4) + '" text-anchor="end" class="trend-axis-label">' + this.formatTokens(tick.value) + '</text>';
+    }.bind(this)).join('');
+
+    var xLabels = dates.map(function(date, index) {
+      var show = dates.length <= 10 || index === 0 || index === dates.length - 1 || index % Math.ceil(dates.length / 6) === 0;
+      if (!show) return '';
+      return '<text x="' + xFor(index) + '" y="' + (height - 8) + '" text-anchor="middle" class="trend-axis-label">' + date.slice(5) + '</text>';
+    }).join('');
+
+    var cumulative = new Array(dates.length).fill(0);
+    var layers = '';
+    for (var s = 0; s < seriesList.length; s++) {
+      var series = seriesList[s];
+      var topPoints = [];
+      var bottomPoints = [];
+      for (var index = 0; index < dates.length; index++) {
+        var bottom = cumulative[index];
+        var top = bottom + (series.values[index] || 0);
+        cumulative[index] = top;
+        topPoints.push(xFor(index) + ',' + yFor(top));
+        bottomPoints.push(xFor(index) + ',' + yFor(bottom));
+      }
+
+      var polygon = topPoints.join(' ') + ' ' + bottomPoints.reverse().join(' ');
+      layers += '<polygon points="' + polygon + '" fill="' + series.color + '" opacity="0.26"></polygon>';
+      layers += '<polyline points="' + topPoints.join(' ') + '" fill="none" stroke="' + series.color + '" stroke-width="1.8" stroke-linejoin="round"></polyline>';
+    }
+
+    var bandWidth = dates.length > 1 ? innerWidth / (dates.length - 1) : innerWidth;
+    var hoverBands = dates.map(function(date, index) {
+      var x = xFor(index) - bandWidth / 2;
+      if (index === 0) x = padLeft;
+      if (index === dates.length - 1) x = width - padRight - bandWidth / 2;
+      return '<rect class="trend-stack-hit" x="' + x + '" y="' + padTop + '" width="' + Math.max(18, bandWidth) + '" height="' + innerHeight + '" ' +
+        'data-index="' + index + '"></rect>';
+    }).join('');
+
+    var legend = seriesList.map(function(series) {
+      return '<span class="legend-item"><span class="legend-swatch" style="background:' + series.color + '"></span>' + this.esc(series.label) + '</span>';
+    }.bind(this)).join('');
+
+    return '<div class="trend-chart-card trend-chart-card-stacked">' +
+      '<div class="trend-tooltip" hidden></div>' +
+      '<div class="chart-legend">' + legend + '</div>' +
+      '<svg viewBox="0 0 ' + width + ' ' + height + '" class="trend-svg" role="img" aria-label="' + this.esc(opts.ariaLabel || 'Per-instance usage trend') + '">' +
+        grid +
+        layers +
+        hoverBands +
+        xLabels +
+      '</svg>' +
+    '</div>';
+  }
+
   renderAggregateTrendChart() {
     var el = document.getElementById('token-trend-total');
     if (!el || !this.tokenData) return;
@@ -956,12 +1047,10 @@ class Dashboard {
       return;
     }
 
-    el.innerHTML = this._renderTrendSvg(series, {
-      dates: dates,
-      area: false,
+    el.innerHTML = this._renderStackedAreaSvg(series, breakdown.days, {
       ariaLabel: 'Per-instance token usage trend',
     });
-    this._bindTrendTooltips(el);
+    this._bindStackedAreaTooltips(el, breakdown.days, series);
   }
 
   _bindTrendTooltips(root) {
@@ -997,6 +1086,50 @@ class Dashboard {
           tooltip.hidden = true;
         });
       }.bind(this));
+    }.bind(this));
+  }
+
+  _bindStackedAreaTooltips(root, breakdownDays, seriesList) {
+    if (!root) return;
+    var card = root.querySelector('.trend-chart-card-stacked');
+    if (!card) return;
+    var tooltip = card.querySelector('.trend-tooltip');
+    if (!tooltip) return;
+    var hits = card.querySelectorAll('.trend-stack-hit');
+    hits.forEach(function(hit) {
+      function showTooltip(evt) {
+        var index = Number(hit.dataset.index || 0);
+        var day = breakdownDays[index];
+        if (!day) return;
+        var total = day.total_tokens || 0;
+        var totalCost = day.cost_usd || 0;
+        var rows = seriesList.map(function(series) {
+          var value = series.values[index] || 0;
+          if (!value) return '';
+          var pct = total > 0 ? (value / total) * 100 : 0;
+          return '<div class="trend-tooltip-breakdown-row">' +
+            '<span class="trend-tooltip-breakdown-name"><span class="legend-swatch" style="background:' + series.color + '"></span>' + this.esc(series.label) + '</span>' +
+            '<span class="trend-tooltip-breakdown-value">' + this.formatTokens(value) + '</span>' +
+            '<span class="trend-tooltip-breakdown-pct">' + pct.toFixed(1) + '%</span>' +
+          '</div>';
+        }.bind(this)).filter(Boolean).join('');
+
+        tooltip.innerHTML =
+          '<div class="trend-tooltip-date">' + this.esc(day.date) + '</div>' +
+          '<div class="trend-tooltip-series">Total · ' + this.formatTokens(total) + ' tokens · ' + this.formatUsd(totalCost) + '</div>' +
+          rows;
+        tooltip.hidden = false;
+
+        var cardRect = card.getBoundingClientRect();
+        tooltip.style.left = (evt.clientX - cardRect.left + 12) + 'px';
+        tooltip.style.top = (evt.clientY - cardRect.top - 12) + 'px';
+      }
+
+      hit.addEventListener('mouseenter', showTooltip.bind(this));
+      hit.addEventListener('mousemove', showTooltip.bind(this));
+      hit.addEventListener('mouseleave', function() {
+        tooltip.hidden = true;
+      });
     }.bind(this));
   }
 
@@ -1402,6 +1535,7 @@ class Dashboard {
       var lastOfMonth = new Date(Date.UTC(year, month + 1, 0));
       var firstWeekday = (firstOfMonth.getUTCDay() + 6) % 7;
       var cells = [];
+      var monthHasData = false;
 
       for (var blank = 0; blank < firstWeekday; blank++) {
         cells.push('<div class="calendar-month-cell is-empty"></div>');
@@ -1415,22 +1549,32 @@ class Dashboard {
           cells.push('<div class="calendar-month-cell is-outside"><span class="calendar-month-date">' + dayNum + '</span></div>');
           continue;
         }
+        if (dayData.total_tokens > 0) monthHasData = true;
 
         var style = this._calendarHeatStyle(dayData, stats);
         var tokenLabel = dayData.total_tokens > 0 ? this.formatTokens(dayData.total_tokens) : '0';
+        var costLabel = dayData.cost_usd > 0 ? this.formatUsd(dayData.cost_usd) : '$0.00';
         var selected = dateKey === this.calendarPinnedDate || (!this.calendarPinnedDate && dateKey === this.calendarHoverDate);
         cells.push(
           '<button class="calendar-month-cell' + (selected ? ' is-selected' : '') + '" ' +
             'data-date="' + dateKey + '" ' +
             'style="background:' + style.background + ';color:' + style.color + ';border-color:' + style.borderColor + ';">' +
             '<span class="calendar-month-date">' + dayNum + '</span>' +
-            '<span class="calendar-month-tokens">' + tokenLabel + '</span>' +
+            '<span class="calendar-month-metrics">' +
+              '<span class="calendar-month-tokens">' + tokenLabel + '</span>' +
+              '<span class="calendar-month-cost">' + costLabel + '</span>' +
+            '</span>' +
           '</button>'
         );
       }
 
       while (cells.length % 7 !== 0) {
         cells.push('<div class="calendar-month-cell is-empty"></div>');
+      }
+
+      if (!monthHasData) {
+        cursor = new Date(Date.UTC(year, month + 1, 1));
+        continue;
       }
 
       monthsHtml += '<section class="calendar-month-card" data-month="' + monthKey + '">' +

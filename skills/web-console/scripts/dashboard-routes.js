@@ -190,6 +190,7 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
     try {
       const health = getSystemHealth();
       const instancesConfig = loadInstancesConfig(zylosDir);
+      const knownInstanceIds = new Set(Object.keys(instancesConfig?.instances || {}));
 
       // Enrich with per-instance conversation counts
       const DB_PATH = path.join(zylosDir, 'comm-bridge', 'c4.db');
@@ -207,7 +208,9 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
 
           const convMap = {};
           for (const row of counts) {
-            convMap[row.target_instance || 'admin'] = {
+            const instanceId = row.target_instance || 'admin';
+            if (knownInstanceIds.size > 0 && !knownInstanceIds.has(instanceId)) continue;
+            convMap[instanceId] = {
               total: row.total,
               today: row.today,
               last_inbound_at: row.last_inbound_at || null,
