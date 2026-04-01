@@ -32,6 +32,7 @@ import {
   buildRuntimeUsage,
   enrichInstancesForDashboard,
   loadInstancesConfig,
+  normalizeDashboardTimestamp,
   readProviderUsage,
 } from './dashboard-data.js';
 
@@ -197,7 +198,8 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
           const db = new Database(DB_PATH, { readonly: true });
           const counts = db.prepare(`
             SELECT target_instance, COUNT(*) as total,
-              SUM(CASE WHEN date(timestamp) = date('now') THEN 1 ELSE 0 END) as today
+              SUM(CASE WHEN date(timestamp) = date('now') THEN 1 ELSE 0 END) as today,
+              MAX(timestamp) as last_inbound_at
             FROM conversations WHERE direction = 'in' AND status = 'delivered'
             GROUP BY target_instance
           `).all();
@@ -205,16 +207,34 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
 
           const convMap = {};
           for (const row of counts) {
-            convMap[row.target_instance || 'admin'] = { total: row.total, today: row.today };
+            convMap[row.target_instance || 'admin'] = {
+              total: row.total,
+              today: row.today,
+              last_inbound_at: row.last_inbound_at || null,
+            };
           }
           // Merge null target into admin
           if (convMap['null']) {
-            convMap['admin'] = convMap['admin'] || { total: 0, today: 0 };
+            convMap['admin'] = convMap['admin'] || { total: 0, today: 0, last_inbound_at: null };
             convMap['admin'].total += convMap['null'].total;
             convMap['admin'].today += convMap['null'].today;
+            if (!convMap['admin'].last_inbound_at || (convMap['null'].last_inbound_at && convMap['null'].last_inbound_at > convMap['admin'].last_inbound_at)) {
+              convMap['admin'].last_inbound_at = convMap['null'].last_inbound_at;
+            }
             delete convMap['null'];
           }
           health.conversation_counts = convMap;
+          health.instances = (health.instances || []).map((inst) => ({
+            ...inst,
+            last_user_message: normalizeDashboardTimestamp(convMap[inst.id]?.last_inbound_at || null),
+            user_idle_seconds: (() => {
+              const normalized = normalizeDashboardTimestamp(convMap[inst.id]?.last_inbound_at || null);
+              if (!normalized) return null;
+              const parsed = Date.parse(normalized);
+              if (Number.isNaN(parsed)) return null;
+              return Math.max(0, Math.floor((Date.now() - parsed) / 1000));
+            })(),
+          }));
         } catch { /* best-effort */ }
       }
 

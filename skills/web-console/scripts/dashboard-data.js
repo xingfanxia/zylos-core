@@ -7,6 +7,28 @@ function resolveTilde(p) {
   return p.replace(/^~/, os.homedir());
 }
 
+export function normalizeDashboardTimestamp(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') {
+    const ms = value > 1e12 ? value : value * 1000;
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  // SQLite timestamps in c4.db are stored as naive UTC strings like
+  // "2026-04-01 09:57:13". Normalize them to ISO UTC so the browser can
+  // safely localize them with toLocaleString().
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw)) {
+    return raw.replace(' ', 'T') + 'Z';
+  }
+
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
 export function loadInstancesConfig(zylosDir) {
   const instancesFile = path.join(zylosDir, 'instances.json');
   try {

@@ -402,8 +402,11 @@ class Dashboard {
       var statusLabel = inst.status || 'unknown';
       var typeClass = inst.type === 'on_demand' ? 'on_demand' : 'dedicated';
       var typeLabel = inst.type || 'dedicated';
-      var lastActivity = inst.last_activity ? this.formatTime(inst.last_activity) : '-';
-      var idle = inst.idle_seconds != null ? this.formatDuration(inst.idle_seconds * 1000) : '-';
+      var lastActivity = inst.last_user_message
+        ? this.formatTime(inst.last_user_message)
+        : (inst.last_activity ? this.formatTime(inst.last_activity) : '-');
+      var idleSeconds = inst.user_idle_seconds != null ? inst.user_idle_seconds : inst.idle_seconds;
+      var idle = idleSeconds != null ? this.formatDuration(idleSeconds * 1000) : '-';
       var primaryMark = inst.primary ? ' <span style="color: var(--warning); font-size: 11px;">(primary)</span>' : '';
       var conv = convCounts[inst.id] || { total: 0, today: 0 };
       var convLabel = this.formatNum(conv.total) + (conv.today > 0 ? ' <span style="color:var(--accent)">(' + conv.today + ' today)</span>' : '');
@@ -438,7 +441,7 @@ class Dashboard {
         '<th>7d</th>' +
         '<th>Context</th>' +
         '<th>Last Handoff</th>' +
-        '<th>Last Activity</th>' +
+        '<th>Last User Msg</th>' +
         '<th>Idle</th>' +
       '</tr></thead>' +
       '<tbody>' + rows + '</tbody>' +
@@ -528,9 +531,9 @@ class Dashboard {
         '<span class="label">Context</span><span class="value mono">' + this._formatContextCell(contextWindow) + '</span>' +
         '<span class="label">Last Handoff</span><span class="value mono">' + this._formatHandoffCell(lastContextHandoff) + '</span>' +
         '<span class="label">Tmux</span><span class="value">' + (inst.tmux_alive ? 'alive' : 'dead') + '</span>' +
-        (inst.last_activity ? '<span class="label">Last Activity</span><span class="value">' + this.formatTime(inst.last_activity) + '</span>' : '') +
+        ((inst.last_user_message || inst.last_activity) ? '<span class="label">Last User Msg</span><span class="value">' + this.formatTime(inst.last_user_message || inst.last_activity) + '</span>' : '') +
         (inst.uptime_ms ? '<span class="label">Uptime</span><span class="value">' + this.formatDuration(inst.uptime_ms) + '</span>' : '') +
-        (inst.idle_seconds != null ? '<span class="label">Idle</span><span class="value">' + this.formatDuration(inst.idle_seconds * 1000) + '</span>' : '') +
+        ((inst.user_idle_seconds != null || inst.idle_seconds != null) ? '<span class="label">Idle</span><span class="value">' + this.formatDuration((inst.user_idle_seconds != null ? inst.user_idle_seconds : inst.idle_seconds) * 1000) + '</span>' : '') +
       '</div>' +
       '<div class="instance-actions">' + actions + '</div>' +
     '</div>';
