@@ -34,6 +34,8 @@ if (INSTANCE_ID) {
 const STATUS_FILE = path.join(AM_DIR, 'statusline.json');
 const STATE_FILE = path.join(AM_DIR, 'context-monitor-state.json');
 const COST_LOG_FILE = path.join(AM_DIR, 'cost-log.jsonl');
+const CONTEXT_WINDOW_FILE = path.join(AM_DIR, 'context-window.json');
+const LAST_CONTEXT_HANDOFF_FILE = path.join(AM_DIR, 'last-context-handoff.json');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
 
 // Thresholds — keep COOLDOWN_SECONDS and ack-deadline (in enqueue call) in sync
@@ -76,6 +78,12 @@ function main(raw) {
   // Always write status file for external queries
   atomicWrite(STATUS_FILE, JSON.stringify(status, null, 2));
 
+  // Normalize Claude statusLine into the same context observability files used by Codex.
+  const contextSnapshot = buildContextWindowSnapshot(status);
+  if (contextSnapshot) {
+    atomicWrite(CONTEXT_WINDOW_FILE, JSON.stringify(contextSnapshot, null, 2));
+  }
+
   // Track session cost and context percentage
   trackSessionCost(status);
 
@@ -109,6 +117,11 @@ function main(raw) {
     } catch (err) {
       log(`Failed to enqueue new-session (attempt ${attempt}/${MAX_RETRIES}): ${err.message}`);
     }
+  }
+
+  const handoffRecord = buildLastContextHandoffRecord(status, { enqueueOk: enqueued });
+  if (handoffRecord) {
+    atomicWrite(LAST_CONTEXT_HANDOFF_FILE, JSON.stringify(handoffRecord, null, 2));
   }
 
   // Only update cooldown after successful enqueue to avoid silent 5-min gap on failure
@@ -182,6 +195,50 @@ function loadState() {
 function saveState(state) {
   ensureDirOnce();
   atomicWrite(STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+function buildContextWindowSnapshot(status) {
+  const cw = status?.context_window;
+  if (!cw || cw.used_percentage == null || !cw.context_window_size) return null;
+
+  const percentUsed = Math.round(cw.used_percentage);
+  const ceilingTokens = cw.context_window_size;
+  return {
+    runtime: 'claude',
+    instance_id: INSTANCE_ID,
+    observed_at: new Date().toISOString(),
+    used_tokens: Math.round((percentUsed / 100) * ceilingTokens),
+    ceiling_tokens: ceilingTokens,
+    percent_used: percentUsed,
+    percent_remaining: cw.remaining_percentage != null
+      ? Math.round(cw.remaining_percentage)
+      : Math.max(0, 100 - percentUsed),
+    threshold_percent: RESTART_THRESHOLD,
+    source: 'claude_statusline',
+    rollout_path: null,
+    session_id: status?.session_id || null,
+  };
+}
+
+function buildLastContextHandoffRecord(status, { enqueueOk = false } = {}) {
+  const cw = status?.context_window;
+  if (!cw || cw.used_percentage == null || !cw.context_window_size) return null;
+
+  const percentUsed = Math.round(cw.used_percentage);
+  const ceilingTokens = cw.context_window_size;
+  return {
+    runtime: 'claude',
+    instance_id: INSTANCE_ID,
+    triggered_at: new Date().toISOString(),
+    used_tokens: Math.round((percentUsed / 100) * ceilingTokens),
+    ceiling_tokens: ceilingTokens,
+    percent_used: percentUsed,
+    threshold_percent: RESTART_THRESHOLD,
+    source: 'claude_statusline',
+    rollout_path: null,
+    enqueue_ok: enqueueOk,
+    session_id: status?.session_id || null,
+  };
 }
 
 /**

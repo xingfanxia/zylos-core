@@ -197,6 +197,8 @@ let USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
 let USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
 let USAGE_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-probe.lock');
 let USAGE_CODEX_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-codex-probe.lock');
+let CONTEXT_WINDOW_FILE = path.join(MONITOR_DIR, 'context-window.json');
+let LAST_CONTEXT_HANDOFF_FILE = path.join(MONITOR_DIR, 'last-context-handoff.json');
 
 // API activity file — written by hook-activity.js (Claude Code hooks)
 let API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
@@ -219,6 +221,8 @@ if (INSTANCE_ID && instanceConfig) {
   USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
   USAGE_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-probe.lock');
   USAGE_CODEX_PROBE_LOCK_FILE = path.join(MONITOR_DIR, 'usage-codex-probe.lock');
+  CONTEXT_WINDOW_FILE = path.join(MONITOR_DIR, 'context-window.json');
+  LAST_CONTEXT_HANDOFF_FILE = path.join(MONITOR_DIR, 'last-context-handoff.json');
   API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
   HOOK_STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
 }
@@ -533,6 +537,53 @@ function enqueueContextRotationHandoff({ ratio = 0, used = 0, ceiling = 0 } = {}
   }
   log(`Context rotation handoff enqueue failed (pct=${pct}%)`);
   return false;
+}
+
+function writeJsonState(filePath, data) {
+  try {
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+  } catch (err) {
+    log(`State write failed (${path.basename(filePath)}): ${err.message}`);
+  }
+}
+
+function persistContextWindowSample({ used = 0, ceiling = 0, ratio = 0, source = 'unknown', rolloutPath = null } = {}) {
+  const percent = Math.round((ratio || 0) * 100);
+  writeJsonState(CONTEXT_WINDOW_FILE, {
+    runtime: adapter?.runtimeId || null,
+    instance_id: INSTANCE_ID,
+    observed_at: new Date().toISOString(),
+    used_tokens: Number.isFinite(used) ? used : 0,
+    ceiling_tokens: Number.isFinite(ceiling) ? ceiling : 0,
+    percent_used: percent,
+    percent_remaining: Math.max(0, 100 - percent),
+    threshold_percent: Math.round((contextMonitor?.threshold || 0) * 100),
+    source,
+    rollout_path: rolloutPath || null,
+  });
+}
+
+function persistLastContextHandoff({
+  used = 0,
+  ceiling = 0,
+  ratio = 0,
+  source = 'unknown',
+  rolloutPath = null,
+  enqueueOk = false,
+} = {}) {
+  const percent = Math.round((ratio || 0) * 100);
+  writeJsonState(LAST_CONTEXT_HANDOFF_FILE, {
+    runtime: adapter?.runtimeId || null,
+    instance_id: INSTANCE_ID,
+    triggered_at: new Date().toISOString(),
+    used_tokens: Number.isFinite(used) ? used : 0,
+    ceiling_tokens: Number.isFinite(ceiling) ? ceiling : 0,
+    percent_used: percent,
+    threshold_percent: Math.round((contextMonitor?.threshold || 0) * 100),
+    source,
+    rollout_path: rolloutPath || null,
+    enqueue_ok: enqueueOk,
+  });
 }
 
 /**
@@ -2076,10 +2127,14 @@ async function init() {
   if (contextMonitor) {
     contextMonitor.startPolling({
       intervalMs: 30_000,
-      onExceed: async ({ used, ceiling, ratio }) => {
+      onSample: async ({ used, ceiling, ratio, source, rolloutPath }) => {
+        persistContextWindowSample({ used, ceiling, ratio, source, rolloutPath });
+      },
+      onExceed: async ({ used, ceiling, ratio, source, rolloutPath }) => {
         const pct = Math.round(ratio * 100);
-        log(`Context at ${pct}% (${used}/${ceiling}), requesting new-session handoff`);
-        enqueueContextRotationHandoff({ ratio, used, ceiling });
+        log(`Context at ${pct}% (${used}/${ceiling}) via ${source || 'unknown'}, requesting new-session handoff`);
+        const enqueueOk = enqueueContextRotationHandoff({ ratio, used, ceiling });
+        persistLastContextHandoff({ used, ceiling, ratio, source, rolloutPath, enqueueOk });
       }
     });
     log(`Context monitor started (${adapter.displayName})`);

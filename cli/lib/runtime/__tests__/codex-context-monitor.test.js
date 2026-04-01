@@ -23,7 +23,7 @@ describe('CodexContextMonitor', () => {
     process.env.ZYLOS_INSTANCE_ID = 'admin';
     const { CodexContextMonitor } = await import(`../codex-context-monitor.js?scope=${Date.now()}`);
     const monitor = new CodexContextMonitor();
-    assert.equal(monitor._getThreadScopeSql(), " AND cwd LIKE '%/instances/admin'");
+    assert.equal(monitor._getThreadScopeSql(), "cwd LIKE '%/instances/admin'");
   });
 
   it('prefers model_context_window from config.toml over models_cache', async () => {

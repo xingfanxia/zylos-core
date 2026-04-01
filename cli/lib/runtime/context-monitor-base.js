@@ -42,7 +42,7 @@ export class ContextMonitorBase {
     const usage = await this.getUsage();
     if (!usage || !usage.ceiling) return null;
     const { used, ceiling } = usage;
-    return { used, ceiling, ratio: used / ceiling };
+    return { ...usage, used, ceiling, ratio: used / ceiling };
   }
 
   /**
@@ -52,9 +52,11 @@ export class ContextMonitorBase {
    * @param {(info: {used: number, ceiling: number, ratio: number}) => Promise<void>} onExceed
    * @returns {Promise<void>}
    */
-  async checkThreshold(onExceed) {
+  async checkThreshold(onExceed, { onSample } = {}) {
     const result = await this.check();
     if (!result) return;
+
+    if (onSample) await onSample(result);
 
     const { used, ceiling, ratio } = result;
     if (ratio < this.threshold) return;
@@ -74,10 +76,10 @@ export class ContextMonitorBase {
    * @param {number}   [opts.intervalMs=30000] Poll interval in ms
    * @param {Function} [opts.onExceed]         Callback fired when threshold exceeded
    */
-  startPolling({ intervalMs = 30_000, onExceed } = {}) {
+  startPolling({ intervalMs = 30_000, onExceed, onSample } = {}) {
     if (this._intervalId) return;
     this._intervalId = setInterval(() => {
-      this.checkThreshold(onExceed).catch(() => {});
+      this.checkThreshold(onExceed, { onSample }).catch(() => {});
     }, intervalMs);
   }
 

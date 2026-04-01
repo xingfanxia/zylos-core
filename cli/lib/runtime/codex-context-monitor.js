@@ -44,9 +44,6 @@ export class CodexContextMonitor extends ContextMonitorBase {
     super(opts);
     this._model = opts.model ?? null;
     this._instanceId = opts.instanceId ?? INSTANCE_ID;
-    // Record start time so SQLite queries ignore threads from prior sessions.
-    // Threads updated before this timestamp belong to a previous Codex run.
-    this._startTime = Math.floor(Date.now() / 1000);
   }
 
   /**
@@ -109,7 +106,12 @@ export class CodexContextMonitor extends ContextMonitorBase {
             const used = event.payload.info.last_token_usage.input_tokens;
             // model_context_window is the effective ceiling (already multiplied by pct)
             const ceiling = event.payload.info.model_context_window ?? this._getModelCeiling();
-            return { used, ceiling };
+            return {
+              used,
+              ceiling,
+              source: 'rollout_token_count',
+              rolloutPath,
+            };
           }
         } catch { /* skip malformed or partial line at read boundary */ }
       }
@@ -131,7 +133,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
     try {
       const sql = `SELECT rollout_path FROM threads
                    WHERE archived = 0
-                     AND updated_at >= ${this._startTime}${this._getThreadScopeSql()}
+                     ${this._getThreadScopeSql()}
                    ORDER BY updated_at DESC
                    LIMIT 1;`;
       const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
@@ -169,7 +171,8 @@ export class CodexContextMonitor extends ContextMonitorBase {
               try {
                 const { mtimeMs } = fs.statSync(fpath);
                 const mtimeSec = mtimeMs / 1000;
-                if (mtimeSec >= this._startTime && mtimeSec > bestMtime) {
+                if (!this._rolloutMatchesInstance(fpath)) continue;
+                if (mtimeSec > bestMtime) {
                   bestMtime = mtimeSec;
                   best = fpath;
                 }
@@ -194,7 +197,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
       // Same start-time filter as _getActiveRolloutPath() — ignore stale threads.
       const sql = `SELECT tokens_used FROM threads
                    WHERE archived = 0
-                     AND updated_at >= ${this._startTime}${this._getThreadScopeSql()}
+                     ${this._getThreadScopeSql()}
                    ORDER BY updated_at DESC
                    LIMIT 1;`;
       const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
@@ -203,7 +206,11 @@ export class CodexContextMonitor extends ContextMonitorBase {
       if (!out) return null;
       const tokensUsed = parseInt(out, 10);
       if (isNaN(tokensUsed)) return null;
-      return { used: tokensUsed, ceiling: this._getModelCeiling() };
+      return {
+        used: tokensUsed,
+        ceiling: this._getModelCeiling(),
+        source: 'sqlite_fallback',
+      };
     } catch {
       return null;
     }
@@ -263,9 +270,41 @@ export class CodexContextMonitor extends ContextMonitorBase {
    * @returns {string}
    */
   _getThreadScopeSql() {
-    if (!this._instanceId) return '';
+    if (!this._instanceId) return '1 = 1';
     const suffix = _sqlEscape(`/instances/${this._instanceId}`);
-    return ` AND cwd LIKE '%${suffix}'`;
+    return `cwd LIKE '%${suffix}'`;
+  }
+
+  _rolloutMatchesInstance(rolloutPath) {
+    if (!this._instanceId) return true;
+    try {
+      const stat = fs.statSync(rolloutPath);
+      if (!stat.size) return false;
+      const readBytes = Math.min(16_384, stat.size);
+      const buf = Buffer.alloc(readBytes);
+      const fd = fs.openSync(rolloutPath, 'r');
+      try {
+        fs.readSync(fd, buf, 0, readBytes, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const lines = buf.toString('utf8').split('\n');
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const event = JSON.parse(trimmed);
+          if (event.type === 'session_meta' && typeof event.payload?.cwd === 'string') {
+            return event.payload.cwd.endsWith(`/instances/${this._instanceId}`);
+          }
+        } catch {
+          // ignore malformed line
+        }
+      }
+    } catch {
+      return false;
+    }
+    return false;
   }
 }
 
