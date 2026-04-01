@@ -686,68 +686,23 @@ class Dashboard {
   }
 
   _getRuntimeUsageWindow(runtime) {
-    var providerUsage = this.data?.provider_usage?.providers?.[runtime];
     var instances = this.data?.instances || [];
-    var usageWindows = this.data?.usage_windows || {};
     var matching = instances.filter(function(inst) {
       return (inst.runtime || 'claude') === runtime;
     });
+    var runtimeUsage = this.data?.runtime_usage?.[runtime];
 
-    if (providerUsage && providerUsage.available) {
-      var providerLooksEmpty = runtime === 'codex' &&
-        ((providerUsage.primary?.used_percent ?? null) === 0) &&
-        ((providerUsage.secondary?.used_percent ?? null) === 0);
-
-      if (!providerLooksEmpty) {
-        return {
-          usage: {
-            runtime: runtime,
-            available: providerUsage.available,
-            session: runtime === 'claude' && providerUsage.primary ? {
-              percent: providerUsage.primary.left_percent,
-              resets: providerUsage.primary.reset_description,
-            } : null,
-            fiveHour: runtime === 'codex' && providerUsage.primary ? {
-              percent: providerUsage.primary.left_percent,
-              resets: providerUsage.primary.reset_description,
-            } : null,
-            weeklyAll: providerUsage.secondary ? {
-              percent: providerUsage.secondary.left_percent,
-              resets: providerUsage.secondary.reset_description,
-            } : null,
-            weeklySonnet: runtime === 'claude' && providerUsage.tertiary ? {
-              percent: providerUsage.tertiary.left_percent,
-              resets: providerUsage.tertiary.reset_description,
-            } : null,
-            tier: null,
-            lastCheck: providerUsage.fetched_at || this.data?.provider_usage?.updated_at || null,
-          },
-          instanceCount: matching.length,
-        };
-      }
-    }
-
-    var bestLocal = null;
-    for (var i = 0; i < matching.length; i++) {
-      var usage = usageWindows[matching[i].id];
-      if (!usage || !usage.available) continue;
-      if (!bestLocal) {
-        bestLocal = usage;
-        continue;
-      }
-      var currentTs = usage.lastCheck ? Date.parse(usage.lastCheck) : 0;
-      var bestTs = bestLocal.lastCheck ? Date.parse(bestLocal.lastCheck) : 0;
-      if (currentTs > bestTs) bestLocal = usage;
-    }
-
-    if (bestLocal) {
+    if (runtimeUsage) {
       return {
         usage: {
-          ...bestLocal,
-          session: runtime === 'claude' ? bestLocal.session : null,
-          fiveHour: runtime === 'codex' ? bestLocal.fiveHour : bestLocal.fiveHour,
-          weeklyAll: bestLocal.weeklyAll,
-          weeklySonnet: runtime === 'claude' ? bestLocal.weeklySonnet : null,
+          runtime: runtime,
+          available: true,
+          session: runtimeUsage.session || null,
+          fiveHour: runtimeUsage.fiveHour || null,
+          weeklyAll: runtimeUsage.weeklyAll || null,
+          weeklySonnet: runtimeUsage.weeklySonnet || null,
+          tier: null,
+          lastCheck: runtimeUsage.lastCheck || null,
         },
         instanceCount: matching.length,
       };

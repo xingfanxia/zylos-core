@@ -8,6 +8,7 @@ const tmpDirs = [];
 
 const {
   annotateTokenCacheWithRuntimes,
+  buildRuntimeUsage,
   readUsageWindowSnapshot,
 } = await import('../dashboard-data.js');
 
@@ -85,5 +86,59 @@ describe('readUsageWindowSnapshot', () => {
     assert.equal(snapshot.runtime, 'claude');
     assert.equal(snapshot.available, false);
     assert.equal(snapshot.source_file, 'usage.json');
+  });
+});
+
+describe('buildRuntimeUsage', () => {
+  it('prefers CodexBar for Claude and local rollout snapshots for Codex', () => {
+    const result = buildRuntimeUsage({
+      instancesConfig: {
+        instances: {
+          admin: { runtime: 'codex' },
+          betty: { runtime: 'codex' },
+          claudeAdmin: { runtime: 'claude' },
+        },
+      },
+      usageWindows: {
+        admin: {
+          available: true,
+          runtime: 'codex',
+          fiveHour: { percent: 18, resets: '10:15' },
+          weeklyAll: { percent: 9, resets: 'Apr 7' },
+          lastCheck: '2026-04-01T08:00:00.000Z',
+        },
+        betty: {
+          available: true,
+          runtime: 'codex',
+          fiveHour: { percent: 24, resets: '10:15' },
+          weeklyAll: { percent: 11, resets: 'Apr 7' },
+          lastCheck: '2026-04-01T08:00:03.000Z',
+        },
+      },
+      providerUsage: {
+        updated_at: '2026-04-01T08:20:00.000Z',
+        providers: {
+          claude: {
+            available: true,
+            fetched_at: '2026-04-01T08:20:00.000Z',
+            primary: { left_percent: 92, reset_description: '11am' },
+            secondary: { left_percent: 1, reset_description: 'Apr 3' },
+            tertiary: { left_percent: 94, reset_description: 'Apr 6' },
+          },
+          codex: {
+            available: true,
+            account_email: 'test@example.com',
+            primary: { left_percent: 99, reset_description: '1pm' },
+            secondary: { left_percent: 100, reset_description: 'Apr 8' },
+          },
+        },
+      },
+    });
+
+    assert.equal(result.claude.session.percent, 92);
+    assert.equal(result.claude.weeklyAll.percent, 1);
+    assert.equal(result.codex.fiveHour.percent, 76);
+    assert.equal(result.codex.weeklyAll.percent, 89);
+    assert.equal(result.codex.source, 'local_rollout');
   });
 });

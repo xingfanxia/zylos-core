@@ -151,3 +151,97 @@ export function readProviderUsage(zylosDir, {
     };
   }
 }
+
+export function buildRuntimeUsage({
+  instancesConfig,
+  usageWindows,
+  providerUsage,
+} = {}) {
+  const runtimeUsage = {};
+
+  function matchingWindows(runtime) {
+    return Object.entries(instancesConfig?.instances || {})
+      .filter(([, inst]) => (inst?.runtime || 'claude') === runtime)
+      .map(([id]) => usageWindows?.[id])
+      .filter((entry) => entry && entry.available);
+  }
+
+  function aggregateLocalMetric(entries, key) {
+    let best = null;
+    for (const entry of entries) {
+      const metric = entry?.[key];
+      if (!metric || metric.percent === null || metric.percent === undefined) continue;
+      if (!best || metric.percent > best.percent) best = metric;
+    }
+    if (!best) return null;
+    return {
+      percent: Math.max(0, 100 - best.percent),
+      resets: best.resets || null,
+    };
+  }
+
+  function latestCheck(entries) {
+    let best = null;
+    for (const entry of entries) {
+      const ts = entry?.lastCheck ? Date.parse(entry.lastCheck) : 0;
+      if (!best || ts > best.ts) best = { ts, value: entry.lastCheck };
+    }
+    return best?.value || null;
+  }
+
+  const claudeProvider = providerUsage?.providers?.claude;
+  if (claudeProvider?.available) {
+    runtimeUsage.claude = {
+      source: 'codexbar',
+      session: claudeProvider.primary ? {
+        percent: claudeProvider.primary.left_percent,
+        resets: claudeProvider.primary.reset_description,
+      } : null,
+      fiveHour: null,
+      weeklyAll: claudeProvider.secondary ? {
+        percent: claudeProvider.secondary.left_percent,
+        resets: claudeProvider.secondary.reset_description,
+      } : null,
+      weeklySonnet: claudeProvider.tertiary ? {
+        percent: claudeProvider.tertiary.left_percent,
+        resets: claudeProvider.tertiary.reset_description,
+      } : null,
+      lastCheck: claudeProvider.fetched_at || providerUsage?.updated_at || null,
+      account_email: claudeProvider.account_email || null,
+    };
+  }
+
+  const codexEntries = matchingWindows('codex');
+  if (codexEntries.length > 0) {
+    runtimeUsage.codex = {
+      source: 'local_rollout',
+      session: null,
+      fiveHour: aggregateLocalMetric(codexEntries, 'fiveHour'),
+      weeklyAll: aggregateLocalMetric(codexEntries, 'weeklyAll'),
+      weeklySonnet: null,
+      lastCheck: latestCheck(codexEntries),
+      account_email: providerUsage?.providers?.codex?.account_email || null,
+    };
+  } else {
+    const codexProvider = providerUsage?.providers?.codex;
+    if (codexProvider?.available) {
+      runtimeUsage.codex = {
+        source: 'codexbar',
+        session: null,
+        fiveHour: codexProvider.primary ? {
+          percent: codexProvider.primary.left_percent,
+          resets: codexProvider.primary.reset_description,
+        } : null,
+        weeklyAll: codexProvider.secondary ? {
+          percent: codexProvider.secondary.left_percent,
+          resets: codexProvider.secondary.reset_description,
+        } : null,
+        weeklySonnet: null,
+        lastCheck: codexProvider.fetched_at || providerUsage?.updated_at || null,
+        account_email: codexProvider.account_email || null,
+      };
+    }
+  }
+
+  return runtimeUsage;
+}

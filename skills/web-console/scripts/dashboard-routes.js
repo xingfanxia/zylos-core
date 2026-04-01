@@ -26,6 +26,7 @@ import {
 import {
   annotateTokenCacheWithRuntimes,
   buildUsageWindows,
+  buildRuntimeUsage,
   loadInstancesConfig,
   readProviderUsage,
 } from './dashboard-data.js';
@@ -215,6 +216,11 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
 
       health.usage_windows = buildUsageWindows(instancesConfig, zylosDir);
       health.provider_usage = readProviderUsage(zylosDir);
+      health.runtime_usage = buildRuntimeUsage({
+        instancesConfig,
+        usageWindows: health.usage_windows,
+        providerUsage: health.provider_usage,
+      });
 
       res.json(health);
     } catch (err) {
