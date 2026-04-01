@@ -241,7 +241,7 @@ export function getDefaultInstance() {
  * Ensure the per-instance working directory exists with correct symlinks.
  *
  * Creates `~/zylos/instances/<instanceId>/` and sets up symlinks to shared
- * resources (.claude, CLAUDE.md, .env, memory) so CC launches from an
+ * resources (.claude, CLAUDE.md, AGENTS.md, .env, memory) so the runtime launches from an
  * isolated cwd while sharing auth, skills, config, and memory.
  *
  * Safe to call repeatedly — only creates missing dirs/links, updates stale ones.
@@ -258,6 +258,7 @@ export function ensureInstanceCwd(instanceId) {
   const symlinks = [
     ['.claude', '../../.claude'],
     ['CLAUDE.md', '../../CLAUDE.md'],
+    ['AGENTS.md', '../../AGENTS.md'],
     ['.env', '../../.env'],
     ['memory', '../../memory'],
   ];

@@ -56,6 +56,37 @@ Launches CC from per-instance working directory:
 - Pre-trusts the instance dir for CC onboarding
 - All `cd` commands in the tmux shell use `instanceCwd`
 
+## Memory Isolation
+
+The memory layer is now hardened for future mixed-runtime use.
+
+### Ownership Rules
+
+| Scope | Path | Allowed writer |
+|------|------|----------------|
+| Shared identity / references / shared reference docs | `memory/shared/...` | primary instance or scheduler |
+| Archive | `memory/archive/...` | primary instance or scheduler |
+| Per-instance working state | `memory/instances/<id>/...` | owning instance only |
+| User profile | `memory/users/<uid>/profile.md` | any instance |
+
+### Enforcement Paths
+
+- `skills/activity-monitor/scripts/memory-guard.js` now enforces the shared-vs-instance policy through the Claude hook template.
+- The guard resolves symlinked paths, so compatibility links still map back to the real shared or instance-owned target before validation.
+- Codex startup memory injection now prints a `MEMORY WRITE POLICY` block so Codex instances receive the same ownership rules even before Codex-native hook enforcement exists.
+- Codex bootstrap now reads per-instance `memory/instances/<id>/state.md` instead of assuming legacy flat `memory/state.md`.
+
+### Operational Note
+
+When deploying changes that touch `templates/.claude/settings.json`, run:
+
+```bash
+cd ~/zylos-core
+node cli/lib/sync-settings-hooks.js
+```
+
+Otherwise existing installs will not pick up the updated hook wiring.
+
 ## Per-Instance Working Directories
 
 Each instance runs CC from its own directory for token tracking isolation:
@@ -64,6 +95,7 @@ Each instance runs CC from its own directory for token tracking isolation:
 ~/zylos/instances/<id>/
   ├── .claude → ../../.claude       (shared skills)
   ├── CLAUDE.md → ../../CLAUDE.md   (shared instructions)
+  ├── AGENTS.md → ../../AGENTS.md   (Codex instructions)
   ├── .env → ../../.env             (shared config)
   └── memory → ../../memory         (shared memory)
 ```
@@ -101,6 +133,7 @@ The web console dashboard (`/dashboard`) provides:
 - Enable/disable instances
 - Suspend/resume on-demand instances
 - Instance cards show: status, type, tmux state, last activity, uptime, idle time
+- Runtime switching is currently global, not per-instance. See [design/mixed-runtime-plan.md](design/mixed-runtime-plan.md) for the planned dashboard runtime actions.
 
 ### User Approval
 - Pending user queue with approve/deny buttons

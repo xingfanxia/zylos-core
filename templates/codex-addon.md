@@ -58,6 +58,16 @@ Only proceed after the user confirms.
 
 3. **Use shell tools for web access.** You do not have built-in `WebSearch` or `WebFetch` tools. Use `curl`, `wget`, or browser automation for web access. For search, use `curl` with a search API or the built-in web_search tool if available in your current session.
 
+### Memory Isolation
+
+In multi-session mode, treat memory ownership strictly:
+
+- Only the primary instance or scheduler may write shared memory (`memory/shared/...`) or archive files (`memory/archive/...`).
+- Non-primary user/worker instances may only write their own `memory/instances/<instance-id>/...` files plus `memory/users/<uid>/profile.md`.
+- Never write another instance's memory directory.
+
+The startup memory injection prints the concrete policy for the current instance. Follow that policy exactly.
+
 ### Approval Behavior
 
 You are running with `--dangerously-bypass-approvals-and-sandbox` (all Codex-internal operations auto-approved, no sandbox):

@@ -18,6 +18,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import {
+  isPrimaryInstance as isPrimaryInstancePolicy,
+  isSchedulerInstance as isSchedulerInstancePolicy,
+  validateMemoryWrite as validateMemoryWritePolicy,
+} from '../../multi-session/memory-policy.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MEMORY_DIR = path.join(ZYLOS_DIR, 'memory');
@@ -32,14 +37,10 @@ const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
  * @returns {boolean}
  */
 export function isSchedulerInstance() {
-  if (!INSTANCE_ID) return false;
-  try {
-    const config = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
-    const schedulerId = config.scheduler_instance ?? config.default_instance;
-    return schedulerId === INSTANCE_ID;
-  } catch {
-    return false;
-  }
+  return isSchedulerInstancePolicy({
+    instanceId: INSTANCE_ID,
+    instancesFilePath: INSTANCES_FILE,
+  });
 }
 
 /**
@@ -50,13 +51,10 @@ export function isSchedulerInstance() {
  * @returns {boolean}
  */
 export function isPrimary() {
-  if (!INSTANCE_ID) return true; // legacy mode = primary
-  try {
-    const config = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
-    return config.instances?.[INSTANCE_ID]?.primary === true;
-  } catch {
-    return true; // fail-open: if can't read config, assume primary
-  }
+  return isPrimaryInstancePolicy({
+    instanceId: INSTANCE_ID,
+    instancesFilePath: INSTANCES_FILE,
+  });
 }
 
 /**
@@ -66,73 +64,15 @@ export function isPrimary() {
  * @returns {string|null} A rejection reason string if blocked, or null if allowed
  */
 export function validateMemoryWrite(filePath) {
-  // Resolve to absolute path
-  const absPath = path.resolve(filePath);
-
-  // Only guard writes to the memory directory
-  if (!absPath.startsWith(MEMORY_DIR + path.sep) && absPath !== MEMORY_DIR) {
-    return null; // not a memory write -- allow
-  }
-
-  const relPath = path.relative(MEMORY_DIR, absPath);
-  const segments = relPath.split(path.sep);
-
-  // Check: writing to instances/<id>/
-  if (segments[0] === 'instances' && segments.length >= 2) {
-    const targetInstanceId = segments[1];
-    if (targetInstanceId !== INSTANCE_ID && INSTANCE_ID) {
-      return `Cannot write to instance '${targetInstanceId}' memory from instance '${INSTANCE_ID}'`;
-    }
-    return null; // writing to own instance dir -- allow
-  }
-
-  // Check: writing to shared/
-  if (segments[0] === 'shared') {
-    if (!isPrimary() && !isSchedulerInstance()) {
-      return `Non-primary instance '${INSTANCE_ID}' cannot write to shared memory`;
-    }
-    return null; // primary or scheduler instance can write to shared
-  }
-
-  // Check: writing to users/ -- allow for user profile writes
-  if (segments[0] === 'users') {
-    return null; // any instance can write user profiles
-  }
-
-  // Check: writing to archive/ -- allow
-  if (segments[0] === 'archive') {
-    return null;
-  }
-
-  // Legacy flat files (identity.md, state.md, etc at top level)
-  // In legacy mode (no INSTANCE_ID), allow everything
-  if (!INSTANCE_ID) return null;
-
-  // In multi-session mode, top-level files should go through shared/ or instances/
-  // But symlinks exist for backward compat, so allow writes to symlinked files
-  try {
-    const realPath = fs.realpathSync(absPath);
-    // If the real path resolves to shared/, re-validate
-    if (realPath.startsWith(path.join(MEMORY_DIR, 'shared') + path.sep)) {
-      if (!isPrimary() && !isSchedulerInstance()) {
-        return `Non-primary instance '${INSTANCE_ID}' cannot write to shared memory (via symlink)`;
-      }
-      return null;
-    }
-    // If the real path resolves to instances/, re-validate
-    if (realPath.startsWith(path.join(MEMORY_DIR, 'instances') + path.sep)) {
-      const realRel = path.relative(path.join(MEMORY_DIR, 'instances'), realPath);
-      const realInstanceId = realRel.split(path.sep)[0];
-      if (realInstanceId !== INSTANCE_ID) {
-        return `Cannot write to instance '${realInstanceId}' memory from instance '${INSTANCE_ID}' (via symlink)`;
-      }
-      return null;
-    }
-  } catch {
-    // File doesn't exist yet (new file creation) -- check path heuristically
-  }
-
-  return null; // default: allow
+  return validateMemoryWritePolicy(filePath, {
+    zylosDir: ZYLOS_DIR,
+    memoryDir: MEMORY_DIR,
+    instanceId: INSTANCE_ID,
+    instancesFilePath: INSTANCES_FILE,
+    existsSync: fs.existsSync,
+    realpathSync: fs.realpathSync,
+    readFileSync: fs.readFileSync,
+  });
 }
 
 /**

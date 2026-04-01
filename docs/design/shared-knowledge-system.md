@@ -126,10 +126,11 @@ shared knowledge sync.
 
 ### memory-guard.js change
 
-The memory guard currently allows non-primary instances to write to shared/
-only through specific paths. The scheduler instance needs write access to all
-shared/reference/ files. Update the guard to allow the scheduler instance
-(or any instance running a shared-knowledge-sync task) to write to shared/.
+Implemented: shared memory writes are now restricted so only the primary
+instance or scheduler may write `shared/` and `archive/`, while non-primary
+instances are limited to their own `instances/<id>/...` paths plus
+`users/<uid>/profile.md`. The scheduler exemption for shared knowledge sync is
+part of the shipped policy.
 
 ### Session injection
 

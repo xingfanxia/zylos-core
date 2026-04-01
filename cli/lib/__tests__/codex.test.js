@@ -8,11 +8,16 @@ const tmpDirs = [];
 
 const { CodexAdapter, buildCodexBootstrapPrompt, isOnboardingPendingState } = await import('../runtime/codex.js');
 
-function makeZylosDir(stateContent) {
+function makeZylosDir(stateContent, opts = {}) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-bootstrap-test-'));
   tmpDirs.push(tmpDir);
   fs.mkdirSync(path.join(tmpDir, 'memory'), { recursive: true });
   fs.writeFileSync(path.join(tmpDir, 'memory', 'state.md'), stateContent, 'utf8');
+  if (opts.instanceId) {
+    const instanceStatePath = path.join(tmpDir, 'memory', 'instances', opts.instanceId, 'state.md');
+    fs.mkdirSync(path.dirname(instanceStatePath), { recursive: true });
+    fs.writeFileSync(instanceStatePath, opts.instanceStateContent || '', 'utf8');
+  }
   return tmpDir;
 }
 
@@ -59,6 +64,21 @@ describe('Codex bootstrap onboarding guard', () => {
 
     assert.match(prompt, /node ".*session-start-prompt\.js"/);
     assert.match(prompt, /Then continue according to the latest control message and ongoing conversation context\./);
+  });
+
+  it('uses instance-specific state.md when instanceId is provided', () => {
+    const zylosDir = makeZylosDir(
+      '# Active State\n\n## Onboarding\n- Status: completed\n',
+      {
+        instanceId: 'user-betty',
+        instanceStateContent: '# Active State\n\n## Onboarding\n- Status: pending\n',
+      }
+    );
+
+    const prompt = buildCodexBootstrapPrompt(zylosDir, { instanceId: 'user-betty' });
+
+    assert.match(prompt, /Do not run the startup follow-up trigger yet because onboarding is pending\./);
+    assert.doesNotMatch(prompt, /node ".*session-start-prompt\.js"/);
   });
 });
 

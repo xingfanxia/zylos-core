@@ -41,6 +41,19 @@ tmux list-sessions -F '#{session_name}' | grep '^claude-user-' | xargs -I{} tmux
 
 Step 5 is only needed when `cli/lib/runtime/claude.js` (the RuntimeAdapter) changes. For skills-only changes, steps 1-4 are sufficient since PM2 restart reloads the AM which imports skills.
 
+If the deploy includes changes to runtime templates or Claude hook wiring, run:
+
+```bash
+cd ~/zylos-core
+node cli/lib/sync-settings-hooks.js
+```
+
+This is required after changes to:
+
+- `templates/.claude/settings.json`
+- Codex runtime config rendering (`~/.codex/config.toml`)
+- any core hook command path or timeout
+
 ## Post-Deploy Smoke Tests
 
 After deploying to `~/zylos`, run the live smoke suite from the repo checkout:
@@ -90,6 +103,26 @@ cd ~/zylos-core
 npm run test:smoke:roundtrip -- --instance user-limh
 npm run test:smoke:full
 ```
+
+## Mixed-Runtime Memory Notes
+
+The current mixed-runtime hardening assumes Claude and Codex may read the same
+memory tree even before full mixed-runtime orchestration is implemented.
+
+What is now enforced:
+
+- Shared memory writes are restricted: only the primary instance or scheduler may write `memory/shared/...` and `memory/archive/...`.
+- Non-primary user/worker instances may write only their own `memory/instances/<id>/...` files plus `memory/users/<uid>/profile.md`.
+- The memory guard is now wired through the Claude hook template, so existing installs need `node cli/lib/sync-settings-hooks.js` after deploy.
+- Codex bootstrap now reads per-instance `memory/instances/<id>/state.md` instead of assuming legacy flat `memory/state.md`.
+- Session-start memory injection now prints a `MEMORY WRITE POLICY` block and resolves runtime-aware per-instance instruction overlays.
+- Per-instance working directories now symlink both `CLAUDE.md` and `AGENTS.md`.
+
+Operationally, this means runtime switching can preserve memory more safely,
+and future mixed-runtime instances will start from a stricter memory policy.
+
+For the broader concurrent Claude+Codex roadmap, including dashboard runtime
+controls, see [design/mixed-runtime-plan.md](design/mixed-runtime-plan.md).
 
 ## Why Not `npm install -g`?
 

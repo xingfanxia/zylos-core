@@ -9,7 +9,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR, resolveSharedFile, resolveInstanceFile } from './shared.js';
+import { describeMemoryWritePolicy } from '../../multi-session/memory-policy.js';
+import {
+  getInstanceInstructionFiles,
+  getInstanceRuntime,
+} from '../../multi-session/runtime-files.js';
 
 const startMs = Date.now();
 let diagnosticModule;
@@ -60,36 +64,68 @@ function section(label, filePath) {
   return lines.join('\n');
 }
 
-function main() {
-  const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+function inlineSection(label, content) {
+  return `=== ${label} ===\n${(content || '').trim()}`;
+}
 
+function getMemoryDir(zylosDir) {
+  return path.join(zylosDir, 'memory');
+}
+
+function resolveSharedMemoryFile(zylosDir, filename) {
+  const memoryDir = getMemoryDir(zylosDir);
+  const sharedDir = fs.existsSync(path.join(memoryDir, 'shared'))
+    ? path.join(memoryDir, 'shared')
+    : memoryDir;
+  const sharedPath = path.join(sharedDir, filename);
+  if (fs.existsSync(sharedPath)) return sharedPath;
+  return path.join(memoryDir, filename);
+}
+
+function resolveInstanceMemoryFile(zylosDir, instanceId, filename) {
+  return path.join(getMemoryDir(zylosDir), 'instances', instanceId, filename);
+}
+
+export function getStartupMemoryContextParts({
+  zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
+  instanceId = process.env.ZYLOS_INSTANCE_ID || null,
+  runtime = null,
+} = {}) {
+  const activeRuntime = runtime || getInstanceRuntime({ zylosDir, instanceId });
   const parts = [
-    section('BOT IDENTITY', resolveSharedFile('identity.md')),
-    section('ACTIVE STATE', INSTANCE_ID
-      ? resolveInstanceFile(INSTANCE_ID, 'state.md')
-      : path.join(MEMORY_DIR, 'state.md')),
-    section('REFERENCES', resolveSharedFile('references.md'))
+    section('BOT IDENTITY', resolveSharedMemoryFile(zylosDir, 'identity.md')),
+    section('ACTIVE STATE', instanceId
+      ? resolveInstanceMemoryFile(zylosDir, instanceId, 'state.md')
+      : path.join(getMemoryDir(zylosDir), 'state.md')),
+    section('REFERENCES', resolveSharedMemoryFile(zylosDir, 'references.md'))
   ];
 
   // Shared context digest (cross-instance awareness)
-  const digestPath = resolveSharedFile('recent-activity.md');
+  const digestPath = resolveSharedMemoryFile(zylosDir, 'recent-activity.md');
   const digestResult = readFileSafe(digestPath);
   if (digestResult.ok && digestResult.content.trim()) {
     parts.push(section('CROSS-INSTANCE CONTEXT', digestPath));
   }
 
-  // Per-instance CLAUDE.md injection (multi-session)
-  if (INSTANCE_ID) {
-    const instanceClaudeMd = path.join(
-      process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
-      'instances', INSTANCE_ID, 'CLAUDE.md'
-    );
-    const result = readFileSafe(instanceClaudeMd);
-    if (result.ok && result.content && result.content.trim().length > 0) {
-      parts.push(`=== INSTANCE INSTRUCTIONS ===\n${result.content.trim()}`);
+  if (instanceId) {
+    parts.push(inlineSection(
+      'MEMORY WRITE POLICY',
+      describeMemoryWritePolicy({ instanceId, instancesFilePath: path.join(zylosDir, 'instances.json') })
+    ));
+
+    for (const entry of getInstanceInstructionFiles({ zylosDir, instanceId, runtime: activeRuntime })) {
+      const result = readFileSafe(entry.path);
+      if (result.ok && result.content && result.content.trim().length > 0) {
+        parts.push(inlineSection(entry.label, result.content));
+      }
     }
   }
 
+  return parts;
+}
+
+function main() {
+  const parts = getStartupMemoryContextParts();
   process.stdout.write(`${parts.join('\n\n')}\n`);
 }
 
