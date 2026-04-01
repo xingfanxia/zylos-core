@@ -307,12 +307,13 @@ export function saveClaudeBaseUrlToSettingsAndEnv(baseUrl) {
  *
  * @param {string} projectDir - The zylos working directory to pre-trust
  * @param {string} existingContent - Existing config.toml contents (optional)
- * @param {{ openaiBaseUrl?: string }} opts - Optional Codex config overrides
+ * @param {{ openaiBaseUrl?: string, model?: string, modelContextWindow?: number, modelAutoCompactTokenLimit?: number, modelReasoningEffort?: string, personality?: string }} opts - Optional Codex config overrides
  * @returns {string}
  */
 export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
   const absProject = path.resolve(projectDir);
   const openaiBaseUrl = opts.openaiBaseUrl || process.env.OPENAI_BASE_URL || '';
+  const runtimeSettings = resolveCodexRuntimeSettings(existingContent, opts);
 
   let preservedProjects = '';
   const projectMatches = existingContent.match(/^\[projects\.[^\]]+\][^\[]+/gm);
@@ -327,6 +328,13 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     '# Codex headless config — written by zylos, do not edit manually.',
     '# Re-generated on each `zylos init` / `zylos runtime codex`.',
     '',
+    '# Runtime defaults / operator overrides',
+    `model = "${escapeTomlString(runtimeSettings.model)}"`,
+    `model_context_window = ${runtimeSettings.modelContextWindow}`,
+    `model_auto_compact_token_limit = ${runtimeSettings.modelAutoCompactTokenLimit}`,
+    `model_reasoning_effort = "${escapeTomlString(runtimeSettings.modelReasoningEffort)}"`,
+    `personality = "${escapeTomlString(runtimeSettings.personality)}"`,
+    '',
     '# Disable startup checks and telemetry',
     'check_for_update_on_startup = false',
     '# analytics: Codex v0.114.0 expects a struct here, not a boolean.',
@@ -334,7 +342,7 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     '',
     '# Acknowledge the latest model NUX so the "Introducing GPT-X" dialog',
     '# is not shown on startup.  Update this when Codex ships a new default model.',
-    'model_availability_nux = "gpt-5.4"',
+    `model_availability_nux = "${escapeTomlString(runtimeSettings.model)}"`,
     ...(openaiBaseUrl ? ['', '# Use a custom OpenAI-compatible base URL', `openai_base_url = "${openaiBaseUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`] : []),
     '',
     '# Enable Codex features required by Zylos runtime workflows.',
@@ -386,6 +394,69 @@ export function writeCodexConfig(projectDir, opts = {}) {
   } catch {
     return false;
   }
+}
+
+const DEFAULT_CODEX_MODEL = 'gpt-5.4';
+const DEFAULT_CODEX_MODEL_CONTEXT_WINDOW = 1_000_000;
+const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT = 800_000;
+const DEFAULT_CODEX_REASONING_EFFORT = 'xhigh';
+const DEFAULT_CODEX_PERSONALITY = 'pragmatic';
+
+function resolveCodexRuntimeSettings(existingContent = '', opts = {}) {
+  return {
+    model:
+      opts.model ||
+      process.env.ZYLOS_CODEX_MODEL ||
+      readTomlString(existingContent, 'model') ||
+      DEFAULT_CODEX_MODEL,
+    modelContextWindow:
+      normalizePositiveInteger(opts.modelContextWindow) ||
+      normalizePositiveInteger(process.env.ZYLOS_CODEX_MODEL_CONTEXT_WINDOW) ||
+      readTomlInteger(existingContent, 'model_context_window') ||
+      DEFAULT_CODEX_MODEL_CONTEXT_WINDOW,
+    modelAutoCompactTokenLimit:
+      normalizePositiveInteger(opts.modelAutoCompactTokenLimit) ||
+      normalizePositiveInteger(process.env.ZYLOS_CODEX_AUTO_COMPACT_TOKEN_LIMIT) ||
+      readTomlInteger(existingContent, 'model_auto_compact_token_limit') ||
+      DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+    modelReasoningEffort:
+      opts.modelReasoningEffort ||
+      process.env.ZYLOS_CODEX_REASONING_EFFORT ||
+      readTomlString(existingContent, 'model_reasoning_effort') ||
+      DEFAULT_CODEX_REASONING_EFFORT,
+    personality:
+      opts.personality ||
+      process.env.ZYLOS_CODEX_PERSONALITY ||
+      readTomlString(existingContent, 'personality') ||
+      DEFAULT_CODEX_PERSONALITY,
+  };
+}
+
+function readTomlString(content = '', key) {
+  if (!content || !key) return null;
+  const match = content.match(new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*["']([^"']+)["']\\s*$`, 'm'));
+  return match?.[1] || null;
+}
+
+function readTomlInteger(content = '', key) {
+  if (!content || !key) return null;
+  const match = content.match(new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*(\\d+)\\s*$`, 'm'));
+  return normalizePositiveInteger(match?.[1]);
+}
+
+function normalizePositiveInteger(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number.parseInt(String(value), 10);
+  if (Number.isNaN(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function escapeTomlString(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**

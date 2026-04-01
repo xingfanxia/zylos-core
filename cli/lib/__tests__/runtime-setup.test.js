@@ -64,6 +64,11 @@ describe('writeCodexConfig', () => {
     const content = fs.readFileSync(configPath, 'utf8');
     assert.match(content, /\[features\]\nmulti_agent = true\n/);
     assert.match(content, /\[notice\]/);
+    assert.match(content, /^model = "gpt-5\.4"$/m);
+    assert.match(content, /^model_context_window = 1000000$/m);
+    assert.match(content, /^model_auto_compact_token_limit = 800000$/m);
+    assert.match(content, /^model_reasoning_effort = "xhigh"$/m);
+    assert.match(content, /^personality = "pragmatic"$/m);
     assert.match(
       content,
       new RegExp(`\\[projects\\."${escapeRegExp(path.resolve(projectDir))}"\\]\\ntrust_level = "trusted"`)
@@ -76,6 +81,35 @@ describe('writeCodexConfig', () => {
       content,
       new RegExp(`\\[projects\\."${escapeRegExp(path.resolve(projectDir))}"\\]\\ntrust_level = "untrusted"`)
     );
+  });
+
+  it('preserves existing runtime overrides from config.toml', () => {
+    const codexDir = path.join(fakeHome, '.codex');
+    const configPath = path.join(codexDir, 'config.toml');
+    const projectDir = path.join(fakeZylosDir, 'workspace', 'project-b');
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      configPath,
+      [
+        'model = "gpt-5.4-mini"',
+        'model_context_window = 777777',
+        'model_auto_compact_token_limit = 555555',
+        'model_reasoning_effort = "medium"',
+        'personality = "direct"',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    assert.equal(writeCodexConfig(projectDir), true);
+
+    const content = fs.readFileSync(configPath, 'utf8');
+    assert.match(content, /^model = "gpt-5\.4-mini"$/m);
+    assert.match(content, /^model_context_window = 777777$/m);
+    assert.match(content, /^model_auto_compact_token_limit = 555555$/m);
+    assert.match(content, /^model_reasoning_effort = "medium"$/m);
+    assert.match(content, /^personality = "direct"$/m);
   });
 });
 
