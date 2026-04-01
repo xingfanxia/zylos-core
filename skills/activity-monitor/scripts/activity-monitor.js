@@ -1653,11 +1653,15 @@ async function monitorLoop() {
       return;
     }
 
-    // Multi-session: skip restart if suspended
+    // Multi-session: let suspended instances consume wake-signal and clear
+    // their suspended flag before we decide whether to skip guardian restart.
     if (suspendMgr?.isSuspended()) {
-      engine.processHeartbeat(false, currentTime);
-      lastState = state;
-      return;
+      suspendMgr.tick({ currentTime, idleSeconds: 0, claudeRunning: false, currentTimeHuman });
+      if (suspendMgr.isSuspended()) {
+        engine.processHeartbeat(false, currentTime);
+        lastState = state;
+        return;
+      }
     }
 
     // Check for wake signal — skip backoff for immediate restart (message waiting)
@@ -1739,11 +1743,15 @@ async function monitorLoop() {
       return;
     }
 
-    // Multi-session: skip restart if suspended
+    // Multi-session: let suspended instances consume wake-signal and clear
+    // their suspended flag before we decide whether to skip guardian restart.
     if (suspendMgr?.isSuspended()) {
-      engine.processHeartbeat(false, currentTime);
-      lastState = state;
-      return;
+      suspendMgr.tick({ currentTime, idleSeconds: 0, claudeRunning: false, currentTimeHuman });
+      if (suspendMgr.isSuspended()) {
+        engine.processHeartbeat(false, currentTime);
+        lastState = state;
+        return;
+      }
     }
 
     // Delegate restart permission to HeartbeatEngine (e.g. won't restart during rate_limited).

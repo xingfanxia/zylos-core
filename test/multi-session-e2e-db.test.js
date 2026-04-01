@@ -114,6 +114,36 @@ function getNextPendingForInstances(db, onlineInstanceIds) {
   `).get(...onlineInstanceIds) || null;
 }
 
+function getPendingTargetInstancesNeedingWake(db, onlineInstanceIds) {
+  if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
+    return db.prepare(`
+      SELECT target_instance,
+             MIN(COALESCE(priority, 3)) AS min_priority,
+             MIN(timestamp) AS oldest_timestamp,
+             MIN(id) AS oldest_id
+      FROM conversations
+      WHERE direction = 'in' AND status = 'pending'
+        AND target_instance IS NOT NULL
+      GROUP BY target_instance
+      ORDER BY min_priority ASC, oldest_timestamp ASC
+    `).all();
+  }
+
+  const placeholders = onlineInstanceIds.map(() => '?').join(', ');
+  return db.prepare(`
+    SELECT target_instance,
+           MIN(COALESCE(priority, 3)) AS min_priority,
+           MIN(timestamp) AS oldest_timestamp,
+           MIN(id) AS oldest_id
+    FROM conversations
+    WHERE direction = 'in' AND status = 'pending'
+      AND target_instance IS NOT NULL
+      AND target_instance NOT IN (${placeholders})
+    GROUP BY target_instance
+    ORDER BY min_priority ASC, oldest_timestamp ASC
+  `).all(...onlineInstanceIds);
+}
+
 function getNextPendingControlForInstances(db, currentTimestamp, onlineInstanceIds) {
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     return db.prepare(`
@@ -477,6 +507,31 @@ describe('Suite 1: Message routing pipeline', () => {
     const bettyResult = getNextPendingForInstance(db, 'user-betty');
     expect(bettyResult).not.toBeNull();
     expect(bettyResult.id).toBe(id);
+  });
+
+  it('Test 5b: offline user targets are surfaced for wake-up without entering online delivery selection', () => {
+    insertConv(db, {
+      channel: 'feishu',
+      endpointId: 'betty-open-id|type:p2p|msg:1',
+      content: 'Wake Betty',
+      targetInstance: 'user-betty',
+      priority: 2,
+    });
+
+    insertConv(db, {
+      channel: 'feishu',
+      endpointId: 'admin-open-id|type:p2p|msg:2',
+      content: 'Hello admin',
+      targetInstance: 'admin',
+      priority: 3,
+    });
+
+    const deliveryCandidate = getNextPendingForInstances(db, ['admin']);
+    expect(deliveryCandidate).not.toBeNull();
+    expect(deliveryCandidate.target_instance).toBe('admin');
+
+    const wakeCandidates = getPendingTargetInstancesNeedingWake(db, ['admin']);
+    expect(wakeCandidates.map(row => row.target_instance)).toEqual(['user-betty']);
   });
 });
 

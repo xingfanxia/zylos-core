@@ -63,7 +63,7 @@ export function writeWakeSignal(instanceId, zylosDir) {
   }
 }
 
-// ── Auto-start / auto-stop for non-primary instances ──────────────────
+// ── Auto-start / auto-stop for instance sessions ──────────────────────
 
 /** Tracks last delivery time per instance for idle reaping. */
 const lastDeliveryAt = new Map();
@@ -78,7 +78,7 @@ const AUTO_START_GRACE_MS = 60 * 1000;
 const IDLE_REAP_TIMEOUT_MS = 30 * 60 * 1000;
 
 /**
- * Signal the Activity Monitor to start a non-primary instance.
+ * Signal the Activity Monitor to start an instance session.
  *
  * The dispatcher does NOT launch CC directly — the AM's RuntimeAdapter
  * handles auth, env vars, cwd, bypass permissions, instruction files, etc.
@@ -339,6 +339,7 @@ export function multiSessionDispatch(item, helpers) {
  * @param {(ms: number) => Promise<void>} helpers.sleep
  * @param {() => number} helpers.nowSeconds
  * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingForInstances
+ * @param {(instanceIds: string[]) => object[]} helpers.getPendingTargetInstancesNeedingWake
  * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingControlForInstances
  * @param {(id: number) => void} helpers.markRejected
  * @param {(id: number) => void} helpers.markControlRejected
@@ -366,6 +367,7 @@ export async function processWithMultiSession(helpers) {
     markRejected,
     markControlRejected,
     getNextPendingForInstances,
+    getPendingTargetInstancesNeedingWake,
     getNextPendingControlForInstances,
   } = helpers;
 
@@ -380,6 +382,34 @@ export async function processWithMultiSession(helpers) {
   if (onlineIds === null) {
     // Fallback: caller should use the single-session processNextMessage instead.
     return { delivered: false, state: 'unknown' };
+  }
+
+  // Wake offline targets with pending inbound conversations before claiming
+  // online-deliverable work. This avoids a deadlock where offline instances
+  // never receive a wake signal because pending rows are filtered out of the
+  // normal claim query until the instance is already online.
+  const wakeCandidates = getPendingTargetInstancesNeedingWake
+    ? getPendingTargetInstancesNeedingWake(onlineIds)
+    : [];
+
+  for (const candidate of wakeCandidates) {
+    const targetInstance = candidate?.target_instance;
+    if (!targetInstance) continue;
+
+    const def = getInstanceDef(targetInstance);
+    if (!def) {
+      markRejected(candidate.oldest_id);
+      log(`Rejected conversation id=${candidate.oldest_id}: unknown instance '${targetInstance}'`);
+      continue;
+    }
+
+    if (def.enabled === false) {
+      markRejected(candidate.oldest_id);
+      log(`Rejected conversation id=${candidate.oldest_id}: instance '${targetInstance}' is disabled`);
+      continue;
+    }
+
+    requestInstanceStart({ ...def, id: targetInstance });
   }
 
   // Skip-loop: try up to MAX_SKIP_ATTEMPTS items.

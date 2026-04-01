@@ -107,6 +107,36 @@ function getNextPendingForInstances(db, onlineInstanceIds) {
   `).get(...onlineInstanceIds) || null;
 }
 
+function getPendingTargetInstancesNeedingWake(db, onlineInstanceIds) {
+  if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
+    return db.prepare(`
+      SELECT target_instance,
+             MIN(COALESCE(priority, 3)) AS min_priority,
+             MIN(timestamp) AS oldest_timestamp,
+             MIN(id) AS oldest_id
+      FROM conversations
+      WHERE direction = 'in' AND status = 'pending'
+        AND target_instance IS NOT NULL
+      GROUP BY target_instance
+      ORDER BY min_priority ASC, oldest_timestamp ASC
+    `).all();
+  }
+
+  const placeholders = onlineInstanceIds.map(() => '?').join(', ');
+  return db.prepare(`
+    SELECT target_instance,
+           MIN(COALESCE(priority, 3)) AS min_priority,
+           MIN(timestamp) AS oldest_timestamp,
+           MIN(id) AS oldest_id
+    FROM conversations
+    WHERE direction = 'in' AND status = 'pending'
+      AND target_instance IS NOT NULL
+      AND target_instance NOT IN (${placeholders})
+    GROUP BY target_instance
+    ORDER BY min_priority ASC, oldest_timestamp ASC
+  `).all(...onlineInstanceIds);
+}
+
 function markRejected(db, id) {
   db.prepare('UPDATE conversations SET status = ? WHERE id = ?').run('rejected', id);
 }
@@ -326,6 +356,32 @@ describe('c4-db-multi — getNextPendingForInstances()', () => {
     const remainingContent = remaining.map(r => r.content);
     expect(remainingContent).toContain('betty msg');
     expect(remainingContent).toContain('offline msg');
+  });
+});
+
+describe('c4-db-multi — getPendingTargetInstancesNeedingWake()', () => {
+  let db;
+
+  beforeEach(() => {
+    db = createTestDb();
+    insertConv(db, { content: 'admin msg', targetInstance: 'admin', priority: 3 });
+    insertConv(db, { content: 'betty msg', targetInstance: 'user-betty', priority: 2 });
+    insertConv(db, { content: 'elaine msg', targetInstance: 'user-elaine', priority: 3 });
+    insertConv(db, { content: 'legacy msg', targetInstance: null, priority: 1 });
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  it('returns only offline target instances that need a wake signal', () => {
+    const result = getPendingTargetInstancesNeedingWake(db, ['admin']);
+    expect(result.map(r => r.target_instance)).toEqual(['user-betty', 'user-elaine']);
+  });
+
+  it('returns all targeted instances when the online set is empty', () => {
+    const result = getPendingTargetInstancesNeedingWake(db, []);
+    expect(result.map(r => r.target_instance)).toEqual(['user-betty', 'admin', 'user-elaine']);
   });
 });
 

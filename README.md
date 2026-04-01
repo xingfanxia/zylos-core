@@ -177,6 +177,8 @@ This works from Windows, ChromeOS, or any platform that can run Claude Code loca
 3. Create the `~/zylos/` directory with memory, skills, and services
 4. Start all background services and launch your AI agent in a tmux session
 
+For fork-based deployments and post-deploy validation, see the [Deployment Guide](docs/deployment.md). It includes live smoke-test commands for routing, cold-start recovery, and real channel roundtrips.
+
 **Talk to your agent:**
 
 ```bash

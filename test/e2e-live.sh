@@ -33,6 +33,10 @@ INSTANCES_JSON="$ZYLOS_DIR/instances.json"
 TS=$(date +%s)  # unique timestamp for this run
 
 # ── Helpers ────────────────────────────────────────────────────────────
+tmux_cmd() {
+  env -u TMUX tmux "$@"
+}
+
 db_query() {
   local sql="$1"; local result=""
   for _ in 1 2 3; do
@@ -65,7 +69,7 @@ get_session() {
 }
 
 session_exists() {
-  tmux has-session -t "$1" 2>/dev/null
+  tmux_cmd has-session -t "$1" 2>/dev/null
 }
 
 # ── Prerequisites ──────────────────────────────────────────────────────
@@ -200,7 +204,7 @@ else
   # Use user-pan (least disruptive to real users)
   PAN_SESSION=$(get_session user-pan)
   if [ -n "$PAN_SESSION" ]; then
-    tmux kill-session -t "$PAN_SESSION" 2>/dev/null || true
+    tmux_cmd kill-session -t "$PAN_SESSION" 2>/dev/null || true
     sleep 2
     if session_exists "$PAN_SESSION"; then
       record_skip "Could not kill ${PAN_SESSION} for cold-start test"

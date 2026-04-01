@@ -41,6 +41,56 @@ tmux list-sessions -F '#{session_name}' | grep '^claude-user-' | xargs -I{} tmux
 
 Step 5 is only needed when `cli/lib/runtime/claude.js` (the RuntimeAdapter) changes. For skills-only changes, steps 1-4 are sufficient since PM2 restart reloads the AM which imports skills.
 
+## Post-Deploy Smoke Tests
+
+After deploying to `~/zylos`, run the live smoke suite from the repo checkout:
+
+```bash
+cd ~/zylos-core
+bash test/full-smoke-live.sh
+```
+
+This runs two layers of verification:
+
+- `test/e2e-live.sh` for routing, queueing, instance selection, live delivery, cold auto-start, scheduler delivery, inter-instance queries, and memory isolation.
+- `test/live-roundtrip-smoke.sh` for real Feishu roundtrip probes against `admin` plus every enabled user instance.
+
+### Reusable Roundtrip Probe
+
+Use the single-instance probe when you only need to verify one session:
+
+```bash
+cd ~/zylos-core
+bash test/live-roundtrip-smoke.sh --instance user-limh
+```
+
+Useful options:
+
+- `--cold-start` — kill the target tmux session before sending, then verify wake + recovery
+- `--chat-id <oc_xxx>` — override the Feishu chat used for send/readback
+- `--endpoint <endpoint_id>` — override the full C4 endpoint
+- `--skip-chat-readback` — skip the final Feishu chat verification step
+
+### Safety Model
+
+By default, the roundtrip probe targets the selected instance but sends the visible reply back to the first admin DM chat from `~/zylos/instances.json`.
+
+That means:
+
+- the target instance really processes the message
+- the outbound reply really goes through Feishu
+- no real user DM is disturbed during the smoke test
+
+Expect one `PROBE_ACK_*` message in the admin DM for each roundtrip probe.
+
+### npm Shortcuts
+
+```bash
+cd ~/zylos-core
+npm run test:smoke:roundtrip -- --instance user-limh
+npm run test:smoke:full
+```
+
 ## Why Not `npm install -g`?
 
 The AM imports the RuntimeAdapter via `ZYLOS_PACKAGE_ROOT` env var, which the ecosystem config resolves by following the `zylos` binary symlink. As long as the symlink points to the fork repo, the adapter is found without npm packaging.

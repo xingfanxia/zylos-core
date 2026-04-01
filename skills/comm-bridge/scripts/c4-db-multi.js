@@ -129,6 +129,49 @@ export function getNextPendingForInstances(onlineInstanceIds) {
   `).get(...onlineInstanceIds) || null;
 }
 
+/**
+ * Get distinct target instances that currently have pending inbound
+ * conversations but are not in the online instance set.
+ *
+ * Used by the dispatcher to write wake signals before normal delivery
+ * selection, so suspended/offline user instances can be restarted when a
+ * fresh user message arrives.
+ *
+ * @param {string[]} onlineInstanceIds - array of instance IDs currently online
+ * @returns {Array<{target_instance: string, min_priority: number, oldest_timestamp: string, oldest_id: number}>}
+ */
+export function getPendingTargetInstancesNeedingWake(onlineInstanceIds) {
+  const db = getDb();
+
+  if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
+    return db.prepare(`
+      SELECT target_instance,
+             MIN(COALESCE(priority, 3)) AS min_priority,
+             MIN(timestamp) AS oldest_timestamp,
+             MIN(id) AS oldest_id
+      FROM conversations
+      WHERE direction = 'in' AND status = 'pending'
+        AND target_instance IS NOT NULL
+      GROUP BY target_instance
+      ORDER BY min_priority ASC, oldest_timestamp ASC
+    `).all();
+  }
+
+  const placeholders = onlineInstanceIds.map(() => '?').join(', ');
+  return db.prepare(`
+    SELECT target_instance,
+           MIN(COALESCE(priority, 3)) AS min_priority,
+           MIN(timestamp) AS oldest_timestamp,
+           MIN(id) AS oldest_id
+    FROM conversations
+    WHERE direction = 'in' AND status = 'pending'
+      AND target_instance IS NOT NULL
+      AND target_instance NOT IN (${placeholders})
+    GROUP BY target_instance
+    ORDER BY min_priority ASC, oldest_timestamp ASC
+  `).all(...onlineInstanceIds);
+}
+
 // ---------------------------------------------------------------------------
 // Control queue queries — instance-filtered
 // ---------------------------------------------------------------------------

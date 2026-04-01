@@ -512,14 +512,21 @@ async function processNextMessage() {
   // Multi-session dispatch hook
   try {
     const { processWithMultiSession } = await import('./c4-dispatcher-multi.js');
-    const { getNextPendingForInstances, getNextPendingControlForInstances, markRejected, markControlRejected } = await import('./c4-db-multi.js');
+    const {
+      getNextPendingForInstances,
+      getPendingTargetInstancesNeedingWake,
+      getNextPendingControlForInstances,
+      markRejected,
+      markControlRejected
+    } = await import('./c4-db-multi.js');
     return await processWithMultiSession({
       getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
       releaseItem, isBypassState, shouldAutoAckHeartbeat,
       handleConversationDeliveryFailure, handleControlDeliveryFailure,
       waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
       markDelivered, ackControl, log, sleep, nowSeconds,
-      getNextPendingForInstances, getNextPendingControlForInstances,
+      getNextPendingForInstances, getPendingTargetInstancesNeedingWake,
+      getNextPendingControlForInstances,
       markRejected, markControlRejected,
     });
   } catch (e) {
