@@ -8,8 +8,9 @@ Goal: support Claude Code and Codex concurrently in one Zylos deployment, with:
 - dashboard controls for per-instance runtime changes
 - dashboard control for global runtime change across all instances
 
-This document covers the implementation plan after the initial mixed-runtime
-memory hardening shipped in the current branch.
+This document now serves as a status + roadmap document. Core mixed-runtime
+support is already live; the remaining items here are the hardening and parity
+work still worth tracking.
 
 ## Current State
 
@@ -19,18 +20,29 @@ What already exists:
 - Global runtime switch via `zylos runtime <claude|codex>`
 - Per-instance `runtime` field in `instances.json`
 - Per-instance tmux session naming and per-instance working directories
+- activity-monitor resolves runtime per instance instead of one global adapter
+- Claude and Codex sessions can coexist in one deployment
+- dispatcher delivery and verification are runtime-aware enough for live mixed deployment
+- dashboard runtime actions exist:
+  - per-instance runtime switch
+  - global switch-all runtime action
+- dashboard usage cards are runtime-aware
 - Mixed-runtime memory hardening:
   - strict shared-vs-instance memory policy
   - Codex bootstrap reads per-instance state
   - startup memory injection resolves runtime-aware per-instance instruction files
   - per-instance cwd includes both `CLAUDE.md` and `AGENTS.md`
+- Codex runtime config rendering preserves/writes runtime settings needed for unattended sessions
+- Codex token history is merged into dashboard cache via `@ccusage/codex`
 
-What is still global:
+What is still shared / imperfect:
 
-- activity-monitor selects one runtime adapter from `~/zylos/.zylos/config.json`
-- startup cleanup kills the "other runtime" main session
-- dispatcher verification is runtime-agnostic but still tuned around the current single-active-runtime model
-- dashboard has no runtime switch actions yet
+- raw Codex state still lives in shared `~/.codex`
+- Codex isolation depends on correct `cwd` attribution rather than separate per-instance Codex homes
+- Codex live limit sources are split:
+  - top cards use rollout snapshots for Codex
+  - Claude top cards use CodexBar CLI
+- Codex auto-compaction has not yet been stress-verified with an intentional 800k+ live session
 
 ## Requirements
 
@@ -119,6 +131,7 @@ Response target:
 ## Implementation Phases
 
 ## Phase 1: Per-instance runtime resolution
+Status: shipped
 
 Objective:
 - remove the global runtime assumption from instance execution paths
@@ -139,6 +152,7 @@ Acceptance:
 - two instance monitors can resolve different runtimes from config without touching the global runtime value
 
 ## Phase 2: Remove global cross-runtime cleanup
+Status: shipped
 
 Objective:
 - allow Claude and Codex sessions to coexist
@@ -157,6 +171,7 @@ Acceptance:
 - starting a Claude instance does not kill a healthy Codex instance
 
 ## Phase 3: Dispatcher runtime awareness
+Status: shipped for live mixed deployment, still worth incremental hardening
 
 Objective:
 - make delivery and verification safe for mixed runtimes
@@ -178,6 +193,7 @@ Acceptance:
 - cold-start wake path works for both runtimes
 
 ## Phase 4: Dashboard instance runtime actions
+Status: shipped
 
 Objective:
 - allow runtime switching from the dashboard
@@ -204,6 +220,7 @@ Acceptance:
 - dashboard surfaces partial failures cleanly
 
 ## Phase 5: Runtime-specific startup parity
+Status: partially shipped; remaining items below are still active follow-up
 
 Objective:
 - make Codex and Claude instance startup behavior equally robust
@@ -217,6 +234,12 @@ Work:
 Acceptance:
 - Codex worker instance boots with correct state, policy, and instructions
 - Claude worker instance still behaves unchanged
+
+Remaining follow-up under this phase:
+
+- stronger Codex-side hard enforcement for memory ownership
+- longer live soak for Codex auto-compaction and session rotation
+- continued cleanup of any residual runtime-specific fallback assumptions in operator tooling
 
 ## Rolling Restart Strategy
 
@@ -244,7 +267,7 @@ Reason:
 
 ## Recommended Order
 
-Build in this order:
+Remaining work is still best approached in this order:
 
 1. Per-instance runtime resolution
 2. Remove global runtime cleanup

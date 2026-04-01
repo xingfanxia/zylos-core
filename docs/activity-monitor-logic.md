@@ -43,9 +43,9 @@
    - `daily-memory-commit`（03:00）
    - `daily-upgrade`（05:00，Claude only）
    - `daily-upgrade-check`（06:00）
-8. 恢复 usage 监测状态（`usage.json`）
+8. 恢复 usage 监测状态（`usage.json` / `usage-codex.json`）
 9. 若 adapter 提供 context monitor（Codex），启动 30s 轮询
-10. 10 秒后尝试清理“另一个 runtime”的 tmux 会话（避免双 runtime 并存）
+10. 不再清理“另一个 runtime”的 tmux 会话；当前实现允许 Claude 与 Codex 并存，只做实例级恢复
 
 ## 4. 主循环（每 1 秒）
 
@@ -244,10 +244,20 @@ fast API error 检测：
 
 Codex adapter 提供 `CodexContextMonitor`：
 
-1. 每 30 秒轮询 context 使用率（JSONL token_count 优先，SQLite 回退）
+1. 每 30 秒轮询 context 使用率（实例级 JSONL token_count 优先，SQLite 回退）
 2. 超阈值（默认 75%）触发 onExceed：
-   - enqueue `new-session` 控制消息（`priority=1` + `bypass-state`）
+   - enqueue `new-session` 控制消息（`priority=1` + `bypass-state` + `target_instance`）
    - 后续由 runtime 内执行 `new-session` skill 完成 handoff
+
+Codex 当前还会做两层实例级约束：
+
+1. 读取共享 `~/.codex/state_5.sqlite` / rollout 时，按 `cwd` 过滤到当前实例
+2. context ceiling 优先取 `~/.codex/config.toml` 的 `model_context_window`
+
+当前线上已验证：
+
+- fresh Codex 实例 rollout 会报告约 `950000` 的有效窗口（配置的 1M 工作窗口）
+- context handoff 控制消息会定向到触发实例，不再随机落到 admin
 
 ## 11. 关键状态文件
 
@@ -263,7 +273,7 @@ Codex adapter 提供 `CodexContextMonitor`：
 8. `daily-upgrade-state.json`：每日升级去重
 9. `daily-memory-commit-state.json`：每日 memory commit 去重
 10. `upgrade-check-state.json`：每日升级检查去重
-11. `usage.json`：usage 采样与告警状态
+11. `usage.json` / `usage-codex.json`：usage 采样与告警状态
 12. `statusline.json` / `context-monitor-state.json` / `cost-log.jsonl`：Claude context 监控相关
 
 ## 12. 运行时差异（Claude vs Codex）
@@ -275,11 +285,15 @@ Codex adapter 提供 `CodexContextMonitor`：
    - Codex probe 固定返回 `detected=false`
 4. context 轮换路径不同：
    - Claude 用 statusLine + `new-session` 控制消息（优雅）
-   - Codex 用 polling + `new-session` 控制消息（skill 驱动切换）
-5. Daily upgrade 只对 Claude 生效
+   - Codex 用 polling + `new-session` 控制消息（skill 驱动切换，且实例级定向）
+5. usage 监控不同：
+   - Claude 顶部 live usage 由 CodexBar CLI 驱动
+   - Codex 顶部 live usage 优先读 rollout rate-limit 快照，必要时才侧车 `/status`
+6. Daily upgrade 只对 Claude 生效
 
 ## 13. 当前实现里的已知边界
 
 1. 维护脚本检测目前仅覆盖 Claude（代码内有 TODO）
-2. usage 监控只在 Claude runtime 启用
+2. Codex 原始状态仍共享在 `~/.codex`，隔离依赖实例级 `cwd` 归因，而不是独立 per-instance `.codex`
 3. `activity-monitor` 与 runtime adapter 仍有并行逻辑（注释中标记“待迁移阶段”）
+4. Codex auto-compaction 的配置与 handoff 路径已打通，但尚未做一次刻意打满到 800k 的长时间线上压测

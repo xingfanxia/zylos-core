@@ -1,15 +1,17 @@
 # Multi-Session Architecture
 
-Multi-session v2 runs multiple Claude Code instances in parallel, each handling a different set of users/channels. Built on upstream zylos-core v0.4.10 with minimal upstream modifications (~300 lines of hooks vs v1's 2,565 lines).
+Multi-session v2 runs multiple runtime instances in parallel, each handling a
+different set of users/channels. Claude Code and Codex can coexist in one
+deployment, with runtime chosen per instance in `instances.json`.
 
 ## Instance Types
 
 | Instance | tmux Session | Type | Lifecycle | Purpose |
 |----------|-------------|------|-----------|---------|
-| admin | claude-main | primary | always-on | Owner DMs, system admin, escalations |
-| scheduler | claude-scheduler | dedicated | on-demand | Runs C5 scheduled tasks |
-| group | claude-group | group | on-demand | All Feishu/Telegram group chats |
-| user-\* | claude-user-\* | user | on-demand | Auto-provisioned per approved user |
+| admin | `instances.json` `tmux_session` | primary | always-on | Owner DMs, system admin, escalations |
+| scheduler | `instances.json` `tmux_session` | dedicated | on-demand | Runs C5 scheduled tasks |
+| group | `instances.json` `tmux_session` | group | on-demand | All Feishu/Telegram group chats |
+| user-\* | `instances.json` `tmux_session` | user | on-demand | Auto-provisioned per approved user |
 
 **On-demand lifecycle:** Auto-start via AM wake signal when a message arrives. Auto-suspend after 30 minutes idle. AM handles the full launch (auth, env, cwd, onboarding).
 
@@ -89,7 +91,7 @@ Otherwise existing installs will not pick up the updated hook wiring.
 
 ## Per-Instance Working Directories
 
-Each instance runs CC from its own directory for token tracking isolation:
+Each instance runs its runtime from its own directory:
 
 ```
 ~/zylos/instances/<id>/
@@ -100,7 +102,15 @@ Each instance runs CC from its own directory for token tracking isolation:
   └── memory → ../../memory         (shared memory)
 ```
 
-CC derives its project dir from `cwd` → each instance writes JSONL transcripts to a unique dir in `~/.claude/projects/`. The `ccusage` tool can then report per-instance token costs.
+Claude derives its project dir from `cwd`, so each instance writes JSONL
+transcripts to a unique dir in `~/.claude/projects/`.
+
+Codex stores runtime state globally under `~/.codex/`, not inside each
+instance folder. Zylos reconstructs per-instance ownership by reading the
+rollout/session metadata and grouping sessions by `session_meta.cwd`.
+
+Operationally, this means Codex separation is enforced logically by Zylos
+rather than by separate per-instance `~/.codex` roots.
 
 Directories are created automatically:
 - For built-in instances (admin, scheduler, group): by `ensureInstanceCwd()` on first launch
@@ -109,16 +119,25 @@ Directories are created automatically:
 ## Token Tracking
 
 ### Data Flow
-1. CC writes JSONL session transcripts to `~/.claude/projects/<project-dir>/` (automatic, every conversation turn)
-2. `update-token-cache.js` runs hourly via PM2 cron, calls `ccusage daily --json --instances`
-3. ccusage reads all JSONL files, computes costs from model + token counts
-4. Script maps project names to instance IDs, writes `~/zylos/activity-monitor/token-cache.json`
-5. Dashboard reads the cache file, renders stacked bar chart + pie chart + per-instance table
+1. Claude writes JSONL session transcripts to `~/.claude/projects/<project-dir>/`.
+2. Codex writes session history to shared `~/.codex/sessions/.../rollout-*.jsonl`.
+3. `update-token-cache.js` runs from PM2 and merges:
+   - Claude history from `ccusage daily --json --instances --breakdown`
+   - Codex history from `@ccusage/codex session --json`
+4. Zylos maps:
+   - Claude project names → instance IDs
+   - Codex rollout `session_meta.cwd` → instance IDs
+5. The merged cache is written to `~/zylos/activity-monitor/token-cache.json`
+6. Dashboard reads the cache and renders per-runtime plus per-instance views
 
 ### Dashboard Token Features
 - Stacked bar chart with per-instance color coding
 - Pie chart showing cost percentage breakdown
 - Per-instance table with input/output/cache tokens and cost
+- Runtime filter: `All`, `Claude`, `Codex`
+- Top runtime usage cards:
+  - Claude live limits from CodexBar CLI
+  - Codex live limits from local rollout snapshots
 - "System" category for unattributed usage (pre-cwd migration data)
 - "Include system usage" toggle (default: off)
 - Day filter buttons (7/14/30 days, client-side filtering)
@@ -133,7 +152,10 @@ The web console dashboard (`/dashboard`) provides:
 - Enable/disable instances
 - Suspend/resume on-demand instances
 - Instance cards show: status, type, tmux state, last activity, uptime, idle time
-- Runtime switching is currently global, not per-instance. See [design/mixed-runtime-plan.md](design/mixed-runtime-plan.md) for the planned dashboard runtime actions.
+- Runtime switching is supported from the dashboard:
+  - per-instance runtime change
+  - global switch-all runtime action
+  - runtime-aware status and usage cards
 
 ### User Approval
 - Pending user queue with approve/deny buttons
@@ -144,6 +166,7 @@ The web console dashboard (`/dashboard`) provides:
 - Aggregate and per-instance token/cost data
 - Visual charts (stacked bars + pie)
 - Configurable time window
+- Runtime-aware top cards and runtime filters
 
 ### System Health
 - CPU, memory, disk usage bars
@@ -159,7 +182,8 @@ The ecosystem config (`templates/pm2/ecosystem.config.cjs`) manages:
 | web-console | Dashboard + API server |
 | c4-dispatcher | Message dispatch loop |
 | activity-monitor-\<id\> | One per enabled instance (generated dynamically) |
-| token-cache-updater | Hourly cron: runs ccusage, updates token cache |
+| token-cache-updater | Daemon: merges Claude `ccusage` and Codex `@ccusage/codex` history |
+| provider-usage-updater | Daemon: refreshes top runtime usage cards |
 | caddy | Reverse proxy (if configured) |
 | zylos-telegram | Telegram bot connector |
 | zylos-feishu | Feishu bot connector |

@@ -54,6 +54,14 @@ This is required after changes to:
 - Codex runtime config rendering (`~/.codex/config.toml`)
 - any core hook command path or timeout
 
+If the deploy includes changes to token collection or dashboard usage logic, refresh
+the cached usage files once after rollout:
+
+```bash
+cd ~/zylos-core
+node skills/activity-monitor/scripts/update-token-cache.js
+```
+
 ## Post-Deploy Smoke Tests
 
 After deploying to `~/zylos`, run the live smoke suite from the repo checkout:
@@ -67,6 +75,32 @@ This runs two layers of verification:
 
 - `test/e2e-live.sh` for routing, queueing, instance selection, live delivery, cold auto-start, scheduler delivery, inter-instance queries, and memory isolation.
 - `test/live-roundtrip-smoke.sh` for real Feishu roundtrip probes against `admin` plus every enabled user instance.
+
+### Mixed-Runtime Verification
+
+When Codex runtime plumbing changes, verify both the live context window and the
+dashboard history path:
+
+```bash
+# 1. Fresh Codex session should report the large effective context window
+sqlite3 -header -column ~/.codex/state_5.sqlite \
+  "SELECT datetime(updated_at,'unixepoch') AS updated_utc, cwd, rollout_path
+   FROM threads
+   WHERE archived = 0 AND cwd LIKE '%/instances/%'
+   ORDER BY updated_at DESC
+   LIMIT 5;"
+
+# then inspect the latest rollout for token_count.model_context_window
+
+# 2. Dashboard token cache should contain Codex history
+curl -s http://127.0.0.1:3456/api/dashboard/tokens | jq '.runtimes.codex.totals'
+```
+
+Expected current behavior:
+
+- fresh spawned Codex instance sessions report an effective `model_context_window`
+  around `950000` (the 95% working ceiling of the configured 1M window)
+- `/api/dashboard/tokens` shows non-zero `runtimes.codex` totals once the cache refresh finishes
 
 ### Reusable Roundtrip Probe
 
@@ -117,6 +151,13 @@ What is now enforced:
 - Codex bootstrap now reads per-instance `memory/instances/<id>/state.md` instead of assuming legacy flat `memory/state.md`.
 - Session-start memory injection now prints a `MEMORY WRITE POLICY` block and resolves runtime-aware per-instance instruction overlays.
 - Per-instance working directories now symlink both `CLAUDE.md` and `AGENTS.md`.
+- Codex runtime config rendering now preserves operator overrides and writes the
+  runtime defaults Zylos expects for unattended sessions:
+  - `model = "gpt-5.4"`
+  - `model_context_window = 1000000`
+  - `model_auto_compact_token_limit = 800000`
+  - `model_reasoning_effort = "xhigh"`
+  - `personality = "pragmatic"`
 
 Operationally, this means runtime switching can preserve memory more safely,
 and future mixed-runtime instances will start from a stricter memory policy.
