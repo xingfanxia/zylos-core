@@ -18,6 +18,8 @@ class Dashboard {
     this.tokenRefreshInterval = null;
     this.sortColumn = null;
     this.sortAsc = true;
+    this.calendarPinnedDate = null;
+    this.calendarHoverDate = null;
 
     this.init();
   }
@@ -550,6 +552,8 @@ class Dashboard {
     this.renderUsageWindows();
     this.renderTokenChart();
     this.renderTokenCalendar();
+    this.renderAggregateTrendChart();
+    this.renderInstanceTrendChart();
     this.renderTokenDonut();
     this.renderTokenTable();
   }
@@ -638,6 +642,362 @@ class Dashboard {
       }
     }
     return Array.from(byDate.values()).sort(function(a, b) { return a.date.localeCompare(b.date); });
+  }
+
+  _rowTotalTokens(row) {
+    if (!row) return 0;
+    if (row.total_tokens != null) return row.total_tokens;
+    return (row.input_tokens || 0) + (row.output_tokens || 0) + (row.cache_read || 0) + (row.cache_write || 0);
+  }
+
+  _buildDailyBreakdown(days) {
+    var tokenView = this._getTokenView();
+    var instances = tokenView.instances || {};
+    var includeSystem = this._canShowSystemUsage();
+    var today = new Date();
+    today.setHours(0, 0, 0, 0);
+    var start = new Date(today);
+    start.setDate(start.getDate() - (days - 1));
+    var startStr = start.toISOString().slice(0, 10);
+    var endStr = today.toISOString().slice(0, 10);
+    var map = new Map();
+
+    function ensure(date) {
+      if (!map.has(date)) {
+        map.set(date, {
+          date: date,
+          total_tokens: 0,
+          cost_usd: 0,
+          runtimes: { claude: 0, codex: 0, other: 0 },
+          runtimeCost: { claude: 0, codex: 0, other: 0 },
+          instances: {},
+          instanceCost: {},
+          system_tokens: 0,
+          system_cost: 0,
+        });
+      }
+      return map.get(date);
+    }
+
+    for (var cursor = new Date(start); cursor <= today; cursor.setDate(cursor.getDate() + 1)) {
+      ensure(cursor.toISOString().slice(0, 10));
+    }
+
+    var ids = Object.keys(instances).sort();
+    for (var i = 0; i < ids.length; i++) {
+      var instanceId = ids[i];
+      var inst = instances[instanceId];
+      var runtimeBuckets = this.tokenRuntimeFilter === 'all'
+        ? Object.keys(inst.runtimes || {})
+        : [this.tokenRuntimeFilter];
+
+      for (var r = 0; r < runtimeBuckets.length; r++) {
+        var runtime = runtimeBuckets[r];
+        var rows = inst.runtimes?.[runtime]?.daily || [];
+        for (var j = 0; j < rows.length; j++) {
+          var row = rows[j];
+          if (!row.date || row.date < startStr || row.date > endStr) continue;
+          var day = ensure(row.date);
+          var tokens = this._rowTotalTokens(row);
+          var cost = row.cost_usd || 0;
+          day.total_tokens += tokens;
+          day.cost_usd += cost;
+          day.runtimes[runtime] = (day.runtimes[runtime] || 0) + tokens;
+          day.runtimeCost[runtime] = (day.runtimeCost[runtime] || 0) + cost;
+          day.instances[instanceId] = (day.instances[instanceId] || 0) + tokens;
+          day.instanceCost[instanceId] = (day.instanceCost[instanceId] || 0) + cost;
+        }
+      }
+    }
+
+    if (includeSystem && this.tokenRuntimeFilter === 'all') {
+      var allDaily = this.tokenData?.daily || [];
+      for (var k = 0; k < allDaily.length; k++) {
+        var totalRow = allDaily[k];
+        if (!totalRow.date || totalRow.date < startStr || totalRow.date > endStr) continue;
+        var totalTokens = this._rowTotalTokens(totalRow);
+        var totalCost = totalRow.cost_usd || 0;
+        var aggregate = ensure(totalRow.date);
+        var systemTokens = Math.max(0, totalTokens - aggregate.total_tokens);
+        var systemCost = Math.max(0, totalCost - aggregate.cost_usd);
+        if (systemTokens > 0 || systemCost > 0) {
+          aggregate.total_tokens += systemTokens;
+          aggregate.cost_usd += systemCost;
+          aggregate.system_tokens += systemTokens;
+          aggregate.system_cost += systemCost;
+          aggregate.instances.system = (aggregate.instances.system || 0) + systemTokens;
+          aggregate.instanceCost.system = (aggregate.instanceCost.system || 0) + systemCost;
+        }
+      }
+    }
+
+    var daysArr = Array.from(map.values()).sort(function(a, b) { return a.date.localeCompare(b.date); });
+    var nonZero = daysArr.map(function(day) { return day.total_tokens; }).filter(function(v) { return v > 0; });
+    var stats = {
+      min: nonZero.length ? Math.min.apply(null, nonZero) : 0,
+      max: nonZero.length ? Math.max.apply(null, nonZero) : 0,
+      avg: nonZero.length ? (nonZero.reduce(function(sum, v) { return sum + v; }, 0) / nonZero.length) : 0,
+    };
+
+    return { days: daysArr, map: map, stats: stats };
+  }
+
+  _calendarHeatAlpha(value, stats) {
+    if (!value || !stats || !stats.max) return 0;
+    var min = stats.min || 0;
+    var avg = stats.avg || 0;
+    var max = stats.max || 0;
+    if (max <= 0) return 0;
+    if (avg <= min) avg = min + (max - min) / 2;
+    if (value <= avg) {
+      var lowerSpan = Math.max(1, avg - min);
+      return 0.18 + 0.42 * ((value - min) / lowerSpan);
+    }
+    var upperSpan = Math.max(1, max - avg);
+    return 0.62 + 0.33 * ((value - avg) / upperSpan);
+  }
+
+  _calendarHeatStyle(day, stats) {
+    if (!day || !day.total_tokens) {
+      return { background: 'var(--bg-200)', color: 'var(--text-muted)', borderColor: 'var(--border)' };
+    }
+    var alpha = Math.max(0.18, Math.min(0.95, this._calendarHeatAlpha(day.total_tokens, stats)));
+    return {
+      background: 'rgba(50, 145, 255, ' + alpha.toFixed(3) + ')',
+      color: alpha > 0.55 ? '#ffffff' : 'var(--text-primary)',
+      borderColor: alpha > 0.75 ? 'rgba(255,255,255,0.18)' : 'rgba(50, 145, 255, 0.25)',
+    };
+  }
+
+  _renderPieCard(title, slices, total, colorFn) {
+    var usable = (slices || []).filter(function(slice) { return slice.value > 0; });
+    if (!usable.length || !total) {
+      return '<div class="usage-detail-card"><div class="usage-detail-title">' + this.esc(title) + '</div><div class="empty-state" style="padding:24px 12px">No usage</div></div>';
+    }
+
+    usable.sort(function(a, b) { return b.value - a.value; });
+    var angle = 0;
+    var stops = [];
+    for (var i = 0; i < usable.length; i++) {
+      var slice = usable[i];
+      var pct = slice.value / total;
+      slice.pct = pct * 100;
+      var color = colorFn(slice.key, i);
+      stops.push(color + ' ' + angle + 'deg ' + (angle + pct * 360) + 'deg');
+      angle += pct * 360;
+    }
+
+    var legend = usable.map(function(slice, idx) {
+      return '<div class="usage-detail-legend-item">' +
+        '<span class="usage-detail-legend-swatch" style="background:' + colorFn(slice.key, idx) + '"></span>' +
+        '<span class="usage-detail-legend-name">' + this.esc(slice.label || slice.key) + '</span>' +
+        '<span class="usage-detail-legend-value">' + this.formatTokens(slice.value) + '</span>' +
+        '<span class="usage-detail-legend-pct">' + slice.pct.toFixed(1) + '%</span>' +
+      '</div>';
+    }.bind(this)).join('');
+
+    return '<div class="usage-detail-card">' +
+      '<div class="usage-detail-title">' + this.esc(title) + '</div>' +
+      '<div class="usage-detail-pie-wrap">' +
+        '<div class="usage-detail-pie" style="background:conic-gradient(' + stops.join(', ') + ')">' +
+          '<div class="usage-detail-pie-hole">' +
+            '<div class="usage-detail-pie-total">' + this.formatTokens(total) + '</div>' +
+            '<div class="usage-detail-pie-label">tokens</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="usage-detail-legend">' + legend + '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  _renderTrendSvg(seriesList, opts) {
+    var width = opts.width || 980;
+    var height = opts.height || 240;
+    var padLeft = 56;
+    var padRight = 18;
+    var padTop = 18;
+    var padBottom = 30;
+    var innerWidth = width - padLeft - padRight;
+    var innerHeight = height - padTop - padBottom;
+
+    var dates = (opts.dates || []);
+    if (!dates.length) {
+      return '<div class="empty-state">No usage data</div>';
+    }
+
+    var maxVal = Math.max.apply(null, seriesList.reduce(function(acc, series) {
+      return acc.concat(series.values);
+    }, []).concat([1]));
+
+    var yTicks = [];
+    for (var i = 0; i < 5; i++) {
+      var ratio = i / 4;
+      yTicks.push({
+        value: Math.round(maxVal * (1 - ratio)),
+        y: padTop + innerHeight * ratio,
+      });
+    }
+
+    function xFor(index) {
+      if (dates.length === 1) return padLeft + innerWidth / 2;
+      return padLeft + (innerWidth * index) / (dates.length - 1);
+    }
+
+    function yFor(value) {
+      if (maxVal <= 0) return padTop + innerHeight;
+      return padTop + innerHeight - (value / maxVal) * innerHeight;
+    }
+
+    var grid = yTicks.map(function(tick) {
+      return '<line x1="' + padLeft + '" y1="' + tick.y + '" x2="' + (width - padRight) + '" y2="' + tick.y + '" class="trend-gridline"></line>' +
+        '<text x="' + (padLeft - 10) + '" y="' + (tick.y + 4) + '" text-anchor="end" class="trend-axis-label">' + this.formatTokens(tick.value) + '</text>';
+    }.bind(this)).join('');
+
+    var xLabels = dates.map(function(date, index) {
+      var show = dates.length <= 10 || index === 0 || index === dates.length - 1 || index % Math.ceil(dates.length / 6) === 0;
+      if (!show) return '';
+      return '<text x="' + xFor(index) + '" y="' + (height - 8) + '" text-anchor="middle" class="trend-axis-label">' + date.slice(5) + '</text>';
+    }).join('');
+
+    var seriesSvg = seriesList.map(function(series, seriesIndex) {
+      var color = series.color;
+      var points = series.values.map(function(value, index) {
+        return xFor(index) + ',' + yFor(value);
+      }).join(' ');
+      var circles = series.values.map(function(value, index) {
+        var cx = xFor(index);
+        var cy = yFor(value);
+        var cost = series.costValues ? (series.costValues[index] || 0) : 0;
+        return '<g class="trend-point-group">' +
+          '<circle cx="' + cx + '" cy="' + cy + '" r="3" fill="' + color + '"></circle>' +
+          '<circle class="trend-hit" cx="' + cx + '" cy="' + cy + '" r="11" fill="transparent" ' +
+            'data-series="' + this.esc(series.label) + '" ' +
+            'data-date="' + this.esc(dates[index]) + '" ' +
+            'data-tokens="' + value + '" ' +
+            'data-cost="' + cost + '"' +
+          '></circle>' +
+        '</g>';
+      }.bind(this)).join('');
+
+      var area = '';
+      if (seriesIndex === 0 && opts.area) {
+        var areaPoints = points + ' ' + xFor(dates.length - 1) + ',' + (padTop + innerHeight) + ' ' + xFor(0) + ',' + (padTop + innerHeight);
+        area = '<polygon points="' + areaPoints + '" fill="' + color + '" opacity="0.12"></polygon>';
+      }
+
+      return area +
+        '<polyline points="' + points + '" fill="none" stroke="' + color + '" stroke-width="' + (series.strokeWidth || 2.5) + '" stroke-linejoin="round" stroke-linecap="round"></polyline>' +
+        circles;
+    }.bind(this)).join('');
+
+    var legend = seriesList.map(function(series) {
+      return '<span class="legend-item"><span class="legend-swatch" style="background:' + series.color + '"></span>' + this.esc(series.label) + '</span>';
+    }.bind(this)).join('');
+
+    return '<div class="trend-chart-card">' +
+      '<div class="trend-tooltip" hidden></div>' +
+      '<div class="chart-legend">' + legend + '</div>' +
+      '<svg viewBox="0 0 ' + width + ' ' + height + '" class="trend-svg" role="img" aria-label="' + this.esc(opts.ariaLabel || 'Usage trend') + '">' +
+        grid +
+        seriesSvg +
+        xLabels +
+      '</svg>' +
+    '</div>';
+  }
+
+  renderAggregateTrendChart() {
+    var el = document.getElementById('token-trend-total');
+    if (!el || !this.tokenData) return;
+    var breakdown = this._buildDailyBreakdown(this.tokenDays);
+    var dates = breakdown.days.map(function(day) { return day.date; });
+    var values = breakdown.days.map(function(day) { return day.total_tokens; });
+    if (!dates.length || !values.some(function(v) { return v > 0; })) {
+      el.innerHTML = '<div class="empty-state">No usage data</div>';
+      return;
+    }
+
+    el.innerHTML = this._renderTrendSvg([
+      {
+        label: this.tokenRuntimeFilter === 'all' ? 'All usage' : (this.tokenRuntimeFilter === 'claude' ? 'Claude' : 'Codex'),
+        values: values,
+        costValues: breakdown.days.map(function(day) { return day.cost_usd || 0; }),
+        color: '#3291ff',
+        strokeWidth: 3,
+      }
+    ], {
+      dates: dates,
+      area: true,
+      ariaLabel: 'Aggregate token usage trend',
+    });
+    this._bindTrendTooltips(el);
+  }
+
+  renderInstanceTrendChart() {
+    var el = document.getElementById('token-trend-instances');
+    if (!el || !this.tokenData) return;
+    var breakdown = this._buildDailyBreakdown(this.tokenDays);
+    var dates = breakdown.days.map(function(day) { return day.date; });
+    var tokenView = this._getTokenView();
+    var instanceIds = Object.keys(tokenView.instances || {}).sort();
+    var series = instanceIds.map(function(instanceId) {
+      return {
+        key: instanceId,
+        label: instanceId,
+        color: this._instanceColor(instanceId),
+        values: breakdown.days.map(function(day) { return day.instances[instanceId] || 0; }),
+        costValues: breakdown.days.map(function(day) { return day.instanceCost[instanceId] || 0; }),
+      };
+    }.bind(this)).filter(function(series) {
+      return series.values.some(function(v) { return v > 0; });
+    });
+
+    if (!dates.length || !series.length) {
+      el.innerHTML = '<div class="empty-state">No per-instance usage data</div>';
+      return;
+    }
+
+    el.innerHTML = this._renderTrendSvg(series, {
+      dates: dates,
+      area: false,
+      ariaLabel: 'Per-instance token usage trend',
+    });
+    this._bindTrendTooltips(el);
+  }
+
+  _bindTrendTooltips(root) {
+    if (!root) return;
+    var cards = root.querySelectorAll('.trend-chart-card');
+    cards.forEach(function(card) {
+      var tooltip = card.querySelector('.trend-tooltip');
+      if (!tooltip) return;
+      var hits = card.querySelectorAll('.trend-hit');
+      hits.forEach(function(hit) {
+        function showTooltip(evt) {
+          var series = hit.dataset.series || '';
+          var date = hit.dataset.date || '';
+          var tokens = Number(hit.dataset.tokens || 0);
+          var cost = Number(hit.dataset.cost || 0);
+          tooltip.innerHTML =
+            '<div class="trend-tooltip-date">' + this.esc(date) + '</div>' +
+            '<div class="trend-tooltip-series">' + this.esc(series) + '</div>' +
+            '<div class="trend-tooltip-line">' + this.formatTokens(tokens) + ' tokens</div>' +
+            '<div class="trend-tooltip-line">' + this.formatUsd(cost) + '</div>';
+          tooltip.hidden = false;
+
+          var cardRect = card.getBoundingClientRect();
+          var x = evt.clientX - cardRect.left + 12;
+          var y = evt.clientY - cardRect.top - 12;
+          tooltip.style.left = x + 'px';
+          tooltip.style.top = y + 'px';
+        }
+
+        hit.addEventListener('mouseenter', showTooltip.bind(this));
+        hit.addEventListener('mousemove', showTooltip.bind(this));
+        hit.addEventListener('mouseleave', function() {
+          tooltip.hidden = true;
+        });
+      }.bind(this));
+    }.bind(this));
   }
 
   _getTokenView() {
@@ -1005,168 +1365,166 @@ class Dashboard {
   renderTokenCalendar() {
     var el = document.getElementById('token-calendar');
     if (!el || !this.tokenData) return;
+    var self = this;
+    var breakdown = this._buildDailyBreakdown(90);
+    var stats = breakdown.stats;
+    var dayMap = breakdown.map;
+    var days = breakdown.days;
+    if (!days.length) {
+      el.innerHTML = '<div class="empty-state">No usage data</div>';
+      this.renderCalendarBreakdown(null, breakdown);
+      return;
+    }
 
-    var tokenView = this._getTokenView();
-    var daily = this._canShowSystemUsage() ? (tokenView.allDaily || []) : [];
-    var instances = tokenView.instances || {};
-
-    // Build date->cost map for the last 90 days
-    var costByDate = new Map();
-    var tokensByDate = new Map();
-
-    if (this._canShowSystemUsage()) {
-      for (var i = 0; i < daily.length; i++) {
-        var r = daily[i];
-        costByDate.set(r.date, (costByDate.get(r.date) || 0) + (r.cost_usd || 0));
-        var tok = (r.input_tokens || 0) + (r.output_tokens || 0) + (r.cache_read || 0) + (r.cache_write || 0);
-        tokensByDate.set(r.date, (tokensByDate.get(r.date) || 0) + tok);
-      }
-    } else {
-      var instanceIds = Object.keys(instances);
-      for (var j = 0; j < instanceIds.length; j++) {
-        var instDaily = instances[instanceIds[j]]?.daily || [];
-        for (var k = 0; k < instDaily.length; k++) {
-          var ir = instDaily[k];
-          costByDate.set(ir.date, (costByDate.get(ir.date) || 0) + (ir.cost_usd || 0));
-          var itok = (ir.input_tokens || 0) + (ir.output_tokens || 0) + (ir.cache_read || 0) + (ir.cache_write || 0);
-          tokensByDate.set(ir.date, (tokensByDate.get(ir.date) || 0) + itok);
+    var defaultDate = this.calendarPinnedDate || this.calendarHoverDate;
+    if (!defaultDate || !dayMap.has(defaultDate)) {
+      for (var di = days.length - 1; di >= 0; di--) {
+        if (days[di].total_tokens > 0) {
+          defaultDate = days[di].date;
+          break;
         }
       }
+      if (!defaultDate) defaultDate = days[days.length - 1].date;
+      if (!this.calendarPinnedDate) this.calendarHoverDate = defaultDate;
     }
 
-    // Generate last 90 days
-    var today = new Date();
-    today.setHours(0, 0, 0, 0);
-    var days = [];
-    for (var d = 89; d >= 0; d--) {
-      var dt = new Date(today);
-      dt.setDate(dt.getDate() - d);
-      var dateStr = dt.toISOString().slice(0, 10);
-      days.push({
-        date: dateStr,
-        day: dt.getDay(),
-        cost: costByDate.get(dateStr) || 0,
-        tokens: tokensByDate.get(dateStr) || 0,
-        monthDay: dt.getDate(),
-        month: dt.getMonth(),
-        dateObj: dt,
-      });
-    }
+    var monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    var firstDate = new Date(days[0].date + 'T00:00:00Z');
+    var lastDate = new Date(days[days.length - 1].date + 'T00:00:00Z');
+    var cursor = new Date(Date.UTC(firstDate.getUTCFullYear(), firstDate.getUTCMonth(), 1));
+    var monthsHtml = '';
 
-    // Compute percentile thresholds for intensity levels
-    var nonZeroCosts = days.filter(function(x) { return x.cost > 0; }).map(function(x) { return x.cost; }).sort(function(a, b) { return a - b; });
+    while (cursor <= lastDate) {
+      var year = cursor.getUTCFullYear();
+      var month = cursor.getUTCMonth();
+      var monthKey = year + '-' + String(month + 1).padStart(2, '0');
+      var firstOfMonth = new Date(Date.UTC(year, month, 1));
+      var lastOfMonth = new Date(Date.UTC(year, month + 1, 0));
+      var firstWeekday = (firstOfMonth.getUTCDay() + 6) % 7;
+      var cells = [];
 
-    var thresholds = [0, 0, 0, 0];
-    if (nonZeroCosts.length > 0) {
-      thresholds[0] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.01)] || nonZeroCosts[0];
-      thresholds[1] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.25)] || nonZeroCosts[0];
-      thresholds[2] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.50)] || nonZeroCosts[0];
-      thresholds[3] = nonZeroCosts[Math.floor(nonZeroCosts.length * 0.75)] || nonZeroCosts[0];
-    }
-
-    var self = this;
-    function getLevel(cost) {
-      if (cost <= 0) return 0;
-      if (cost <= thresholds[1]) return 1;
-      if (cost <= thresholds[2]) return 2;
-      if (cost <= thresholds[3]) return 3;
-      return 4;
-    }
-
-    // Organize into weeks (columns)
-    // Pad the first week to start on Monday (day 1)
-    var weeks = [];
-    var currentWeek = [];
-
-    // Pad first week
-    var firstDay = days[0].day;
-    var mondayOffset = (firstDay + 6) % 7; // convert Sun=0 to Mon=0
-    for (var p = 0; p < mondayOffset; p++) {
-      currentWeek.push(null);
-    }
-
-    for (var di = 0; di < days.length; di++) {
-      var dayItem = days[di];
-      var mondayIdx = (dayItem.day + 6) % 7;
-      if (mondayIdx === 0 && currentWeek.length > 0) {
-        weeks.push(currentWeek);
-        currentWeek = [];
+      for (var blank = 0; blank < firstWeekday; blank++) {
+        cells.push('<div class="calendar-month-cell is-empty"></div>');
       }
-      currentWeek.push(dayItem);
-    }
-    if (currentWeek.length > 0) {
-      while (currentWeek.length < 7) currentWeek.push(null);
-      weeks.push(currentWeek);
-    }
 
-    // Month labels
-    var monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    var monthLabels = [];
-    var lastMonth = -1;
-    for (var wi = 0; wi < weeks.length; wi++) {
-      var firstRealDay = null;
-      for (var ci = 0; ci < weeks[wi].length; ci++) {
-        if (weeks[wi][ci]) { firstRealDay = weeks[wi][ci]; break; }
+      for (var dayNum = 1; dayNum <= lastOfMonth.getUTCDate(); dayNum++) {
+        var dateObj = new Date(Date.UTC(year, month, dayNum));
+        var dateKey = dateObj.toISOString().slice(0, 10);
+        var dayData = dayMap.get(dateKey);
+        if (!dayData) {
+          cells.push('<div class="calendar-month-cell is-outside"><span class="calendar-month-date">' + dayNum + '</span></div>');
+          continue;
+        }
+
+        var style = this._calendarHeatStyle(dayData, stats);
+        var tokenLabel = dayData.total_tokens > 0 ? this.formatTokens(dayData.total_tokens) : '0';
+        var selected = dateKey === this.calendarPinnedDate || (!this.calendarPinnedDate && dateKey === this.calendarHoverDate);
+        cells.push(
+          '<button class="calendar-month-cell' + (selected ? ' is-selected' : '') + '" ' +
+            'data-date="' + dateKey + '" ' +
+            'style="background:' + style.background + ';color:' + style.color + ';border-color:' + style.borderColor + ';">' +
+            '<span class="calendar-month-date">' + dayNum + '</span>' +
+            '<span class="calendar-month-tokens">' + tokenLabel + '</span>' +
+          '</button>'
+        );
       }
-      if (firstRealDay && firstRealDay.month !== lastMonth) {
-        monthLabels.push({ weekIdx: wi, label: monthNames[firstRealDay.month] });
-        lastMonth = firstRealDay.month;
+
+      while (cells.length % 7 !== 0) {
+        cells.push('<div class="calendar-month-cell is-empty"></div>');
       }
+
+      monthsHtml += '<section class="calendar-month-card" data-month="' + monthKey + '">' +
+        '<div class="calendar-month-card-header">' +
+          '<div class="calendar-month-card-title">' + monthNames[month] + ' ' + year + '</div>' +
+        '</div>' +
+        '<div class="calendar-month-weekdays">' +
+          '<span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>' +
+        '</div>' +
+        '<div class="calendar-month-grid">' + cells.join('') + '</div>' +
+      '</section>';
+
+      cursor = new Date(Date.UTC(year, month + 1, 1));
     }
 
-    // Build month header (positioned above week columns)
-    var monthHeaderHtml = '<div class="calendar-months" style="position: relative; height: 14px; margin-bottom: 4px; padding-left: 28px;">';
-    for (var mi = 0; mi < monthLabels.length; mi++) {
-      var ml = monthLabels[mi];
-      var leftPos = ml.weekIdx * 14; // 12px cell + 2px gap
-      monthHeaderHtml += '<span style="position: absolute; left: ' + leftPos + 'px;">' + ml.label + '</span>';
-    }
-    monthHeaderHtml += '</div>';
-
-    // Day labels
-    var dayLabelsHtml = '<div class="calendar-day-labels">' +
-      '<div class="calendar-day-label">Mon</div>' +
-      '<div class="calendar-day-label"></div>' +
-      '<div class="calendar-day-label">Wed</div>' +
-      '<div class="calendar-day-label"></div>' +
-      '<div class="calendar-day-label">Fri</div>' +
-      '<div class="calendar-day-label"></div>' +
-      '<div class="calendar-day-label"></div>' +
-    '</div>';
-
-    // Build weeks
-    var weeksHtml = weeks.map(function(week) {
-      var cellsHtml = week.map(function(dayData) {
-        if (!dayData) return '<div class="calendar-day" style="visibility: hidden;"></div>';
-        var level = getLevel(dayData.cost);
-        var tooltipText = dayData.date.slice(5) + ': $' + dayData.cost.toFixed(2) + ' (' + self.formatTokens(dayData.tokens) + ' tokens)';
-        return '<div class="calendar-day" data-level="' + level + '">' +
-          '<div class="calendar-tooltip">' + tooltipText + '</div>' +
-        '</div>';
-      }).join('');
-      return '<div class="calendar-week">' + cellsHtml + '</div>';
-    }).join('');
-
-    // Color scale legend
-    var scaleHtml = '<div class="calendar-scale">' +
-      '<span>Less</span>' +
-      '<div class="calendar-scale-cell" style="background: var(--bg-200);"></div>' +
-      '<div class="calendar-scale-cell" style="background: #0c2d48;"></div>' +
-      '<div class="calendar-scale-cell" style="background: #0a4a7a;"></div>' +
-      '<div class="calendar-scale-cell" style="background: #0070f3;"></div>' +
-      '<div class="calendar-scale-cell" style="background: #3291ff;"></div>' +
-      '<span>More</span>' +
-    '</div>';
-
-    el.innerHTML = '<div class="calendar-container">' +
-      '<div class="calendar-header">' +
-        '<span></span>' +
-        scaleHtml +
+    el.innerHTML = '<div class="calendar-shell">' +
+      '<div class="calendar-shell-header">' +
+        '<div class="calendar-shell-copy">' +
+          '<div class="calendar-shell-title">Last 90 days</div>' +
+          '<div class="calendar-shell-meta">Adaptive intensity from min ' + this.formatTokens(stats.min) + ' · avg ' + this.formatTokens(Math.round(stats.avg || 0)) + ' · max ' + this.formatTokens(stats.max) + '</div>' +
+        '</div>' +
+        '<div class="calendar-shell-scale">' +
+          '<span>Low</span>' +
+          '<span class="calendar-scale-chip" style="background:rgba(50,145,255,0.18)"></span>' +
+          '<span class="calendar-scale-chip" style="background:rgba(50,145,255,0.40)"></span>' +
+          '<span class="calendar-scale-chip" style="background:rgba(50,145,255,0.65)"></span>' +
+          '<span class="calendar-scale-chip" style="background:rgba(50,145,255,0.92)"></span>' +
+          '<span>High</span>' +
+        '</div>' +
       '</div>' +
-      monthHeaderHtml +
-      '<div class="calendar-body">' +
-        dayLabelsHtml +
-        '<div class="calendar-heatmap">' + weeksHtml + '</div>' +
+      '<div class="calendar-months-grid">' + monthsHtml + '</div>' +
+    '</div>';
+
+    var cellsEls = el.querySelectorAll('.calendar-month-cell[data-date]');
+    cellsEls.forEach(function(cell) {
+      cell.addEventListener('mouseenter', function() {
+        if (self.calendarPinnedDate) return;
+        self.calendarHoverDate = cell.dataset.date;
+        self.renderTokenCalendar();
+      });
+      cell.addEventListener('click', function() {
+        var date = cell.dataset.date;
+        self.calendarPinnedDate = self.calendarPinnedDate === date ? null : date;
+        self.calendarHoverDate = date;
+        self.renderTokenCalendar();
+      });
+    });
+
+    this.renderCalendarBreakdown(this.calendarPinnedDate || this.calendarHoverDate, breakdown);
+  }
+
+  renderCalendarBreakdown(selectedDate, breakdown) {
+    var el = document.getElementById('calendar-breakdown');
+    if (!el) return;
+    if (!breakdown || !selectedDate || !breakdown.map.has(selectedDate)) {
+      el.innerHTML = '<div class="empty-state">Hover or click a day to inspect its breakdown.</div>';
+      return;
+    }
+
+    var day = breakdown.map.get(selectedDate);
+    var runtimeSlices = Object.keys(day.runtimes).map(function(runtime) {
+      return {
+        key: runtime,
+        label: runtime,
+        value: day.runtimes[runtime] || 0,
+      };
+    }).filter(function(slice) { return slice.value > 0; });
+
+    var instanceSlices = Object.keys(day.instances).map(function(instanceId) {
+      return {
+        key: instanceId,
+        label: instanceId,
+        value: day.instances[instanceId] || 0,
+      };
+    }).filter(function(slice) { return slice.value > 0; }).sort(function(a, b) { return b.value - a.value; });
+
+    var runtimeColor = function(key) {
+      if (key === 'claude') return '#f5a623';
+      if (key === 'codex') return '#3291ff';
+      if (key === 'system') return '#6b7280';
+      return '#14b8a6';
+    };
+
+    el.innerHTML = '<div class="usage-breakdown-shell">' +
+      '<div class="usage-breakdown-header">' +
+        '<div>' +
+          '<div class="usage-breakdown-date">' + this.esc(selectedDate) + '</div>' +
+          '<div class="usage-breakdown-meta">' + this.formatTokens(day.total_tokens) + ' tokens · ' + this.formatUsd(day.cost_usd || 0) + '</div>' +
+        '</div>' +
+        '<div class="usage-breakdown-hint">' + (this.calendarPinnedDate ? 'Pinned selection' : 'Hover preview') + '</div>' +
+      '</div>' +
+      '<div class="usage-breakdown-grid">' +
+        this._renderPieCard('By Runtime', runtimeSlices, day.total_tokens, runtimeColor) +
+        this._renderPieCard('By Instance', instanceSlices, day.total_tokens, this._instanceColor.bind(this)) +
       '</div>' +
     '</div>';
   }
