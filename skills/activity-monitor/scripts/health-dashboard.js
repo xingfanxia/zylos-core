@@ -53,6 +53,27 @@ function readStatusFile(statusPath) {
   }
 }
 
+export function normalizeTimestampToIso(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') {
+    const ms = value > 1e12 ? value : value * 1000;
+    const date = new Date(ms);
+    return Number.isNaN(date.getTime()) ? null : date.toISOString();
+  }
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+export function resolveLastActivity({ statusData = null, apiData = null } = {}) {
+  return (
+    normalizeTimestampToIso(statusData?.last_user_activity) ||
+    normalizeTimestampToIso(statusData?.last_activity) ||
+    normalizeTimestampToIso(apiData?.last_user_activity) ||
+    normalizeTimestampToIso(apiData?.updated_at) ||
+    null
+  );
+}
+
 function getPm2Processes() {
   try {
     const raw = execSync('pm2 jlist 2>/dev/null', { encoding: 'utf8', timeout: 15000 });
@@ -125,16 +146,16 @@ export function getSystemHealth() {
         status = 'stopped';
       }
 
-      // Read last user activity (UserPromptSubmit only, not heartbeats)
-      let lastActivity = null;
+      // Prefer the activity timestamp already persisted into agent-status.json,
+      // because idle_seconds is derived from the same clock source.
+      let apiData = null;
       try {
         const apiFile = path.join(stateDir, 'api-activity.json');
         if (fs.existsSync(apiFile)) {
-          const api = JSON.parse(fs.readFileSync(apiFile, 'utf8'));
-          const ts = api.last_user_activity || api.updated_at;
-          if (ts) lastActivity = new Date(ts).toISOString();
+          apiData = JSON.parse(fs.readFileSync(apiFile, 'utf8'));
         }
       } catch { /* best-effort */ }
+      const lastActivity = resolveLastActivity({ statusData, apiData });
 
       // Find matching PM2 process uptime
       const pm2Name = `activity-monitor-${id}`;
