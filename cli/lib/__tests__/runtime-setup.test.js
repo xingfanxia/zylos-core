@@ -111,6 +111,57 @@ describe('writeCodexConfig', () => {
     assert.match(content, /^model_reasoning_effort = "medium"$/m);
     assert.match(content, /^personality = "direct"$/m);
   });
+
+  it('preserves non-zylos sections and extra keys inside managed sections', () => {
+    const codexDir = path.join(fakeHome, '.codex');
+    const configPath = path.join(codexDir, 'config.toml');
+    const projectDir = path.join(fakeZylosDir, 'workspace', 'project-c');
+
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(
+      configPath,
+      [
+        'model = "gpt-5.4-mini"',
+        '',
+        '[features]',
+        'multi_agent = false',
+        'experimental_widget = true',
+        '',
+        '[notice]',
+        'hide_full_access_warning = false',
+        'keep_custom_notice = true',
+        '',
+        '[notice.model_migrations]',
+        '"gpt-5.3-codex" = "gpt-5.3-codex"',
+        '"custom-model" = "custom-target"',
+        '',
+        '[mcp_servers.context7]',
+        'command = "npx"',
+        'args = ["-y", "@upstash/context7-mcp"]',
+        '',
+        '[plugins.example]',
+        'enabled = true',
+        '',
+        '[tui]',
+        'theme = "nord"',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    assert.equal(writeCodexConfig(projectDir), true);
+
+    const content = fs.readFileSync(configPath, 'utf8');
+    assert.match(content, /\[features\][\s\S]*multi_agent = true/);
+    assert.match(content, /\[features\][\s\S]*experimental_widget = true/);
+    assert.match(content, /\[notice\][\s\S]*hide_full_access_warning = true/);
+    assert.match(content, /\[notice\][\s\S]*keep_custom_notice = true/);
+    assert.match(content, /\[notice\.model_migrations\][\s\S]*"gpt-5\.3-codex" = "gpt-5\.4"/);
+    assert.match(content, /\[notice\.model_migrations\][\s\S]*"custom-model" = "custom-target"/);
+    assert.match(content, /\[mcp_servers\.context7\][\s\S]*command = "npx"/);
+    assert.match(content, /\[plugins\.example\][\s\S]*enabled = true/);
+    assert.match(content, /\[tui\][\s\S]*theme = "nord"/);
+  });
 });
 
 function escapeRegExp(text) {

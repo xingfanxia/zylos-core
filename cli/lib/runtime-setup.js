@@ -312,19 +312,15 @@ export function saveClaudeBaseUrlToSettingsAndEnv(baseUrl) {
  */
 export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
   const absProject = path.resolve(projectDir);
-  const openaiBaseUrl = opts.openaiBaseUrl || process.env.OPENAI_BASE_URL || '';
+  const openaiBaseUrl =
+    opts.openaiBaseUrl ||
+    process.env.OPENAI_BASE_URL ||
+    readTomlString(existingContent, 'openai_base_url') ||
+    '';
   const runtimeSettings = resolveCodexRuntimeSettings(existingContent, opts);
+  const parsed = parseTomlBlocks(existingContent);
 
-  let preservedProjects = '';
-  const projectMatches = existingContent.match(/^\[projects\.[^\]]+\][^\[]+/gm);
-  if (projectMatches) {
-    const toKeep = projectMatches.filter(
-      (s) => !s.includes(`"${absProject}"`) && !s.includes(`'${absProject}'`)
-    );
-    if (toKeep.length) preservedProjects = '\n' + toKeep.join('\n').trimEnd() + '\n';
-  }
-
-  const config = [
+  const managedTopLevel = [
     '# Codex headless config — written by zylos, do not edit manually.',
     '# Re-generated on each `zylos init` / `zylos runtime codex`.',
     '',
@@ -343,30 +339,71 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     '# Acknowledge the latest model NUX so the "Introducing GPT-X" dialog',
     '# is not shown on startup.  Update this when Codex ships a new default model.',
     `model_availability_nux = "${escapeTomlString(runtimeSettings.model)}"`,
-    ...(openaiBaseUrl ? ['', '# Use a custom OpenAI-compatible base URL', `openai_base_url = "${openaiBaseUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`] : []),
-    '',
-    '# Enable Codex features required by Zylos runtime workflows.',
-    '[features]',
-    'multi_agent = true',
-    '',
-    '# Suppress all known interactive notice dialogs',
-    '[notice]',
-    'hide_full_access_warning = true',
-    'hide_world_writable_warning = true',
-    'hide_rate_limit_model_nudge = true',
-    'hide_gpt5_1_migration_prompt = true',
-    '"hide_gpt-5.1-codex-max_migration_prompt" = true',
-    '',
-    '# Acknowledge known model migrations so no migration prompt appears',
-    '[notice.model_migrations]',
-    '"gpt-5.3-codex" = "gpt-5.4"',
-    '',
-    '# Trust the zylos project directory',
-    `[projects."${absProject}"]`,
-    'trust_level = "trusted"',
-  ].join('\n') + '\n';
+    ...(openaiBaseUrl
+      ? ['', '# Use a custom OpenAI-compatible base URL', `openai_base_url = "${escapeTomlString(openaiBaseUrl)}"`]
+      : []),
+  ];
 
-  return config + preservedProjects;
+  const preservedTopLevel = filterPreservedTopLevelLines(parsed.topLevelLines, new Set([
+    'model',
+    'model_context_window',
+    'model_auto_compact_token_limit',
+    'model_reasoning_effort',
+    'personality',
+    'check_for_update_on_startup',
+    'model_availability_nux',
+    'openai_base_url',
+  ]));
+
+  const featuresBlock = renderMergedSectionBlock('features', parsed.sections.get('features')?.bodyLines || [], {
+    multi_agent: 'true',
+  }, {
+    comment: '# Enable Codex features required by Zylos runtime workflows.',
+  });
+
+  const noticeBlock = renderMergedSectionBlock('notice', parsed.sections.get('notice')?.bodyLines || [], {
+    hide_full_access_warning: 'true',
+    hide_world_writable_warning: 'true',
+    hide_rate_limit_model_nudge: 'true',
+    hide_gpt5_1_migration_prompt: 'true',
+    '"hide_gpt-5.1-codex-max_migration_prompt"': 'true',
+  }, {
+    comment: '# Suppress all known interactive notice dialogs',
+  });
+
+  const migrationsBlock = renderMergedSectionBlock('notice.model_migrations', parsed.sections.get('notice.model_migrations')?.bodyLines || [], {
+    '"gpt-5.3-codex"': '"gpt-5.4"',
+  }, {
+    comment: '# Acknowledge known model migrations so no migration prompt appears',
+  });
+
+  const projectHeader = `projects."${absProject}"`;
+  const projectBlock = renderMergedSectionBlock(projectHeader, parsed.sections.get(projectHeader)?.bodyLines || [], {
+    trust_level: '"trusted"',
+  }, {
+    comment: '# Trust the zylos project directory',
+  });
+
+  const preservedSectionBlocks = [];
+  for (const section of parsed.sectionOrder) {
+    if (section === 'features') continue;
+    if (section === 'notice') continue;
+    if (section === 'notice.model_migrations') continue;
+    if (section === projectHeader) continue;
+    preservedSectionBlocks.push(parsed.sections.get(section).raw.trimEnd());
+  }
+
+  const chunks = [
+    managedTopLevel.join('\n').trimEnd(),
+    preservedTopLevel.join('\n').trim(),
+    featuresBlock,
+    noticeBlock,
+    migrationsBlock,
+    projectBlock,
+    preservedSectionBlocks.join('\n\n').trim(),
+  ].filter(Boolean);
+
+  return chunks.join('\n\n').trimEnd() + '\n';
 }
 
 /**
@@ -457,6 +494,93 @@ function escapeTomlString(value) {
 
 function escapeRegExp(text) {
   return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseTomlBlocks(content = '') {
+  const lines = String(content || '').split('\n');
+  const topLevelLines = [];
+  const sections = new Map();
+  const sectionOrder = [];
+
+  let currentHeader = null;
+  let currentLines = [];
+
+  function flushCurrent() {
+    if (!currentHeader) return;
+    const raw = currentLines.join('\n').trimEnd();
+    const bodyLines = currentLines.slice(1);
+    sections.set(currentHeader, { raw, bodyLines });
+    sectionOrder.push(currentHeader);
+    currentHeader = null;
+    currentLines = [];
+  }
+
+  for (const line of lines) {
+    const match = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (match) {
+      flushCurrent();
+      currentHeader = match[1];
+      currentLines = [line];
+      continue;
+    }
+
+    if (currentHeader) {
+      currentLines.push(line);
+    } else {
+      topLevelLines.push(line);
+    }
+  }
+
+  flushCurrent();
+  return { topLevelLines, sections, sectionOrder };
+}
+
+function filterPreservedTopLevelLines(lines = [], managedKeys = new Set()) {
+  return lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('#')) return false;
+    const match = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=/);
+    if (!match) return true;
+    return !managedKeys.has(match[1]);
+  });
+}
+
+function renderMergedSectionBlock(header, existingBodyLines = [], managedAssignments = {}, opts = {}) {
+  const managedKeys = new Set(Object.keys(managedAssignments));
+  const preserved = [];
+
+  for (const line of existingBodyLines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (preserved[preserved.length - 1] !== '') preserved.push('');
+      continue;
+    }
+    if (trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const match = trimmed.match(/^((?:"[^"]+"|[A-Za-z0-9_.-]+))\s*=/);
+    if (match && managedKeys.has(match[1])) {
+      continue;
+    }
+    preserved.push(line);
+  }
+
+  while (preserved[0] === '') preserved.shift();
+  while (preserved[preserved.length - 1] === '') preserved.pop();
+
+  const bodyLines = [
+    ...Object.entries(managedAssignments).map(([key, value]) => `${key} = ${value}`),
+    ...(preserved.length ? [''] : []),
+    ...preserved,
+  ];
+
+  return [
+    opts.comment || null,
+    `[${header}]`,
+    ...bodyLines,
+  ].filter((line) => line !== null).join('\n').trimEnd();
 }
 
 /**
