@@ -142,6 +142,7 @@ export function getSystemHealth() {
 
       instances.push({
         id,
+        runtime: inst.runtime || 'claude',
         type: inst.type || 'dedicated',
         primary: inst.primary || false,
         enabled: inst.enabled !== false,

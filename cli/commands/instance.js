@@ -13,10 +13,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { bold, dim, green, red, yellow, cyan, heading } from '../lib/colors.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
+const ZYLOS_PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -63,6 +67,11 @@ function pm2ProcessStatus(name) {
 function resolveDir(dir) {
   if (!dir) return dir;
   return dir.replace(/^~/, os.homedir());
+}
+
+function writeWakeSignal(stateDir) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'wake-signal'), new Date().toISOString());
 }
 
 function parseArgs(argv) {
@@ -274,7 +283,8 @@ function startInstance(id) {
     // Delete if exists but stopped
     try { execSync(`pm2 delete "${pm2Name}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ignore */ }
 
-    const startCmd = `ZYLOS_INSTANCE_ID=${id} ZYLOS_DIR=${ZYLOS_DIR} pm2 start "${amScript}" --name "${pm2Name}" --restart-delay 5000 --max-restarts 10`;
+    const tmuxSession = inst.tmux_session || `claude-${id}`;
+    const startCmd = `ZYLOS_INSTANCE_ID=${id} ZYLOS_TMUX_SESSION=${tmuxSession} ZYLOS_DIR=${ZYLOS_DIR} ZYLOS_PACKAGE_ROOT=${ZYLOS_PACKAGE_ROOT} pm2 start "${amScript}" --name "${pm2Name}" --restart-delay 5000 --max-restarts 10`;
     execSync(startCmd, { encoding: 'utf8', stdio: 'pipe' });
     execSync('pm2 save 2>/dev/null', { stdio: 'pipe' });
 
@@ -603,30 +613,14 @@ function resumeInstance(id) {
     process.exit(1);
   }
 
-  const configDir = resolveDir(inst.config_dir);
-  const envPrefix = configDir ? `CLAUDE_CONFIG_DIR='${configDir}' ` : '';
-  const runtime = inst.runtime || 'claude';
-  const launchCmd = `${envPrefix}${runtime}`;
-
   try {
-    execSync(`tmux new-session -d -s "${tmuxSession}" -x 220 -y 50 '${launchCmd}'`, { encoding: 'utf8' });
+    writeWakeSignal(stateDir);
   } catch (err) {
-    console.error(red(`Failed to start tmux session: ${err.message}`));
+    console.error(red(`Failed to write wake signal: ${err.message}`));
     process.exit(1);
   }
 
-  // Clear suspended status
-  const statusFile = path.join(stateDir, 'agent-status.json');
-  try {
-    fs.writeFileSync(statusFile, JSON.stringify({
-      state: 'idle',
-      resumed_at: Date.now(),
-      resumed_by: 'cli',
-      last_check_human: new Date().toISOString(),
-    }, null, 2) + '\n');
-  } catch { /* best-effort */ }
-
-  console.log(green(`Instance "${id}" resumed (tmux session "${tmuxSession}").`));
+  console.log(green(`Instance "${id}" resume requested.`));
 }
 
 function suspendAllInstances() {
@@ -700,30 +694,14 @@ function resumeAllInstances() {
       continue;
     }
 
-    const configDir = resolveDir(inst.config_dir);
-    const envPrefix = configDir ? `CLAUDE_CONFIG_DIR='${configDir}' ` : '';
-    const runtime = inst.runtime || 'claude';
-    const launchCmd = `${envPrefix}${runtime}`;
-
     try {
-      execSync(`tmux new-session -d -s "${tmuxSession}" -x 220 -y 50 '${launchCmd}'`, { encoding: 'utf8' });
+      writeWakeSignal(stateDir);
     } catch {
       console.log(yellow(`  Failed to resume "${id}"`));
       continue;
     }
 
-    // Clear suspended status
-    const statusFile = path.join(stateDir, 'agent-status.json');
-    try {
-      fs.writeFileSync(statusFile, JSON.stringify({
-        state: 'idle',
-        resumed_at: Date.now(),
-        resumed_by: 'cli-bulk',
-        last_check_human: new Date().toISOString(),
-      }, null, 2) + '\n');
-    } catch { /* best-effort */ }
-
-    console.log(green(`  Resumed "${id}"`));
+    console.log(green(`  Resume requested for "${id}"`));
     count++;
   }
 

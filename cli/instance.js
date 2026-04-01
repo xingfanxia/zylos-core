@@ -77,6 +77,11 @@ function tmuxSessionExists(session) {
   }
 }
 
+function writeWakeSignal(stateDir) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, 'wake-signal'), new Date().toISOString());
+}
+
 /**
  * Read the status from an instance's agent-status.json file.
  * Returns a string: 'running', 'suspended', 'stopped', or 'unknown'.
@@ -166,7 +171,7 @@ function parseArgs(argv) {
 // Commands
 // ---------------------------------------------------------------------------
 
-function cmdCreate(id, flags) {
+async function cmdCreate(id, flags) {
   if (!id) errorExit('Usage: node instance.js create <id> [options]');
   if (!VALID_ID.test(id)) errorExit(`Invalid instance ID "${id}". Must match /^[a-zA-Z0-9_-]+$/.`);
 
@@ -472,38 +477,17 @@ function cmdResume(id) {
     errorExit(`tmux session "${tmuxSession}" already exists.`);
   }
 
-  // Launch Claude Code in a new tmux session (same pattern as startOnDemandInstance)
-  const configDir = inst.config_dir ? resolveTilde(inst.config_dir) : null;
-  const runtime = inst.runtime || 'claude';
-  const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
-  if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
-  tmuxArgs.push(runtime);
-
-  try {
-    execFileSync('tmux', tmuxArgs, { stdio: 'pipe', timeout: 15000 });
-  } catch (err) {
-    errorExit(`Failed to create tmux session "${tmuxSession}": ${err.message}`);
-  }
-
-  // Clear suspended status
   const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-  const statusFile = path.join(stateDir, 'agent-status.json');
   try {
-    const statusData = {
-      state: 'idle',
-      resumed_at: Date.now(),
-      resumed_by: 'cli',
-      last_check_human: new Date().toISOString(),
-    };
-    fs.writeFileSync(statusFile, JSON.stringify(statusData, null, 2) + '\n');
-  } catch {
-    // Best-effort status write — the AM will update it soon anyway
+    writeWakeSignal(stateDir);
+  } catch (err) {
+    errorExit(`Failed to request resume for "${id}": ${err.message}`);
   }
 
   if (jsonMode) {
-    console.log(JSON.stringify({ ok: true, id, status: 'resumed', session: tmuxSession }));
+    console.log(JSON.stringify({ ok: true, id, status: 'resume_requested', session: tmuxSession }));
   } else {
-    console.log(`Instance "${id}" resumed (tmux session "${tmuxSession}" started).`);
+    console.log(`Instance "${id}" resume requested.`);
   }
 }
 
@@ -661,33 +645,12 @@ function cmdResumeAll() {
       continue;
     }
 
-    // Launch Claude Code
-    const configDir = inst.config_dir ? resolveTilde(inst.config_dir) : null;
-    const runtime = inst.runtime || 'claude';
-    const tmuxArgs = ['new-session', '-d', '-s', tmuxSession, '-x', '220', '-y', '50'];
-    if (configDir) tmuxArgs.push('-e', `CLAUDE_CONFIG_DIR=${configDir}`);
-    tmuxArgs.push(runtime);
-
-    try {
-      execFileSync('tmux', tmuxArgs, { stdio: 'pipe', timeout: 15000 });
-    } catch {
-      skipped.push({ id, reason: 'start failed' });
-      continue;
-    }
-
-    // Clear suspended status
     const stateDir = resolveTilde(inst.state_dir) || path.join(ZYLOS_DIR, 'activity-monitor', id);
-    const statusFile = path.join(stateDir, 'agent-status.json');
     try {
-      const statusData = {
-        state: 'idle',
-        resumed_at: Date.now(),
-        resumed_by: 'cli-bulk',
-        last_check_human: new Date().toISOString(),
-      };
-      fs.writeFileSync(statusFile, JSON.stringify(statusData, null, 2) + '\n');
+      writeWakeSignal(stateDir);
     } catch {
-      // Best-effort
+      skipped.push({ id, reason: 'resume request failed' });
+      continue;
     }
 
     resumed.push(id);
@@ -778,7 +741,7 @@ Global options:
 // Main
 // ---------------------------------------------------------------------------
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
 
   // Check for --json anywhere in args (before parsing command)
@@ -799,7 +762,7 @@ function main() {
 
   switch (command) {
     case 'create':
-      cmdCreate(positional[0], flags);
+      await cmdCreate(positional[0], flags);
       break;
     case 'list':
     case 'ls':
@@ -840,4 +803,4 @@ function main() {
   process.exit(0);
 }
 
-main();
+await main();

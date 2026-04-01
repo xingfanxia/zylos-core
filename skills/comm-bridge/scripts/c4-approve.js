@@ -13,11 +13,26 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+
+function resolvePackageRoot() {
+  if (process.env.ZYLOS_PACKAGE_ROOT) return process.env.ZYLOS_PACKAGE_ROOT;
+  try {
+    const zylosBin = execSync('command -v zylos 2>/dev/null || true', {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).trim();
+    if (!zylosBin) return '';
+    const realPath = fs.realpathSync(zylosBin);
+    return path.dirname(path.dirname(realPath));
+  } catch {
+    return '';
+  }
+}
 
 // Import DB functions
 import { getDb, close } from './c4-db.js';
@@ -29,7 +44,7 @@ function usage() {
   process.exit(1);
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   if (args.length < 2) usage();
 
@@ -44,7 +59,7 @@ function main() {
   }
 
   if (action === 'approve') {
-    approveUser(chatId, instanceName);
+    await approveUser(chatId, instanceName);
   } else if (action === 'deny') {
     denyUser(chatId);
   } else {
@@ -52,7 +67,7 @@ function main() {
   }
 }
 
-function approveUser(chatId, name) {
+async function approveUser(chatId, name) {
   // Generate instance name from chat_id if not provided
   const instanceName = name || `user-${chatId.substring(0, 12)}`;
 
@@ -141,7 +156,12 @@ function approveUser(chatId, name) {
     ], {
       timeout: 30000,
       stdio: 'pipe',
-      env: { ...process.env, ZYLOS_INSTANCE_ID: instanceName },
+      env: {
+        ...process.env,
+        ZYLOS_INSTANCE_ID: instanceName,
+        ZYLOS_TMUX_SESSION: `claude-${instanceName}`,
+        ...(resolvePackageRoot() ? { ZYLOS_PACKAGE_ROOT: resolvePackageRoot() } : {}),
+      },
     });
     execFileSync('pm2', ['save'], { timeout: 15000, stdio: 'pipe' });
     console.log(`PM2: started activity-monitor-${instanceName}`);
@@ -206,4 +226,4 @@ export async function checkAndHoldForApproval(endpoint, targetInstance, noReply,
 
 // Only run main() when executed directly, not when imported as a module
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
-if (isDirectRun) main();
+if (isDirectRun) await main();

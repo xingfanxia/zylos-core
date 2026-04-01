@@ -167,6 +167,19 @@ describe('getInputBoxText', () => {
     ].join('\n');
     assert.equal(getInputBoxText(capture), '');
   });
+
+  it('falls back to the Codex status-bar footer when separators are absent', () => {
+    const capture = [
+      '╭───────────────────────────────────────╮',
+      '│ >_ OpenAI Codex (v0.118.0)            │',
+      '╰───────────────────────────────────────╯',
+      '',
+      '› Implement {feature}',
+      '',
+      '  gpt-5.4 default · 100% left · ~/zylos-core'
+    ].join('\n');
+    assert.equal(getInputBoxText(capture), 'Implement {feature}');
+  });
 });
 
 // ── checkInputBox ───────────────────────────────────────────────────
@@ -215,6 +228,19 @@ describe('checkInputBox', () => {
       '  tab to queue message                                        72% context left'
     ].join('\n');
     assert.equal(checkInputBox(capture), 'empty');
+  });
+
+  it('returns "has_content" for Codex status-bar captures', () => {
+    const capture = [
+      '╭───────────────────────────────────────╮',
+      '│ >_ OpenAI Codex (v0.118.0)            │',
+      '╰───────────────────────────────────────╯',
+      '',
+      '› Implement {feature}',
+      '',
+      '  gpt-5.4 default · 100% left · ~/zylos-core'
+    ].join('\n');
+    assert.equal(checkInputBox(capture), 'has_content');
   });
 });
 

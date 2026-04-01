@@ -529,7 +529,7 @@ export function getUnsummarizedRange() {
   ).get();
   const afterId = lastCheckpoint?.end_conversation_id || 0;
   const result = db.prepare(
-    'SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count FROM conversations WHERE id > ?'
+    "SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count FROM conversations WHERE id > ? AND status = 'delivered'"
   ).get(afterId);
   return {
     begin_id: result?.begin_id || null,
@@ -552,12 +552,12 @@ export function getUnsummarizedConversations(limit = null) {
 
   if (limit) {
     return db.prepare(
-      'SELECT * FROM (SELECT * FROM conversations WHERE id > ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC'
+      "SELECT * FROM (SELECT * FROM conversations WHERE id > ? AND status = 'delivered' ORDER BY id DESC LIMIT ?) ORDER BY id ASC"
     ).all(afterId, limit);
   }
 
   return db.prepare(
-    'SELECT * FROM conversations WHERE id > ? ORDER BY id ASC'
+    "SELECT * FROM conversations WHERE id > ? AND status = 'delivered' ORDER BY id ASC"
   ).all(afterId);
 }
 

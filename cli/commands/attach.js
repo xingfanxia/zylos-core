@@ -2,16 +2,39 @@
  * Attach to the active runtime's tmux session with a detach hint.
  */
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { bold } from '../lib/colors.js';
-import { getActiveAdapter } from '../lib/runtime/index.js';
+import { getActiveAdapter, getAdapterForInstance } from '../lib/runtime/index.js';
+
+const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+
+function resolvePrimaryInstance() {
+  const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
+  try {
+    const cfg = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
+    const entries = Object.entries(cfg.instances || {});
+    if (entries.length === 0) return null;
+    const primary = entries.find(([, inst]) => inst.primary === true) || entries.find(([id]) => id === cfg.default_instance) || entries[0];
+    return { id: primary[0], ...primary[1] };
+  } catch {
+    return null;
+  }
+}
 
 let SESSION = 'claude-main';
 let RUNTIME_LABEL = 'Claude';
+let INSTANCE_ID = null;
 try {
-  const adapter = getActiveAdapter();
+  const primaryInstance = resolvePrimaryInstance();
+  const adapter = primaryInstance
+    ? getAdapterForInstance({ instanceId: primaryInstance.id, zylosDir: ZYLOS_DIR })
+    : getActiveAdapter();
   SESSION = adapter.sessionName;
   RUNTIME_LABEL = adapter.displayName;
+  INSTANCE_ID = primaryInstance?.id || null;
 } catch { /* config absent — use Claude defaults */ }
 
 export function attachCommand() {
@@ -32,8 +55,12 @@ export function attachCommand() {
       console.error(`  Check status: ${bold('zylos status')}`);
     } else {
       console.error(`No active ${RUNTIME_LABEL} session found.`);
-      console.error(`  First time? Run ${bold('zylos init')}`);
-      console.error(`  Otherwise:  Run ${bold('zylos start')}`);
+      if (INSTANCE_ID) {
+        console.error(`  Resume the primary instance: ${bold(`zylos instance resume ${INSTANCE_ID}`)}`);
+      } else {
+        console.error(`  First time? Run ${bold('zylos init')}`);
+        console.error(`  Otherwise:  Run ${bold('zylos start')}`);
+      }
     }
     process.exit(1);
   }

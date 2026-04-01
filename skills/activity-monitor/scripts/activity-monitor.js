@@ -54,7 +54,8 @@
  *     separates Guardian (process liveness) from HeartbeatEngine (functional liveness)
  *
  * v21 changes (multi-runtime support — #311):
- *   - RuntimeAdapter abstraction: getActiveAdapter() reads runtime from config.json
+ *   - RuntimeAdapter abstraction: activity-monitor resolves the adapter at startup
+ *     (now instance-aware in multi-session mode, falling back to config.json)
  *   - Replaced startClaude/killTmuxSession/isClaudeRunning/sendToTmux/isClaudeLoggedIn
  *     with adapter.launch/stop/isRunning/sendMessage/checkAuth
  *   - HeartbeatEngine deps now merged from adapter.getHeartbeatDeps() (probe) + fixed deps
@@ -175,7 +176,7 @@ const _runtimeIndexPath = (() => {
 })();
 const _runtimeDirPath = path.dirname(_runtimeIndexPath);
 const _sessionHandoffPath = path.join(_runtimeDirPath, 'session-handoff.js');
-const { getActiveAdapter } = await import(_runtimeIndexPath);
+const { getAdapterForInstance } = await import(_runtimeIndexPath);
 const { enqueueNewSession } = await import(_sessionHandoffPath);
 
 const __filename = fileURLToPath(import.meta.url);
@@ -328,7 +329,7 @@ let lastDeadApiPid = null;
 let authRetrySuppressedUntil = 0;
 let startAgentInProgress = false;
 
-let adapter;         // initialized in init() via getActiveAdapter()
+let adapter;         // initialized in init() via getAdapterForInstance()
 let engine;          // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
 let procSampler;     // initialized in init()
@@ -1955,9 +1956,14 @@ async function init() {
     fs.mkdirSync(MONITOR_DIR, { recursive: true });
   }
 
-  // Load the active runtime adapter (claude or codex, from config.json)
-  adapter = getActiveAdapter();
   const config = readConfigObject();
+  // Resolve runtime per instance in multi-session mode, falling back to the
+  // globally configured runtime in single-session deployments.
+  adapter = getAdapterForInstance({
+    instanceId: INSTANCE_ID,
+    config,
+    zylosDir: ZYLOS_DIR,
+  });
   const heartbeatEnabled = isRuntimeHeartbeatEnabled({ runtimeId: adapter.runtimeId, config });
 
   // Initialize ProcSampler for frozen-process detection via context-switch sampling.
@@ -2083,17 +2089,6 @@ async function init() {
     log(`Startup with health=${initialHealth}; will verify immediately when ${adapter.displayName} is running`);
   }
 
-  // Startup cleanup: kill the other runtime's tmux session if it exists.
-  // Runs on every startup (not just runtime switches) — if the other session is
-  // absent (normal case) the kill fails silently. The 10 s delay gives a running
-  // agent time to finish its current response before being terminated.
-  const OTHER_SESSION = adapter.runtimeId === 'codex' ? 'claude-main' : 'codex-main';
-  setTimeout(() => {
-    try {
-      execSync(`tmux kill-session -t "${OTHER_SESSION}" 2>/dev/null`, { stdio: 'pipe', timeout: 3000 });
-      log(`Startup cleanup: killed stale ${OTHER_SESSION} session from previous runtime`);
-    } catch { /* session didn't exist — normal startup, no-op */ }
-  }, 10_000);
 }
 
 try {

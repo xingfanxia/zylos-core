@@ -24,6 +24,8 @@ const HOME = os.homedir();
 const CODEX_DIR = path.join(HOME, '.codex');
 const SQLITE_FILE = path.join(CODEX_DIR, 'state_5.sqlite');
 const MODELS_CACHE_FILE = path.join(CODEX_DIR, 'models_cache.json');
+const CODEX_CONFIG_FILE = path.join(CODEX_DIR, 'config.toml');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
 // Bytes to read from the end of the JSONL file — large enough to capture
 // several turns including their token_count events.
@@ -41,6 +43,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
   constructor(opts = {}) {
     super(opts);
     this._model = opts.model ?? null;
+    this._instanceId = opts.instanceId ?? INSTANCE_ID;
     // Record start time so SQLite queries ignore threads from prior sessions.
     // Threads updated before this timestamp belong to a previous Codex run.
     this._startTime = Math.floor(Date.now() / 1000);
@@ -128,7 +131,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
     try {
       const sql = `SELECT rollout_path FROM threads
                    WHERE archived = 0
-                     AND updated_at >= ${this._startTime}
+                     AND updated_at >= ${this._startTime}${this._getThreadScopeSql()}
                    ORDER BY updated_at DESC
                    LIMIT 1;`;
       const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
@@ -191,7 +194,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
       // Same start-time filter as _getActiveRolloutPath() — ignore stale threads.
       const sql = `SELECT tokens_used FROM threads
                    WHERE archived = 0
-                     AND updated_at >= ${this._startTime}
+                     AND updated_at >= ${this._startTime}${this._getThreadScopeSql()}
                    ORDER BY updated_at DESC
                    LIMIT 1;`;
       const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
@@ -207,15 +210,29 @@ export class CodexContextMonitor extends ContextMonitorBase {
   }
 
   /**
-   * Get effective context window ceiling from ~/.codex/models_cache.json.
-   * Effective ceiling = context_window × (effective_context_window_percent / 100).
+   * Get effective context window ceiling.
    *
-   * Not cached — re-reads on each call so a model upgrade mid-session is
-   * reflected without requiring a PM2 restart. The file is small (~2 KB).
+   * Fallback order:
+   *   1. ~/.codex/config.toml `model_context_window`
+   *   2. ~/.codex/models_cache.json effective ceiling
+   *   3. DEFAULT_CEILING
+   *
+   * config.toml takes precedence because operators may explicitly override the
+   * effective window there (for example GPT-5.4 set to 1,000,000 tokens), while
+   * models_cache.json can be stale or reflect a smaller default.
    *
    * @returns {number}
    */
   _getModelCeiling() {
+    try {
+      const config = fs.readFileSync(CODEX_CONFIG_FILE, 'utf8');
+      const match = config.match(/^\s*model_context_window\s*=\s*(\d+)\s*$/m);
+      if (match?.[1]) {
+        const parsed = parseInt(match[1], 10);
+        if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+      }
+    } catch { /* config.toml missing or unreadable */ }
+
     try {
       const cache = JSON.parse(fs.readFileSync(MODELS_CACHE_FILE, 'utf8'));
       const models = cache.models ?? [];
@@ -230,6 +247,25 @@ export class CodexContextMonitor extends ContextMonitorBase {
     } catch { /* models_cache.json missing or malformed */ }
 
     return DEFAULT_CEILING;
+  }
+
+  /**
+   * Restrict thread lookup to the current instance in multi-session mode.
+   *
+   * Codex stores every runtime's threads in one shared ~/.codex/state_5.sqlite.
+   * In mixed multi-session deployments, selecting only by updated_at can pick
+   * another instance's thread and trigger false context-handoff loops.
+   *
+   * We scope by cwd suffix (`.../instances/<instanceId>`) instead of absolute
+   * path because older sessions may have been launched under a different $HOME
+   * prefix during migrations or manual restarts.
+   *
+   * @returns {string}
+   */
+  _getThreadScopeSql() {
+    if (!this._instanceId) return '';
+    const suffix = _sqlEscape(`/instances/${this._instanceId}`);
+    return ` AND cwd LIKE '%${suffix}'`;
   }
 }
 
@@ -246,4 +282,8 @@ function _readdirSafe(dir) {
   } catch {
     return [];
   }
+}
+
+function _sqlEscape(value) {
+  return String(value).replace(/'/g, "''");
 }

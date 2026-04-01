@@ -197,7 +197,7 @@ function getUnsummarizedConversationsForInstance(db, instanceId) {
   const afterId = lastCheckpoint?.end_conversation_id || 0;
   return db.prepare(`
     SELECT * FROM conversations
-    WHERE id > ? AND (target_instance = ? OR target_instance IS NULL)
+    WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
     ORDER BY id ASC
   `).all(afterId, instanceId);
 }
@@ -209,7 +209,7 @@ function getAllUnsummarizedConversations(db) {
   const afterId = lastCheckpoint?.end_conversation_id || 0;
   return db.prepare(`
     SELECT * FROM conversations
-    WHERE id > ?
+    WHERE id > ? AND status = 'delivered'
     ORDER BY id ASC
   `).all(afterId);
 }

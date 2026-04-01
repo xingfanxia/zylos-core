@@ -203,6 +203,7 @@ export function getDeliveryDelay(byteLength) {
 export function getInputBoxText(capture) {
   const lines = capture.split('\n');
   const separatorIndexes = [];
+  const footerPattern = /tab to queue message|\b\d+%\s+left\s+·/i;
 
   for (let i = 0; i < lines.length; i++) {
     if (/^\u2500+$/.test(lines[i]) && lines[i].length > 10) {
@@ -211,7 +212,7 @@ export function getInputBoxText(capture) {
   }
 
   if (separatorIndexes.length < 2) {
-    const footerIndex = lines.findIndex(line => /tab to queue message/i.test(line));
+    const footerIndex = lines.findIndex(line => footerPattern.test(line));
     if (footerIndex === -1) {
       return null;
     }

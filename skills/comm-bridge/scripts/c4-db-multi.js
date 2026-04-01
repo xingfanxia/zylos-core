@@ -262,7 +262,7 @@ export function getUnsummarizedRangeForInstance(instanceId) {
   const result = db.prepare(`
     SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count
     FROM conversations
-    WHERE id > ? AND (target_instance = ? OR target_instance IS NULL)
+    WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
   `).get(afterId, instanceId);
 
   return {
@@ -293,7 +293,7 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
     return db.prepare(`
       SELECT * FROM (
         SELECT * FROM conversations
-        WHERE id > ? AND (target_instance = ? OR target_instance IS NULL)
+        WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
         ORDER BY id DESC LIMIT ?
       ) ORDER BY id ASC
     `).all(afterId, instanceId, limit);
@@ -301,7 +301,7 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
 
   return db.prepare(`
     SELECT * FROM conversations
-    WHERE id > ? AND (target_instance = ? OR target_instance IS NULL)
+    WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
     ORDER BY id ASC
   `).all(afterId, instanceId);
 }
