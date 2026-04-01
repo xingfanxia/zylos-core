@@ -641,6 +641,7 @@ header {
   border-radius: 8px;
   padding: 14px;
   box-shadow: 0 0 0 1px var(--border);
+  min-width: 0;
 }
 
 .usage-window-card.usage-tier-warning {
@@ -660,6 +661,10 @@ header {
   margin-bottom: 12px;
 }
 
+.usage-window-header > * {
+  min-width: 0;
+}
+
 .usage-window-name {
   font-size: 14px;
   font-weight: 600;
@@ -671,6 +676,7 @@ header {
   color: var(--text-muted);
   font-family: var(--font-mono);
   margin-top: 2px;
+  overflow-wrap: anywhere;
 }
 
 .usage-window-tier {
@@ -695,6 +701,7 @@ header {
   background: var(--bg-200);
   border-radius: 6px;
   padding: 10px;
+  min-width: 0;
 }
 
 .usage-metric-label {
@@ -710,6 +717,7 @@ header {
   font-weight: 600;
   color: var(--text-primary);
   font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .usage-metric-meta {
@@ -718,6 +726,8 @@ header {
   margin-top: 4px;
   font-family: var(--font-mono);
   min-height: 14px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .usage-window-footer {
@@ -725,6 +735,8 @@ header {
   font-size: 11px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 /* Bar chart */

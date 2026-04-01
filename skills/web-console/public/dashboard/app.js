@@ -687,50 +687,70 @@ class Dashboard {
 
   _getRuntimeUsageWindow(runtime) {
     var providerUsage = this.data?.provider_usage?.providers?.[runtime];
-    if (providerUsage && providerUsage.available) {
-      return {
-        usage: {
-          runtime: runtime,
-          available: providerUsage.available,
-          session: runtime === 'claude' && providerUsage.primary ? {
-            percent: providerUsage.primary.used_percent,
-            resets: providerUsage.primary.reset_description,
-          } : null,
-          fiveHour: runtime === 'codex' && providerUsage.primary ? {
-            percent: providerUsage.primary.used_percent,
-            resets: providerUsage.primary.reset_description,
-          } : null,
-          weeklyAll: providerUsage.secondary ? {
-            percent: providerUsage.secondary.used_percent,
-            resets: providerUsage.secondary.reset_description,
-          } : null,
-          weeklySonnet: runtime === 'claude' && providerUsage.tertiary ? {
-            percent: providerUsage.tertiary.used_percent,
-            resets: providerUsage.tertiary.reset_description,
-          } : null,
-          tier: null,
-          lastCheck: providerUsage.fetched_at || this.data?.provider_usage?.updated_at || null,
-        },
-        instanceCount: (this.data?.instances || []).filter(function(inst) {
-          return (inst.runtime || 'claude') === runtime;
-        }).length,
-      };
-    }
-
     var instances = this.data?.instances || [];
     var usageWindows = this.data?.usage_windows || {};
     var matching = instances.filter(function(inst) {
       return (inst.runtime || 'claude') === runtime;
     });
 
-    for (var i = 0; i < matching.length; i++) {
-      var usage = usageWindows[matching[i].id];
-      if (usage && usage.available) {
+    if (providerUsage && providerUsage.available) {
+      var providerLooksEmpty = runtime === 'codex' &&
+        ((providerUsage.primary?.used_percent ?? null) === 0) &&
+        ((providerUsage.secondary?.used_percent ?? null) === 0);
+
+      if (!providerLooksEmpty) {
         return {
-          usage: usage,
+          usage: {
+            runtime: runtime,
+            available: providerUsage.available,
+            session: runtime === 'claude' && providerUsage.primary ? {
+              percent: providerUsage.primary.left_percent,
+              resets: providerUsage.primary.reset_description,
+            } : null,
+            fiveHour: runtime === 'codex' && providerUsage.primary ? {
+              percent: providerUsage.primary.left_percent,
+              resets: providerUsage.primary.reset_description,
+            } : null,
+            weeklyAll: providerUsage.secondary ? {
+              percent: providerUsage.secondary.left_percent,
+              resets: providerUsage.secondary.reset_description,
+            } : null,
+            weeklySonnet: runtime === 'claude' && providerUsage.tertiary ? {
+              percent: providerUsage.tertiary.left_percent,
+              resets: providerUsage.tertiary.reset_description,
+            } : null,
+            tier: null,
+            lastCheck: providerUsage.fetched_at || this.data?.provider_usage?.updated_at || null,
+          },
           instanceCount: matching.length,
         };
       }
+    }
+
+    var bestLocal = null;
+    for (var i = 0; i < matching.length; i++) {
+      var usage = usageWindows[matching[i].id];
+      if (!usage || !usage.available) continue;
+      if (!bestLocal) {
+        bestLocal = usage;
+        continue;
+      }
+      var currentTs = usage.lastCheck ? Date.parse(usage.lastCheck) : 0;
+      var bestTs = bestLocal.lastCheck ? Date.parse(bestLocal.lastCheck) : 0;
+      if (currentTs > bestTs) bestLocal = usage;
+    }
+
+    if (bestLocal) {
+      return {
+        usage: {
+          ...bestLocal,
+          session: runtime === 'claude' ? bestLocal.session : null,
+          fiveHour: runtime === 'codex' ? bestLocal.fiveHour : bestLocal.fiveHour,
+          weeklyAll: bestLocal.weeklyAll,
+          weeklySonnet: runtime === 'claude' ? bestLocal.weeklySonnet : null,
+        },
+        instanceCount: matching.length,
+      };
     }
 
     return {
@@ -773,7 +793,6 @@ class Dashboard {
       var sessionPrimary = this._formatUsagePrimary(usage.session);
       var fiveHourPrimary = this._formatUsagePrimary(usage.fiveHour);
       var weeklyPrimary = this._formatUsagePrimary(usage.weeklyAll);
-      var sonnetPrimary = this._formatUsagePrimary(usage.weeklySonnet);
       var tierClass = usage.tier ? ' usage-tier-' + usage.tier : '';
       var lastCheck = usage.lastCheck ? this.formatTime(usage.lastCheck) : 'no live sample';
       var todayPrimary = this.formatUsd(tokenWindows.today.cost_usd || 0);
@@ -790,14 +809,6 @@ class Dashboard {
             '<div class="usage-metric-label">Session</div>' +
             '<div class="usage-metric-value">' + sessionPrimary + '</div>' +
             '<div class="usage-metric-meta">' + this.esc(this._formatUsageMeta(usage.session)) + '</div>' +
-          '</div>';
-
-      var secondaryMetric = runtime === 'codex'
-        ? ''
-        : '<div class="usage-metric">' +
-            '<div class="usage-metric-label">Opus Week</div>' +
-            '<div class="usage-metric-value">' + sonnetPrimary + '</div>' +
-            '<div class="usage-metric-meta">' + this.esc(this._formatUsageMeta(usage.weeklySonnet)) + '</div>' +
           '</div>';
 
       var footerMeta = runtime === 'codex'
@@ -824,7 +835,6 @@ class Dashboard {
             '<div class="usage-metric-value">' + todayPrimary + '</div>' +
             '<div class="usage-metric-meta">' + this.esc(todayMeta) + '</div>' +
           '</div>' +
-          secondaryMetric +
         '</div>' +
         '<div class="usage-window-footer">Last check: ' + this.esc(lastCheck) + (footerMeta ? ' · ' + this.esc(footerMeta) : '') + '</div>' +
       '</div>';
