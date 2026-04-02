@@ -22,6 +22,15 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_PATH = path.join(ZYLOS_DIR, 'instances.json');
 const CACHE_TTL_MS = 10_000;
 
+function _readRuntimeFromConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, '.zylos', 'config.json'), 'utf8'));
+    return cfg.runtime === 'codex' ? 'codex' : 'claude';
+  } catch {
+    return 'claude';
+  }
+}
+
 // ── instances.json cache ────────────────────────────────────────────
 
 /** @type {{ data: object | null, mtime: number, readAt: number }} */
@@ -138,7 +147,7 @@ export function getMonitorDir(instanceId) {
  *
  * Resolution order:
  *  1. `tmux_session` from instance definition
- *  2. `claude-<instanceId>` (convention)
+ *  2. `<runtime>-<instanceId>` (convention based on instance or global runtime)
  *  3. Active runtime from config.json (single-session fallback)
  *
  * @param {string} [instanceId] - defaults to getInstanceId()
@@ -149,17 +158,13 @@ export function getSessionName(instanceId) {
   const inst = id ? getInstanceDef(id) : null;
 
   if (inst?.tmux_session) return inst.tmux_session;
-  if (id) return `claude-${id}`;
-
-  // Single-session: read active runtime from config.json (matches c4-config.js logic)
-  try {
-    const cfg = JSON.parse(
-      fs.readFileSync(path.join(ZYLOS_DIR, '.zylos', 'config.json'), 'utf8')
-    );
-    return cfg.runtime === 'codex' ? 'codex-main' : 'claude-main';
-  } catch {
-    return 'claude-main';
+  if (id) {
+    const runtime = inst?.runtime || _readRuntimeFromConfig();
+    return `${runtime}-${id}`;
   }
+
+  // Single-session fallback: use active runtime from config.json
+  return `${_readRuntimeFromConfig()}-main`;
 }
 
 /**
