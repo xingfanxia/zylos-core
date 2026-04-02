@@ -223,19 +223,19 @@ export function findPromptY(capture) {
  * prompt line's Y coordinate to catch multi-line wrapped input where the
  * cursor wraps to a new line at x ≤ 2.
  */
-export function checkInputBox() {
-  const cursorX = getCursorX();
+export function checkInputBox(session = TMUX_SESSION) {
+  const cursorX = getCursorX(session);
   if (cursorX < 0) return 'indeterminate';
   if (cursorX > CURSOR_EMPTY_THRESHOLD) return 'has_content';
 
   // cursor_x ≤ threshold — could be truly empty or multi-line wrapped input.
   // Capture the pane and compare prompt line Y with cursor Y.
-  const cursorY = getCursorY();
+  const cursorY = getCursorY(session);
   if (cursorY < 0) return 'indeterminate';
 
   let capture;
   try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
   } catch {
@@ -261,9 +261,9 @@ export function isUsageOverlayCapture(capture) {
 // is empty (cursor sits right after the prompt char, e.g. ">" = column 2).
 const CURSOR_EMPTY_THRESHOLD = 2;
 
-export function getCursorX() {
+export function getCursorX(session = TMUX_SESSION) {
   try {
-    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_x}'], {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_x}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -274,9 +274,9 @@ export function getCursorX() {
   }
 }
 
-export function getCursorY() {
+export function getCursorY(session = TMUX_SESSION) {
   try {
-    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_y}'], {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_y}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -287,12 +287,12 @@ export function getCursorY() {
   }
 }
 
-async function submitAndVerify() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+async function submitAndVerify(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
-    const state = checkInputBox();
+    const state = checkInputBox(session);
 
     if (state === 'empty') {
       return { verified: true, state: 'empty' };
@@ -301,12 +301,12 @@ async function submitAndVerify() {
     if (state === 'indeterminate') {
       log(`Enter verify attempt ${attempt + 1}: indeterminate state, checking for overlay`);
       try {
-        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
           encoding: 'utf8', stdio: 'pipe', timeout: 5000
         });
         if (isUsageOverlayCapture(capture)) {
           log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-          execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'], { stdio: 'pipe', timeout: 5000 });
+          execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
         }
       } catch { /* capture failed, continue retry loop */ }
       continue;
@@ -314,7 +314,7 @@ async function submitAndVerify() {
 
     // state === 'has_content' — message wasn't submitted, retry Enter
     log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   }
 
   return { verified: false, state: 'has_content' };
