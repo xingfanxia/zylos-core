@@ -4,7 +4,10 @@ import { describe, it } from 'node:test';
 process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 
 const {
+  fetchClaudeNativeUsage,
   normalizeProviderPayload,
+  normalizeNativeClaudeUsage,
+  runProviderUsageOnce,
 } = await import('../update-provider-usage.js');
 
 describe('normalizeProviderPayload', () => {
@@ -40,5 +43,85 @@ describe('normalizeProviderPayload', () => {
     assert.equal(normalized.available, false);
     assert.equal(normalized.error, 'not available');
     assert.equal(normalized.primary, null);
+  });
+});
+
+describe('normalizeNativeClaudeUsage', () => {
+  it('normalizes zylos native Claude /usage probe output', () => {
+    const normalized = normalizeNativeClaudeUsage({
+      session: 1,
+      weeklyAll: 99,
+      weeklySonnet: 6,
+      sessionResets: '3pm (UTC)',
+      weeklyAllResets: 'Apr 3, 3am (UTC)',
+      weeklySonnetResets: 'Apr 6, 6am (UTC)',
+    }, '2026-04-01T13:13:46.846Z');
+
+    assert.equal(normalized.available, true);
+    assert.equal(normalized.source, 'zylos-native');
+    assert.equal(normalized.primary.left_percent, 99);
+    assert.equal(normalized.secondary.left_percent, 1);
+    assert.equal(normalized.tertiary.left_percent, 94);
+  });
+});
+
+describe('fetchClaudeNativeUsage', () => {
+  it('returns native Claude provider data on probe success', () => {
+    const result = fetchClaudeNativeUsage({
+      now: '2026-04-01T13:13:46.846Z',
+      runUsageProbeImpl: () => ({
+        ok: true,
+        usage: {
+          session: 1,
+          weeklyAll: 99,
+          weeklySonnet: 6,
+          sessionResets: '3pm (UTC)',
+          weeklyAllResets: 'Apr 3, 3am (UTC)',
+          weeklySonnetResets: 'Apr 6, 6am (UTC)',
+        },
+      }),
+    });
+
+    assert.equal(result.available, true);
+    assert.equal(result.source, 'zylos-native');
+    assert.equal(result.secondary.left_percent, 1);
+  });
+});
+
+describe('runProviderUsageOnce', () => {
+  it('falls back to native Claude probe when CodexBar Claude probe fails', () => {
+    const payload = runProviderUsageOnce({
+      log: () => {},
+      execFileSyncImpl: (bin, args) => {
+        if (String(args[1]) === '--provider' && String(args[2]) === 'claude') {
+          const err = new Error('claude failed');
+          err.stderr = Buffer.from('Claude usage probe timed out.');
+          throw err;
+        }
+        return JSON.stringify([{
+          provider: 'codex',
+          source: 'codex-cli',
+          usage: {
+            primary: { usedPercent: 1, windowMinutes: 300, resetDescription: '6pm' },
+            secondary: { usedPercent: 10, windowMinutes: 10080, resetDescription: 'Apr 8' },
+          },
+        }]);
+      },
+      fetchClaudeNativeUsageImpl: () => ({
+        provider: 'claude',
+        available: true,
+        fetched_at: '2026-04-01T13:13:46.846Z',
+        source: 'zylos-native',
+        primary: { used_percent: 1, left_percent: 99, reset_description: '3pm (UTC)' },
+        secondary: { used_percent: 99, left_percent: 1, reset_description: 'Apr 3' },
+        tertiary: { used_percent: 6, left_percent: 94, reset_description: 'Apr 6' },
+      }),
+      filePath: '/tmp/provider-usage-test.json',
+    });
+
+    assert.equal(payload.providers.codex.available, true);
+    assert.equal(payload.providers.claude.available, true);
+    assert.equal(payload.providers.claude.source, 'zylos-native');
+    assert.equal(payload.providers.claude.secondary.left_percent, 1);
   });
 });

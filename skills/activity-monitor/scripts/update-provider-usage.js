@@ -4,12 +4,15 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execFileSync } from 'child_process';
+import { runUsageProbe } from './usage-probe-runner.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
 const DEFAULT_INTERVAL_MS = Number.parseInt(process.env.PROVIDER_USAGE_INTERVAL_MS || '', 10) || 5 * 60 * 1000;
 const DEFAULT_RETRY_MS = Number.parseInt(process.env.PROVIDER_USAGE_RETRY_MS || '', 10) || 60 * 1000;
 const DEFAULT_CODEXBAR_BIN = process.env.CODEXBAR_BIN || path.join(ZYLOS_DIR, 'bin', 'codexbar');
+const DEFAULT_CLAUDE_PROBE_TIMEOUT_SECONDS = Number.parseInt(process.env.CLAUDE_PROVIDER_PROBE_TIMEOUT_SECONDS || '', 10) || 45;
+const DEFAULT_CLAUDE_CAPTURE_WAIT_SECONDS = Number.parseInt(process.env.CLAUDE_PROVIDER_CAPTURE_WAIT_SECONDS || '', 10) || 20;
 
 function resolveCodexBarBin() {
   if (DEFAULT_CODEXBAR_BIN && fs.existsSync(DEFAULT_CODEXBAR_BIN)) return DEFAULT_CODEXBAR_BIN;
@@ -60,6 +63,39 @@ export function normalizeProviderPayload(provider, payload, fetchedAt = new Date
   };
 }
 
+export function normalizeNativeClaudeUsage(usage, fetchedAt = new Date().toISOString()) {
+  return {
+    provider: 'claude',
+    available: true,
+    fetched_at: fetchedAt,
+    source: 'zylos-native',
+    version: null,
+    account_email: null,
+    login_method: 'claude-cli',
+    primary: usage?.session == null ? null : {
+      used_percent: usage.session,
+      left_percent: Math.max(0, 100 - usage.session),
+      window_minutes: null,
+      resets_at: null,
+      reset_description: usage.sessionResets || null,
+    },
+    secondary: usage?.weeklyAll == null ? null : {
+      used_percent: usage.weeklyAll,
+      left_percent: Math.max(0, 100 - usage.weeklyAll),
+      window_minutes: null,
+      resets_at: null,
+      reset_description: usage.weeklyAllResets || null,
+    },
+    tertiary: usage?.weeklySonnet == null ? null : {
+      used_percent: usage.weeklySonnet,
+      left_percent: Math.max(0, 100 - usage.weeklySonnet),
+      window_minutes: null,
+      resets_at: null,
+      reset_description: usage.weeklySonnetResets || null,
+    },
+  };
+}
+
 export function fetchProviderUsage(provider, {
   execFileSyncImpl = execFileSync,
   codexbarBin = resolveCodexBarBin(),
@@ -96,6 +132,39 @@ export function fetchProviderUsage(provider, {
   }
 }
 
+export function fetchClaudeNativeUsage({
+  zylosDir = ZYLOS_DIR,
+  now = new Date().toISOString(),
+  timeoutSeconds = DEFAULT_CLAUDE_PROBE_TIMEOUT_SECONDS,
+  captureWaitSeconds = DEFAULT_CLAUDE_CAPTURE_WAIT_SECONDS,
+  runUsageProbeImpl = runUsageProbe,
+} = {}) {
+  const sessionName = `claude-provider-probe-${process.pid}-${Date.now()}`;
+  const result = runUsageProbeImpl({
+    zylosDir,
+    timeoutSeconds,
+    captureWaitSeconds,
+    sessionName,
+  });
+
+  if (!result?.ok || !result.usage) {
+    return {
+      provider: 'claude',
+      available: false,
+      fetched_at: now,
+      source: 'zylos-native',
+      error: result?.reason || 'Claude native usage probe failed',
+      primary: null,
+      secondary: null,
+      tertiary: null,
+      account_email: null,
+      version: null,
+    };
+  }
+
+  return normalizeNativeClaudeUsage(result.usage, now);
+}
+
 export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmpPath = `${filePath}.tmp`;
@@ -106,11 +175,23 @@ export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
 export function runProviderUsageOnce({
   execFileSyncImpl = execFileSync,
   filePath = PROVIDER_USAGE_FILE,
+  fetchClaudeNativeUsageImpl = fetchClaudeNativeUsage,
   log = console.log,
 } = {}) {
   const fetchedAt = new Date().toISOString();
   const codexbarBin = resolveCodexBarBin();
-  const claude = fetchProviderUsage('claude', { execFileSyncImpl, codexbarBin, now: fetchedAt });
+  let claude = fetchProviderUsage('claude', { execFileSyncImpl, codexbarBin, now: fetchedAt });
+  if (!claude.available) {
+    const nativeClaude = fetchClaudeNativeUsageImpl({ zylosDir: ZYLOS_DIR, now: fetchedAt });
+    if (nativeClaude.available) {
+      claude = nativeClaude;
+    } else {
+      claude = {
+        ...claude,
+        fallback_error: nativeClaude.error || null,
+      };
+    }
+  }
   const codex = fetchProviderUsage('codex', { execFileSyncImpl, codexbarBin, now: fetchedAt });
   const payload = {
     updated_at: fetchedAt,
