@@ -15,6 +15,8 @@ deployment, with runtime chosen per instance in `instances.json`.
 
 **On-demand lifecycle:** Auto-start via AM wake signal when a message arrives. Auto-suspend after 30 minutes idle. AM handles the full launch (auth, env, cwd, onboarding).
 
+**Session naming convention:** tmux sessions use `<runtime>-<id>` (e.g., `codex-main`, `codex-user-pan` for Codex runtime; `claude-main` for Claude runtime). The `getSessionName()` fallback in `instance-config.js` reads the instance or global runtime to derive the correct prefix. Explicit `tmux_session` in `instances.json` always takes precedence.
+
 ## Key Components
 
 ### Instance Config (`skills/multi-session/instance-config.js`)

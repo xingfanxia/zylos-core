@@ -35,8 +35,9 @@ cp ~/zylos-core/templates/pm2/ecosystem.config.cjs ~/zylos/pm2/ecosystem.config.
 pm2 delete all && pm2 start ~/zylos/pm2/ecosystem.config.cjs && pm2 save
 
 # 5. Restart CC instances (AM auto-restarts them within ~20s)
-for s in claude-main claude-scheduler claude-group; do tmux kill-session -t "$s" 2>/dev/null; done
-tmux list-sessions -F '#{session_name}' | grep '^claude-user-' | xargs -I{} tmux kill-session -t {}
+# Session prefix matches runtime: codex-* for Codex, claude-* for Claude
+for s in codex-main codex-scheduler codex-group; do tmux kill-session -t "$s" 2>/dev/null; done
+tmux list-sessions -F '#{session_name}' | grep '^codex-user-' | xargs -I{} tmux kill-session -t {}
 ```
 
 Step 5 is only needed when `cli/lib/runtime/claude.js` (the RuntimeAdapter) changes. For skills-only changes, steps 1-4 are sufficient since PM2 restart reloads the AM which imports skills.
@@ -181,7 +182,7 @@ These are installed separately from their own repos and must be excluded from rs
 
 ## Upstream Merge
 
-Fork main stays on top of upstream v0.4.10 via squash merge. To merge new upstream:
+Fork main stays on top of upstream v0.4.10 (last synced 2026-04-02, 41 commits). To merge new upstream:
 
 ```bash
 cd ~/zylos-core
