@@ -59,10 +59,10 @@ function insertConv(db, { direction = 'in', channel = 'telegram', endpointId = n
 function insertControl(db, { content, priority = 3, requireIdle = 0, bypassState = 0, status = 'pending', targetInstance = null, availableAt = null }) {
   const now = Math.floor(Date.now() / 1000);
   const stmt = db.prepare(`
-    INSERT INTO control_queue (content, priority, require_idle, bypass_state, status, retry_count, available_at, created_at, updated_at, target_instance)
-    VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+    INSERT INTO control_queue (raw_content, content, priority, require_idle, bypass_state, status, retry_count, available_at, created_at, updated_at, target_instance)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
   `);
-  const result = stmt.run(content, priority, requireIdle, bypassState, status, availableAt, now, now, targetInstance);
+  const result = stmt.run(content, content, priority, requireIdle, bypassState, status, availableAt, now, now, targetInstance);
   return Number(result.lastInsertRowid);
 }
 
