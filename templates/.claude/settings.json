@@ -1,8 +1,51 @@
 {
+  "model": "opus",
+  "autoMemoryEnabled": false,
+  "autoDreamEnabled": false,
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "",
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/zylos-memory/scripts/session-start-inject.js",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/comm-bridge/scripts/c4-session-init.js",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/activity-monitor/scripts/session-start-prompt.js",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/zylos-memory/scripts/session-start-inject.js",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/comm-bridge/scripts/c4-session-init.js",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/activity-monitor/scripts/session-start-prompt.js",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
         "hooks": [
           {
             "type": "command",
@@ -50,6 +93,18 @@
           }
         ],
         "matcher": ""
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/zylos/.claude/skills/activity-monitor/scripts/hook-auth-prompt.js",
+            "async": true,
+            "timeout": 5000
+          }
+        ]
       }
     ],
     "PostToolUse": [

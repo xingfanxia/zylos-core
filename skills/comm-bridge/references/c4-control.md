@@ -17,14 +17,14 @@ Control messages are stored in the `control_queue` table in `~/zylos/comm-bridge
 Insert a new control message into the queue.
 
 ```bash
-c4-control.js enqueue --content "<text>" [--priority 3] [--require-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]
+c4-control.js enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--content <text>` | Instruction content (required) |
 | `--priority <n>` | Priority level (see Priority Levels below, default: 3 = normal) |
-| `--require-idle` | Only deliver when Claude is idle |
+| `--block-queue-until-idle` | Wait for sustained idle, then block later dispatch until execution settles |
 | `--bypass-state` | Deliver regardless of current state |
 | `--ack-deadline <seconds>` | Seconds from now until the control times out if unacknowledged |
 | `--available-in <seconds>` | Delay before the control becomes eligible for delivery |
@@ -50,7 +50,7 @@ c4-control.js get --id <control_id>
 status=pending
 ```
 
-Possible status values: `pending`, `running`, `done`, `failed`, `timeout`.
+Possible status values: `pending`, `running`, `done`, `failed`, `timeout`, `superseded`.
 
 ### ack
 
@@ -107,6 +107,7 @@ For slash-style controls that must stay as a clean command (for example `/clear`
 pending ──► running ──► done
                    └──► failed
 pending ──► timeout  (ack deadline exceeded)
+pending ──► superseded  (replaced by a newer equivalent pending control)
 ```
 
 - `pending`: Queued, waiting for delivery
@@ -114,6 +115,7 @@ pending ──► timeout  (ack deadline exceeded)
 - `done`: Acknowledged successfully
 - `failed`: Delivery or processing failed
 - `timeout`: Ack deadline exceeded without acknowledgement
+- `superseded`: Older equivalent pending control replaced by a newer one; retained for audit only
 
 ## Examples
 
@@ -132,10 +134,10 @@ pending ──► timeout  (ack deadline exceeded)
 # Delayed maintenance command (available in 60s, idle-only)
 ~/zylos/.claude/skills/comm-bridge/scripts/c4-control.js \
     enqueue --content "Run log rotation" \
-    --require-idle --available-in 60
+    --block-queue-until-idle --available-in 60
 
 # Enqueue clean slash command (no ack suffix)
 ~/zylos/.claude/skills/comm-bridge/scripts/c4-control.js \
     enqueue --content "/clear" \
-    --priority 1 --require-idle --no-ack-suffix
+    --priority 1 --block-queue-until-idle --no-ack-suffix
 ```

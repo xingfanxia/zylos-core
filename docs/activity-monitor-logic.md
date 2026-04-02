@@ -1,7 +1,7 @@
 # Activity Monitor 全链路逻辑梳理
 
 > 基于 `zylos-core` `main` 分支当前实现（`skills/activity-monitor/scripts/activity-monitor.js` v26 注释头）。  
-> 本文描述的是“代码真实行为”，不是历史设计草案。
+> 本文描述的是"代码真实行为"，不是历史设计草案。
 
 ## 1. 目标与边界
 
@@ -10,7 +10,7 @@
 它负责四类事情：
 
 1. 运行态监测：判断 `busy/idle/stopped/offline` 并写状态文件
-2. 存活性校验：通过 heartbeat + C4 control queue 验证“功能可用”，不仅是进程存活
+2. 存活性校验：通过 heartbeat + C4 control queue 验证"功能可用"，不仅是进程存活
 3. 自愈恢复：崩溃重启、失败回退、限流冷却、卡死检测、API 错误快恢复
 4. 定时维护：健康检查、每日升级、每日 memory commit、每日升级检查、usage 监控
 
@@ -45,7 +45,7 @@
    - `daily-upgrade-check`（06:00）
 8. 恢复 usage 监测状态（`usage.json` / `usage-codex.json`）
 9. 若 adapter 提供 context monitor（Codex），启动 30s 轮询
-10. 不再清理“另一个 runtime”的 tmux 会话；当前实现允许 Claude 与 Codex 并存，只做实例级恢复
+10. 不再清理"另一个 runtime"的 tmux 会话；当前实现允许 Claude 与 Codex 并存，只做实例级恢复
 
 ## 4. 主循环（每 1 秒）
 
@@ -95,7 +95,7 @@
 1. Claude 下优先对话文件 mtime（`~/.claude/projects/.../*.jsonl`）
 2. 失败时回退 tmux `window_activity`
 3. 再失败回退当前时间（兜底）
-4. 若 hook 报告 `active=true` 且更“新”，覆盖活动时间戳
+4. 若 hook 报告 `active=true` 且更"新"，覆盖活动时间戳
 
 Hook 数据来自 `api-activity.json`，关键字段：
 
@@ -111,7 +111,7 @@ Hook 数据来自 `api-activity.json`，关键字段：
 
 并且有 hook 新鲜度保护：
 
-- `api-activity.json` 超过 60 秒未更新，`active_tools` 视为陈旧，不参与“确认活跃”
+- `api-activity.json` 超过 60 秒未更新，`active_tools` 视为陈旧，不参与"确认活跃"
 
 ## 6. Heartbeat 状态机（功能存活性）
 
@@ -211,18 +211,18 @@ fast API error 检测：
 | --- | --- | --- | --- |
 | 健康检查 | 每 6 小时 | `agentRunning && health=ok` | enqueue 控制消息，让 agent 执行 PM2/磁盘/内存检查并写日志 |
 | Daily memory commit | 每天 03:00 | 无 health 门控 | 直接执行 `zylos-memory/scripts/daily-commit.js` |
-| Daily upgrade | 每天 05:00 | `health=ok` 且 runtime=Claude | enqueue `upgrade-claude` 控制消息 |
+| Daily upgrade | 每天 05:00 | `health=ok` 且 `daily_upgrade_enabled=true` | enqueue `upgrade-claude` 控制消息（默认关闭） |
 | Daily upgrade check | 每天 06:00 | `health=ok` | 后台 spawn `upgrade-check.js`，检查 core/components 可升级版本并通知 |
-| Usage monitor | 配置化周期（默认 1h） | Claude + idle + 活跃时段 + 无 pending 控制消息 | 自动 `/usage` 解析并按阈值告警 |
+| Usage monitor | 配置化周期（默认 1h） | `usage_monitor_enabled=true` + Claude/Codex idle + 活跃时段 + 无 pending 控制消息 | 读取本地 usage 快照（Claude: `statusline.json`/`usage.json`; Codex: `usage-codex.json`，必要时 fallback rollout）并按阈值告警 |
 
 ### 9.1 Memory Sync 触发职责拆分
 
-下面这张表用于区分“谁负责检测/提示”与“谁真正执行 sync”，避免把 `daily-memory-commit` 和 `Memory Sync` 混为一件事。
+下面这张表用于区分"谁负责检测/提示"与"谁真正执行 sync"，避免把 `daily-memory-commit` 和 `Memory Sync` 混为一件事。
 
 | 职责 | 负责组件 | 触发条件 | 实际动作 |
 | --- | --- | --- | --- |
 | 检测未汇总对话是否超阈值 | `comm-bridge` (`c4-session-init.js`) | session init 时 `unsummarized.count > CHECKPOINT_THRESHOLD` | 计算范围并判定 `needsSync=true` |
-| 向会话注入“需要同步”提示 | `comm-bridge` (`c4-session-init.js`) | `needsSync=true` | 在启动注入文本追加 `Please use zylos-memory skill ...` |
+| 向会话注入"需要同步"提示 | `comm-bridge` (`c4-session-init.js`) | `needsSync=true` | 在启动注入文本追加 `Please use zylos-memory skill ...` |
 | 执行 Memory Sync 主流程 | 当前 runtime agent（按 `zylos-memory/SKILL.md`） | 收到/识别提示后 | 拉取 unsummarized、更新 memory 文件、生成 summary |
 | 写入 C4 checkpoint | `comm-bridge` CLI (`c4-checkpoint.js create`) | Memory Sync 完成且有新对话 | 按 sync 结果写 checkpoint |
 | 每日 memory 快照提交 | `activity-monitor` (`daily-memory-commit`) | 每天 03:00 | 执行 `zylos-memory/scripts/daily-commit.js` 做本地 git snapshot |
@@ -289,11 +289,11 @@ Codex 当前还会做两层实例级约束：
 5. usage 监控不同：
    - Claude 顶部 live usage 由 CodexBar CLI 驱动
    - Codex 顶部 live usage 优先读 rollout rate-limit 快照，必要时才侧车 `/status`
-6. Daily upgrade 只对 Claude 生效
+6. Daily upgrade 默认关闭，需 `zylos config set daily_upgrade_enabled true` 显式启用
 
 ## 13. 当前实现里的已知边界
 
 1. 维护脚本检测目前仅覆盖 Claude（代码内有 TODO）
 2. Codex 原始状态仍共享在 `~/.codex`，隔离依赖实例级 `cwd` 归因，而不是独立 per-instance `.codex`
-3. `activity-monitor` 与 runtime adapter 仍有并行逻辑（注释中标记“待迁移阶段”）
+3. `activity-monitor` 与 runtime adapter 仍有并行逻辑（注释中标记"待迁移阶段"）
 4. Codex auto-compaction 的配置与 handoff 路径已打通，但尚未做一次刻意打满到 800k 的长时间线上压测

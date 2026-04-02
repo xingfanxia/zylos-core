@@ -24,10 +24,11 @@ const mod = await import(new URL(`../c4-dispatcher.js?${cacheBuster}`, import.me
 const {
   sanitizeMessage,
   getDeliveryDelay,
-  getInputBoxText,
-  checkInputBox,
+  findPromptY,
   isUsageOverlayCapture,
   isBypassState,
+  isKeystrokeControl,
+  parseKeystrokeKey,
   getHeartbeatPhase,
   shouldAutoAckHeartbeat,
   readJsonFileWithRetry
@@ -46,14 +47,6 @@ after(() => {
   }
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
-
-// ── helpers ──────────────────────────────────────────────────────────
-
-/** Build a fake tmux capture with two separator lines surrounding `content`. */
-function makeCapture(content) {
-  const sep = '\u2500'.repeat(40);
-  return `${sep}\n${content}\n${sep}`;
-}
 
 // ── sanitizeMessage ─────────────────────────────────────────────────
 
@@ -107,140 +100,77 @@ describe('getDeliveryDelay', () => {
   });
 });
 
-// ── getInputBoxText ─────────────────────────────────────────────────
+// ── findPromptY ─────────────────────────────────────────────────────
 
-describe('getInputBoxText', () => {
-  it('returns text between the last two separator lines', () => {
-    const capture = makeCapture('hello world');
-    assert.equal(getInputBoxText(capture), 'hello world');
+describe('findPromptY', () => {
+  it('finds › prompt line in a Codex-style capture', () => {
+    const capture = [
+      '',                                                  // Y=0
+      '• Some output text',                                // Y=1
+      '',                                                  // Y=2
+      '› hello world',                                     // Y=3
+      '',                                                  // Y=4
+      '  gpt-5.4 medium · 82% left · ~/zylos'             // Y=5
+    ].join('\n');
+    assert.equal(findPromptY(capture), 3);
   });
 
-  it('returns null when fewer than 2 separators are present', () => {
-    const oneSep = '\u2500'.repeat(40) + '\nsome text';
-    assert.equal(getInputBoxText(oneSep), null);
-  });
-
-  it('returns null for plain text with no separators', () => {
-    assert.equal(getInputBoxText('just some text'), null);
-  });
-
-  it('returns empty string when box is empty (two adjacent separators)', () => {
+  it('finds ❯ prompt line in a Claude-style capture', () => {
     const sep = '\u2500'.repeat(40);
-    assert.equal(getInputBoxText(`${sep}\n${sep}`), '');
+    const capture = [
+      sep,                                                 // Y=0
+      '❯ some input',                                      // Y=1
+      sep                                                  // Y=2
+    ].join('\n');
+    assert.equal(findPromptY(capture), 1);
   });
 
-  it('uses the last two separators when more than two exist', () => {
+  it('returns last prompt line when multiple exist', () => {
+    const capture = [
+      '› first prompt',                                    // Y=0
+      '• output',                                          // Y=1
+      '› second prompt',                                   // Y=2
+      '',                                                  // Y=3
+      '  gpt-5.4 medium · 82% left · ~/zylos'             // Y=4
+    ].join('\n');
+    assert.equal(findPromptY(capture), 2);
+  });
+
+  it('returns -1 when no prompt character is found', () => {
+    assert.equal(findPromptY('no prompt here\njust text'), -1);
+  });
+
+  it('finds prompt with leading whitespace', () => {
+    const capture = [
+      '',
+      '  › indented prompt',
+      '  footer line'
+    ].join('\n');
+    assert.equal(findPromptY(capture), 1);
+  });
+
+  it('finds empty prompt line (just › with no text)', () => {
+    const capture = [
+      '• output',                                          // Y=0
+      '›',                                                 // Y=1
+      '',                                                  // Y=2
+      '  gpt-5.4 medium · 82% left · ~/zylos'             // Y=3
+    ].join('\n');
+    assert.equal(findPromptY(capture), 1);
+  });
+
+  it('finds prompt when Codex output contains ─ separator lines', () => {
     const sep = '\u2500'.repeat(40);
-    const capture = `${sep}\nfirst\n${sep}\nsecond\n${sep}`;
-    assert.equal(getInputBoxText(capture), 'second');
-  });
-
-  it('ignores short lines of ─ chars (length <= 10)', () => {
-    const shortSep = '\u2500'.repeat(5);
-    const longSep = '\u2500'.repeat(40);
-    // Only one valid separator (the long one), so returns null
-    assert.equal(getInputBoxText(`${shortSep}\ntext\n${longSep}`), null);
-  });
-
-  it('handles multi-line content in the input box', () => {
-    const capture = makeCapture('line1\nline2\nline3');
-    assert.equal(getInputBoxText(capture), 'line1\nline2\nline3');
-  });
-
-  it('falls back to Codex prompt/footer layout when separators are absent', () => {
     const capture = [
-      '',
-      '› [Lark DM] hello',
-      '  wrapped line',
-      '',
-      '  tab to queue message                                        72% context left'
+      '• Ran some command',                                // Y=0
+      sep,                                                 // Y=1 (output separator)
+      '• Result text',                                     // Y=2
+      '',                                                  // Y=3
+      '› user input',                                      // Y=4
+      '',                                                  // Y=5
+      '  gpt-5.4 medium · 82% left · ~/zylos'             // Y=6
     ].join('\n');
-    assert.equal(getInputBoxText(capture), '[Lark DM] hello\n  wrapped line');
-  });
-
-  it('returns empty string for a bare Codex prompt before the footer', () => {
-    const capture = [
-      '',
-      '›',
-      '',
-      '  tab to queue message                                        72% context left'
-    ].join('\n');
-    assert.equal(getInputBoxText(capture), '');
-  });
-
-  it('falls back to the Codex status-bar footer when separators are absent', () => {
-    const capture = [
-      '╭───────────────────────────────────────╮',
-      '│ >_ OpenAI Codex (v0.118.0)            │',
-      '╰───────────────────────────────────────╯',
-      '',
-      '› Implement {feature}',
-      '',
-      '  gpt-5.4 default · 100% left · ~/zylos-core'
-    ].join('\n');
-    assert.equal(getInputBoxText(capture), 'Implement {feature}');
-  });
-});
-
-// ── checkInputBox ───────────────────────────────────────────────────
-
-describe('checkInputBox', () => {
-  it('returns "empty" when box contains only whitespace', () => {
-    const capture = makeCapture('   \n  ');
-    assert.equal(checkInputBox(capture), 'empty');
-  });
-
-  it('returns "empty" when box contains only the prompt char ❯', () => {
-    const capture = makeCapture('\u276F');
-    assert.equal(checkInputBox(capture), 'empty');
-  });
-
-  it('returns "has_content" when box contains actual text', () => {
-    const capture = makeCapture('some user input');
-    assert.equal(checkInputBox(capture), 'has_content');
-  });
-
-  it('returns "indeterminate" when no separators are found', () => {
-    assert.equal(checkInputBox('no separators here'), 'indeterminate');
-  });
-
-  it('returns "empty" for box with only ❯ and whitespace', () => {
-    const capture = makeCapture('  \u276F  ');
-    assert.equal(checkInputBox(capture), 'empty');
-  });
-
-  it('returns "has_content" for Codex prompt/footer captures', () => {
-    const capture = [
-      '',
-      '› [Lark DM] hello',
-      '  wrapped line',
-      '',
-      '  tab to queue message                                        72% context left'
-    ].join('\n');
-    assert.equal(checkInputBox(capture), 'has_content');
-  });
-
-  it('returns "empty" for a bare Codex prompt/footer capture', () => {
-    const capture = [
-      '',
-      '›',
-      '',
-      '  tab to queue message                                        72% context left'
-    ].join('\n');
-    assert.equal(checkInputBox(capture), 'empty');
-  });
-
-  it('returns "has_content" for Codex status-bar captures', () => {
-    const capture = [
-      '╭───────────────────────────────────────╮',
-      '│ >_ OpenAI Codex (v0.118.0)            │',
-      '╰───────────────────────────────────────╯',
-      '',
-      '› Implement {feature}',
-      '',
-      '  gpt-5.4 default · 100% left · ~/zylos-core'
-    ].join('\n');
-    assert.equal(checkInputBox(capture), 'has_content');
+    assert.equal(findPromptY(capture), 4);
   });
 });
 
@@ -259,8 +189,7 @@ describe('isUsageOverlayCapture', () => {
   });
 
   it('returns false for normal chat capture', () => {
-    const capture = makeCapture('hello world');
-    assert.equal(isUsageOverlayCapture(capture), false);
+    assert.equal(isUsageOverlayCapture('hello world'), false);
   });
 });
 
@@ -381,5 +310,60 @@ describe('readJsonFileWithRetry', () => {
     const file = path.join(tmpDir, 'broken.json');
     fs.writeFileSync(file, '{"health":');
     assert.throws(() => readJsonFileWithRetry(file, 2), /Unexpected end of JSON input|JSON/);
+  });
+});
+
+// ── isKeystrokeControl ──────────────────────────────────────────────
+
+describe('isKeystrokeControl', () => {
+  it('returns true for control items with [KEYSTROKE] prefix', () => {
+    assert.equal(isKeystrokeControl({ type: 'control', content: '[KEYSTROKE]Enter' }), true);
+  });
+
+  it('returns true for keystroke with other keys', () => {
+    assert.equal(isKeystrokeControl({ type: 'control', content: '[KEYSTROKE]Tab' }), true);
+  });
+
+  it('returns false for conversation items with [KEYSTROKE] prefix', () => {
+    assert.equal(isKeystrokeControl({ type: 'conversation', content: '[KEYSTROKE]Enter' }), false);
+  });
+
+  it('returns false for control items without [KEYSTROKE] prefix', () => {
+    assert.equal(isKeystrokeControl({ type: 'control', content: 'Heartbeat check' }), false);
+  });
+
+  it('returns false for empty content', () => {
+    assert.equal(isKeystrokeControl({ type: 'control', content: '' }), false);
+  });
+
+  it('returns false for null/undefined content', () => {
+    assert.equal(isKeystrokeControl({ type: 'control' }), false);
+    assert.equal(isKeystrokeControl({ type: 'control', content: null }), false);
+  });
+});
+
+// ── parseKeystrokeKey ───────────────────────────────────────────────
+
+describe('parseKeystrokeKey', () => {
+  it('extracts Enter key from [KEYSTROKE]Enter', () => {
+    assert.equal(parseKeystrokeKey('[KEYSTROKE]Enter'), 'Enter');
+  });
+
+  it('trims whitespace from key name', () => {
+    assert.equal(parseKeystrokeKey('[KEYSTROKE]  Enter  '), 'Enter');
+  });
+
+  it('extracts other key names', () => {
+    assert.equal(parseKeystrokeKey('[KEYSTROKE]Tab'), 'Tab');
+    assert.equal(parseKeystrokeKey('[KEYSTROKE]Escape'), 'Escape');
+  });
+
+  it('returns empty string for bare prefix', () => {
+    assert.equal(parseKeystrokeKey('[KEYSTROKE]'), '');
+  });
+
+  it('handles null/undefined content', () => {
+    assert.equal(parseKeystrokeKey(null), '');
+    assert.equal(parseKeystrokeKey(undefined), '');
   });
 });

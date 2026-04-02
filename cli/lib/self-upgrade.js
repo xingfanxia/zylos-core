@@ -17,6 +17,7 @@ import { extractScriptPath, extractSkillName, getCommandHooks } from './hook-uti
 import { smartSync, formatMergeResult } from './smart-merge.js';
 import { runMigrations } from './migrate.js';
 import { writeCodexConfig } from './runtime-setup.js';
+import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 
 // Fork modules loaded lazily to avoid top-level await (breaks node:test imports)
 let _forkConfig;
@@ -399,23 +400,26 @@ function listTemplateFiles(templatesDir) {
  *  - modified_hook: same script path, different command or timeout
  *  - removed_hook:  in installed, not in template (core skills only)
  */
-function generateMigrationHints(templatesDir) {
+export function generateMigrationHints(templatesDir, deps = {}) {
   const hints = [];
+  const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const existsSync = deps.existsSync ?? fs.existsSync;
+  const readFileSync = deps.readFileSync ?? fs.readFileSync;
 
   const templateSettingsPath = path.join(templatesDir, '.claude', 'settings.json');
-  if (!fs.existsSync(templateSettingsPath)) return hints;
+  if (!existsSync(templateSettingsPath)) return hints;
 
-  const installedSettingsPath = path.join(ZYLOS_DIR, '.claude', 'settings.json');
+  const installedSettingsPath = path.join(zylosDir, '.claude', 'settings.json');
 
   let templateSettings, installedSettings;
   try {
-    templateSettings = JSON.parse(fs.readFileSync(templateSettingsPath, 'utf8'));
+    templateSettings = JSON.parse(readFileSync(templateSettingsPath, 'utf8'));
   } catch {
     return hints;
   }
   try {
-    installedSettings = fs.existsSync(installedSettingsPath)
-      ? JSON.parse(fs.readFileSync(installedSettingsPath, 'utf8'))
+    installedSettings = existsSync(installedSettingsPath)
+      ? JSON.parse(readFileSync(installedSettingsPath, 'utf8'))
       : {};
   } catch {
     installedSettings = {};
@@ -496,6 +500,24 @@ function generateMigrationHints(templatesDir) {
     });
   }
 
+  if (Object.hasOwn(templateSettings, 'model') && !Object.hasOwn(installedSettings, 'model')) {
+    hints.push({
+      type: 'model_backfill',
+      value: templateSettings.model,
+    });
+  }
+
+  // Backfill boolean settings (autoMemoryEnabled, autoDreamEnabled)
+  for (const key of ['autoMemoryEnabled', 'autoDreamEnabled']) {
+    if (Object.hasOwn(templateSettings, key) && !Object.hasOwn(installedSettings, key)) {
+      hints.push({
+        type: 'setting_backfill',
+        key,
+        value: templateSettings[key],
+      });
+    }
+  }
+
   // --- Reverse pass: detect removed hooks (core skills only) ---
   for (const [event, matchers] of Object.entries(installedHooks)) {
     if (!Array.isArray(matchers)) continue;
@@ -564,25 +586,36 @@ function createContext({ tempDir, newVersion, mode, mergeUpstream } = {}) {
 /**
  * Step 1: backup Core Skills
  */
-function step1_backupCoreSkills(ctx) {
+export function step1_backupCoreSkills(ctx, deps = {}) {
   const startTime = Date.now();
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const backupDir = path.join(os.tmpdir(), `zylos-core-backup-${timestamp}`);
+  const backupDir = deps.backupDir ?? path.join(os.tmpdir(), `zylos-core-backup-${timestamp}`);
+  const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
+  const copyTreeFn = deps.copyTree ?? copyTree;
+  const fsApi = deps.fs ?? fs;
 
   try {
-    fs.mkdirSync(backupDir, { recursive: true });
+    fsApi.mkdirSync(backupDir, { recursive: true });
 
     // Backup the skills directory (include .zylos manifests — needed for correct rollback)
-    if (fs.existsSync(SKILLS_DIR)) {
-      copyTree(SKILLS_DIR, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
+    if (fsApi.existsSync(skillsDir)) {
+      copyTreeFn(skillsDir, path.join(backupDir, 'skills'), { excludes: ['node_modules'] });
     }
 
     // Backup instruction files (will be modified in step 7)
     for (const name of ['CLAUDE.md', 'ZYLOS.md', 'AGENTS.md']) {
-      const src = path.join(ZYLOS_DIR, name);
-      if (fs.existsSync(src)) {
-        fs.copyFileSync(src, path.join(backupDir, name));
+      const src = path.join(zylosDir, name);
+      if (fsApi.existsSync(src)) {
+        fsApi.copyFileSync(src, path.join(backupDir, name));
       }
+    }
+
+    const ecosystemSrc = deps.ecosystemPath ?? path.join(zylosDir, 'pm2', 'ecosystem.config.cjs');
+    if (fsApi.existsSync(ecosystemSrc)) {
+      const backupPm2Dir = path.join(backupDir, 'pm2');
+      fsApi.mkdirSync(backupPm2Dir, { recursive: true });
+      fsApi.copyFileSync(ecosystemSrc, path.join(backupPm2Dir, 'ecosystem.config.cjs'));
     }
 
     ctx.backupDir = backupDir;
@@ -844,15 +877,20 @@ function step7_syncClaudeMd(ctx) {
  * @param {object[]} hints - Output from generateMigrationHints()
  * @returns {{ applied: number, errors: string[] }}
  */
-function applyMigrationHints(hints) {
+export function applyMigrationHints(hints, deps = {}) {
   const result = { applied: 0, errors: [] };
   if (!hints || hints.length === 0) return result;
 
-  const settingsPath = path.join(ZYLOS_DIR, '.claude', 'settings.json');
+  const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const existsSync = deps.existsSync ?? fs.existsSync;
+  const readFileSync = deps.readFileSync ?? fs.readFileSync;
+  const mkdirSync = deps.mkdirSync ?? fs.mkdirSync;
+  const writeFileSync = deps.writeFileSync ?? fs.writeFileSync;
+  const settingsPath = path.join(zylosDir, '.claude', 'settings.json');
   let settings;
   try {
-    settings = fs.existsSync(settingsPath)
-      ? JSON.parse(fs.readFileSync(settingsPath, 'utf8'))
+    settings = existsSync(settingsPath)
+      ? JSON.parse(readFileSync(settingsPath, 'utf8'))
       : {};
   } catch {
     settings = {};
@@ -931,6 +969,18 @@ function applyMigrationHints(hints) {
           result.applied++;
         }
 
+      } else if (hint.type === 'model_backfill') {
+        if (!Object.hasOwn(settings, 'model')) {
+          settings.model = hint.value;
+          result.applied++;
+        }
+
+      } else if (hint.type === 'setting_backfill') {
+        if (!Object.hasOwn(settings, hint.key)) {
+          settings[hint.key] = hint.value;
+          result.applied++;
+        }
+
       } else if (hint.type === 'removed_hook') {
         // Remove the hook by script path
         const matchers = settings.hooks[hint.event];
@@ -976,8 +1026,8 @@ function applyMigrationHints(hints) {
 
   // Write back
   const dir = path.dirname(settingsPath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
 
   return result;
 }
@@ -1102,21 +1152,24 @@ export function step10_ensureCodexConfig(deps = {}) {
         step: 10,
         name: 'ensure_codex_config',
         status: 'skipped',
-        message: 'warning: failed to refresh ~/.codex/config.toml outside codex runtime',
+        message: 'warning: failed to refresh codex config outside codex runtime',
         duration: Date.now() - startTime
       };
     }
-    return { step: 10, name: 'ensure_codex_config', status: 'failed', error: 'failed to write ~/.codex/config.toml', duration: Date.now() - startTime };
+    return { step: 10, name: 'ensure_codex_config', status: 'failed', error: 'failed to write codex config', duration: Date.now() - startTime };
   }
 
-  return { step: 10, name: 'ensure_codex_config', status: 'done', message: 'updated ~/.codex/config.toml', duration: Date.now() - startTime };
+  return { step: 10, name: 'ensure_codex_config', status: 'done', message: 'updated codex config (project + global)', duration: Date.now() - startTime };
 }
 
 /**
  * Step 11: start core services
  */
-function step11_startCoreServices(ctx) {
+export function step11_startCoreServices(ctx, deps = {}) {
   const startTime = Date.now();
+  const fsApi = deps.fs ?? fs;
+  const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
+  const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
 
   if (ctx.servicesWereRunning.length === 0) {
     return { step: 11, name: 'start_core_services', status: 'skipped', message: 'no services to restart', duration: Date.now() - startTime };
@@ -1129,32 +1182,32 @@ function step11_startCoreServices(ctx) {
   const ecosystemTemplateSrc = ctx.tempDir
     ? path.join(ctx.tempDir, 'templates', 'pm2', 'ecosystem.config.cjs')
     : null;
-  const pm2Dir = path.join(ZYLOS_DIR, 'pm2');
-  const ecosystemDest = path.join(pm2Dir, 'ecosystem.config.cjs');
-  if (ecosystemTemplateSrc && fs.existsSync(ecosystemTemplateSrc)) {
+  const pm2Dir = path.join(zylosDir, 'pm2');
+  const ecosystemDest = deps.ecosystemPath ?? getCoreEcosystemPath();
+  if (ecosystemTemplateSrc && fsApi.existsSync(ecosystemTemplateSrc)) {
     try {
-      fs.mkdirSync(pm2Dir, { recursive: true });
-      fs.copyFileSync(ecosystemTemplateSrc, ecosystemDest);
+      fsApi.mkdirSync(pm2Dir, { recursive: true });
+      fsApi.copyFileSync(ecosystemTemplateSrc, ecosystemDest);
       ecosystemPath = ecosystemDest;
     } catch {
-      // Non-fatal — fall back to pm2 restart below
+      // Non-fatal — if copy fails, we can still use an already-deployed ecosystem file below.
     }
-  } else if (fs.existsSync(ecosystemDest)) {
+  } else if (fsApi.existsSync(ecosystemDest)) {
     // No new template available; use the existing ecosystem file
     ecosystemPath = ecosystemDest;
   }
+  ecosystemPath = ecosystemPath ?? ecosystemDest;
 
   const started = [];
   const failed = [];
 
   for (const name of ctx.servicesWereRunning) {
     try {
-      if (ecosystemPath) {
-        // Re-read the ecosystem file so PM2 picks up updated env vars
-        execSync(`pm2 start "${ecosystemPath}" --only ${name} 2>/dev/null`, { stdio: 'pipe' });
-      } else {
-        execSync(`pm2 restart ${name} 2>/dev/null`, { stdio: 'pipe' });
-      }
+      restartFn(name, {
+        ecosystemPath,
+        stdio: 'pipe',
+        fallbackToPlainRestartOnError: true,
+      });
       started.push(name);
     } catch {
       failed.push(name);
@@ -1221,13 +1274,19 @@ function step12_verifyServices(ctx) {
 /**
  * Rollback from backup.
  */
-function rollbackSelf(ctx) {
+export function rollbackSelf(ctx, deps = {}) {
   const results = [];
+  const fsApi = deps.fs ?? fs;
+  const syncTreeFn = deps.syncTree ?? syncTree;
+  const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
+  const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
+  const skillsDir = deps.skillsDir ?? SKILLS_DIR;
+  const ecosystemPath = deps.ecosystemPath ?? getCoreEcosystemPath();
 
   // Restore Core Skills from backup (include .zylos manifests to keep them in sync with files)
-  if (ctx.backupDir && fs.existsSync(path.join(ctx.backupDir, 'skills'))) {
+  if (ctx.backupDir && fsApi.existsSync(path.join(ctx.backupDir, 'skills'))) {
     try {
-      syncTree(path.join(ctx.backupDir, 'skills'), SKILLS_DIR, { excludes: ['node_modules'] });
+      syncTreeFn(path.join(ctx.backupDir, 'skills'), skillsDir, { excludes: ['node_modules'] });
       results.push({ action: 'restore_core_skills', success: true });
     } catch (err) {
       results.push({ action: 'restore_core_skills', success: false, error: err.message });
@@ -1238,13 +1297,24 @@ function rollbackSelf(ctx) {
   if (ctx.backupDir) {
     for (const name of ['CLAUDE.md', 'ZYLOS.md', 'AGENTS.md']) {
       const backup = path.join(ctx.backupDir, name);
-      if (fs.existsSync(backup)) {
+      if (fsApi.existsSync(backup)) {
         try {
-          fs.copyFileSync(backup, path.join(ZYLOS_DIR, name));
+          fsApi.copyFileSync(backup, path.join(zylosDir, name));
           results.push({ action: `restore_${name.toLowerCase().replace('.', '_')}`, success: true });
         } catch (err) {
           results.push({ action: `restore_${name.toLowerCase().replace('.', '_')}`, success: false, error: err.message });
         }
+      }
+    }
+
+    const backupEcosystem = path.join(ctx.backupDir, 'pm2', 'ecosystem.config.cjs');
+    if (fsApi.existsSync(backupEcosystem)) {
+      try {
+        fsApi.mkdirSync(path.dirname(ecosystemPath), { recursive: true });
+        fsApi.copyFileSync(backupEcosystem, ecosystemPath);
+        results.push({ action: 'restore_pm2_ecosystem', success: true });
+      } catch (err) {
+        results.push({ action: 'restore_pm2_ecosystem', success: false, error: err.message });
       }
     }
   }
@@ -1252,7 +1322,11 @@ function rollbackSelf(ctx) {
   // Restart services if they were running
   for (const name of ctx.servicesWereRunning) {
     try {
-      execSync(`pm2 restart ${name} 2>/dev/null || true`, { stdio: 'pipe' });
+      restartFn(name, {
+        ecosystemPath,
+        stdio: 'pipe',
+        fallbackToPlainRestartOnError: true,
+      });
       results.push({ action: `restart_${name}`, success: true });
     } catch (err) {
       results.push({ action: `restart_${name}`, success: false, error: err.message });
@@ -1348,6 +1422,12 @@ export async function runSelfUpgrade({ tempDir, newVersion, mode, mergeUpstream,
   const step7 = ctx.steps.find(s => s.step === 7);
   const instructionFilesRebuilt = step7?.status === 'done' && Boolean(step7?.message?.includes('rebuilt'));
 
+  // Check if settings.json was modified (hooks, statusLine, model) — requires
+  // Claude restart to load the new configuration.
+  const step9 = ctx.steps.find(s => s.step === 9);
+  const settingsChanged = step9?.status === 'done' &&
+    !/all up to date|no changes/.test(step9?.message || '');
+
   return {
     action: 'self_upgrade',
     success: true,
@@ -1358,6 +1438,7 @@ export async function runSelfUpgrade({ tempDir, newVersion, mode, mergeUpstream,
     templates,
     migrationHints,
     instructionFilesRebuilt,
+    settingsChanged,
     mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
     mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
   };

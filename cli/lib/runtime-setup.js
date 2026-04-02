@@ -300,29 +300,29 @@ export function saveClaudeBaseUrlToSettingsAndEnv(baseUrl) {
 // ── Codex credential helpers ───────────────────────────────────────────────
 
 /**
- * Render ~/.codex/config.toml with the required headless configuration.
+ * Render project-level .codex/config.toml with headless configuration.
  *
- * Existing [projects.*] trust entries in the file are preserved; top-level
- * settings and the zylos project trust entry are always regenerated.
+ * Contains settings required for zylos unattended operation: interactive prompt
+ * suppression, feature flags, model migration acknowledgements, and runtime
+ * defaults (model, context window, reasoning effort).
  *
- * @param {string} projectDir - The zylos working directory to pre-trust
+ * Preserves existing TOML content: user-added keys and non-managed sections
+ * are kept intact across regeneration.
+ *
+ * Written to <projectDir>/.codex/config.toml (Codex project-level config).
+ *
  * @param {string} existingContent - Existing config.toml contents (optional)
- * @param {{ openaiBaseUrl?: string, model?: string, modelContextWindow?: number, modelAutoCompactTokenLimit?: number, modelReasoningEffort?: string, personality?: string }} opts - Optional Codex config overrides
+ * @param {{ model?: string, modelContextWindow?: number, modelAutoCompactTokenLimit?: number, modelReasoningEffort?: string, personality?: string }} opts - Optional Codex config overrides
  * @returns {string}
  */
-export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
-  const absProject = path.resolve(projectDir);
-  const openaiBaseUrl =
-    opts.openaiBaseUrl ||
-    process.env.OPENAI_BASE_URL ||
-    readTomlString(existingContent, 'openai_base_url') ||
-    '';
+export function renderCodexProjectConfig(existingContent = '', opts = {}) {
   const runtimeSettings = resolveCodexRuntimeSettings(existingContent, opts);
   const parsed = parseTomlBlocks(existingContent);
 
   const managedTopLevel = [
-    '# Codex headless config — written by zylos, do not edit manually.',
+    '# Zylos project-level Codex config — written by zylos, do not edit manually.',
     '# Re-generated on each `zylos init` / `zylos runtime codex`.',
+    '# Headless operation: suppress all interactive prompts.',
     '',
     '# Runtime defaults / operator overrides',
     `model = "${escapeTomlString(runtimeSettings.model)}"`,
@@ -331,17 +331,12 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     `model_reasoning_effort = "${escapeTomlString(runtimeSettings.modelReasoningEffort)}"`,
     `personality = "${escapeTomlString(runtimeSettings.personality)}"`,
     '',
-    '# Disable startup checks and telemetry',
+    '# Disable startup checks',
     'check_for_update_on_startup = false',
-    '# analytics: Codex v0.114.0 expects a struct here, not a boolean.',
-    '# Omitting this field leaves analytics at default (no crash on startup).',
     '',
     '# Acknowledge the latest model NUX so the "Introducing GPT-X" dialog',
     '# is not shown on startup.  Update this when Codex ships a new default model.',
     `model_availability_nux = "${escapeTomlString(runtimeSettings.model)}"`,
-    ...(openaiBaseUrl
-      ? ['', '# Use a custom OpenAI-compatible base URL', `openai_base_url = "${escapeTomlString(openaiBaseUrl)}"`]
-      : []),
   ];
 
   const preservedTopLevel = filterPreservedTopLevelLines(parsed.topLevelLines, new Set([
@@ -352,7 +347,6 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     'personality',
     'check_for_update_on_startup',
     'model_availability_nux',
-    'openai_base_url',
   ]));
 
   const featuresBlock = renderMergedSectionBlock('features', parsed.sections.get('features')?.bodyLines || [], {
@@ -377,19 +371,11 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     comment: '# Acknowledge known model migrations so no migration prompt appears',
   });
 
-  const projectHeader = `projects."${absProject}"`;
-  const projectBlock = renderMergedSectionBlock(projectHeader, parsed.sections.get(projectHeader)?.bodyLines || [], {
-    trust_level: '"trusted"',
-  }, {
-    comment: '# Trust the zylos project directory',
-  });
-
   const preservedSectionBlocks = [];
   for (const section of parsed.sectionOrder) {
     if (section === 'features') continue;
     if (section === 'notice') continue;
     if (section === 'notice.model_migrations') continue;
-    if (section === projectHeader) continue;
     preservedSectionBlocks.push(parsed.sections.get(section).raw.trimEnd());
   }
 
@@ -399,7 +385,6 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
     featuresBlock,
     noticeBlock,
     migrationsBlock,
-    projectBlock,
     preservedSectionBlocks.join('\n\n').trim(),
   ].filter(Boolean);
 
@@ -407,9 +392,50 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
 }
 
 /**
- * Write ~/.codex/config.toml with a comprehensive headless configuration that
- * suppresses all known interactive prompts (trust dialogs, model upgrade notices,
- * update checks, telemetry prompts, etc.).
+ * Render global ~/.codex/config.toml with user/environment-level settings.
+ *
+ * Contains only trust declarations and optional base URL override.
+ * Existing [projects.*] trust entries are preserved; the zylos project trust
+ * entry is always regenerated.
+ *
+ * @param {string} projectDir - The zylos working directory to pre-trust
+ * @param {string} existingContent - Existing global config.toml contents (optional)
+ * @param {{ openaiBaseUrl?: string }} opts - Optional Codex config overrides
+ * @returns {string}
+ */
+export function renderCodexGlobalConfig(projectDir, existingContent = '', opts = {}) {
+  const absProject = path.resolve(projectDir);
+  const openaiBaseUrl = opts.openaiBaseUrl || process.env.OPENAI_BASE_URL || '';
+
+  let preservedProjects = '';
+  const projectMatches = existingContent.match(/^\[projects\.[^\]]+\][^\[]+/gm);
+  if (projectMatches) {
+    const toKeep = projectMatches.filter(
+      (s) => !s.includes(`"${absProject}"`) && !s.includes(`'${absProject}'`)
+    );
+    if (toKeep.length) preservedProjects = '\n' + toKeep.join('\n').trimEnd() + '\n';
+  }
+
+  const config = [
+    '# Codex global config — written by zylos, do not edit manually.',
+    '# Re-generated on each `zylos init` / `zylos runtime codex`.',
+    ...(openaiBaseUrl ? ['', '# Use a custom OpenAI-compatible base URL', `openai_base_url = "${openaiBaseUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`] : []),
+    '',
+    '# Trust the zylos project directory',
+    `[projects."${absProject}"]`,
+    'trust_level = "trusted"',
+  ].join('\n') + '\n';
+
+  return config + preservedProjects;
+}
+
+/**
+ * Write Codex configuration to both project-level and global locations.
+ *
+ * - Project config (<projectDir>/.codex/config.toml): headless settings,
+ *   features, notice suppression — required for zylos unattended operation.
+ * - Global config (~/.codex/config.toml): trust declarations, optional
+ *   base URL override.
  *
  * Called by both `zylos init` (Codex runtime) and `zylos runtime codex` so the
  * config is always present when switching to Codex.
@@ -418,15 +444,35 @@ export function renderCodexConfig(projectDir, existingContent = '', opts = {}) {
  * @returns {boolean} true on success
  */
 export function writeCodexConfig(projectDir, opts = {}) {
-  const codexDir = path.join(os.homedir(), '.codex');
-  const configPath = path.join(codexDir, 'config.toml');
   try {
+    // Write project-level config (with TOML preservation)
+    const projectCodexDir = path.join(path.resolve(projectDir), '.codex');
+    const projectConfigPath = path.join(projectCodexDir, 'config.toml');
+    let existingProject = '';
+    try {
+      existingProject = fs.readFileSync(projectConfigPath, 'utf8');
+    } catch { /* new file — nothing to preserve */ }
+    fs.mkdirSync(projectCodexDir, { recursive: true });
+    fs.writeFileSync(
+      projectConfigPath,
+      renderCodexProjectConfig(existingProject, opts),
+      'utf8'
+    );
+
+    // Write global config
+    const globalCodexDir = path.join(os.homedir(), '.codex');
+    const globalConfigPath = path.join(globalCodexDir, 'config.toml');
     let existing = '';
     try {
-      existing = fs.readFileSync(configPath, 'utf8');
+      existing = fs.readFileSync(globalConfigPath, 'utf8');
     } catch { /* new file — nothing to preserve */ }
-    fs.mkdirSync(codexDir, { recursive: true });
-    fs.writeFileSync(configPath, renderCodexConfig(projectDir, existing, opts), 'utf8');
+    fs.mkdirSync(globalCodexDir, { recursive: true });
+    fs.writeFileSync(
+      globalConfigPath,
+      renderCodexGlobalConfig(projectDir, existing, opts),
+      'utf8'
+    );
+
     return true;
   } catch {
     return false;

@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     content TEXT NOT NULL,          -- message content (large messages: preview + file path)
     status TEXT DEFAULT 'pending',  -- 'pending' | 'delivered' | 'failed' (for direction='in' queue)
     priority INTEGER DEFAULT 3,     -- 1=urgent, 2=high, 3=normal
-    require_idle INTEGER DEFAULT 0, -- 1=wait for Claude idle state, 0=deliver immediately
+    require_idle INTEGER DEFAULT 0, -- legacy/internal name for block_queue_until_idle behavior
     retry_count INTEGER DEFAULT 0,  -- delivery retries for incoming queue
     target_instance TEXT DEFAULT NULL -- target zylos instance for multi-session routing
 );
@@ -36,9 +36,10 @@ CREATE INDEX IF NOT EXISTS idx_conversations_target_instance ON conversations(ta
 -- Control queue table (heartbeat/system control plane)
 CREATE TABLE IF NOT EXISTS control_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    raw_content TEXT NOT NULL,
     content TEXT NOT NULL,
     priority INTEGER DEFAULT 3,
-    require_idle INTEGER DEFAULT 0,
+    require_idle INTEGER DEFAULT 0, -- legacy/internal name for block_queue_until_idle behavior
     bypass_state INTEGER DEFAULT 0,
     ack_deadline_at INTEGER,
     status TEXT DEFAULT 'pending',

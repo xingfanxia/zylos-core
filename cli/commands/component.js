@@ -113,7 +113,7 @@ function formatC4Reply(type, data) {
       return r;
     }
     case 'self-upgrade': {
-      const { success, from, to, changelog, failedStep, error, rollback, migrationHints, mergeConflicts, mergedFiles, instructionFilesRebuilt } = data;
+      const { success, from, to, changelog, failedStep, error, rollback, migrationHints, mergeConflicts, mergedFiles, instructionFilesRebuilt, settingsChanged } = data;
       if (!success) {
         let r = `zylos-core upgrade failed (step ${failedStep}): ${error}`;
         if (rollback?.performed) {
@@ -151,8 +151,12 @@ function formatC4Reply(type, data) {
         }
         r += '\nPlease update hooks in ~/zylos/.claude/settings.json and restart Claude to apply.';
       }
-      if (instructionFilesRebuilt) {
-        r += '\n\nInstruction files updated — Claude will restart automatically to load the new instructions. No action needed.';
+      if (instructionFilesRebuilt || settingsChanged) {
+        const what = [
+          instructionFilesRebuilt && 'instruction files',
+          settingsChanged && 'hook settings',
+        ].filter(Boolean).join(' and ');
+        r += `\n\n${what.charAt(0).toUpperCase() + what.slice(1)} updated — Claude will restart automatically to load the new configuration. No action needed.`;
       }
       return r;
     }
@@ -1098,17 +1102,17 @@ async function upgradeSelfCore({ providedTempDir, branch, beta = false, mode = '
       }
       output.reply = formatC4Reply('self-upgrade', { ...result, changelog: coreChangelog });
       console.log(JSON.stringify(output, null, 2));
-      // Auto-restart when instruction files were rebuilt so the runtime reloads
-      // the new CLAUDE.md / AGENTS.md without prompting the user.
-      // /exit is a Claude Code slash command — only enqueue it for Claude runtime.
-      // For Codex, the guardian picks up the new AGENTS.md on next launch cycle.
+      // Auto-restart for instruction file changes (CLAUDE.md / AGENTS.md).
+      // Settings hook changes are handled by sync-settings-hooks.js directly,
+      // which enqueues /exit from the newly installed package — avoiding the
+      // bootstrap problem where the old component.js lacks restart logic.
       if (result.success && result.instructionFilesRebuilt) {
         try {
           const activeRuntime = getZylosConfig().runtime ?? 'claude';
           if (activeRuntime === 'claude') {
             const c4ControlPath = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js');
             const { spawnSync } = await import('child_process');
-            spawnSync('node', [c4ControlPath, 'enqueue', '--content', '/exit', '--priority', '1', '--require-idle'], { stdio: 'pipe' });
+            spawnSync('node', [c4ControlPath, 'enqueue', '--content', '/exit', '--priority', '1', '--block-queue-until-idle', '--no-ack-suffix'], { stdio: 'pipe' });
           }
         } catch { /* non-fatal */ }
       }

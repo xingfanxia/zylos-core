@@ -18,9 +18,11 @@ export const CONTROL_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const ENTER_VERIFY_MAX_RETRIES = 3;
 export const ENTER_VERIFY_WAIT_MS = 500;
 
-// For require_idle messages: minimum sustained idle seconds before delivery.
+// For legacy require_idle / external block_queue_until_idle messages:
+// minimum sustained idle seconds before delivery.
 export const REQUIRE_IDLE_MIN_SECONDS = 3;
-// For require_idle messages: allow execution time before dispatching the next message.
+// For legacy require_idle / external block_queue_until_idle messages:
+// allow execution time before dispatching the next message.
 export const REQUIRE_IDLE_POST_SEND_HOLD_MS = 5000;
 export const REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS = 120000;
 export const REQUIRE_IDLE_EXECUTION_POLL_MS = 1000;
@@ -31,16 +33,17 @@ export const CONTENT_PREVIEW_CHARS = 100;
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 
 // Read active runtime from config.json to dispatch to the correct tmux session.
-// Defaults to 'claude-main' when config is absent or runtime is unset.
-function _getActiveSessionName() {
+// Defaults to 'claude' when config is absent or runtime is unset.
+function _readConfig() {
   try {
-    const cfg = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, '.zylos', 'config.json'), 'utf8'));
-    return cfg.runtime === 'codex' ? 'codex-main' : 'claude-main';
+    return JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, '.zylos', 'config.json'), 'utf8'));
   } catch {
-    return 'claude-main';
+    return {};
   }
 }
-export const TMUX_SESSION = _getActiveSessionName();
+const _cfg = _readConfig();
+export const ACTIVE_RUNTIME = _cfg.runtime === 'codex' ? 'codex' : 'claude';
+export const TMUX_SESSION = ACTIVE_RUNTIME === 'codex' ? 'codex-main' : 'claude-main';
 export const DATA_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 export const DB_PATH = path.join(DATA_DIR, 'c4.db');
 export const ACTIVITY_MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');

@@ -200,66 +200,54 @@ export function getDeliveryDelay(byteLength) {
   return Math.min(DELIVERY_DELAY_BASE + extra, DELIVERY_DELAY_MAX);
 }
 
-export function getInputBoxText(capture) {
+/**
+ * Find the Y coordinate (0-indexed line number) of the last prompt line
+ * (starting with › or ❯) in a tmux capture string.
+ * Returns -1 if no prompt line is found.
+ */
+export function findPromptY(capture) {
   const lines = capture.split('\n');
-  const separatorIndexes = [];
-  const footerPattern = /tab to queue message|\b\d+%\s+left\s+·/i;
-
-  for (let i = 0; i < lines.length; i++) {
-    if (/^\u2500+$/.test(lines[i]) && lines[i].length > 10) {
-      separatorIndexes.push(i);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*[›❯]/.test(lines[i])) {
+      return i;
     }
   }
-
-  if (separatorIndexes.length < 2) {
-    const footerIndex = lines.findIndex(line => footerPattern.test(line));
-    if (footerIndex === -1) {
-      return null;
-    }
-
-    let promptIndex = -1;
-    for (let i = footerIndex - 1; i >= 0; i--) {
-      if (/^\s*[›❯](?:\s.*)?$/.test(lines[i])) {
-        promptIndex = i;
-        break;
-      }
-    }
-
-    if (promptIndex === -1) {
-      return null;
-    }
-
-    const promptText = [lines[promptIndex].replace(/^\s*[›❯]\s?/, '')];
-    for (let i = promptIndex + 1; i < footerIndex; i++) {
-      const line = lines[i];
-      if (!line.trim()) break;
-      if (/^\s*[›❯](?:\s.*)?$/.test(line)) break;
-      promptText.push(line);
-    }
-
-    return promptText.join('\n').trimEnd();
-  }
-
-  const start = separatorIndexes[separatorIndexes.length - 2] + 1;
-  const end = separatorIndexes[separatorIndexes.length - 1];
-  return lines.slice(start, end).join('\n');
+  return -1;
 }
 
-export function checkInputBox(capture) {
-  const text = getInputBoxText(capture);
-  if (text === null) {
+/**
+ * Unified input box state detection for both Claude and Codex runtimes.
+ *
+ * Primary signal: cursor_x (from tmux) — fast, no content parsing.
+ * Secondary signal: when cursor_x ≤ threshold, compare cursor_y with the
+ * prompt line's Y coordinate to catch multi-line wrapped input where the
+ * cursor wraps to a new line at x ≤ 2.
+ */
+export function checkInputBox() {
+  const cursorX = getCursorX();
+  if (cursorX < 0) return 'indeterminate';
+  if (cursorX > CURSOR_EMPTY_THRESHOLD) return 'has_content';
+
+  // cursor_x ≤ threshold — could be truly empty or multi-line wrapped input.
+  // Capture the pane and compare prompt line Y with cursor Y.
+  const cursorY = getCursorY();
+  if (cursorY < 0) return 'indeterminate';
+
+  let capture;
+  try {
+    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+      encoding: 'utf8', stdio: 'pipe', timeout: 5000
+    });
+  } catch {
     return 'indeterminate';
   }
 
-  const stripped = text
-    .replace(/\u276F/g, '')
-    .replace(/[\p{C}\p{Z}]+/gu, '');
+  const promptY = findPromptY(capture);
+  if (promptY < 0) return 'indeterminate';
 
-  if (stripped.length === 0) {
-    return 'empty';
-  }
-
-  return 'has_content';
+  // If cursor is on the prompt line itself, input is empty.
+  // If cursor is below the prompt line, there's wrapped multi-line content.
+  return cursorY === promptY ? 'empty' : 'has_content';
 }
 
 export function isUsageOverlayCapture(capture) {
@@ -269,53 +257,67 @@ export function isUsageOverlayCapture(capture) {
   return hasUsageHeader && hasEscHint;
 }
 
-async function dismissGhostTextAndCapture(session = TMUX_SESSION) {
-  execFileSync('tmux', ['send-keys', '-t', session, 'Space'], { stdio: 'pipe', timeout: 5000 });
-  await sleep(100);
+// Empty prompt threshold: cursor at column 0, 1, or 2 means the input box
+// is empty (cursor sits right after the prompt char, e.g. ">" = column 2).
+const CURSOR_EMPTY_THRESHOLD = 2;
 
-  const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-    encoding: 'utf8',
-    stdio: 'pipe',
-    timeout: 5000
-  });
-
-  execFileSync('tmux', ['send-keys', '-t', session, 'BSpace'], { stdio: 'pipe', timeout: 5000 });
-  await sleep(100);
-  return capture;
+export function getCursorX() {
+  try {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_x}'], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 5000
+    });
+    return parseInt(out.trim(), 10);
+  } catch {
+    return -1;
+  }
 }
 
-async function submitAndVerify(session = TMUX_SESSION) {
-  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
-  let lastState = 'indeterminate';
+export function getCursorY() {
+  try {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_y}'], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 5000
+    });
+    return parseInt(out.trim(), 10);
+  } catch {
+    return -1;
+  }
+}
+
+async function submitAndVerify() {
+  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
-    const capture = await dismissGhostTextAndCapture(session);
-    const state = checkInputBox(capture);
-    lastState = state;
+    const state = checkInputBox();
 
     if (state === 'empty') {
-      return { verified: true, state };
+      return { verified: true, state: 'empty' };
     }
 
     if (state === 'indeterminate') {
-      log(`Enter verify attempt ${attempt + 1}: separator detection failed, retrying capture`);
-      saveTmuxCapture(capture, `separator-fail-attempt-${attempt + 1}`);
-
-      // If a /usage settings overlay is open in the main session, dismiss it so
-      // pasted user messages can be submitted normally.
-      if (isUsageOverlayCapture(capture)) {
-        log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-        execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
-      }
+      log(`Enter verify attempt ${attempt + 1}: indeterminate state, checking for overlay`);
+      try {
+        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+          encoding: 'utf8', stdio: 'pipe', timeout: 5000
+        });
+        if (isUsageOverlayCapture(capture)) {
+          log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
+          execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'], { stdio: 'pipe', timeout: 5000 });
+        }
+      } catch { /* capture failed, continue retry loop */ }
       continue;
     }
 
-    log(`Enter verify attempt ${attempt + 1}: input box has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    // state === 'has_content' — message wasn't submitted, retry Enter
+    log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
+    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   }
 
-  return { verified: false, state: lastState };
+  return { verified: false, state: 'has_content' };
 }
 
 async function sendToTmux(message, options = {}) {
@@ -363,7 +365,7 @@ async function sendToTmux(message, options = {}) {
     const agentState = getAgentState();
     if ((procState && procState.alive === false) ||
         agentState.state === 'offline' || agentState.state === 'stopped') {
-      log('Verification failed and agent is dead/offline — marking as verify_failed');
+      log('Verification failed and agent is dead/offline -- marking as verify_failed');
       return 'verify_failed';
     }
   }
@@ -373,6 +375,14 @@ async function sendToTmux(message, options = {}) {
 
 export function isBypassState(item) {
   return item.type === 'control' && item.bypass_state === 1;
+}
+
+export function isKeystrokeControl(item) {
+  return item.type === 'control' && (item.content || '').startsWith('[KEYSTROKE]');
+}
+
+export function parseKeystrokeKey(content) {
+  return (content || '').slice('[KEYSTROKE]'.length).trim();
 }
 
 function releaseItem(item, reason = null) {
@@ -428,17 +438,17 @@ async function handleControlDeliveryFailure(control, reason) {
 }
 
 async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FILE) {
-  log(`require_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms before next dispatch`);
+  log(`block_queue_until_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms before next dispatch`);
   await sleep(REQUIRE_IDLE_POST_SEND_HOLD_MS);
 
   let state = getAgentState(statusFile).state;
   if (state === 'offline' || state === 'stopped') {
-    log(`require_idle item id=${msgId}: agent state=${state}, continuing`);
+    log(`block_queue_until_idle item id=${msgId}: agent state=${state}, continuing`);
     return;
   }
 
   if (state === 'idle') {
-    log(`require_idle item id=${msgId}: agent remained idle after hold, continuing`);
+    log(`block_queue_until_idle item id=${msgId}: agent remained idle after hold, continuing`);
     return;
   }
 
@@ -447,12 +457,12 @@ async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FIL
     await sleep(REQUIRE_IDLE_EXECUTION_POLL_MS);
     state = getAgentState(statusFile).state;
     if (state === 'idle' || state === 'offline' || state === 'stopped') {
-      log(`require_idle item id=${msgId}: settled with agent state=${state}`);
+      log(`block_queue_until_idle item id=${msgId}: settled with agent state=${state}`);
       return;
     }
   }
 
-  log(`require_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
+  log(`block_queue_until_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
 function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances } = {}) {
@@ -597,9 +607,30 @@ async function processNextMessage() {
     }
   }
 
-  log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
+  // Keystroke delivery: content prefixed with [KEYSTROKE] sends raw key to tmux
+  // without buffer paste or "Meanwhile" prefix. Used for auto-approve permission prompts.
+  const rawContent = item.content || '';
+  if (isKeystrokeControl(item)) {
+    const key = parseKeystrokeKey(rawContent);
+    log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority})`);
+    try {
+      execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, key], { stdio: 'pipe', timeout: 5000 });
+      ackControl(item.id);
+      log(`Keystroke delivered: key=${key} (control id=${item.id})`);
+      return { delivered: true, state: agentState.state };
+    } catch (err) {
+      log(`Keystroke delivery error: ${err.message}`);
+      await handleControlDeliveryFailure(item, `KEYSTROKE_ERROR: ${err.message}`);
+      return { delivered: false, state: agentState.state };
+    }
+  }
 
-  const deliveryContent = item.content || '';
+  log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
+  // Prefix control messages with "Meanwhile, " so the agent treats them as
+  // concurrent background tasks that should not interrupt the user's active work.
+  // Skip for slash commands (e.g. /exit, /clear) which must be delivered verbatim.
+  const isSlashCommand = rawContent.startsWith('/');
+  const deliveryContent = (item.type === 'control' && !isSlashCommand) ? `Meanwhile, ${rawContent}` : rawContent;
   const result = await sendToTmux(deliveryContent, {
     strictVerify: item.type === 'conversation'
   });

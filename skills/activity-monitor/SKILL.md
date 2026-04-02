@@ -20,8 +20,8 @@ This is a **PM2 service** (not directly invoked by Claude). It runs continuously
 4. **Maintenance Awareness**: Waits for restart/upgrade scripts to complete before starting the agent
 5. **Heartbeat Liveness Detection**: Periodically sends heartbeat probes via the C4 control queue to verify the agent is responsive, triggering recovery when probes fail
 6. **Health Check**: Periodically enqueues system health checks (PM2, disk, memory) via the C4 control queue
-7. **Daily Upgrade**: Enqueues a Claude Code upgrade via the C4 control queue at 5:00 AM local time daily (Claude runtime only)
-8. **Context Monitoring**: Receives context usage data after every turn; triggers new-session handoff when usage exceeds 70%
+7. **Daily Upgrade**: Enqueues a Claude Code upgrade via the C4 control queue at 5:00 AM local time daily (disabled by default; enable with `zylos config set daily_upgrade_enabled true`)
+8. **Context Monitoring**: Receives context usage data after every turn; triggers early memory sync at 60% and new-session handoff at 75%
 
 ## Status File Format
 
@@ -131,7 +131,7 @@ When health transitions back to `ok`, the engine reads `~/zylos/activity-monitor
 
 The activity monitor periodically enqueues system health checks via the C4 control queue.
 
-- **Interval**: Every 6 hours (21600 seconds)
+- **Interval**: Every 24 hours (86400 seconds)
 - **Persisted state**: `~/zylos/activity-monitor/health-check-state.json` (survives restarts)
 - **Priority**: 3 (normal)
 - **Gated by health**: Only enqueued when `health === 'ok'`
@@ -149,12 +149,13 @@ The health check control message instructs Claude to:
 
 The activity monitor enqueues a daily Claude Code upgrade via the C4 control queue.
 
+- **Enabled**: Off by default. Enable with `zylos config set daily_upgrade_enabled true`
 - **Schedule**: 5:00 AM local time (configured by `DAILY_UPGRADE_HOUR`)
 - **Timezone**: Loaded from `~/zylos/.env` `TZ` field, falls back to `process.env.TZ`, then `UTC`
 - **Persisted state**: `~/zylos/activity-monitor/daily-upgrade-state.json` (tracks last upgrade date)
 - **Priority**: 3 (normal)
 - **Gated by health**: Only enqueued when `health === 'ok'`
-- **Gated by agent**: Only enqueued when the agent process is running (Claude runtime only)
+- **Gated by config**: Only enqueued when `daily_upgrade_enabled` is `true` in config
 - **Once per day**: Checks local date to avoid duplicate enqueues
 
 The control message instructs Claude to use the `upgrade-claude` skill, which handles idle detection, `/exit`, upgrade, and automatic restart.
@@ -165,13 +166,14 @@ Event-driven context monitoring via Claude Code's statusLine feature, replacing 
 
 - **Mechanism**: `context-monitor.js` runs as a statusLine command — Claude Code pipes context data to it via stdin after every turn (zero turn cost)
 - **Status file**: Writes `~/zylos/activity-monitor/statusline.json` with full context data (used_percentage, remaining_percentage, cost, session_id)
-- **Threshold**: Triggers new-session handoff when `used_percentage >= 70%`
-- **Cooldown**: 10 minutes between triggers (state in `~/zylos/activity-monitor/context-monitor-state.json`)
-- **Delivery**: Enqueues via C4 control queue with priority 1, no require-idle — ensures the trigger reaches Claude even during long tasks
-- **Two-stage design**: The trigger message instructs Claude to start the new-session handoff flow; the actual `/clear` is gated by require-idle in the new-session skill's final step
+- **Two thresholds**:
+  - **Early memory sync** at `60%` (80% of 75%): Enqueues a prompt for Claude to run memory sync as a background task, so it completes well before the session switch. Only triggers when unsummarized conversation count exceeds the checkpoint threshold (30).
+  - **New-session handoff** at `75%`: Enqueues the new-session trigger. Priority 1, 5-minute cooldown.
+- **Delivery**: Enqueues via C4 control queue with bypass_state — ensures the trigger reaches Claude even during long tasks
+- **Two-stage design**: The trigger message instructs Claude to start the new-session handoff flow; the actual `/clear` is gated by block-queue-until-idle in the new-session skill's final step
 - **Log**: `~/zylos/activity-monitor/context-monitor.log`
 
-The `check-context` skill remains available for manual on-demand context checks.
+The early memory sync decouples memory sync from the session switch. Memory sync is also triggered by the new session's startup hook if unsummarized conversations exceed the threshold, so data is never lost.
 
 ## Daily Memory Commit
 
@@ -190,6 +192,31 @@ Both daily tasks (upgrade, memory commit) use the same `DailySchedule` class:
 - **Window**: Each target hour provides a ~3600s window; with ~1s loop interval it is virtually impossible to miss entirely
 - **Dedup**: Date-based (`last_date === today`) ensures exactly-once per day, even with imprecise timing
 - **Persistence**: State files survive activity monitor restarts
+
+## Permission Auto-Approve
+
+When Claude Code shows a permission prompt (PermissionRequest event), the `hook-auth-prompt.js` hook automatically sends an Enter keystroke to approve it.
+
+**This is intentional by design.** Zylos operates in a full-delegation model where the machine's permissions are entirely granted to the AI agent. Auto-approving permission prompts is the expected behavior, not a security gap.
+
+### How It Works
+
+1. Claude Code fires a PermissionRequest hook when a tool call requires user approval
+2. `hook-auth-prompt.js` logs the event to `hook-timing.log`
+3. If `auto_approve_permission` is true (default), it enqueues a `[KEYSTROKE]Enter` control at priority 0 with bypass-state and 1-second delay
+4. The C4 dispatcher delivers the Enter keystroke to the tmux session, auto-confirming the prompt
+
+### Configuration
+
+```bash
+# Disable auto-approve (require manual confirmation)
+zylos config set auto_approve_permission false
+
+# Re-enable (default)
+zylos config set auto_approve_permission true
+```
+
+Config key: `auto_approve_permission` in `~/.zylos/config.json` (default: `true`).
 
 ## Log File
 

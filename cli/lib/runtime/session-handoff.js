@@ -10,7 +10,7 @@
  *
  * Codex flow:
  *   enqueueNewSession() → C4 delivers control message → Codex runs new-session skill
- *   (memory sync + handoff summary + /clear)
+ *   (handoff summary + /exit)
  */
 
 import { execFileSync } from 'node:child_process';
@@ -52,14 +52,15 @@ export function enqueueNewSession({
     `(${used.toLocaleString()} / ${ceiling.toLocaleString()} tokens), ` +
     'exceeding threshold.';
   const content = runtime === 'codex'
-    ? `${base} Run $new-session now and follow SKILL.md in order. Complete memory sync and write/send the session handoff summary before the final session-switch command; do not skip checklist steps.`
+    ? `${base} Run $new-session now and follow SKILL.md in order. Write/send the session handoff summary before the final session-switch command; do not skip checklist steps.`
     : `${base} Use the new-session skill to start a fresh session.`;
   const args = [
     C4_CONTROL, 'enqueue',
     '--content', content,
     '--priority', '1',
     '--bypass-state',
-    '--ack-deadline', '300',
+    '--block-queue-until-idle',
+    '--no-ack-suffix',
   ];
   if (instanceId) {
     args.push('--target-instance', instanceId);

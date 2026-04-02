@@ -3,7 +3,7 @@
  * C4 Communication Bridge - Control Queue Interface
  *
  * Commands:
- *   enqueue --content "<text>" [--priority 3] [--require-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]
+ *   enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]
  *   get --id <control_id>
  *   ack --id <control_id>
  */
@@ -18,7 +18,8 @@ import {
 
 function usage() {
   console.error('Usage: c4-control.js <enqueue|get|ack> [options]');
-  console.error('  enqueue --content "<text>" [--priority 3] [--require-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]');
+  console.error('  enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]');
+  console.error('           Legacy alias: --require-idle');
   console.error('  get --id <control_id>');
   console.error('  ack --id <control_id>');
 }
@@ -88,12 +89,13 @@ function handleEnqueue(args) {
   const now = nowSeconds();
   const ackDeadlineAt = ackDeadlineSeconds !== null ? now + ackDeadlineSeconds : null;
   const availableAt = availableInSeconds !== null ? now + availableInSeconds : null;
+  const requireIdle = hasFlag(args, '--block-queue-until-idle') || hasFlag(args, '--require-idle');
 
   const targetInstance = parseStringArg(args, '--target-instance');
 
   const record = insertControl(content, {
     priority: priority ?? 3,
-    requireIdle: hasFlag(args, '--require-idle'),
+    requireIdle,
     bypassState: hasFlag(args, '--bypass-state'),
     appendAckSuffix: !hasFlag(args, '--no-ack-suffix'),
     ackDeadlineAt,
@@ -102,6 +104,9 @@ function handleEnqueue(args) {
   });
 
   console.log(`OK: enqueued control ${record.id}`);
+  if (record.superseded_count > 0) {
+    console.log(`OK: superseded ${record.superseded_count} equivalent pending control(s)`);
+  }
 }
 
 function handleGet(args) {

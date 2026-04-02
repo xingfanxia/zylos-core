@@ -68,7 +68,9 @@ function findC4ReceivePath() {
  * @param {string} message - Message to send
  * @param {object} options - Dispatch options
  * @param {number} options.priority - Message priority 1-3 (default: 3)
- * @param {boolean} options.requireIdle - Whether to wait for idle state (default: false)
+ * @param {boolean} options.blockQueueUntilIdle - Whether to wait for sustained idle
+ *   and hold subsequent dispatch until execution settles (default: false)
+ * @param {boolean} options.requireIdle - Legacy alias for blockQueueUntilIdle
  * @param {string} options.replyChannel - Reply channel (e.g., 'telegram')
  * @param {string} options.replyEndpoint - Reply endpoint (e.g., user ID)
  * @param {string} options.targetInstance - Target instance ID for multi-session dispatch
@@ -77,6 +79,7 @@ function findC4ReceivePath() {
 export function sendViaC4(message, options = {}) {
   const {
     priority = 3,
+    blockQueueUntilIdle = false,
     requireIdle = false,
     replyChannel = null,
     replyEndpoint = null,
@@ -99,8 +102,8 @@ export function sendViaC4(message, options = {}) {
       args.push('--no-reply');
     }
 
-    if (requireIdle) {
-      args.push('--require-idle');
+    if (blockQueueUntilIdle || requireIdle) {
+      args.push('--block-queue-until-idle');
     }
 
     if (targetInstance) {
