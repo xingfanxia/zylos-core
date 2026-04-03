@@ -163,9 +163,11 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
       ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
     };
 
+    // Always delete + start (never pm2 restart) so PM2 picks up fresh env.
+    // pm2 restart reuses cached config and never applies new env vars like
+    // ZYLOS_TMUX_SESSION, causing session name mismatches after runtime switch.
     if (currentStatus === 'online' || currentStatus === 'launching') {
-      execFileSync('pm2', ['restart', pm2Name], { stdio: 'pipe', timeout: 30000, env });
-      return 'restarted';
+      try { execFileSync('pm2', ['delete', pm2Name], { stdio: 'pipe', timeout: 15000 }); } catch { /* best effort */ }
     }
 
     execFileSync('pm2', [
@@ -179,7 +181,7 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
       '10',
     ], { stdio: 'pipe', timeout: 30000, env });
     execFileSync('pm2', ['save'], { stdio: 'pipe', timeout: 15000, env });
-    return 'started';
+    return currentStatus ? 'restarted' : 'started';
   }
 
   // ----- Root redirect -----
