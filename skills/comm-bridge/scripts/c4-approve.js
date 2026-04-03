@@ -101,7 +101,19 @@ async function approveUser(chatId, name) {
     console.error(`Warning: failed to create instance cwd (${err.message})`);
   }
 
-  // 1c. Set auto_suspend + idle_timeout (CLI doesn't have these flags)
+  // 1c. Create per-instance memory directory with bootstrap files
+  try {
+    const memDir = path.join(ZYLOS_DIR, 'memory', 'instances', instanceName);
+    const sessDir = path.join(memDir, 'sessions');
+    fs.mkdirSync(sessDir, { recursive: true });
+    fs.writeFileSync(path.join(memDir, 'state.md'), `# ${instanceName} Instance State\n\n## Active Work\n- None\n\n## Pending Tasks\n- None\n`);
+    fs.writeFileSync(path.join(sessDir, 'current.md'), `# Session Log — ${instanceName}\n\n## ${new Date().toISOString().slice(0, 10)}\n- Instance created via approval flow\n`);
+    console.log(`Memory directory created: ${memDir}`);
+  } catch (err) {
+    console.error(`Warning: failed to create memory directory (${err.message})`);
+  }
+
+  // 1d. Set auto_suspend + idle_timeout (CLI doesn't have these flags)
   try {
     const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
     const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
