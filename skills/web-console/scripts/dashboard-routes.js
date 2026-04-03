@@ -446,18 +446,41 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         return res.json({ ok: true, id, runtime, changed: false });
       }
 
+      // Capture old tmux session name before updating config
+      const oldTmuxSession = inst.tmux_session || `claude-${id}`;
+
       updateInstancesConfig((cfg) => {
         if (!cfg) return null;
-        cfg.instances[id] = { ...cfg.instances[id], runtime };
+        const updated = { ...cfg.instances[id], runtime };
+        // Update tmux_session prefix to match the new runtime
+        const otherRuntime = runtime === 'claude' ? 'codex' : 'claude';
+        if (updated.tmux_session && updated.tmux_session.startsWith(`${otherRuntime}-`)) {
+          updated.tmux_session = `${runtime}-${updated.tmux_session.slice(otherRuntime.length + 1)}`;
+        }
+        cfg.instances[id] = updated;
         return cfg;
       });
 
       const updatedInst = getInstanceDef(id) || { ...inst, runtime };
       const status = readStatusSnapshot(id);
       const isSuspended = status?.state === 'suspended';
-      const tmuxSession = updatedInst.tmux_session || `claude-${id}`;
 
-      try { killTmuxSessionIfExists(tmuxSession); } catch { /* best effort */ }
+      // Kill the old tmux session (using the pre-update name)
+      try { killTmuxSessionIfExists(oldTmuxSession); } catch { /* best effort */ }
+
+      // Clear suspended state and write wake signal so the guardian
+      // starts the new runtime immediately instead of staying stuck.
+      if (isSuspended) {
+        try {
+          const statusFile = getStatusFileForInstance(id);
+          if (statusFile && fs.existsSync(statusFile)) {
+            const snap = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+            snap.state = 'offline';
+            fs.writeFileSync(statusFile, JSON.stringify(snap, null, 2));
+          }
+        } catch { /* best effort */ }
+      }
+      try { requestWake(id, updatedInst); } catch { /* best effort */ }
 
       let pm2Action = 'skipped';
       if (updatedInst.enabled !== false) {
@@ -485,11 +508,24 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
     }
 
     try {
+      // Capture old tmux session names before updating config
+      const oldSessions = {};
+      const rawCfg = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
+      for (const [id, inst] of Object.entries(rawCfg.instances || {})) {
+        oldSessions[id] = inst.tmux_session || `claude-${id}`;
+      }
+
       const updates = [];
       updateInstancesConfig((cfg) => {
         if (!cfg) return null;
+        const otherRuntime = runtime === 'claude' ? 'codex' : 'claude';
         for (const [id, inst] of Object.entries(cfg.instances || {})) {
-          cfg.instances[id] = { ...inst, runtime };
+          const updated = { ...inst, runtime };
+          // Update tmux_session prefix to match the new runtime
+          if (updated.tmux_session && updated.tmux_session.startsWith(`${otherRuntime}-`)) {
+            updated.tmux_session = `${runtime}-${updated.tmux_session.slice(otherRuntime.length + 1)}`;
+          }
+          cfg.instances[id] = updated;
           updates.push(id);
         }
         return cfg;
@@ -503,9 +539,24 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
 
         const status = readStatusSnapshot(id);
         const isSuspended = status?.state === 'suspended';
-        const tmuxSession = inst.tmux_session || `claude-${id}`;
 
-        try { killTmuxSessionIfExists(tmuxSession); } catch { /* best effort */ }
+        // Kill the old tmux session (using the pre-update name)
+        const oldTmuxSession = oldSessions[id] || inst.tmux_session || `claude-${id}`;
+        try { killTmuxSessionIfExists(oldTmuxSession); } catch { /* best effort */ }
+
+        // Clear suspended state and write wake signal so the guardian
+        // starts the new runtime immediately instead of staying stuck.
+        if (isSuspended) {
+          try {
+            const statusFile = getStatusFileForInstance(id);
+            if (statusFile && fs.existsSync(statusFile)) {
+              const snap = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+              snap.state = 'offline';
+              fs.writeFileSync(statusFile, JSON.stringify(snap, null, 2));
+            }
+          } catch { /* best effort */ }
+        }
+        try { requestWake(id, inst); } catch { /* best effort */ }
 
         let pm2Action = 'skipped';
         if (inst.enabled !== false) {
