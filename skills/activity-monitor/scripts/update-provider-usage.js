@@ -4,15 +4,13 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execFileSync } from 'child_process';
-import { runUsageProbe } from './usage-probe-runner.js';
+import { readClaudeUsageFromMonitorFiles } from './usage-monitor-file-reader.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
 const DEFAULT_INTERVAL_MS = Number.parseInt(process.env.PROVIDER_USAGE_INTERVAL_MS || '', 10) || 5 * 60 * 1000;
 const DEFAULT_RETRY_MS = Number.parseInt(process.env.PROVIDER_USAGE_RETRY_MS || '', 10) || 60 * 1000;
 const DEFAULT_CODEXBAR_BIN = process.env.CODEXBAR_BIN || path.join(ZYLOS_DIR, 'bin', 'codexbar');
-const DEFAULT_CLAUDE_PROBE_TIMEOUT_SECONDS = Number.parseInt(process.env.CLAUDE_PROVIDER_PROBE_TIMEOUT_SECONDS || '', 10) || 45;
-const DEFAULT_CLAUDE_CAPTURE_WAIT_SECONDS = Number.parseInt(process.env.CLAUDE_PROVIDER_CAPTURE_WAIT_SECONDS || '', 10) || 20;
 
 function resolveCodexBarBin() {
   if (DEFAULT_CODEXBAR_BIN && fs.existsSync(DEFAULT_CODEXBAR_BIN)) return DEFAULT_CODEXBAR_BIN;
@@ -135,25 +133,21 @@ export function fetchProviderUsage(provider, {
 export function fetchClaudeNativeUsage({
   zylosDir = ZYLOS_DIR,
   now = new Date().toISOString(),
-  timeoutSeconds = DEFAULT_CLAUDE_PROBE_TIMEOUT_SECONDS,
-  captureWaitSeconds = DEFAULT_CLAUDE_CAPTURE_WAIT_SECONDS,
-  runUsageProbeImpl = runUsageProbe,
+  readImpl = readClaudeUsageFromMonitorFiles,
 } = {}) {
-  const sessionName = `claude-provider-probe-${process.pid}-${Date.now()}`;
-  const result = runUsageProbeImpl({
-    zylosDir,
-    timeoutSeconds,
-    captureWaitSeconds,
-    sessionName,
+  const monitorDir = path.join(zylosDir, 'activity-monitor');
+  const usage = readImpl({
+    statuslineFile: path.join(monitorDir, 'statusline.json'),
+    usageStateFile: path.join(monitorDir, 'usage.json'),
   });
 
-  if (!result?.ok || !result.usage) {
+  if (!usage) {
     return {
       provider: 'claude',
       available: false,
       fetched_at: now,
       source: 'zylos-native',
-      error: result?.reason || 'Claude native usage probe failed',
+      error: 'No Claude usage data found in monitor files',
       primary: null,
       secondary: null,
       tertiary: null,
@@ -162,7 +156,14 @@ export function fetchClaudeNativeUsage({
     };
   }
 
-  return normalizeNativeClaudeUsage(result.usage, now);
+  return normalizeNativeClaudeUsage({
+    session: usage.sessionPercent,
+    sessionResets: usage.sessionResets,
+    weeklyAll: usage.weeklyAllPercent,
+    weeklyAllResets: usage.weeklyAllResets,
+    weeklySonnet: usage.weeklySonnetPercent,
+    weeklySonnetResets: usage.weeklySonnetResets,
+  }, now);
 }
 
 export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
