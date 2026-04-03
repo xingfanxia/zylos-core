@@ -542,8 +542,8 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         const status = readStatusSnapshot(id);
         const isSuspended = status?.state === 'suspended';
 
-        // Kill the old tmux session (using the pre-update name)
-        const oldTmuxSession = oldSessions[id] || inst.tmux_session || `claude-${id}`;
+        // Kill the old tmux session (using the pre-update name, never the post-update inst)
+        const oldTmuxSession = oldSessions[id] || `claude-${id}`;
         try { killTmuxSessionIfExists(oldTmuxSession); } catch { /* best effort */ }
 
         // Clear suspended state and write wake signal so the guardian
