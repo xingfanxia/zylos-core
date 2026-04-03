@@ -246,13 +246,6 @@ async function main() {
     } catch { /* instance router not available */ }
   }
 
-  // Check if unknown endpoint should be held for approval
-  try {
-    const { checkAndHoldForApproval } = await import('./c4-approve.js');
-    const held = await checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
-    if (held) return; // message held for approval, don't insert normally
-  } catch { /* approval module not available */ }
-
   let replyViaSuffix = '';
   if (!noReply) {
     const scriptDir = __dirname;
@@ -261,6 +254,18 @@ async function main() {
   }
 
   const fullMessage = content + replyViaSuffix;
+
+  // Check if unknown endpoint should be held for approval
+  try {
+    const { checkAndHoldForApproval, holdAndNotify } = await import('./c4-approve.js');
+    const held = await checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
+    if (held) {
+      const record = holdAndNotify(channel, endpoint, fullMessage, priority, targetInstance);
+      emitSuccess(json, record.id);
+      close();
+      return;
+    }
+  } catch { /* approval module not available */ }
   let dbContent = fullMessage;
   const byteLength = Buffer.byteLength(fullMessage, 'utf8');
 

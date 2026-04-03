@@ -35,7 +35,7 @@ function resolvePackageRoot() {
 }
 
 // Import DB functions
-import { getDb, close } from './c4-db.js';
+import { getDb, close, insertConversation, insertControl } from './c4-db.js';
 
 function usage() {
   console.log('Usage:');
@@ -81,7 +81,7 @@ async function approveUser(chatId, name) {
     const result = execFileSync('node', [
       cliPath, 'create', instanceName,
       '--chat-ids', chatId,
-      '--type', 'user',
+      '--type', 'on_demand',
       '--description', `Auto-provisioned for ${chatId}`,
       '--json'
     ], { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
@@ -106,6 +106,7 @@ async function approveUser(chatId, name) {
     const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
     const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
     if (config.instances[instanceName]) {
+      config.instances[instanceName].type = 'user';
       config.instances[instanceName].auto_suspend = true;
       config.instances[instanceName].idle_timeout_min = 30;
       fs.writeFileSync(instancesFile, JSON.stringify(config, null, 2) + '\n');
@@ -215,13 +216,60 @@ export async function checkAndHoldForApproval(endpoint, targetInstance, noReply,
   // Don't hold if endpoint is in the routing table (known user)
   try {
     const { isEndpointRouted } = await import('./c4-instance-router.js');
-    if (isEndpointRouted(endpoint)) return false;
+    const chatId = endpoint ? endpoint.split('|')[0] : endpoint;
+    if (isEndpointRouted(chatId, endpoint)) return false;
   } catch {
     return false; // instance router not available, don't hold
   }
-  // Unknown endpoint — for now, don't hold (let it route to default instance)
-  // Full approval flow can be enabled later by returning true here
-  return false;
+  // Unknown endpoint — hold for admin approval and notify
+  try {
+    // Insert the held message into DB with pending_approval status
+    // (caller passes content separately via holdAndNotify)
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Hold an unknown user's message and notify admin for approval.
+ * Called by c4-receive.js when checkAndHoldForApproval() returns true.
+ *
+ * @param {string} channel - Message channel
+ * @param {string} endpoint - Sender endpoint
+ * @param {string} content - Full message content (with reply-via suffix)
+ * @param {number} priority - Message priority
+ * @param {string|null} targetInstance - Resolved target (fallback default)
+ */
+export function holdAndNotify(channel, endpoint, content, priority, targetInstance) {
+  // 1. Insert message as pending_approval
+  const record = insertConversation('in', channel, endpoint, content, 'pending_approval', priority, false, targetInstance);
+
+  // 2. Extract chat_id for admin notification
+  const chatId = endpoint ? endpoint.split('|')[0] : 'unknown';
+
+  // 3. Notify admin via control queue
+  const preview = content.substring(0, 200).replace(/----.*$/, '').trim();
+  const notification = [
+    `🔔 New user pending approval:`,
+    `  Chat ID: ${chatId}`,
+    `  Channel: ${channel}`,
+    `  Message preview: "${preview}"`,
+    ``,
+    `To approve: node ${path.join(__dirname, 'c4-approve.js')} approve ${chatId} --name user-<name>`,
+    `To deny:    node ${path.join(__dirname, 'c4-approve.js')} deny ${chatId}`,
+    `Or use the dashboard Pending Users section.`,
+  ].join('\n');
+
+  try {
+    insertControl(notification, {
+      priority: 2,
+      appendAckSuffix: false,
+      targetInstance: 'admin',
+    });
+  } catch { /* best effort — admin will see it on dashboard regardless */ }
+
+  return record;
 }
 
 // Only run main() when executed directly, not when imported as a module
