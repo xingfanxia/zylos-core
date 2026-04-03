@@ -56,7 +56,7 @@ export const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 export const SKILLS_DIR = path.join(ZYLOS_DIR, '.claude', 'skills');
 
 export const CHECKPOINT_THRESHOLD = 30;      // unsummarized conversation count to trigger Memory Sync
-export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by session-init when above threshold
+export const SESSION_INIT_RECENT_COUNT = 30;  // max conversations returned by session-init when above threshold
 
 export const STALE_STATUS_THRESHOLD = 5000; // ms
 export const TMUX_MISSING_WARN_THRESHOLD = 30;
