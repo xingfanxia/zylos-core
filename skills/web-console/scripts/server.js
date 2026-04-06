@@ -435,9 +435,9 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Serve index.html for root
+// Redirect root to dashboard
 app.get('/', (req, res) => {
-  res.sendFile(path.join(SKILL_ROOT, 'public', 'index.html'));
+  res.redirect('/dashboard/');
 });
 
 // Multi-session dashboard (optional module)
