@@ -228,9 +228,21 @@ if (INSTANCE_ID && instanceConfig) {
   HOOK_STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
 }
 
-// Conversation directory - auto-detect based on working directory
-const ZYLOS_PATH = ZYLOS_DIR.replace(/\//g, '-');
-const CONV_DIR = path.join(os.homedir(), '.claude', 'projects', ZYLOS_PATH);
+// Conversation directory — resolve from per-instance cwd when available.
+// CC derives its project dir from realpath(cwd), replacing / and _ with -.
+let CONV_DIR;
+if (INSTANCE_ID && instanceConfig) {
+  try {
+    const instanceCwd = instanceConfig.getInstanceCwd(INSTANCE_ID);
+    const realCwd = fs.realpathSync(instanceCwd);
+    CONV_DIR = path.join(os.homedir(), '.claude', 'projects', realCwd.replace(/[/_]/g, '-'));
+  } catch {
+    // Fallback if instance cwd doesn't exist yet
+    CONV_DIR = path.join(os.homedir(), '.claude', 'projects', ZYLOS_DIR.replace(/\//g, '-'));
+  }
+} else {
+  CONV_DIR = path.join(os.homedir(), '.claude', 'projects', ZYLOS_DIR.replace(/\//g, '-'));
+}
 
 // Activity monitor cadence
 const INTERVAL = 1000;
