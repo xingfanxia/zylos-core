@@ -86,7 +86,19 @@
 6. 执行 3 分钟周期即时探针（非 `engine` 的 2 小时安全网）
 7. 执行 15 秒主动 API 错误扫描（需连续 2 次命中）
 8. 驱动 heartbeat 状态机（`engine.processHeartbeat(true, now)`）
-9. 调度健康检查 / 日任务 / usage 检查
+9. 驱动 SuspendManager（`suspendMgr.tick({currentTime, idleSeconds, claudeRunning: agentRunning, currentTimeHuman})`）
+10. 调度健康检查 / 日任务 / usage 检查
+
+### 4.3 SuspendManager（`suspend-manager.js`）
+
+多实例模式下负责空闲自动挂起和唤醒：
+
+- `tick(ctx)` 每秒被调用一次，需传入完整上下文对象 `{currentTime, idleSeconds, claudeRunning, currentTimeHuman}`
+- 当 `claudeRunning=true` 且 `idleSeconds > idleTimeoutMin * 60` 时，调用 `killTmuxSession()`（通过 `adapter.stop()`）并写 `agent-status.json` 为 `state: 'suspended'`
+- 挂起后 AM 持续运行（PM2 不受影响），在后续 tick 中检测 `wake-signal` 文件或 pending 消息来决定唤醒
+- 唤醒时清除 suspended 状态，Guardian 自动重启 tmux/Claude 会话
+
+**注意：** offline/stopped 分支（L1344/L1434）也调用 `tick()`，但传入 `claudeRunning: false`，仅用于唤醒检测。
 
 ## 5. 活动信号与 busy/idle 判定
 

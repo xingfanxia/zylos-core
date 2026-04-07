@@ -13,7 +13,13 @@ deployment, with runtime chosen per instance in `instances.json`.
 | group | `instances.json` `tmux_session` | group | on-demand | All Feishu/Telegram group chats |
 | user-\* | `instances.json` `tmux_session` | user | on-demand | Auto-provisioned per approved user |
 
-**On-demand lifecycle:** Auto-start via AM wake signal when a message arrives. Auto-suspend after 30 minutes idle. AM handles the full launch (auth, env, cwd, onboarding).
+**On-demand lifecycle:** Auto-start via AM wake signal when a message arrives. Auto-suspend after 30 minutes idle (configurable via `idle_timeout_min`). AM handles the full launch (auth, env, cwd, onboarding).
+
+**Suspend/wake flow:**
+1. **Suspend path (two mechanisms):**
+   - **SuspendManager** (in AM): `tick()` checks `idleSeconds` against `idle_timeout_min * 60` each second. When exceeded and Claude is running, kills the tmux session and writes `state: 'suspended'` to `agent-status.json`.
+   - **Dispatcher reap** (belt-and-suspenders): `reapIdleInstances()` tracks `lastDeliveryAt` per instance. If no message was delivered within `IDLE_REAP_TIMEOUT_MS`, writes a `suspend-signal` file for the AM to pick up.
+2. **Wake path:** When a pending message targets an offline instance, the dispatcher's `getPendingTargetInstancesNeedingWake()` detects it and writes a `wake-signal` file. The AM reads this on its next tick, clears suspended state, and Guardian auto-restarts the tmux/Claude session. The dispatcher then delivers the queued message.
 
 **Session naming convention:** tmux sessions use `<runtime>-<id>` (e.g., `codex-main`, `codex-user-pan` for Codex runtime; `claude-main` for Claude runtime). The `getSessionName()` fallback in `instance-config.js` reads the instance or global runtime to derive the correct prefix. Explicit `tmux_session` in `instances.json` always takes precedence.
 
@@ -50,8 +56,10 @@ Extracted dispatch logic with zero imports from the base dispatcher. Receives al
 When an unknown user messages, the flow is:
 1. Message held with `status=pending_approval`
 2. Dashboard shows pending user with approve/deny buttons
-3. On approve: creates instance (CLI), creates per-instance cwd, sets auto_suspend, releases held messages, starts AM process
+3. On approve: creates instance via CLI (`--chat-ids` flag writes routing + chat_ids), creates per-instance cwd + memory dir, sets `type=user`, `auto_suspend=true`, `idle_timeout_min=30`, releases held messages (`pending_approval` → `pending`), starts AM process
 4. On deny: marks messages as rejected
+
+**Note:** The approve script calls the deployed CLI at `~/zylos/cli/instance.js` (not the repo copy at `cli/commands/instance.js`). The deployed CLI supports `--chat-ids` for comma-separated chat ID routing. The dashboard API strips `|type:p2p` suffixes before passing chat IDs to the approve script.
 
 ### RuntimeAdapter (`cli/lib/runtime/claude.js`)
 Launches CC from per-instance working directory:
