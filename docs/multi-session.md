@@ -40,12 +40,14 @@ Key exports:
 
 ### Message Routing (`skills/comm-bridge/scripts/c4-instance-router.js`)
 Routes incoming messages to the correct instance:
-1. Check routing table in `instances.json` (explicit chat_id → instance mapping)
-2. Check `chat_ids` arrays in instance definitions
-3. Detect group chats (`|type:group` in endpoint for Feishu, negative chat_id for Telegram)
+1. Detect group chats (`|type:group` in endpoint for Feishu, negative chat_id for Telegram) → route to `group` instance
+2. Check routing table in `instances.json` (explicit chat_id → instance mapping)
+3. Check `chat_ids` arrays in instance definitions
 4. Fall back to default instance
 
 **Important:** Feishu `oc_` prefix does NOT indicate group chat — it's used for both groups AND p2p DMs. Only `|type:group` in the endpoint string is reliable.
+
+Both `resolveInstance()` (message delivery) and `isEndpointRouted()` (approval check) use `isGroupEndpoint()` for group detection. This ensures group chats bypass the approval flow and route directly to the group instance without needing explicit routing entries.
 
 ### Multi-Session Dispatcher (`skills/comm-bridge/scripts/c4-dispatcher-multi.js`)
 Extracted dispatch logic with zero imports from the base dispatcher. Receives all dependencies via injection. Handles:
@@ -55,11 +57,13 @@ Extracted dispatch logic with zero imports from the base dispatcher. Receives al
 - Idle instance reaping
 
 ### User Approval (`skills/comm-bridge/scripts/c4-approve.js`)
-When an unknown user messages, the flow is:
-1. Message held with `status=pending_approval`
+When an unknown **DM user** messages, the flow is:
+1. `isEndpointRouted()` returns false (not in routing table, not a group chat) → message held with `status=pending_approval`
 2. Dashboard shows pending user with approve/deny buttons
 3. On approve: creates instance via CLI (`--chat-ids` flag writes routing + chat_ids), creates per-instance cwd + memory dir, sets `type=user`, `auto_suspend=true`, `idle_timeout_min=30`, releases held messages (`pending_approval` → `pending`), starts AM process
 4. On deny: marks messages as rejected
+
+**Group chats skip approval entirely** — `isEndpointRouted()` detects `|type:group` endpoints and returns true when a group instance exists, so they route directly to the group instance.
 
 **Note:** The approve script calls the deployed CLI at `~/zylos/cli/instance.js` (not the repo copy at `cli/commands/instance.js`). The deployed CLI supports `--chat-ids` for comma-separated chat ID routing. The dashboard API strips `|type:p2p` suffixes before passing chat IDs to the approve script.
 
