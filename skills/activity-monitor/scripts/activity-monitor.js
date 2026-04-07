@@ -1562,7 +1562,7 @@ async function monitorLoop() {
   }
 
   // Multi-session: tick suspend manager with current idle duration
-  suspendMgr?.tick(idleSeconds);
+  suspendMgr?.tick({ currentTime, idleSeconds, claudeRunning: agentRunning, currentTimeHuman });
 
   // Rate-limit detection is now handled inside HeartbeatEngine.onHeartbeatFailure
   // via the detectRateLimit dep callback (dual-signal: heartbeat failure + tmux text).
