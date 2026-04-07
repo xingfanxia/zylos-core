@@ -67,12 +67,12 @@ class Dashboard {
     container.innerHTML = pending.map(p => `
       <div class="pending-card">
         <div class="pending-info">
-          <div class="pending-name">${this.esc(p.user_name || p.chat_id)}</div>
+          <div class="pending-name">${this.esc(p.sender_name || p.chat_id)}</div>
           <div class="pending-detail">${this.esc(p.channel)} &middot; ${this.esc(p.chat_id)} &middot; ${p.msg_count || '?'} held message(s)</div>
           <div class="pending-preview">"${this.esc((p.preview || '').substring(0, 100))}"</div>
         </div>
         <div class="pending-actions">
-          <input type="text" placeholder="instance name" value="${this.esc(p.suggested_id || (p.user_name ? 'user-' + p.user_name.toLowerCase().replace(/\s+/g, '') : ''))}"
+          <input type="text" placeholder="instance name" value="${this.esc(p.suggested_id || (p.sender_name ? 'user-' + p.sender_name.toLowerCase().replace(/\s+/g, '') : ''))}"
             data-chat-id="${this.esc(p.chat_id)}" class="approve-name-input">
           <button class="btn-approve" data-action="approve" data-chat-id="${this.esc(p.chat_id)}">Approve</button>
           <button class="btn-deny" data-action="deny" data-chat-id="${this.esc(p.chat_id)}">Deny</button>
