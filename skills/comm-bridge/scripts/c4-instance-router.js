@@ -295,6 +295,11 @@ export function isEndpointRouted(chatId, endpointId) {
   loadConfig();
   if (!config) return false;
 
+  // Group chats route to the group instance automatically — no approval needed
+  if (isGroupEndpoint(chatId, endpointId) && getGroupInstance()) {
+    return true;
+  }
+
   // Check routing table
   if (config.routing) {
     if (chatId && config.routing[chatId]) return true;
