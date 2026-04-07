@@ -104,8 +104,11 @@
 
 活动时间戳优先级：
 
-1. Claude 下优先对话文件 mtime（`~/.claude/projects/.../*.jsonl`）
+1. Claude 下优先对话文件 mtime（`~/.claude/projects/<project-dir>/*.jsonl`）
+   - 多实例模式下，`CONV_DIR` 从 `instanceConfig.getInstanceCwd()` + `fs.realpathSync()` 派生
+   - CC 的 project dir 命名规则：`realpath(cwd).replace(/[/_]/g, '-')`
 2. 失败时回退 tmux `window_activity`
+   - **注意：** 当 API hook 确认空闲（`active=false`, `active_tools=0`）时，tmux activity 会被抑制（Claude statusline 每 30 分钟刷新一次会触发假活动）
 3. 再失败回退当前时间（兜底）
 4. 若 hook 报告 `active=true` 且更"新"，覆盖活动时间戳
 

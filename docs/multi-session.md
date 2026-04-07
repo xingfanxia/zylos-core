@@ -17,9 +17,11 @@ deployment, with runtime chosen per instance in `instances.json`.
 
 **Suspend/wake flow:**
 1. **Suspend path (two mechanisms):**
-   - **SuspendManager** (in AM): `tick()` checks `idleSeconds` against `idle_timeout_min * 60` each second. When exceeded and Claude is running, kills the tmux session and writes `state: 'suspended'` to `agent-status.json`.
+   - **SuspendManager** (in AM): `tick()` checks `idleSeconds` against `idle_timeout_min * 60` each second. When exceeded and Claude is running, kills the tmux session and writes `state: 'suspended'` to `agent-status.json`. Idle time is derived from CC's conversation JSONL file mtime (`source=conv_file`), not tmux pane activity.
    - **Dispatcher reap** (belt-and-suspenders): `reapIdleInstances()` tracks `lastDeliveryAt` per instance. If no message was delivered within `IDLE_REAP_TIMEOUT_MS`, writes a `suspend-signal` file for the AM to pick up.
 2. **Wake path:** When a pending message targets an offline instance, the dispatcher's `getPendingTargetInstancesNeedingWake()` detects it and writes a `wake-signal` file. The AM reads this on its next tick, clears suspended state, and Guardian auto-restarts the tmux/Claude session. The dispatcher then delivers the queued message.
+
+**Important:** The AM's `CONV_DIR` must resolve to CC's actual project directory. CC derives project dirs from `realpath(instanceCwd)` with `/` and `_` replaced by `-`. The AM uses `instanceConfig.getInstanceCwd()` + `fs.realpathSync()` to match this. If idle detection shows `source=tmux_activity` instead of `source=conv_file` in `agent-status.json`, the CONV_DIR resolution is broken.
 
 **Session naming convention:** tmux sessions use `<runtime>-<id>` (e.g., `codex-main`, `codex-user-pan` for Codex runtime; `claude-main` for Claude runtime). The `getSessionName()` fallback in `instance-config.js` reads the instance or global runtime to derive the correct prefix. Explicit `tmux_session` in `instances.json` always takes precedence.
 
