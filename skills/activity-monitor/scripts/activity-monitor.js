@@ -1524,6 +1524,19 @@ async function monitorLoop() {
     source = 'api_hook';
   }
 
+  // Suppress tmux-only activity when API hook confirms idle.
+  // Claude's statusline refreshes every ~30 min, bumping tmux window_activity
+  // without any real user/agent work. When hooks are fresh and report idle
+  // (active=false, active_tools=0), trust the hook over tmux.
+  if (source === 'tmux_activity' && hookFresh && !apiActivity?.active && activeTools === 0) {
+    // Use the last API activity timestamp instead — it reflects real work,
+    // not statusline refreshes.
+    if (apiUpdatedSec > 0) {
+      activity = apiUpdatedSec;
+      source = 'api_hook_idle';
+    }
+  }
+
   const inactiveSeconds = currentTime - activity;
 
   // State determination uses all available signals:
