@@ -38,7 +38,7 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
  * Maximum items to attempt per processWithMultiSession call before giving up.
  * Prevents unbounded looping when every claimed item is for an offline instance.
  */
-const MAX_SKIP_ATTEMPTS = 5;
+const MAX_SKIP_ATTEMPTS = 10;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Lifecycle functions
@@ -450,9 +450,11 @@ export async function processWithMultiSession(helpers) {
     const bypass = isBypassState(item);
 
     // require_idle gate (must be idle with sufficient duration).
+    // Continue the skip loop instead of returning — a non-idle target must not
+    // block delivery of other items targeting different (idle) instances.
     if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
       releaseItem(item);
-      return { delivered: false, state: claudeState.state };
+      continue;
     }
 
     // Heartbeat auto-ack shortcut.
