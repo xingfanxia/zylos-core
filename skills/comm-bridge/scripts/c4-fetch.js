@@ -21,10 +21,12 @@ const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 // Instance-scoped query overrides (loaded lazily, graceful degradation)
 let _getUnsummarizedRangeForInstance = null;
 let _getConversationsByRangeForInstance = null;
+let _getLastCheckpointForInstance = null;
 try {
   const multiMod = await import('./c4-db-multi.js');
   _getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
   _getConversationsByRangeForInstance = multiMod.getConversationsByRangeForInstance;
+  _getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
 } catch {
   // c4-db-multi.js not available — instance-scoped queries disabled
 }
@@ -41,7 +43,9 @@ function usage() {
 }
 
 function outputConversations(beginId, endId, { allInstances = false } = {}) {
-  const checkpoint = getLastCheckpoint();
+  const checkpoint = (!allInstances && INSTANCE_ID && _getLastCheckpointForInstance)
+    ? _getLastCheckpointForInstance(INSTANCE_ID)
+    : getLastCheckpoint();
   const useInstanceFilter = !allInstances && INSTANCE_ID && _getConversationsByRangeForInstance;
   const conversations = useInstanceFilter
     ? _getConversationsByRangeForInstance(INSTANCE_ID, beginId, endId)

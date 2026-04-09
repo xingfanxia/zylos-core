@@ -242,6 +242,52 @@ export function markControlRejected(id) {
 }
 
 // ---------------------------------------------------------------------------
+// Checkpoint queries — instance-filtered
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the most recent checkpoint for a specific instance.
+ * Falls back to global (NULL) checkpoints for backward compatibility.
+ *
+ * @param {string} instanceId - the instance ID to filter by
+ * @returns {object|null} checkpoint record or null
+ */
+export function getLastCheckpointForInstance(instanceId) {
+  const db = getDb();
+  return db.prepare(
+    `SELECT id, timestamp, summary, start_conversation_id, end_conversation_id, target_instance
+     FROM checkpoints
+     WHERE target_instance = ? OR target_instance IS NULL
+     ORDER BY id DESC LIMIT 1`
+  ).get(instanceId) || null;
+}
+
+/**
+ * Create a checkpoint scoped to a specific instance.
+ *
+ * @param {number} endConversationId - last conversation ID covered
+ * @param {string|null} summary - checkpoint summary
+ * @param {string} instanceId - target instance ID
+ * @returns {object} created checkpoint record
+ */
+export function createCheckpointForInstance(endConversationId, summary, instanceId) {
+  const db = getDb();
+  const prevCheckpoint = db.prepare(
+    'SELECT end_conversation_id FROM checkpoints WHERE (target_instance = ? OR target_instance IS NULL) ORDER BY id DESC LIMIT 1'
+  ).get(instanceId);
+  const startId = prevCheckpoint ? (prevCheckpoint.end_conversation_id || 0) + 1 : 1;
+  const stmt = db.prepare('INSERT INTO checkpoints (summary, start_conversation_id, end_conversation_id, target_instance) VALUES (?, ?, ?, ?)');
+  const result = stmt.run(summary, startId, endConversationId, instanceId);
+  return {
+    id: result.lastInsertRowid,
+    start_conversation_id: startId,
+    end_conversation_id: endConversationId,
+    target_instance: instanceId,
+    timestamp: new Date().toISOString()
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Unsummarized / range queries — instance-filtered
 // ---------------------------------------------------------------------------
 
@@ -255,8 +301,8 @@ export function markControlRejected(id) {
 export function getUnsummarizedRangeForInstance(instanceId) {
   const db = getDb();
   const lastCheckpoint = db.prepare(
-    'SELECT end_conversation_id FROM checkpoints ORDER BY id DESC LIMIT 1'
-  ).get();
+    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? OR target_instance IS NULL ORDER BY id DESC LIMIT 1'
+  ).get(instanceId);
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
   const result = db.prepare(`
@@ -285,8 +331,8 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
   const limit = opts?.limit ?? null;
 
   const lastCheckpoint = db.prepare(
-    'SELECT end_conversation_id FROM checkpoints ORDER BY id DESC LIMIT 1'
-  ).get();
+    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? OR target_instance IS NULL ORDER BY id DESC LIMIT 1'
+  ).get(instanceId);
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
   if (limit) {

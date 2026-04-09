@@ -24,11 +24,13 @@ const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 // Instance-scoped query overrides (loaded lazily, graceful degradation)
 let _getUnsummarizedRangeForInstance = null;
 let _getUnsummarizedConversationsForInstance = null;
+let _getLastCheckpointForInstance = null;
 let _multiLoadFailed = false;
 try {
   const multiMod = await import('./c4-db-multi.js');
   _getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
   _getUnsummarizedConversationsForInstance = multiMod.getUnsummarizedConversationsForInstance;
+  _getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
 } catch (err) {
   _multiLoadFailed = true;
   console.error(`[c4-session-init] WARN: c4-db-multi.js import failed: ${err.message}`);
@@ -38,7 +40,9 @@ const startMs = Date.now();
 
 function main() {
   try {
-    const checkpoint = getLastCheckpoint();
+    const checkpoint = (INSTANCE_ID && _getLastCheckpointForInstance)
+      ? _getLastCheckpointForInstance(INSTANCE_ID)
+      : getLastCheckpoint();
     const lines = [];
 
     // Guard: in multi-session mode, never fall back to unfiltered global queries.
