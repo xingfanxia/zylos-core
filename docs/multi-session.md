@@ -73,6 +73,17 @@ Launches CC from per-instance working directory:
 - Calls `ensureInstanceCwd()` to create dir + symlinks if missing
 - Pre-trusts the instance dir for CC onboarding
 - All `cd` commands in the tmux shell use `instanceCwd`
+- **Auto-continue:** Detects prior sessions (*.jsonl in CC project dir) and adds `--continue` flag to resume the most recent conversation on restart
+
+### Session Context Restoration
+
+On every CC restart (suspend/wake, crash recovery, heartbeat timeout, context rotation, daily upgrade), three layers restore context:
+
+1. **`--continue` flag** — resumes CC's internal context window (compressed conversation, reasoning, tool calls). CC's project dir is derived from `realpath(instanceCwd)` with `/` and `_` replaced by `-`.
+2. **`session-start-inject.js`** (SessionStart hook) — injects per-instance memory (`state.md`, `sessions/current.md`)
+3. **`c4-session-init.js`** (SessionStart hook) — injects last checkpoint summary + up to 30 recent instance-scoped conversations from c4.db
+
+Layer 1 preserves CC's internal understanding; layers 2-3 provide structured context from external systems. All three fire on every restart.
 
 ## Memory Isolation
 
