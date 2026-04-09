@@ -24,12 +24,14 @@ const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 // Instance-scoped query overrides (loaded lazily, graceful degradation)
 let _getUnsummarizedRangeForInstance = null;
 let _getUnsummarizedConversationsForInstance = null;
+let _multiLoadFailed = false;
 try {
   const multiMod = await import('./c4-db-multi.js');
   _getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
   _getUnsummarizedConversationsForInstance = multiMod.getUnsummarizedConversationsForInstance;
-} catch {
-  // c4-db-multi.js not available — instance-scoped queries disabled
+} catch (err) {
+  _multiLoadFailed = true;
+  console.error(`[c4-session-init] WARN: c4-db-multi.js import failed: ${err.message}`);
 }
 
 const startMs = Date.now();
@@ -37,10 +39,25 @@ const startMs = Date.now();
 function main() {
   try {
     const checkpoint = getLastCheckpoint();
+    const lines = [];
+
+    // Guard: in multi-session mode, never fall back to unfiltered global queries.
+    // Injecting nothing is strictly safer than injecting all instances' conversations.
+    if (INSTANCE_ID && _multiLoadFailed) {
+      console.error(`[c4-session-init] Instance ${INSTANCE_ID}: instance-scoped queries unavailable, skipping conversation injection`);
+      if (checkpoint?.summary) {
+        lines.push(`[Last Checkpoint Summary] ${checkpoint.summary}`);
+        lines.push('');
+      }
+      lines.push('[Recent Conversations]');
+      lines.push('(instance-scoped query unavailable — skipped to prevent cross-instance bleed)');
+      console.log(lines.join('\n'));
+      return;
+    }
+
     const range = (INSTANCE_ID && _getUnsummarizedRangeForInstance)
       ? _getUnsummarizedRangeForInstance(INSTANCE_ID)
       : getUnsummarizedRange();
-    const lines = [];
 
     // Always output last checkpoint summary
     if (checkpoint?.summary) {
@@ -58,7 +75,7 @@ function main() {
 
     // Get conversations: all if under threshold, last N if over
     const getConvos = (INSTANCE_ID && _getUnsummarizedConversationsForInstance)
-      ? (limit) => _getUnsummarizedConversationsForInstance(INSTANCE_ID, limit)
+      ? (limit) => _getUnsummarizedConversationsForInstance(INSTANCE_ID, limit != null ? { limit } : undefined)
       : getUnsummarizedConversations;
     const conversations = needsSync
       ? getConvos(SESSION_INIT_RECENT_COUNT)
