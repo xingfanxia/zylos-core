@@ -305,10 +305,12 @@ export function getUnsummarizedRangeForInstance(instanceId) {
   ).get(instanceId);
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
+  // Only include messages explicitly targeting this instance.
+  // Exclude NULL-targeted rows (legacy/outgoing) to prevent cross-instance context bleed.
   const result = db.prepare(`
     SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count
     FROM conversations
-    WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
+    WHERE id > ? AND status = 'delivered' AND target_instance = ?
   `).get(afterId, instanceId);
 
   return {
@@ -335,11 +337,13 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
   ).get(instanceId);
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
+  // Only include messages explicitly targeting this instance.
+  // Exclude NULL-targeted rows (legacy/outgoing) to prevent cross-instance context bleed.
   if (limit) {
     return db.prepare(`
       SELECT * FROM (
         SELECT * FROM conversations
-        WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
+        WHERE id > ? AND status = 'delivered' AND target_instance = ?
         ORDER BY id DESC LIMIT ?
       ) ORDER BY id ASC
     `).all(afterId, instanceId, limit);
@@ -347,7 +351,7 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
 
   return db.prepare(`
     SELECT * FROM conversations
-    WHERE id > ? AND status = 'delivered' AND (target_instance = ? OR target_instance IS NULL)
+    WHERE id > ? AND status = 'delivered' AND target_instance = ?
     ORDER BY id ASC
   `).all(afterId, instanceId);
 }
@@ -366,7 +370,7 @@ export function getConversationsByRangeForInstance(begin, end, instanceId) {
   return db.prepare(`
     SELECT * FROM conversations
     WHERE id >= ? AND id <= ?
-      AND (target_instance = ? OR target_instance IS NULL)
+      AND target_instance = ?
     ORDER BY id ASC
   `).all(begin, end, instanceId);
 }
