@@ -413,9 +413,14 @@ export async function processWithMultiSession(helpers) {
   }
 
   // Skip-loop: try up to MAX_SKIP_ATTEMPTS items.
+  // Track items held in 'running' state so we can release them at the end.
+  // Items must stay 'running' during the loop to prevent re-claiming the same item.
+  const heldItems = [];
+
   for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
     const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
     if (!item) {
+      for (const held of heldItems) releaseItem(held);
       return { delivered: false, state: 'idle' };
     }
 
@@ -439,9 +444,9 @@ export async function processWithMultiSession(helpers) {
       continue;
     }
 
-    // ── skip ──
+    // ── skip ── (hold in running state to prevent re-claim in this cycle)
     if (decision.action === 'skip') {
-      releaseItem(item);
+      heldItems.push(item);
       continue;
     }
 
@@ -450,10 +455,9 @@ export async function processWithMultiSession(helpers) {
     const bypass = isBypassState(item);
 
     // require_idle gate (must be idle with sufficient duration).
-    // Continue the skip loop instead of returning — a non-idle target must not
-    // block delivery of other items targeting different (idle) instances.
+    // Hold the item to prevent re-claim, then continue to try other items.
     if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
-      releaseItem(item);
+      heldItems.push(item);
       continue;
     }
 
@@ -464,6 +468,7 @@ export async function processWithMultiSession(helpers) {
       if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed })) {
         ackControl(item.id);
         log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}`);
+        for (const held of heldItems) releaseItem(held);
         return { delivered: true, state: claudeState.state };
       }
     }
@@ -506,6 +511,7 @@ export async function processWithMultiSession(helpers) {
         autoStartedAt.delete(targetInstance);
       }
 
+      for (const held of heldItems) releaseItem(held);
       return { delivered: true, state: claudeState.state };
     }
 
@@ -519,9 +525,11 @@ export async function processWithMultiSession(helpers) {
       await handleConversationDeliveryFailure(item, statusFile);
     }
 
+    for (const held of heldItems) releaseItem(held);
     return { delivered: false, state: claudeState.state };
   }
 
   // Exhausted skip attempts — all tried items were for offline/busy instances.
+  for (const held of heldItems) releaseItem(held);
   return { delivered: false, state: 'skip_exhausted' };
 }
