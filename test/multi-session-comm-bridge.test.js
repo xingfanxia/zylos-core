@@ -255,12 +255,16 @@ describe('c4-db-multi — runPendingMigrations()', () => {
 
   it('is idempotent — running twice does not error', () => {
     runPendingMigrations(db, MIGRATIONS_DIR);
-    // Run again — should not throw (migration already tracked in _migrations)
+    const firstRun = db.prepare('SELECT name FROM _migrations').all();
+    // Run again — should not throw (migrations already tracked in _migrations)
     expect(() => runPendingMigrations(db, MIGRATIONS_DIR)).not.toThrow();
 
-    const rows = db.prepare('SELECT name FROM _migrations').all();
-    // Still only one entry per migration file
-    expect(rows.length).toBe(1);
+    const secondRun = db.prepare('SELECT name FROM _migrations').all();
+    // Same number of entries (no duplicates)
+    expect(secondRun.length).toBe(firstRun.length);
+    // Each migration file has exactly one entry
+    const names = secondRun.map(r => r.name);
+    expect(new Set(names).size).toBe(names.length);
   });
 });
 
