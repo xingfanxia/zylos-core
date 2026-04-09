@@ -73,14 +73,17 @@ export function createClaudeProbe({
       const deadline = phase === 'stuck' ? stuckAckDeadline : ackDeadline;
       const content = `Heartbeat check. [phase=${phase}]`;
       try {
-        const out = execFileSync('node', [C4_CONTROL, 'enqueue',
+        const args = [C4_CONTROL, 'enqueue',
           '--content', content,
-          // Priority 0 = highest. Must not be lowered — heartbeat must jump
-          // the queue ahead of conversation messages to avoid false timeout kills.
           '--priority', '0',
           '--bypass-state',
           '--ack-deadline', String(deadline),
-        ], { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
+        ];
+        // Multi-session: route heartbeat to the correct instance
+        if (process.env.ZYLOS_INSTANCE_ID) {
+          args.push('--target-instance', process.env.ZYLOS_INSTANCE_ID);
+        }
+        const out = execFileSync('node', args, { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
 
         const match = out.match(/control\s+(\d+)/i);
         if (!match) return false;
