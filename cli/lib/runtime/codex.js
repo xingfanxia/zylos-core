@@ -25,10 +25,12 @@ import { buildInstructionFile } from './instruction-builder.js';
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
 import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../config.js';
+import { writeCodexConfig } from '../runtime-setup.js';
+import { getInstanceStateFile } from '../../../skills/multi-session/runtime-files.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'codex-main';
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'codex-main';
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 
 // When CODEX_BYPASS_PERMISSIONS=false, skip --dangerously-bypass-approvals-and-sandbox.
@@ -56,11 +58,14 @@ export function isOnboardingPendingState(stateContent = '') {
   return /^-\s+Status:\s+pending\b/m.test(stateContent);
 }
 
-export function buildCodexBootstrapPrompt(zylosDir = ZYLOS_DIR) {
+export function buildCodexBootstrapPrompt(zylosDir = ZYLOS_DIR, opts = {}) {
   const memInjectScript = path.join(zylosDir, '.claude', 'skills', 'zylos-memory', 'scripts', 'session-start-inject.js');
   const sessionInitScript = path.join(zylosDir, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-session-init.js');
   const startupPromptScript = path.join(zylosDir, '.claude', 'skills', 'activity-monitor', 'scripts', 'session-start-prompt.js');
-  const statePath = path.join(zylosDir, 'memory', 'state.md');
+  const statePath = getInstanceStateFile({
+    zylosDir,
+    instanceId: opts.instanceId ?? process.env.ZYLOS_INSTANCE_ID ?? null,
+  });
 
   let onboardingPending = false;
   try {
@@ -100,7 +105,7 @@ export function buildCodexBootstrapPrompt(zylosDir = ZYLOS_DIR) {
 export class CodexAdapter extends RuntimeAdapter {
   get displayName() { return 'Codex'; }
   get runtimeId() { return 'codex'; }
-  get sessionName()  { return 'codex-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -196,10 +201,26 @@ export class CodexAdapter extends RuntimeAdapter {
       if (name === 'codex' || name === 'node') return true;
     } catch { }
 
-    // Check children of pane process for codex
+    // Check direct children of the pane shell. Codex commonly runs as
+    // `node /usr/bin/codex ...`, so matching only the process name is too
+    // narrow on some hosts.
     try {
-      execSync(`pgrep -P ${panePid} -f "codex" > /dev/null 2>&1`);
-      return true;
+      const childPids = execSync(`pgrep -P ${panePid} 2>/dev/null`, { encoding: 'utf8' })
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+
+      for (const childPid of childPids) {
+        let childName = '';
+        let childArgs = '';
+        try {
+          childName = execSync(`ps -p ${childPid} -o comm= 2>/dev/null`, { encoding: 'utf8' }).trim();
+          childArgs = execSync(`ps -p ${childPid} -o args= 2>/dev/null`, { encoding: 'utf8' }).trim();
+        } catch { /* ignore individual child inspection failures */ }
+
+        if (childName === 'codex') return true;
+        if (childName === 'node' && /\bcodex\b/.test(childArgs)) return true;
+      }
     } catch { }
 
     return false;
@@ -260,6 +281,25 @@ export class CodexAdapter extends RuntimeAdapter {
     // 1. Build AGENTS.md before launching (pass memorySnapshot for session rotation)
     await this.buildInstructionFile({ memorySnapshot: opts.memorySnapshot });
 
+    // 1b. Resolve per-instance working directory so each Codex instance gets
+    // its own AGENTS.md overlay, memory context, and trusted worktree.
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+      } catch (err) {
+        console.error(`[CodexAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
+    // Keep Codex trust config fresh for both the shared root and any per-instance cwd.
+    try { writeCodexConfig(ZYLOS_DIR); } catch { /* best effort */ }
+    if (instanceCwd !== ZYLOS_DIR) {
+      try { writeCodexConfig(instanceCwd); } catch { /* best effort */ }
+    }
+
     // 1.5. Ensure .agents/skills → .claude/skills symlink for Codex skill discovery.
     // Codex follows the Agent Skills spec and looks for skills in <workdir>/.agents/skills/.
     // We point it to the canonical skills directory via symlink — no files need to move.
@@ -281,7 +321,9 @@ export class CodexAdapter extends RuntimeAdapter {
     // preserving the onboarding pending guard from the older bootstrap flow.
     let tmpPrompt = null;
     try {
-      const combined = buildCodexBootstrapPrompt(ZYLOS_DIR);
+      const combined = buildCodexBootstrapPrompt(ZYLOS_DIR, {
+        instanceId: process.env.ZYLOS_INSTANCE_ID || null,
+      });
       tmpPrompt = path.join(os.tmpdir(), `.zylos-prompt-${process.pid}-${Date.now()}`);
       fs.writeFileSync(tmpPrompt, combined, { mode: 0o600 });
     } catch { /* prompt build failed — launch without initial prompt */ }
@@ -294,27 +336,32 @@ export class CodexAdapter extends RuntimeAdapter {
     const exitLogFile = path.join(monitorDir, 'codex-exit.log');
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
+    // Unlike Claude, a live Codex pane is not a shell we can safely reuse by
+    // pasting a launcher command into it. A restart must recreate the tmux
+    // session so the command executes in a fresh shell instead of being treated
+    // as in-session user text.
     if (_tmuxHasSession()) {
-      const cmd = tmpPrompt
-        ? `cd "${ZYLOS_DIR}"; _p=$(cat "${tmpPrompt}"); rm -f "${tmpPrompt}"; ${codexCmd} "$_p"; ${exitLogSnippet}`
-        : `cd "${ZYLOS_DIR}"; ${codexCmd}; ${exitLogSnippet}`;
-      await this.sendMessage(cmd);
-    } else {
-      const tmuxArgs = ['new-session', '-d', '-s', SESSION, '-e', `PATH=${process.env.PATH}`];
-      if (process.getuid?.() === 0) tmuxArgs.push('-e', 'IS_SANDBOX=1');
-
-      const promptSnippet = tmpPrompt
-        ? `_p=$(cat "${tmpPrompt}"); rm -f "${tmpPrompt}"; ${codexCmd} "$_p"`
-        : codexCmd;
-      const shellCmd = `cd "${ZYLOS_DIR}" && ${promptSnippet}; ${exitLogSnippet}`;
-      tmuxArgs.push('--', shellCmd);
-
       try {
-        execFileSync('tmux', tmuxArgs);
-      } catch (e) {
-        if (tmpPrompt) try { fs.unlinkSync(tmpPrompt); } catch { }
-        throw new Error(`Failed to create tmux session: ${e.message}`);
-      }
+        execSync(`tmux kill-session -t "${SESSION}" 2>/dev/null`);
+      } catch { /* best effort */ }
+    }
+
+    const tmuxArgs = ['new-session', '-d', '-s', SESSION, '-e', `PATH=${process.env.PATH}`];
+    if (process.env.ZYLOS_INSTANCE_ID) tmuxArgs.push('-e', `ZYLOS_INSTANCE_ID=${process.env.ZYLOS_INSTANCE_ID}`);
+    if (process.env.ZYLOS_TMUX_SESSION) tmuxArgs.push('-e', `ZYLOS_TMUX_SESSION=${process.env.ZYLOS_TMUX_SESSION}`);
+    if (process.getuid?.() === 0) tmuxArgs.push('-e', 'IS_SANDBOX=1');
+
+    const promptSnippet = tmpPrompt
+      ? `_p=$(cat "${tmpPrompt}"); rm -f "${tmpPrompt}"; ${codexCmd} "$_p"`
+      : codexCmd;
+    const shellCmd = `cd "${instanceCwd}" && ${promptSnippet}; ${exitLogSnippet}`;
+    tmuxArgs.push('--', shellCmd);
+
+    try {
+      execFileSync('tmux', tmuxArgs);
+    } catch (e) {
+      if (tmpPrompt) try { fs.unlinkSync(tmpPrompt); } catch { }
+      throw new Error(`Failed to create tmux session: ${e.message}`);
     }
 
     // 4. Schedule a startup dialog check.
@@ -385,10 +432,12 @@ function _tmuxHasSession() {
 
 function _getTmuxPanePid() {
   try {
-    return execSync(
-      `tmux list-panes -t "${SESSION}" -F '#{pane_pid}' 2>/dev/null | head -1`,
-      { encoding: 'utf8' }
-    ).trim();
+    const output = execFileSync('tmux', ['list-panes', '-t', SESSION, '-F', '#{pane_pid}'], {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 5000,
+    });
+    return output.trim().split('\n')[0] || null;
   } catch {
     return null;
   }

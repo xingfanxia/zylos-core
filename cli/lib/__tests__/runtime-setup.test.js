@@ -51,6 +51,15 @@ describe('renderCodexProjectConfig', () => {
     assert.doesNotMatch(content, /trust_level/);
     assert.doesNotMatch(content, /openai_base_url/);
   });
+
+  it('includes default runtime settings (model, context window, reasoning effort)', () => {
+    const content = renderCodexProjectConfig();
+    assert.match(content, /^model = "gpt-5\.4"$/m);
+    assert.match(content, /^model_context_window = 1000000$/m);
+    assert.match(content, /^model_auto_compact_token_limit = 800000$/m);
+    assert.match(content, /^model_reasoning_effort = "xhigh"$/m);
+    assert.match(content, /^personality = "pragmatic"$/m);
+  });
 });
 
 describe('renderCodexGlobalConfig', () => {
@@ -98,6 +107,11 @@ describe('writeCodexConfig', () => {
     assert.match(projectContent, /\[features\]\nmulti_agent = true/);
     assert.match(projectContent, /\[notice\]/);
     assert.match(projectContent, /check_for_update_on_startup = false/);
+    assert.match(projectContent, /^model = "gpt-5\.4"$/m);
+    assert.match(projectContent, /^model_context_window = 1000000$/m);
+    assert.match(projectContent, /^model_auto_compact_token_limit = 800000$/m);
+    assert.match(projectContent, /^model_reasoning_effort = "xhigh"$/m);
+    assert.match(projectContent, /^personality = "pragmatic"$/m);
     assert.doesNotMatch(projectContent, /\[projects\./);
 
     // Global config has trust only
@@ -146,6 +160,86 @@ describe('writeCodexConfig', () => {
       globalContent,
       new RegExp(`\\[projects\\."${escapeRegExp(path.resolve(projectDir))}"\\]\\ntrust_level = "untrusted"`)
     );
+  });
+
+  it('preserves existing runtime overrides from project config.toml', () => {
+    const projectDir = path.join(fakeZylosDir, 'workspace', 'project-preserve');
+    const projectCodexDir = path.join(path.resolve(projectDir), '.codex');
+    const projectConfigPath = path.join(projectCodexDir, 'config.toml');
+
+    fs.mkdirSync(projectCodexDir, { recursive: true });
+    fs.writeFileSync(
+      projectConfigPath,
+      [
+        'model = "gpt-5.4-mini"',
+        'model_context_window = 777777',
+        'model_auto_compact_token_limit = 555555',
+        'model_reasoning_effort = "medium"',
+        'personality = "direct"',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    assert.equal(writeCodexConfig(projectDir), true);
+
+    const content = fs.readFileSync(projectConfigPath, 'utf8');
+    assert.match(content, /^model = "gpt-5\.4-mini"$/m);
+    assert.match(content, /^model_context_window = 777777$/m);
+    assert.match(content, /^model_auto_compact_token_limit = 555555$/m);
+    assert.match(content, /^model_reasoning_effort = "medium"$/m);
+    assert.match(content, /^personality = "direct"$/m);
+  });
+
+  it('preserves non-zylos sections and extra keys inside managed sections', () => {
+    const projectDir = path.join(fakeZylosDir, 'workspace', 'project-sections');
+    const projectCodexDir = path.join(path.resolve(projectDir), '.codex');
+    const projectConfigPath = path.join(projectCodexDir, 'config.toml');
+
+    fs.mkdirSync(projectCodexDir, { recursive: true });
+    fs.writeFileSync(
+      projectConfigPath,
+      [
+        'model = "gpt-5.4-mini"',
+        '',
+        '[features]',
+        'multi_agent = false',
+        'experimental_widget = true',
+        '',
+        '[notice]',
+        'hide_full_access_warning = false',
+        'keep_custom_notice = true',
+        '',
+        '[notice.model_migrations]',
+        '"gpt-5.3-codex" = "gpt-5.3-codex"',
+        '"custom-model" = "custom-target"',
+        '',
+        '[mcp_servers.context7]',
+        'command = "npx"',
+        'args = ["-y", "@upstash/context7-mcp"]',
+        '',
+        '[plugins.example]',
+        'enabled = true',
+        '',
+        '[tui]',
+        'theme = "nord"',
+        '',
+      ].join('\n'),
+      'utf8'
+    );
+
+    assert.equal(writeCodexConfig(projectDir), true);
+
+    const content = fs.readFileSync(projectConfigPath, 'utf8');
+    assert.match(content, /\[features\][\s\S]*multi_agent = true/);
+    assert.match(content, /\[features\][\s\S]*experimental_widget = true/);
+    assert.match(content, /\[notice\][\s\S]*hide_full_access_warning = true/);
+    assert.match(content, /\[notice\][\s\S]*keep_custom_notice = true/);
+    assert.match(content, /\[notice\.model_migrations\][\s\S]*"gpt-5\.3-codex" = "gpt-5\.4"/);
+    assert.match(content, /\[notice\.model_migrations\][\s\S]*"custom-model" = "custom-target"/);
+    assert.match(content, /\[mcp_servers\.context7\][\s\S]*command = "npx"/);
+    assert.match(content, /\[plugins\.example\][\s\S]*enabled = true/);
+    assert.match(content, /\[tui\][\s\S]*theme = "nord"/);
   });
 });
 

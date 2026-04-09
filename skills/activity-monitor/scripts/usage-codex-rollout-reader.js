@@ -8,6 +8,7 @@ const CODEX_DIR = path.join(HOME, '.codex');
 const SQLITE_FILE = path.join(CODEX_DIR, 'state_5.sqlite');
 const SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
 const TAIL_BYTES = 65_536;
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
 function formatResetTime(epochSeconds) {
   if (!epochSeconds) return null;
@@ -56,15 +57,67 @@ function readTailLines(filePath) {
   return buf.toString('utf8').split('\n');
 }
 
-function getActiveRolloutPath() {
+function readHeadLines(filePath) {
+  const stat = fs.statSync(filePath);
+  if (!stat.size) return [];
+
+  const readBytes = Math.min(16_384, stat.size);
+  const buf = Buffer.alloc(readBytes);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    fs.readSync(fd, buf, 0, readBytes, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  return buf.toString('utf8').split('\n');
+}
+
+export function extractRolloutCwdFromLines(lines) {
+  if (!Array.isArray(lines)) return null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]?.trim();
+    if (!line) continue;
+    try {
+      const event = JSON.parse(line);
+      if (event.type === 'session_meta' && event.payload?.cwd) {
+        return event.payload.cwd;
+      }
+    } catch {
+      // ignore malformed lines
+    }
+  }
+  return null;
+}
+
+function rolloutMatchesInstance(filePath, instanceId) {
+  if (!instanceId) return true;
+  try {
+    const cwd = extractRolloutCwdFromLines(readHeadLines(filePath));
+    return typeof cwd === 'string' && cwd.endsWith(`/instances/${instanceId}`);
+  } catch {
+    return false;
+  }
+}
+
+function sqlEscape(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+export function getActiveRolloutPath({
+  instanceId = INSTANCE_ID,
+  execFileSyncImpl = execFileSync,
+  sessionsDir = SESSIONS_DIR,
+} = {}) {
   try {
     const sql = [
       'SELECT rollout_path FROM threads',
       'WHERE archived = 0',
+      instanceId ? `AND cwd LIKE '%${sqlEscape(`/instances/${instanceId}`)}'` : null,
       'ORDER BY updated_at DESC',
       'LIMIT 1;'
-    ].join(' ');
-    const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
+    ].filter(Boolean).join(' ');
+    const out = execFileSyncImpl('sqlite3', [SQLITE_FILE, sql], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -78,8 +131,8 @@ function getActiveRolloutPath() {
     let bestPath = null;
     let bestMtime = 0;
 
-    for (const year of fs.readdirSync(SESSIONS_DIR)) {
-      const yearDir = path.join(SESSIONS_DIR, year);
+    for (const year of fs.readdirSync(sessionsDir)) {
+      const yearDir = path.join(sessionsDir, year);
       for (const month of fs.readdirSync(yearDir)) {
         const monthDir = path.join(yearDir, month);
         for (const day of fs.readdirSync(monthDir)) {
@@ -87,6 +140,7 @@ function getActiveRolloutPath() {
           for (const file of fs.readdirSync(dayDir)) {
             if (!file.startsWith('rollout-') || !file.endsWith('.jsonl')) continue;
             const fullPath = path.join(dayDir, file);
+            if (!rolloutMatchesInstance(fullPath, instanceId)) continue;
             const mtimeMs = fs.statSync(fullPath).mtimeMs;
             if (mtimeMs > bestMtime) {
               bestMtime = mtimeMs;
@@ -139,8 +193,8 @@ export function parseCodexUsageFromRolloutLines(lines) {
   return null;
 }
 
-export function readCodexUsageFromActiveRollout() {
-  const rolloutPath = getActiveRolloutPath();
+export function readCodexUsageFromActiveRollout(opts = {}) {
+  const rolloutPath = getActiveRolloutPath(opts);
   if (!rolloutPath) return null;
 
   try {
