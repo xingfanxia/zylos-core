@@ -182,7 +182,9 @@ These are installed separately from their own repos and must be excluded from rs
 
 ## Upstream Merge
 
-Fork main stays on top of upstream v0.4.10 (last synced 2026-04-02, 41 commits). To merge new upstream:
+Fork main stays on top of upstream v0.4.12 (last synced 2026-04-09). Fork contains 6 squashed feature commits on top of upstream.
+
+### Simple merge (small upstream updates)
 
 ```bash
 cd ~/zylos-core
@@ -193,3 +195,57 @@ git push origin main
 ```
 
 Then follow deploy steps above.
+
+### Rebase (keeps fork history linear on top of upstream)
+
+Preferred when fork commits are clean and upstream updates are small:
+
+```bash
+git fetch upstream
+git rebase upstream/main
+# Resolve conflicts file-by-file if any (typically package.json, CHANGELOG.md)
+git push --force-with-lease origin main
+```
+
+### Squash-cleanup workflow (when fork accumulates many fix-regression chains)
+
+When the fork has accumulated many commits fixing regressions from earlier fork
+work, squash before merging for a cleaner history:
+
+```bash
+# 1. Backup
+git branch backup-main-pre-cleanup main
+git tag backup-pre-cleanup-$(date +%Y%m%d)
+git push origin backup-main-pre-cleanup backup-pre-cleanup-$(date +%Y%m%d)
+
+# 2. Find merge-base with upstream
+MERGE_BASE=$(git merge-base main upstream/main)
+
+# 3. Soft-reset to merge-base, keeping all changes staged
+git checkout -b cleanup-squash main
+git reset --soft $MERGE_BASE
+git reset  # unstage
+
+# 4. Commit in logical groups
+git add <group-1-files> && git commit -m "feat: ..."
+# ... repeat for each group
+
+# 5. Verify tree matches main (zero loss)
+git diff cleanup-squash..main --stat  # should be empty
+
+# 6. Rebase onto upstream/main to pull in new upstream commits
+git rebase upstream/main  # git 3-way merges auto-resolve non-overlapping files
+
+# 7. Run tests
+npm test
+bash test/live-roundtrip-smoke.sh --instance admin --skip-chat-readback
+
+# 8. Force-push when green
+git branch -f main cleanup-squash
+git push --force-with-lease origin main
+
+# 9. Rollback command if needed
+git push --force-with-lease origin backup-main-pre-cleanup:main
+```
+
+Last squash: 2026-04-09 — 67 fork commits → 6 clean commits on upstream v0.4.12.
