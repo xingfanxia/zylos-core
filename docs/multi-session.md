@@ -56,6 +56,12 @@ Extracted dispatch logic with zero imports from the base dispatcher. Receives al
 - Grace period during instance boot (60s)
 - Idle instance reaping
 
+**Skip loop:** `processWithMultiSession` claims items one at a time in a loop (up to `MAX_SKIP_ATTEMPTS=10`). Items that can't be delivered (offline target, suspended, unhealthy, `require_idle` not met) are released/skipped and the loop tries the next item. This prevents head-of-line blocking where an undeliverable item at the front of the queue starves all items behind it.
+
+**`require_idle` settlement:** After delivering a `require_idle=1` message (e.g., scheduled tasks), the dispatcher holds the queue for 5 seconds then waits up to 120s for the target instance to return to idle before dispatching the next item. This prevents flooding a single instance with back-to-back system tasks.
+
+**Known pitfall — stale agent-status:** If an instance's `agent-status.json` shows `busy` but the instance is actually idle (stale status from a crashed/stuck activity monitor), `require_idle=1` items targeting that instance will be skipped indefinitely. The items remain in `pending` status until the status file is corrected or the items are manually expired.
+
 ### User Approval (`skills/comm-bridge/scripts/c4-approve.js`)
 When an unknown **DM user** messages, the flow is:
 1. `isEndpointRouted()` returns false (not in routing table, not a group chat) → message held with `status=pending_approval`
