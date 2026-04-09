@@ -81,6 +81,9 @@ export class HeartbeatEngine {
 
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
+
+    // Cold-start grace period: skip heartbeat processing during warmup
+    this.warmupUntil = 0;
   }
 
   get health() {
@@ -105,6 +108,18 @@ export class HeartbeatEngine {
     const suffix = reason ? ` (${reason})` : '';
     this.deps.log(`Health: ${this.healthState.toUpperCase()} -> ${nextHealth.toUpperCase()}${suffix}`);
     this.healthState = nextHealth;
+  }
+
+  /**
+   * Signal that a cold start is in progress. Suppresses heartbeat processing
+   * for `seconds` to avoid false-positive failures during instance startup.
+   * Also resets health to 'ok' so the instance starts clean.
+   * @param {number} seconds - Grace period duration
+   */
+  notifyColdStart(seconds) {
+    this.warmupUntil = Math.floor(Date.now() / 1000) + seconds;
+    this.setHealth('ok', `cold_start_grace_${seconds}s`);
+    this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
 
   /**
@@ -192,6 +207,9 @@ export class HeartbeatEngine {
   }
 
   processHeartbeat(agentRunning, currentTime) {
+    // Skip processing during cold-start grace period
+    if (currentTime < this.warmupUntil) return;
+
     // Track agentRunning transitions for process signal acceleration
     this._trackAgentRunning(agentRunning, currentTime);
 

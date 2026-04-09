@@ -18,6 +18,7 @@ import path from 'path';
 import os from 'os';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
 /**
  * Get Claude's actual PID by reading the grandparent PID.
@@ -33,7 +34,15 @@ function getClaudePid() {
   } catch { /* best-effort */ }
   return process.ppid;
 }
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+
+// Instance-aware monitor directory
+let MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+if (INSTANCE_ID) {
+  try {
+    const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+    MONITOR_DIR = getMonitorDir(INSTANCE_ID);
+  } catch { /* use default */ }
+}
 const ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
 const STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
 const STATE_LOCK_FILE = `${STATE_FILE}.lock`;
@@ -112,7 +121,7 @@ function atomicWrite(filePath, data) {
 
 let input = '';
 process.stdin.on('data', chunk => { input += chunk; });
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   try {
     const hookData = JSON.parse(input);
     const event = hookData.hook_event_name;
@@ -163,6 +172,21 @@ process.stdin.on('end', () => {
       }
 
       const claudePid = getClaudePid();
+      const now = Date.now();
+
+      // Read existing activity to preserve last_user_activity across events
+      let existingActivity = {};
+      try {
+        if (fs.existsSync(ACTIVITY_FILE)) {
+          existingActivity = JSON.parse(fs.readFileSync(ACTIVITY_FILE, 'utf8'));
+        }
+      } catch { /* best-effort */ }
+
+      // Only update last_user_activity on actual user prompts
+      const lastUserActivity = eventType === 'prompt'
+        ? now
+        : (existingActivity.last_user_activity || now);
+
       atomicWrite(ACTIVITY_FILE, {
         version: 2,
         pid: claudePid,
@@ -172,10 +196,33 @@ process.stdin.on('end', () => {
         active,
         active_tools: state.active_tools,
         in_prompt: state.in_prompt ?? false,
-        updated_at: Date.now()
+        updated_at: now,
+        last_user_activity: lastUserActivity
       });
 
       atomicWrite(STATE_FILE, state);
+
+      // Optional token tracking for multi-session
+      if (INSTANCE_ID) {
+        try {
+          const { recordTokenUsage, closeDb } = await import('./token-tracker.js');
+          const usage = hookData.usage || null;
+          if (usage) {
+            recordTokenUsage(
+              INSTANCE_ID,
+              usage.input_tokens || 0,
+              usage.output_tokens || 0,
+              usage.model || null,
+              usage.cost_usd || 0,
+              {
+                cacheReadTokens: usage.cache_read_tokens || 0,
+                cacheWriteTokens: usage.cache_write_tokens || 0,
+              }
+            );
+          }
+          closeDb();
+        } catch { /* token tracker not available */ }
+      }
     } finally {
       if (hasLock) {
         releaseStateLock();

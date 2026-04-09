@@ -110,7 +110,9 @@ export async function showStatus() {
         console.log(`  ${dim('→ Run: zylos init to complete setup')}`);
       } else {
         // Check runtime status from activity monitor
-        const statusFile = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+        const statusFilePrimary = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+        const statusFileFallback = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+        const statusFile = fs.existsSync(statusFilePrimary) ? statusFilePrimary : statusFileFallback;
         if (fs.existsSync(statusFile)) {
           try {
             const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
@@ -132,7 +134,9 @@ export async function showStatus() {
       }
     } else {
       // Codex: just show status file if available
-      const statusFile = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+      const statusFilePrimaryCodex = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+      const statusFileFallbackCodex = path.join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+      const statusFile = fs.existsSync(statusFilePrimaryCodex) ? statusFilePrimaryCodex : statusFileFallbackCodex;
       if (fs.existsSync(statusFile)) {
         try {
           const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));

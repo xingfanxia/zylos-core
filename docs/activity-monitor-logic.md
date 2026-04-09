@@ -1,7 +1,7 @@
 # Activity Monitor 全链路逻辑梳理
 
 > 基于 `zylos-core` `main` 分支当前实现（`skills/activity-monitor/scripts/activity-monitor.js` v26 注释头）。  
-> 本文描述的是“代码真实行为”，不是历史设计草案。
+> 本文描述的是"代码真实行为"，不是历史设计草案。
 
 ## 1. 目标与边界
 
@@ -10,7 +10,7 @@
 它负责四类事情：
 
 1. 运行态监测：判断 `busy/idle/stopped/offline` 并写状态文件
-2. 存活性校验：通过 heartbeat + C4 control queue 验证“功能可用”，不仅是进程存活
+2. 存活性校验：通过 heartbeat + C4 control queue 验证"功能可用"，不仅是进程存活
 3. 自愈恢复：崩溃重启、失败回退、限流冷却、卡死检测、API 错误快恢复
 4. 定时维护：健康检查、每日升级、每日 memory commit、每日升级检查、usage 监控
 
@@ -43,9 +43,9 @@
    - `daily-memory-commit`（03:00）
    - `daily-upgrade`（05:00，Claude only）
    - `daily-upgrade-check`（06:00）
-8. 恢复 usage 监测状态（`usage.json`）
+8. 恢复 usage 监测状态（`usage.json` / `usage-codex.json`）
 9. 若 adapter 提供 context monitor（Codex），启动 30s 轮询
-10. 10 秒后尝试清理“另一个 runtime”的 tmux 会话（避免双 runtime 并存）
+10. 不再清理"另一个 runtime"的 tmux 会话；当前实现允许 Claude 与 Codex 并存，只做实例级恢复
 
 ## 4. 主循环（每 1 秒）
 
@@ -86,16 +86,31 @@
 6. 执行 3 分钟周期即时探针（非 `engine` 的 2 小时安全网）
 7. 执行 15 秒主动 API 错误扫描（需连续 2 次命中）
 8. 驱动 heartbeat 状态机（`engine.processHeartbeat(true, now)`）
-9. 调度健康检查 / 日任务 / usage 检查
+9. 驱动 SuspendManager（`suspendMgr.tick({currentTime, idleSeconds, claudeRunning: agentRunning, currentTimeHuman})`）
+10. 调度健康检查 / 日任务 / usage 检查
+
+### 4.3 SuspendManager（`suspend-manager.js`）
+
+多实例模式下负责空闲自动挂起和唤醒：
+
+- `tick(ctx)` 每秒被调用一次，需传入完整上下文对象 `{currentTime, idleSeconds, claudeRunning, currentTimeHuman}`
+- 当 `claudeRunning=true` 且 `idleSeconds > idleTimeoutMin * 60` 时，调用 `killTmuxSession()`（通过 `adapter.stop()`）并写 `agent-status.json` 为 `state: 'suspended'`
+- 挂起后 AM 持续运行（PM2 不受影响），在后续 tick 中检测 `wake-signal` 文件或 pending 消息来决定唤醒
+- 唤醒时清除 suspended 状态，Guardian 自动重启 tmux/Claude 会话
+
+**注意：** offline/stopped 分支（L1344/L1434）也调用 `tick()`，但传入 `claudeRunning: false`，仅用于唤醒检测。
 
 ## 5. 活动信号与 busy/idle 判定
 
 活动时间戳优先级：
 
-1. Claude 下优先对话文件 mtime（`~/.claude/projects/.../*.jsonl`）
+1. Claude 下优先对话文件 mtime（`~/.claude/projects/<project-dir>/*.jsonl`）
+   - 多实例模式下，`CONV_DIR` 从 `instanceConfig.getInstanceCwd()` + `fs.realpathSync()` 派生
+   - CC 的 project dir 命名规则：`realpath(cwd).replace(/[/_]/g, '-')`
 2. 失败时回退 tmux `window_activity`
+   - **注意：** 当 API hook 确认空闲（`active=false`, `active_tools=0`）时，tmux activity 会被抑制（Claude statusline 每 30 分钟刷新一次会触发假活动）
 3. 再失败回退当前时间（兜底）
-4. 若 hook 报告 `active=true` 且更“新”，覆盖活动时间戳
+4. 若 hook 报告 `active=true` 且更"新"，覆盖活动时间戳
 
 Hook 数据来自 `api-activity.json`，关键字段：
 
@@ -111,7 +126,7 @@ Hook 数据来自 `api-activity.json`，关键字段：
 
 并且有 hook 新鲜度保护：
 
-- `api-activity.json` 超过 60 秒未更新，`active_tools` 视为陈旧，不参与“确认活跃”
+- `api-activity.json` 超过 60 秒未更新，`active_tools` 视为陈旧，不参与"确认活跃"
 
 ## 6. Heartbeat 状态机（功能存活性）
 
@@ -217,12 +232,12 @@ fast API error 检测：
 
 ### 9.1 Memory Sync 触发职责拆分
 
-下面这张表用于区分“谁负责检测/提示”与“谁真正执行 sync”，避免把 `daily-memory-commit` 和 `Memory Sync` 混为一件事。
+下面这张表用于区分"谁负责检测/提示"与"谁真正执行 sync"，避免把 `daily-memory-commit` 和 `Memory Sync` 混为一件事。
 
 | 职责 | 负责组件 | 触发条件 | 实际动作 |
 | --- | --- | --- | --- |
 | 检测未汇总对话是否超阈值 | `comm-bridge` (`c4-session-init.js`) | session init 时 `unsummarized.count > CHECKPOINT_THRESHOLD` | 计算范围并判定 `needsSync=true` |
-| 向会话注入“需要同步”提示 | `comm-bridge` (`c4-session-init.js`) | `needsSync=true` | 在启动注入文本追加 `Please use zylos-memory skill ...` |
+| 向会话注入"需要同步"提示 | `comm-bridge` (`c4-session-init.js`) | `needsSync=true` | 在启动注入文本追加 `Please use zylos-memory skill ...` |
 | 执行 Memory Sync 主流程 | 当前 runtime agent（按 `zylos-memory/SKILL.md`） | 收到/识别提示后 | 拉取 unsummarized、更新 memory 文件、生成 summary |
 | 写入 C4 checkpoint | `comm-bridge` CLI (`c4-checkpoint.js create`) | Memory Sync 完成且有新对话 | 按 sync 结果写 checkpoint |
 | 每日 memory 快照提交 | `activity-monitor` (`daily-memory-commit`) | 每天 03:00 | 执行 `zylos-memory/scripts/daily-commit.js` 做本地 git snapshot |
@@ -244,10 +259,20 @@ fast API error 检测：
 
 Codex adapter 提供 `CodexContextMonitor`：
 
-1. 每 30 秒轮询 context 使用率（JSONL token_count 优先，SQLite 回退）
+1. 每 30 秒轮询 context 使用率（实例级 JSONL token_count 优先，SQLite 回退）
 2. 超阈值（默认 75%）触发 onExceed：
-   - enqueue `new-session` 控制消息（`priority=1` + `bypass-state`）
+   - enqueue `new-session` 控制消息（`priority=1` + `bypass-state` + `target_instance`）
    - 后续由 runtime 内执行 `new-session` skill 完成 handoff
+
+Codex 当前还会做两层实例级约束：
+
+1. 读取共享 `~/.codex/state_5.sqlite` / rollout 时，按 `cwd` 过滤到当前实例
+2. context ceiling 优先取 `~/.codex/config.toml` 的 `model_context_window`
+
+当前线上已验证：
+
+- fresh Codex 实例 rollout 会报告约 `950000` 的有效窗口（配置的 1M 工作窗口）
+- context handoff 控制消息会定向到触发实例，不再随机落到 admin
 
 ## 11. 关键状态文件
 
@@ -263,7 +288,7 @@ Codex adapter 提供 `CodexContextMonitor`：
 8. `daily-upgrade-state.json`：每日升级去重
 9. `daily-memory-commit-state.json`：每日 memory commit 去重
 10. `upgrade-check-state.json`：每日升级检查去重
-11. `usage.json`：usage 采样与告警状态
+11. `usage.json` / `usage-codex.json`：usage 采样与告警状态
 12. `statusline.json` / `context-monitor-state.json` / `cost-log.jsonl`：Claude context 监控相关
 
 ## 12. 运行时差异（Claude vs Codex）
@@ -275,11 +300,15 @@ Codex adapter 提供 `CodexContextMonitor`：
    - Codex probe 固定返回 `detected=false`
 4. context 轮换路径不同：
    - Claude 用 statusLine + `new-session` 控制消息（优雅）
-   - Codex 用 polling + `new-session` 控制消息（skill 驱动切换）
-5. Daily upgrade 默认关闭，需 `zylos config set daily_upgrade_enabled true` 显式启用
+   - Codex 用 polling + `new-session` 控制消息（skill 驱动切换，且实例级定向）
+5. usage 监控不同：
+   - Claude 顶部 live usage 由 CodexBar CLI 驱动
+   - Codex 顶部 live usage 优先读 rollout rate-limit 快照，必要时才侧车 `/status`
+6. Daily upgrade 默认关闭，需 `zylos config set daily_upgrade_enabled true` 显式启用
 
 ## 13. 当前实现里的已知边界
 
 1. 维护脚本检测目前仅覆盖 Claude（代码内有 TODO）
-2. usage 监控只在 Claude runtime 启用
-3. `activity-monitor` 与 runtime adapter 仍有并行逻辑（注释中标记“待迁移阶段”）
+2. Codex 原始状态仍共享在 `~/.codex`，隔离依赖实例级 `cwd` 归因，而不是独立 per-instance `.codex`
+3. `activity-monitor` 与 runtime adapter 仍有并行逻辑（注释中标记"待迁移阶段"）
+4. Codex auto-compaction 的配置与 handoff 路径已打通，但尚未做一次刻意打满到 800k 的长时间线上压测

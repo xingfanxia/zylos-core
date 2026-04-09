@@ -23,7 +23,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] [--target-instance <id>] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Do not append "reply via" suffix (use for system messages)');
@@ -46,7 +46,8 @@ function parseArgs(args) {
     priority: 3,
     noReply: false,
     requireIdle: false,
-    json: false
+    json: false,
+    targetInstance: null
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -72,6 +73,9 @@ function parseArgs(args) {
         break;
       case '--content':
         result.content = args[++i];
+        break;
+      case '--target-instance':
+        result.targetInstance = args[++i];
         break;
       default:
         if (args[i].startsWith('--')) {
@@ -170,14 +174,14 @@ function emitError(json, code, message, exitCode = 1) {
   process.exit(exitCode);
 }
 
-function main() {
+async function main() {
   const parsed = parseArgs(process.argv.slice(2));
   if (parsed.error) {
     const asJson = process.argv.slice(2).includes('--json');
     emitError(asJson, 'INVALID_ARGS', parsed.error);
   }
 
-  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json } = parsed;
+  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json, targetInstance: explicitTargetInstance } = parsed;
   let channel = rawChannel;
 
   if (!channel && noReply) {
@@ -233,6 +237,15 @@ function main() {
     }
   }
 
+  // Resolve target instance for multi-session routing
+  let targetInstance = explicitTargetInstance;
+  if (!targetInstance) {
+    try {
+      const { resolveInstance } = await import('./c4-instance-router.js');
+      targetInstance = resolveInstance(endpoint);
+    } catch { /* instance router not available */ }
+  }
+
   let replyViaSuffix = '';
   if (!noReply) {
     const scriptDir = __dirname;
@@ -241,6 +254,18 @@ function main() {
   }
 
   const fullMessage = content + replyViaSuffix;
+
+  // Check if unknown endpoint should be held for approval
+  try {
+    const { checkAndHoldForApproval, holdAndNotify } = await import('./c4-approve.js');
+    const held = await checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
+    if (held) {
+      const record = holdAndNotify(channel, endpoint, fullMessage, priority, targetInstance);
+      emitSuccess(json, record.id);
+      close();
+      return;
+    }
+  } catch { /* approval module not available */ }
   let dbContent = fullMessage;
   const byteLength = Buffer.byteLength(fullMessage, 'utf8');
 
@@ -258,7 +283,7 @@ function main() {
   }
 
   try {
-    const record = insertConversation('in', channel, endpoint, dbContent, 'pending', priority, requireIdle);
+    const record = insertConversation('in', channel, endpoint, dbContent, 'pending', priority, requireIdle, targetInstance);
     emitSuccess(json, record.id);
   } catch (err) {
     emitError(json, 'INTERNAL_ERROR', `failed to queue message: ${err.message}`);
