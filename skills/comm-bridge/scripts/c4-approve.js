@@ -120,9 +120,9 @@ async function approveUser(chatId, name) {
     if (config.instances[instanceName]) {
       config.instances[instanceName].type = 'user';
       config.instances[instanceName].auto_suspend = true;
-      config.instances[instanceName].idle_timeout_min = 30;
+      config.instances[instanceName].idle_timeout_min = 360;
       fs.writeFileSync(instancesFile, JSON.stringify(config, null, 2) + '\n');
-      console.log(`Set auto_suspend=true, idle_timeout_min=30 for ${instanceName}`);
+      console.log(`Set auto_suspend=true, idle_timeout_min=360 for ${instanceName}`);
     }
   } catch (err) {
     console.error(`Warning: failed to set auto_suspend (${err.message})`);

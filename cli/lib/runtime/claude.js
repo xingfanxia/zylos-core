@@ -279,18 +279,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
       ? ' -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY'
       : '';
 
-    // Auto-continue: resume the most recent conversation if prior sessions exist.
-    // CC's --continue flag picks up the latest session in the current project dir.
-    let continueFlag = '';
-    try {
-      const realCwd = fs.realpathSync(instanceCwd);
-      const projectDir = path.join(os.homedir(), '.claude', 'projects', realCwd.replace(/[/_]/g, '-'));
-      const hasSession = fs.existsSync(projectDir) &&
-        fs.readdirSync(projectDir).some(f => f.endsWith('.jsonl'));
-      if (hasSession) continueFlag = ' --continue';
-    } catch { /* first launch — no prior session */ }
-
-    const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${continueFlag}${bypassFlag}`;
+    // No --continue: CC's resume locks model to original session and double-injects
+    // context (zylos's c4-session-init hook already restores conversation history).
+    const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'claude-exit.log');

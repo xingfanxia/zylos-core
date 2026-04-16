@@ -40,7 +40,7 @@ export function loadSuspendConfig(instanceId) {
     if (!inst) return null;
     return {
       autoSuspend: inst.auto_suspend === true,
-      idleTimeoutMin: inst.idle_timeout_min || 30,
+      idleTimeoutMin: inst.idle_timeout_min || 360,
     };
   } catch {
     return null;
