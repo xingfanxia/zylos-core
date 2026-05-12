@@ -396,6 +396,30 @@ describe('shouldAutoAckHeartbeat', () => {
       confirmedActive: false
     }), false);
   });
+
+  it('auto-acks idle heartbeat below sustained-idle threshold when a require_idle control is waiting', () => {
+    // Starvation guard: if /clear or any require_idle control is queued, deliver-and-reply
+    // on the heartbeat would reset the idle counter and block the waiting control forever.
+    assert.equal(shouldAutoAckHeartbeat({
+      item: heartbeatItem,
+      agentState: { state: 'idle', health: 'ok', idleSeconds: 1, healthy: true },
+      procState: aliveProc,
+      confirmedActive: false,
+      requireIdleWaiting: true
+    }), true);
+  });
+
+  it('still does not auto-ack when state is not idle even with require_idle waiting', () => {
+    // The starvation guard only widens the idleSeconds gate, not the state gate —
+    // we must not auto-ack while Claude is still actively generating.
+    assert.equal(shouldAutoAckHeartbeat({
+      item: heartbeatItem,
+      agentState: { state: 'busy', health: 'ok', idleSeconds: 0, healthy: true },
+      procState: aliveProc,
+      confirmedActive: false,
+      requireIdleWaiting: true
+    }), false);
+  });
 });
 
 describe('readJsonFileWithRetry', () => {

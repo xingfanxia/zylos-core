@@ -20,6 +20,7 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
 const STATE_PATH = path.join(ZYLOS_DIR, 'memory', 'state.md');
 const DEFAULT_CHILD_TIMEOUT_MS = 2500;
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 let diagnosticModule;
 let diagnosticLoadAttempted = false;
 
@@ -108,12 +109,16 @@ export async function enqueueStartupPrompt(source, {
   // orchestrator's per-step withTimeout budget can actually preempt it.
   // The child's own timeout + SIGKILL remains the hard backstop (bounds the
   // #601-class enqueue hang even if the orchestrator budget is generous).
-  await execFile('node', [
+  const enqueueArgs = [
     controlPath, 'enqueue',
     '--content', prompt,
     '--priority', '2',
-    '--no-ack-suffix'
-  ], {
+    '--no-ack-suffix',
+  ];
+  // Multi-session: route the startup prompt to this instance's queue so it
+  // isn't delivered to the wrong (or default) session.
+  if (INSTANCE_ID) enqueueArgs.push('--target-instance', INSTANCE_ID);
+  await execFile('node', enqueueArgs, {
     timeout: childTimeoutMs,
     killSignal: 'SIGKILL',
   });

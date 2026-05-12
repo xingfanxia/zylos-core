@@ -5,9 +5,9 @@
  */
 
 import { execFileSync } from 'child_process';
+import path from 'path';
 import { readFileSync, existsSync, statSync } from 'fs';
 import net from 'net';
-import path from 'path';
 import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
 import {
   getNextPending,
@@ -16,6 +16,7 @@ import {
   markDelivered,
   getPendingCount,
   getPendingControlCount,
+  hasPendingRequireIdleControl,
   close,
   incrementRetryCount,
   markFailed,
@@ -51,7 +52,7 @@ import {
   PROC_STATE_FILE,
   API_ACTIVITY_FILE,
   STALE_STATUS_THRESHOLD,
-  TMUX_MISSING_WARN_THRESHOLD
+  TMUX_MISSING_WARN_THRESHOLD,
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
@@ -121,19 +122,19 @@ export function readJsonFileWithRetry(filePath, attempts = 3) {
   throw lastErr;
 }
 
-function getAgentState() {
+function getAgentState(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(statusFile)) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'missing' };
     }
 
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     const ageMs = Date.now() - stats.mtimeMs;
     if (ageMs > STALE_STATUS_THRESHOLD) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'stale' };
     }
 
-    const status = readJsonFileWithRetry(AGENT_STATUS_FILE);
+    const status = readJsonFileWithRetry(statusFile);
     let state = status.state;
 
     if (!state && typeof status.idle_seconds === 'number') {
@@ -157,10 +158,11 @@ function getAgentState() {
  * Read proc-state.json written by the activity monitor's ProcSampler.
  * Returns { alive, frozen, ... } or null if unavailable/stale (>30s).
  */
-function readProcState() {
+function readProcState(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(PROC_STATE_FILE)) return null;
-    const data = readJsonFileWithRetry(PROC_STATE_FILE);
+    const procFile = path.join(path.dirname(statusFile), 'proc-state.json');
+    if (!existsSync(procFile)) return null;
+    const data = readJsonFileWithRetry(procFile);
     const age = nowSeconds() - (data.lastSampleAt || 0);
     if (age > 30) return null;
     return data;
@@ -173,10 +175,11 @@ function readProcState() {
  * Check if agent is confirmed active: api-activity.json must show active_tools > 0
  * AND be fresh (updated within 60s). Prevents stale hook state from gating auto-ack.
  */
-function isAgentConfirmedActive() {
+function isAgentConfirmedActive(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(API_ACTIVITY_FILE)) return false;
-    const data = readJsonFileWithRetry(API_ACTIVITY_FILE);
+    const apiFile = path.join(path.dirname(statusFile), 'api-activity.json');
+    if (!existsSync(apiFile)) return false;
+    const data = readJsonFileWithRetry(apiFile);
     const updatedAt = data?.updated_at ? Math.floor(data.updated_at / 1000) : 0;
     const age = nowSeconds() - updatedAt;
     return (data?.active_tools ?? 0) > 0 && age < 60;
@@ -185,12 +188,12 @@ function isAgentConfirmedActive() {
   }
 }
 
-function isAgentStatusFresh() {
+function isAgentStatusFresh(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(statusFile)) {
       return false;
     }
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     return (Date.now() - stats.mtimeMs) <= STALE_STATUS_THRESHOLD;
   } catch {
     return false;
@@ -206,7 +209,7 @@ export function isRecoveryHeartbeatPhase(phase) {
   return phase === 'recovery' || phase === 'post_restart';
 }
 
-export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive }) {
+export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive, requireIdleWaiting = false }) {
   const isHeartbeat = Boolean(item && (item.content || '').includes('Heartbeat check'));
   if (!isHeartbeat) return false;
   const phase = getHeartbeatPhase(item.content);
@@ -230,11 +233,18 @@ export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedA
   // Idle path: only auto-ack the periodic primary probe. Recovery/stuck/down
   // probes must still be delivered end-to-end so the heartbeat engine can
   // observe real failures while the session is idle.
+  //
+  // Starvation guard: when a require_idle control (e.g. /clear) is already
+  // pending behind the sustained-idle threshold, delivering this heartbeat to
+  // Claude would prompt a reply, reset the idle counter, and starve the
+  // waiting control. In that case, auto-ack on any idle moment — the
+  // require_idle check at the consumer side still enforces the threshold for
+  // the actual /clear delivery.
   return (
     phase === 'primary' &&
     agentState?.health === 'ok' &&
     agentState?.state === 'idle' &&
-    agentState?.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS &&
+    (requireIdleWaiting || agentState?.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS) &&
     procState.frozen !== true
   );
 }
@@ -296,20 +306,21 @@ export function checkClaudeFallbackInputBox(capture) {
 
 /**
  * Cursor-based detector: primary signal for all runtimes.
+ * Multi-session: session parameter defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
-export function checkInputBoxByCursor() {
-  const cursorX = getCursorX();
+export function checkInputBoxByCursor(session = TMUX_SESSION) {
+  const cursorX = getCursorX(session);
   if (cursorX < 0) return 'indeterminate';
   if (cursorX > CURSOR_EMPTY_THRESHOLD) return 'has_content';
 
   // cursor_x ≤ threshold — could be truly empty or multi-line wrapped input.
   // Capture the pane and compare prompt line Y with cursor Y.
-  const cursorY = getCursorY();
+  const cursorY = getCursorY(session);
   if (cursorY < 0) return 'indeterminate';
 
   let capture;
   try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
   } catch {
@@ -328,9 +339,10 @@ export function checkInputBoxByCursor() {
  * Unified detector:
  * - Codex: cursor-only.
  * - Claude: cursor-first; if it reports has_content, fallback to text parser.
+ * Multi-session: session defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
-export function checkInputBox() {
-  const cursorState = checkInputBoxByCursor();
+export function checkInputBox(session = TMUX_SESSION) {
+  const cursorState = checkInputBoxByCursor(session);
   if (cursorState !== 'has_content') {
     return cursorState;
   }
@@ -341,7 +353,7 @@ export function checkInputBox() {
 
   let capture;
   try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
   } catch {
@@ -357,12 +369,12 @@ export function isUsageOverlayCapture(capture) {
 }
 
 // Empty prompt threshold: cursor at column 0, 1, or 2 means the input box
-// is empty (cursor sits right after the prompt char, e.g. "❯ " = column 2).
+// is empty (cursor sits right after the prompt char, e.g. ">" = column 2).
 const CURSOR_EMPTY_THRESHOLD = 2;
 
-export function getCursorX() {
+export function getCursorX(session = TMUX_SESSION) {
   try {
-    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_x}'], {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_x}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -373,9 +385,9 @@ export function getCursorX() {
   }
 }
 
-export function getCursorY() {
+export function getCursorY(session = TMUX_SESSION) {
   try {
-    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_y}'], {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_y}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -386,12 +398,12 @@ export function getCursorY() {
   }
 }
 
-async function submitAndVerify() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+async function submitAndVerify(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
-    const state = checkInputBox();
+    const state = checkInputBox(session);
 
     if (state === 'empty') {
       return { verified: true, state: 'empty' };
@@ -400,12 +412,12 @@ async function submitAndVerify() {
     if (state === 'indeterminate') {
       log(`Enter verify attempt ${attempt + 1}: indeterminate state, checking for overlay`);
       try {
-        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
           encoding: 'utf8', stdio: 'pipe', timeout: 5000
         });
         if (isUsageOverlayCapture(capture)) {
           log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-          execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'], { stdio: 'pipe', timeout: 5000 });
+          execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
         }
       } catch { /* capture failed, continue retry loop */ }
       continue;
@@ -413,7 +425,7 @@ async function submitAndVerify() {
 
     // state === 'has_content' — message wasn't submitted, retry Enter
     log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   }
 
   return { verified: false, state: 'has_content' };
@@ -421,6 +433,7 @@ async function submitAndVerify() {
 
 async function sendToTmux(message, options = {}) {
   const strictVerify = options.strictVerify === true;
+  const session = options.session || TMUX_SESSION;
   const acceptShutdownAfterSubmit = options.acceptShutdownAfterSubmit === true;
   const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
@@ -428,7 +441,7 @@ async function sendToTmux(message, options = {}) {
 
   try {
     execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
-    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', TMUX_SESSION], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
   } catch (err) {
     log(`Error pasting to tmux: ${err.message}`);
     logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
@@ -445,7 +458,7 @@ async function sendToTmux(message, options = {}) {
 
   let verifyResult = { verified: false, state: 'indeterminate' };
   try {
-    verifyResult = await submitAndVerify();
+    verifyResult = await submitAndVerify(session);
   } catch (err) {
     log(`Warning: Enter verification error: ${err.message}`);
   }
@@ -504,8 +517,8 @@ function hasAckSuffix(content = '') {
   return content.includes('---- ack via:');
 }
 
-async function handleConversationDeliveryFailure(msg) {
-  const channelHealthy = isAgentStatusFresh();
+async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_FILE) {
+  const channelHealthy = isAgentStatusFresh(statusFile);
 
   if (channelHealthy) {
     const currentCount = msg.retry_count || 0;
@@ -544,11 +557,11 @@ async function handleControlDeliveryFailure(control, reason) {
   log(`Retry ${transition.retry_count} for control id=${control.id}`);
 }
 
-async function waitForRequireIdleSettlement(msgId) {
+async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FILE) {
   log(`block_queue_until_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms before next dispatch`);
   await sleep(REQUIRE_IDLE_POST_SEND_HOLD_MS);
 
-  let state = getAgentState().state;
+  let state = getAgentState(statusFile).state;
   if (state === 'offline' || state === 'stopped') {
     log(`block_queue_until_idle item id=${msgId}: agent state=${state}, continuing`);
     return;
@@ -562,7 +575,7 @@ async function waitForRequireIdleSettlement(msgId) {
   const deadline = Date.now() + REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     await sleep(REQUIRE_IDLE_EXECUTION_POLL_MS);
-    state = getAgentState().state;
+    state = getAgentState(statusFile).state;
     if (state === 'idle' || state === 'offline' || state === 'stopped') {
       log(`block_queue_until_idle item id=${msgId}: settled with agent state=${state}`);
       return;
@@ -572,8 +585,27 @@ async function waitForRequireIdleSettlement(msgId) {
   log(`block_queue_until_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem() {
+function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances } = {}) {
   const current = nowSeconds();
+
+  // When multi-session provides instance IDs, use instance-filtered queries.
+  if (onlineInstanceIds !== null && getNextPendingControlForInstances && getNextPendingForInstances) {
+    const control = getNextPendingControlForInstances(current, onlineInstanceIds);
+    if (control) {
+      if (claimControl(control.id)) {
+        return { ...control, type: 'control' };
+      }
+      return null;
+    }
+
+    const msg = getNextPendingForInstances(onlineInstanceIds);
+    if (msg && claimConversation(msg.id)) {
+      return { ...msg, type: 'conversation' };
+    }
+
+    return null;
+  }
+
   const control = getNextPendingControl(current);
   if (control) {
     if (claimControl(control.id)) {
@@ -608,6 +640,31 @@ function maybeCleanupControlQueue() {
 }
 
 async function processNextMessage() {
+  // Multi-session dispatch hook
+  try {
+    const { processWithMultiSession } = await import('./c4-dispatcher-multi.js');
+    const {
+      getNextPendingForInstances,
+      getPendingTargetInstancesNeedingWake,
+      getNextPendingControlForInstances,
+      markRejected,
+      markControlRejected
+    } = await import('./c4-db-multi.js');
+    return await processWithMultiSession({
+      getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+      releaseItem, isBypassState, shouldAutoAckHeartbeat,
+      handleConversationDeliveryFailure, handleControlDeliveryFailure,
+      waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+      markDelivered, ackControl, log, sleep, nowSeconds,
+      getNextPendingForInstances, getPendingTargetInstancesNeedingWake,
+      getNextPendingControlForInstances,
+      markRejected, markControlRejected,
+    });
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session error: ${e.message}`);
+    // Fall through to single-session logic below
+  }
+
   maybeCleanupControlQueue();
   const timedOut = expireTimedOutControls();
   if (timedOut > 0) {
@@ -659,11 +716,12 @@ async function processNextMessage() {
   if (bypass) {
     const procState = readProcState();
     const confirmed = isAgentConfirmedActive();
-    if (shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive: confirmed })) {
+    const requireIdleWaiting = hasPendingRequireIdleControl();
+    if (shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
       const phase = getHeartbeatPhase(item.content);
       const reason = confirmed
         ? `phase=${phase} /proc alive + active_tools>0 fresh (delta=${procState.lastDelta})`
-        : `phase=${phase} /proc alive + health=ok + idle_seconds=${agentState.idleSeconds}`;
+        : `phase=${phase} /proc alive + health=ok + idle_seconds=${agentState.idleSeconds}${requireIdleWaiting ? ' + require_idle_waiting' : ''}`;
       log(`Auto-acking heartbeat id=${item.id}: ${reason}`);
       ackControl(item.id);
       return { delivered: true, state: agentState.state };
@@ -784,6 +842,13 @@ async function main() {
   close();
   process.exit(0);
 }
+
+export {
+  getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+  releaseItem, handleConversationDeliveryFailure, handleControlDeliveryFailure,
+  waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+  markDelivered, ackControl, log, sleep, nowSeconds,
+};
 
 // PM2 sets argv[1] to its own ProcessContainerFork.js, so classic ESM
 // isMainModule checks are unreliable here. Keep the default auto-start

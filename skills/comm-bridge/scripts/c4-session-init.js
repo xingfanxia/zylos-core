@@ -1,14 +1,20 @@
 #!/usr/bin/env node
 /**
  * C4 Communication Bridge - Session Init
- * Called by session start hook. Outputs context prompt for Claude Code as
- * uniform `=== LABEL ===` blocks (see session-format.js), shared with the
- * memory injection step so the combined session-start context reads
- * consistently:
+ * Called by the SessionStart orchestrator via initC4Session(), which returns
+ * the context string. Emits uniform `=== LABEL ===` blocks (see session-format.js),
+ * shared with the memory injection step so the combined session-start context
+ * reads consistently:
  * - Last checkpoint (summary if present, else a `(no summary …)` fallback so
  *   the block never silently disappears when a checkpoint has a null summary)
  * - Unsummarized conversations (all if ≤ threshold, last N if > threshold)
  * - Memory Sync instruction (only if > threshold)
+ *
+ * Multi-session aware: when ZYLOS_INSTANCE_ID is set, the checkpoint / range /
+ * conversation queries are scoped to that instance. If the instance-scoped query
+ * layer is unavailable, conversation injection is SKIPPED rather than falling
+ * back to unfiltered global queries — injecting nothing is strictly safer than
+ * bleeding other instances' conversations into this session.
  *
  * Usage: node c4-session-init.js
  */
@@ -16,6 +22,8 @@
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
 import { fileURLToPath } from 'node:url';
+
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
 export async function initC4Session() {
   let close = () => {};
@@ -30,8 +38,26 @@ export async function initC4Session() {
     close = closeDb;
     const { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } = await import('./c4-config.js');
 
-    const checkpoint = getLastCheckpoint();
-    const range = getUnsummarizedRange();
+    // Instance-scoped query overrides (loaded lazily, graceful degradation).
+    let getLastCheckpointForInstance = null;
+    let getUnsummarizedRangeForInstance = null;
+    let getUnsummarizedConversationsForInstance = null;
+    let multiLoadFailed = false;
+    if (INSTANCE_ID) {
+      try {
+        const multiMod = await import('./c4-db-multi.js');
+        getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
+        getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
+        getUnsummarizedConversationsForInstance = multiMod.getUnsummarizedConversationsForInstance;
+      } catch (err) {
+        multiLoadFailed = true;
+        console.error(`[c4-session-init] WARN: c4-db-multi.js import failed: ${err.message}`);
+      }
+    }
+
+    const checkpoint = (INSTANCE_ID && getLastCheckpointForInstance)
+      ? getLastCheckpointForInstance(INSTANCE_ID)
+      : getLastCheckpoint();
     const sections = [];
 
     // Always surface the last checkpoint. Summary present → show it; summary
@@ -47,6 +73,21 @@ export async function initC4Session() {
       }
     }
 
+    // Guard: in multi-session mode, never fall back to unfiltered global queries.
+    // Injecting nothing is strictly safer than injecting all instances' conversations.
+    if (INSTANCE_ID && multiLoadFailed) {
+      console.error(`[c4-session-init] Instance ${INSTANCE_ID}: instance-scoped queries unavailable, skipping conversation injection`);
+      sections.push(formatSection(
+        'RECENT CONVERSATIONS',
+        '(instance-scoped query unavailable — skipped to prevent cross-instance bleed)',
+      ));
+      return `${sections.join('\n\n')}\n`;
+    }
+
+    const range = (INSTANCE_ID && getUnsummarizedRangeForInstance)
+      ? getUnsummarizedRangeForInstance(INSTANCE_ID)
+      : getUnsummarizedRange();
+
     if (range.count === 0) {
       sections.push(formatSection('RECENT CONVERSATIONS', 'No new conversations since last checkpoint.'));
       return `${sections.join('\n\n')}\n`;
@@ -54,14 +95,17 @@ export async function initC4Session() {
 
     const needsSync = range.count > CHECKPOINT_THRESHOLD;
 
-    // Get conversations: all if under threshold, last N if over
+    // Get conversations: all if under threshold, last N if over.
+    const getConvos = (INSTANCE_ID && getUnsummarizedConversationsForInstance)
+      ? (limit) => getUnsummarizedConversationsForInstance(INSTANCE_ID, limit != null ? { limit } : undefined)
+      : getUnsummarizedConversations;
     const conversations = needsSync
-      ? getUnsummarizedConversations(SESSION_INIT_RECENT_COUNT)
-      : getUnsummarizedConversations();
+      ? getConvos(SESSION_INIT_RECENT_COUNT)
+      : getConvos();
 
     sections.push(formatSection('RECENT CONVERSATIONS', formatConversations(conversations)));
 
-    // If over threshold, append Memory Sync instruction
+    // If over threshold, append Memory Sync instruction.
     if (needsSync) {
       sections.push(formatSection(
         'ACTION REQUIRED',

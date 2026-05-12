@@ -15,6 +15,34 @@ const __dirname = path.dirname(__filename);
 
 const INIT_SQL_PATH = path.join(__dirname, '..', 'init-db.sql');
 
+// Run pending SQL migrations from the migrations/ directory (sync, inline)
+function _runMigrations(database) {
+  const migrationsDir = path.join(__dirname, '..', 'migrations');
+  if (!fs.existsSync(migrationsDir)) return;
+
+  try {
+    database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
+      name TEXT PRIMARY KEY,
+      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    const files = fs.readdirSync(migrationsDir)
+      .filter(f => f.endsWith('.sql'))
+      .sort();
+
+    for (const file of files) {
+      const applied = database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(file);
+      if (applied) continue;
+
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      database.exec(sql);
+      database.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
+    }
+  } catch (err) {
+    console.error(`[c4-db] Migration error: ${err.message}`);
+  }
+}
+
 let db = null;
 
 /**
@@ -35,6 +63,9 @@ export function getDb() {
 
     if (isNew) {
       initSchema();
+    } else {
+      // Run pending migrations for existing databases (e.g., adding target_instance column)
+      _runMigrations(db);
     }
 
     ensureConversationsSchema(db);
@@ -131,7 +162,7 @@ function ensureStatusNoticeCooldownSchema(database) {
  * @param {boolean} requireIdle - whether to wait for Claude idle state (default: false)
  * @returns {object} - inserted record with id
  */
-export function insertConversation(direction, channel, endpointId, content, status = null, priority = 3, requireIdle = false, deliveryAction = null) {
+export function insertConversation(direction, channel, endpointId, content, status = null, priority = 3, requireIdle = false, deliveryAction = null, targetInstance = null) {
   const db = getDb();
 
   // Default status: 'pending' for incoming, 'delivered' for outgoing
@@ -140,11 +171,11 @@ export function insertConversation(direction, channel, endpointId, content, stat
   const requireIdleVal = requireIdle ? 1 : 0;
 
   const stmt = db.prepare(`
-    INSERT INTO conversations (direction, channel, endpoint_id, content, status, delivery_action, priority, require_idle)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO conversations (direction, channel, endpoint_id, content, status, delivery_action, priority, require_idle, target_instance)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  const result = stmt.run(direction, channel, endpointId, content, finalStatus, deliveryAction, priority, requireIdleVal);
+  const result = stmt.run(direction, channel, endpointId, content, finalStatus, deliveryAction, priority, requireIdleVal, targetInstance);
 
   return {
     id: result.lastInsertRowid,
@@ -156,6 +187,7 @@ export function insertConversation(direction, channel, endpointId, content, stat
     delivery_action: deliveryAction,
     priority,
     require_idle: requireIdleVal,
+    target_instance: targetInstance,
     retry_count: 0
   };
 }
@@ -230,7 +262,7 @@ export function getStatusNoticeCooldowns() {
 export function getNextPending() {
   const db = getDb();
   return db.prepare(`
-    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count
+    SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count, target_instance
     FROM conversations
     WHERE direction = 'in' AND status = 'pending'
     ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
@@ -323,6 +355,25 @@ export function getPendingControlCount() {
 }
 
 /**
+ * Check whether any pending control item is waiting on require_idle.
+ * Used by the dispatcher to widen heartbeat auto-ack when a require_idle
+ * control (e.g. /clear) is blocked behind a sustained-idle threshold —
+ * delivering heartbeats in that window resets the idle counter and starves
+ * the require_idle item indefinitely.
+ *
+ * @returns {boolean}
+ */
+export function hasPendingRequireIdleControl() {
+  const db = getDb();
+  const result = db.prepare(`
+    SELECT 1 FROM control_queue
+    WHERE status = 'pending' AND require_idle = 1
+    LIMIT 1
+  `).get();
+  return Boolean(result);
+}
+
+/**
  * Insert a control queue record
  * @param {string} content - instruction content
  * @param {object} options - queue options
@@ -337,7 +388,8 @@ export function insertControl(content, options = {}) {
     bypassState = false,
     ackDeadlineAt = null,
     availableAt = null,
-    appendAckSuffix = true
+    appendAckSuffix = true,
+    targetInstance = null
   } = options;
 
   const tx = database.transaction(() => {
@@ -345,9 +397,9 @@ export function insertControl(content, options = {}) {
     const insertStmt = database.prepare(`
       INSERT INTO control_queue (
         raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-        status, retry_count, available_at, last_error, created_at, updated_at
+        status, retry_count, available_at, last_error, created_at, updated_at, target_instance
       )
-      VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?, ?)
     `);
 
     const result = insertStmt.run(
@@ -359,7 +411,8 @@ export function insertControl(content, options = {}) {
       ackDeadlineAt,
       availableAt,
       current,
-      current
+      current,
+      targetInstance
     );
 
     const id = Number(result.lastInsertRowid);
@@ -392,7 +445,7 @@ export function insertControl(content, options = {}) {
 
     const row = database.prepare(`
       SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-             status, retry_count, available_at, last_error, created_at, updated_at
+             status, retry_count, available_at, last_error, created_at, updated_at, target_instance
       FROM control_queue
       WHERE id = ?
     `).get(id);
@@ -415,7 +468,7 @@ export function getControlById(id) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-           status, retry_count, available_at, last_error, created_at, updated_at
+           status, retry_count, available_at, last_error, created_at, updated_at, target_instance
     FROM control_queue
     WHERE id = ?
   `).get(id) || null;
@@ -430,7 +483,7 @@ export function getNextPendingControl(current = nowSeconds()) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-           status, retry_count, available_at, last_error, created_at, updated_at
+           status, retry_count, available_at, last_error, created_at, updated_at, target_instance
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
@@ -636,7 +689,7 @@ export function getUnsummarizedRange() {
   ).get();
   const afterId = lastCheckpoint?.end_conversation_id || 0;
   const result = db.prepare(
-    'SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count FROM conversations WHERE id > ?'
+    "SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count FROM conversations WHERE id > ? AND status = 'delivered'"
   ).get(afterId);
   return {
     begin_id: result?.begin_id || null,
@@ -659,12 +712,12 @@ export function getUnsummarizedConversations(limit = null) {
 
   if (limit) {
     return db.prepare(
-      'SELECT * FROM (SELECT * FROM conversations WHERE id > ? ORDER BY id DESC LIMIT ?) ORDER BY id ASC'
+      "SELECT * FROM (SELECT * FROM conversations WHERE id > ? AND status = 'delivered' ORDER BY id DESC LIMIT ?) ORDER BY id ASC"
     ).all(afterId, limit);
   }
 
   return db.prepare(
-    'SELECT * FROM conversations WHERE id > ? ORDER BY id ASC'
+    "SELECT * FROM conversations WHERE id > ? AND status = 'delivered' ORDER BY id ASC"
   ).all(afterId);
 }
 
@@ -735,7 +788,9 @@ export function close() {
 }
 
 // CLI mode
-const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// realpathSync handles symlinked invocation (e.g. ~/zylos -> /home/x_computelabs_ai/zylos):
+// Node resolves import.meta.url to the realpath but leaves argv[1] as-passed.
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
 
 if (isMainModule) {
   const args = process.argv.slice(2);

@@ -14,6 +14,7 @@
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { getZylosConfig } from '../config.js';
+import { getInstanceRuntime } from '../../../skills/multi-session/runtime-files.js';
 
 // ── Runtime registry ──────────────────────────────────────────────────────
 
@@ -73,5 +74,24 @@ export function getAdapter(name, config) {
 export function getActiveAdapter(config) {
   const cfg = config ?? getZylosConfig();
   const runtime = cfg.runtime ?? 'claude';
+  return getAdapter(runtime, cfg);
+}
+
+/**
+ * Get an adapter instance for a specific instance.
+ * Falls back to the globally configured runtime in single-session mode.
+ *
+ * @param {object} [opts]
+ * @param {string|null} [opts.instanceId]
+ * @param {object} [opts.config]
+ * @param {string} [opts.zylosDir]
+ * @returns {import('./base.js').RuntimeAdapter}
+ */
+export function getAdapterForInstance(opts = {}) {
+  const cfg = opts.config ?? getZylosConfig();
+  const runtime = getInstanceRuntime({
+    zylosDir: opts.zylosDir,
+    instanceId: opts.instanceId,
+  });
   return getAdapter(runtime, cfg);
 }

@@ -11,6 +11,12 @@ export const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos
 export const MEMORY_DIR = path.join(ZYLOS_DIR, 'memory');
 export const SESSIONS_DIR = path.join(MEMORY_DIR, 'sessions');
 
+// Multi-session path constants
+export const SHARED_DIR = fs.existsSync(path.join(MEMORY_DIR, 'shared'))
+  ? path.join(MEMORY_DIR, 'shared')
+  : MEMORY_DIR;
+export const INSTANCES_DIR = path.join(MEMORY_DIR, 'instances');
+
 export const BUDGETS = {
   'identity.md': 16 * 1024,
   'state.md': 16 * 1024,
@@ -85,6 +91,68 @@ export function walkFiles(rootDir, prefix = '', depth = 0) {
   }
 
   return out;
+}
+
+/**
+ * Resolve a file path in shared/ if it exists, else fall back to MEMORY_DIR.
+ * @param {string} filename - File name (e.g., 'identity.md')
+ * @returns {string} Absolute path
+ */
+export function resolveSharedFile(filename) {
+  const sharedPath = path.join(SHARED_DIR, filename);
+  if (fs.existsSync(sharedPath)) return sharedPath;
+  return path.join(MEMORY_DIR, filename);
+}
+
+/**
+ * Resolve the directory for a specific instance.
+ * @param {string} instanceId
+ * @returns {string} Absolute path to INSTANCES_DIR/<id>/
+ */
+export function resolveInstanceDir(instanceId) {
+  return path.join(INSTANCES_DIR, instanceId);
+}
+
+/**
+ * Resolve a file path within an instance's directory.
+ * @param {string} instanceId
+ * @param {string} filename
+ * @returns {string} Absolute path
+ */
+export function resolveInstanceFile(instanceId, filename) {
+  return path.join(INSTANCES_DIR, instanceId, filename);
+}
+
+/**
+ * Resolve sessions directory. Instance-specific when instanceId is provided.
+ * @param {string} [instanceId] - Optional instance ID
+ * @returns {string} Absolute path to sessions directory
+ */
+export function resolveSessionsDir(instanceId) {
+  if (instanceId) {
+    return path.join(INSTANCES_DIR, instanceId, 'sessions');
+  }
+  return SESSIONS_DIR;
+}
+
+/**
+ * Return array of reference file paths from shared/reference/ or MEMORY_DIR/reference/.
+ * @returns {string[]} Absolute paths to existing reference files
+ */
+export function resolveReferenceFiles() {
+  const results = [];
+  for (const relPath of REFERENCE_FILES) {
+    const sharedPath = path.join(SHARED_DIR, relPath);
+    if (fs.existsSync(sharedPath)) {
+      results.push(sharedPath);
+      continue;
+    }
+    const defaultPath = path.join(MEMORY_DIR, relPath);
+    if (fs.existsSync(defaultPath)) {
+      results.push(defaultPath);
+    }
+  }
+  return results;
 }
 
 export function dateInTimeZone(date, tz) {

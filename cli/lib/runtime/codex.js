@@ -25,6 +25,9 @@ import { buildInstructionFile } from './instruction-builder.js';
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
 import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../config.js';
+// writeCodexConfig is lazy-loaded inside launch() — top-level import would pull
+// runtime-setup.js (which imports spawnSync) and break test module mocks that
+// don't include spawnSync in their child_process namedExports.
 import {
   tmuxHasSession,
   tmuxGetPanePid,
@@ -43,7 +46,7 @@ import { ensureCodexHooksTrusted } from '../codex-hooks.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'codex-main';
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'codex-main';
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 
 // When CODEX_BYPASS_PERMISSIONS=false, skip --dangerously-bypass-approvals-and-sandbox.
@@ -72,7 +75,7 @@ function getCodexApiBaseUrl() {
 export class CodexAdapter extends RuntimeAdapter {
   get displayName() { return 'Codex'; }
   get runtimeId() { return 'codex'; }
-  get sessionName()  { return 'codex-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -237,6 +240,30 @@ export class CodexAdapter extends RuntimeAdapter {
     // 1. Build AGENTS.md before launching (pass memorySnapshot for session rotation)
     await this.buildInstructionFile({ memorySnapshot: opts.memorySnapshot });
 
+    // 1b. Resolve per-instance working directory so each Codex instance gets
+    // its own AGENTS.md overlay, memory context, and trusted worktree.
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+      } catch (err) {
+        console.error(`[CodexAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
+    // Keep Codex trust config fresh for both the shared root and any per-instance cwd.
+    // Lazy-imported to keep test mocks (no spawnSync) working — see note at top.
+    let writeCodexConfig;
+    try { ({ writeCodexConfig } = await import('../runtime-setup.js')); } catch { /* test stub */ }
+    if (writeCodexConfig) {
+      try { writeCodexConfig(ZYLOS_DIR); } catch { /* best effort */ }
+      if (instanceCwd !== ZYLOS_DIR) {
+        try { writeCodexConfig(instanceCwd); } catch { /* best effort */ }
+      }
+    }
+
     // 1.5. Ensure .agents/skills → .claude/skills symlink for Codex skill discovery.
     const agentsDir = path.join(ZYLOS_DIR, '.agents');
     const agentsSkillsPath = path.join(agentsDir, 'skills');
@@ -250,9 +277,12 @@ export class CodexAdapter extends RuntimeAdapter {
     }
 
     // 2. Native SessionStart hook trust is required for startup context.
+    // Scope trust to the per-instance cwd so a Codex process launched from an
+    // instance directory picks up the trusted SessionStart hook (the hook script
+    // itself lives under the shared ZYLOS_DIR).
     ensureCodexHooksTrusted({
       zylosDir: ZYLOS_DIR,
-      projectDir: ZYLOS_DIR,
+      projectDir: instanceCwd,
       codexBin: CODEX_BIN,
     });
 
@@ -264,9 +294,21 @@ export class CodexAdapter extends RuntimeAdapter {
     const exitLogFile = path.join(monitorDir, 'codex-exit.log');
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
+    // Codex pane reuse: upstream v0.5.0 allows reusing the tmux pane (after Codex
+    // exits, the parent shell is still alive); we keep that behavior. For the
+    // multi-session fork we additionally propagate instance identity into env
+    // and use the per-instance cwd.
     if (tmuxHasSession(SESSION)) {
-      // Existing tmux session — start a fresh Codex process. SessionStart fires.
-      const cmd = `cd "${ZYLOS_DIR}"; ${codexCmd}; ${exitLogSnippet}`;
+      // Existing tmux session — start a fresh Codex process; the native
+      // SessionStart hook fires and bootstraps startup context. Re-export
+      // instance identity so subsequent in-session restarts inherit it, and
+      // cd to the per-instance cwd.
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${codexCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
@@ -278,6 +320,11 @@ export class CodexAdapter extends RuntimeAdapter {
         ? buildCleanEnv({ processEnv: process.env, dotenvVars, manifest, uid: process.getuid?.() })
         : buildCompatEnv({ processEnv: process.env, dotenvVars });
 
+      // Multi-session: propagate instance identity into the launched Codex process
+      // so its hooks/skills write to the correct per-instance paths.
+      if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
+      if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
+
       // Build launch spec — Codex reads auth from ~/.codex/auth.json via HOME
       const args = [];
       if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox');
@@ -287,7 +334,7 @@ export class CodexAdapter extends RuntimeAdapter {
         command: CODEX_BIN,
         args,
         env,
-        cwd: ZYLOS_DIR,
+        cwd: instanceCwd,
         exitLogFile,
       });
 

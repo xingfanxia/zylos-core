@@ -1,6 +1,21 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
-import { parseCodexUsageFromRolloutLines } from '../usage-codex-rollout-reader.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, it } from 'node:test';
+import {
+  extractRolloutCwdFromLines,
+  getActiveRolloutPath,
+  parseCodexUsageFromRolloutLines,
+} from '../usage-codex-rollout-reader.js';
+
+const tmpDirs = [];
+
+afterEach(() => {
+  while (tmpDirs.length > 0) {
+    fs.rmSync(tmpDirs.pop(), { recursive: true, force: true });
+  }
+});
 
 describe('usage-codex-rollout-reader', () => {
   it('parses primary and secondary rate limits from token_count events', () => {
@@ -62,5 +77,45 @@ describe('usage-codex-rollout-reader', () => {
     ];
 
     assert.equal(parseCodexUsageFromRolloutLines(lines), null);
+  });
+
+  it('extracts cwd from rollout session metadata', () => {
+    const cwd = extractRolloutCwdFromLines([
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { cwd: '/home/xingfanxia/zylos/instances/admin' },
+      }),
+    ]);
+
+    assert.equal(cwd, '/home/xingfanxia/zylos/instances/admin');
+  });
+
+  it('scopes filesystem fallback rollout lookup to the requested instance', () => {
+    const sessionsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-rollout-test-'));
+    tmpDirs.push(sessionsDir);
+
+    const todayDir = path.join(sessionsDir, '2026', '04', '01');
+    fs.mkdirSync(todayDir, { recursive: true });
+
+    const adminPath = path.join(todayDir, 'rollout-admin.jsonl');
+    const bettyPath = path.join(todayDir, 'rollout-betty.jsonl');
+
+    fs.writeFileSync(adminPath, `${JSON.stringify({ type: 'session_meta', payload: { cwd: '/home/xingfanxia/zylos/instances/admin' } })}\n`);
+    fs.writeFileSync(bettyPath, `${JSON.stringify({ type: 'session_meta', payload: { cwd: '/home/xingfanxia/zylos/instances/user-betty' } })}\n`);
+
+    const earlier = new Date('2026-04-01T08:00:00.000Z');
+    const later = new Date('2026-04-01T09:00:00.000Z');
+    fs.utimesSync(adminPath, earlier, earlier);
+    fs.utimesSync(bettyPath, later, later);
+
+    const chosen = getActiveRolloutPath({
+      instanceId: 'admin',
+      sessionsDir,
+      execFileSyncImpl: () => {
+        throw new Error('sqlite unavailable');
+      },
+    });
+
+    assert.equal(chosen, adminPath);
   });
 });

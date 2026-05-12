@@ -38,7 +38,8 @@ import { buildCleanEnv, buildCompatEnv, loadRuntimeEnvManifest, writeLaunchSpec 
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'claude-main';
+// Multi-session: allow ZYLOS_TMUX_SESSION env var to override the default
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'claude-main';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 // When CLAUDE_BYPASS_PERMISSIONS=false, skip --dangerously-skip-permissions.
@@ -76,7 +77,7 @@ function _parseEnvValue(content, key) {
 export class ClaudeAdapter extends RuntimeAdapter {
   get displayName() { return 'Claude Code'; }
   get runtimeId() { return 'claude'; }
-  get sessionName()  { return 'claude-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -245,8 +246,21 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // 1. Build instruction file before launching
     await this.buildInstructionFile();
 
+    // 1b. Resolve per-instance working directory (token tracking isolation)
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+      } catch (err) {
+        console.error(`[ClaudeAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
     // 2. Pre-accept onboarding/trust dialogs (all auth methods)
     _ensureOnboardingComplete(ZYLOS_DIR);
+    if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
 
     // 3. Detect auth method to avoid "Auth conflict" errors
     const useCredentialsFile = _hasCredentialsFile();
@@ -284,6 +298,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
     const envStripFlags = hasNativeAuth
       ? ' -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY'
       : '';
+
+    // No --continue: CC's resume locks model to original session and double-injects
+    // context (zylos's c4-session-init hook already restores conversation history).
     const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
@@ -291,8 +308,14 @@ export class ClaudeAdapter extends RuntimeAdapter {
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
     if (tmuxHasSession(SESSION)) {
-      // Existing session — send command via sendMessage, no env rebuild
-      const cmd = `cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
+      // Existing session — send command via sendMessage, no env rebuild.
+      // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
@@ -306,6 +329,11 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
       // Strip vars that cause Claude to refuse startup ("already running" detection)
       for (const v of ENV_VARS_TO_STRIP) delete env[v];
+
+      // Multi-session: propagate instance identity into the launched Claude process
+      // so its hooks/skills write to the correct per-instance paths.
+      if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
+      if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
 
       // Inject auth tokens
       if (hasNativeAuth) {
@@ -326,7 +354,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         command: CLAUDE_BIN,
         args,
         env,
-        cwd: ZYLOS_DIR,
+        cwd: instanceCwd,
         exitLogFile,
       });
 

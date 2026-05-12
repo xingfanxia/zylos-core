@@ -7,9 +7,14 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR } from './shared.js';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
+import { describeMemoryWritePolicy } from '../../multi-session/memory-policy.js';
+import {
+  getInstanceInstructionFiles,
+  getInstanceRuntime,
+} from '../../multi-session/runtime-files.js';
 
 let diagnosticModule;
 let diagnosticLoadAttempted = false;
@@ -51,13 +56,97 @@ function section(label, filePath) {
   return formatSection(label, content);
 }
 
-export function injectMemory() {
+function inlineSection(label, content) {
+  return formatSection(label, content);
+}
+
+function getMemoryDir(zylosDir) {
+  return path.join(zylosDir, 'memory');
+}
+
+function resolveSharedMemoryFile(zylosDir, filename) {
+  const memoryDir = getMemoryDir(zylosDir);
+  const sharedDir = fs.existsSync(path.join(memoryDir, 'shared'))
+    ? path.join(memoryDir, 'shared')
+    : memoryDir;
+  const sharedPath = path.join(sharedDir, filename);
+  if (fs.existsSync(sharedPath)) return sharedPath;
+  return path.join(memoryDir, filename);
+}
+
+function resolveInstanceMemoryFile(zylosDir, instanceId, filename) {
+  return path.join(getMemoryDir(zylosDir), 'instances', instanceId, filename);
+}
+
+/**
+ * Check if an instance should receive the cross-instance activity digest.
+ * User-type instances should NOT see other users' activity to prevent identity confusion.
+ * Returns true for admin (primary), scheduler, group, and unknown/single-session mode.
+ */
+function _isDigestEligible(instanceId, zylosDir) {
+  if (!instanceId) return true; // single-session mode
+  try {
+    const instancesFile = path.join(zylosDir, 'instances.json');
+    const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
+    const inst = config?.instances?.[instanceId];
+    if (!inst) return true; // unknown instance, allow by default
+    return inst.primary === true ||
+           inst.type === 'group' ||
+           config.scheduler_instance === instanceId;
+  } catch {
+    return true; // can't read config, allow by default
+  }
+}
+
+export function getStartupMemoryContextParts({
+  zylosDir = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
+  instanceId = process.env.ZYLOS_INSTANCE_ID || null,
+  runtime = null,
+} = {}) {
+  const activeRuntime = runtime || getInstanceRuntime({ zylosDir, instanceId });
   const parts = [
-    section('BOT IDENTITY', path.join(MEMORY_DIR, 'identity.md')),
-    section('ACTIVE STATE', path.join(MEMORY_DIR, 'state.md')),
-    section('REFERENCES', path.join(MEMORY_DIR, 'references.md'))
+    section('BOT IDENTITY', resolveSharedMemoryFile(zylosDir, 'identity.md')),
+    section('ACTIVE STATE', instanceId
+      ? resolveInstanceMemoryFile(zylosDir, instanceId, 'state.md')
+      : path.join(getMemoryDir(zylosDir), 'state.md')),
+    section('REFERENCES', resolveSharedMemoryFile(zylosDir, 'references.md'))
   ];
 
+  // Shared context digest (cross-instance awareness)
+  // Only inject for admin/scheduler/group — user instances don't need other users' activity,
+  // and the cross-user references can cause identity confusion.
+  if (_isDigestEligible(instanceId, zylosDir)) {
+    const digestPath = resolveSharedMemoryFile(zylosDir, 'recent-activity.md');
+    const digestResult = readFileSafe(digestPath);
+    if (digestResult.ok && digestResult.content.trim()) {
+      parts.push(section('CROSS-INSTANCE CONTEXT', digestPath));
+    }
+  }
+
+  if (instanceId) {
+    parts.push(inlineSection(
+      'MEMORY WRITE POLICY',
+      describeMemoryWritePolicy({ instanceId, instancesFilePath: path.join(zylosDir, 'instances.json') })
+    ));
+
+    for (const entry of getInstanceInstructionFiles({ zylosDir, instanceId, runtime: activeRuntime })) {
+      const result = readFileSafe(entry.path);
+      if (result.ok && result.content && result.content.trim().length > 0) {
+        parts.push(inlineSection(entry.label, result.content));
+      }
+    }
+  }
+
+  return parts;
+}
+
+/**
+ * Assemble the session-start memory context. Returns a string terminated by a
+ * trailing newline. Invoked by the SessionStart orchestrator (writeStdout step)
+ * and by the standalone CLI below.
+ */
+export function injectMemory() {
+  const parts = getStartupMemoryContextParts();
   return `${parts.join('\n\n')}\n`;
 }
 
@@ -72,7 +161,7 @@ async function runCli() {
   }
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
   runCli().catch(() => {
     // Best-effort.
   });

@@ -184,7 +184,17 @@ const __dirname = path.dirname(__filename);
 
 // Core runtime config
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+// Multi-session (fork): each instance gets its own activity-monitor state dir.
+// getMonitorDir() honors ZYLOS_INSTANCE_ID + instances.json `state_dir` override,
+// falling back to ~/zylos/activity-monitor when no instance is set (single-session).
+const {
+  getInstanceId: _getInstanceId,
+  getMonitorDir: _getInstanceMonitorDir,
+  isPrimary: _isInstancePrimary,
+  isInstanceEnabled: _isInstanceEnabled,
+} = await import('../../multi-session/instance-config.js').catch(() => ({}));
+const INSTANCE_ID = _getInstanceId ? _getInstanceId() : null;
+const MONITOR_DIR = _getInstanceMonitorDir ? _getInstanceMonitorDir() : path.join(ZYLOS_DIR, 'activity-monitor');
 const STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
 const AM_SOCKET_FILE = path.join(MONITOR_DIR, 'am.sock');
 const MESSAGE_ROUTER_CACHE_FILE = path.join(MONITOR_DIR, 'message-router-probe-cache.json');
@@ -403,7 +413,10 @@ function atomicWriteJson(filePath, value) {
 }
 
 function writeStatusFile(statusObj) {
-  writeStatus({ statusFile: STATUS_FILE, statusObj, healthEngine: engine });
+  // Stamp every status write with the instance id (multi-session: dashboard + downstream
+  // consumers expect this field to disambiguate per-instance status files).
+  const enriched = INSTANCE_ID ? { ...statusObj, instance_id: INSTANCE_ID } : statusObj;
+  writeStatus({ statusFile: STATUS_FILE, statusObj: enriched, healthEngine: engine });
 }
 
 function buildNotRunningStatus({

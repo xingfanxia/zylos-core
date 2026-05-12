@@ -11,6 +11,19 @@
 
 import { createCheckpoint, getCheckpoints, getLastCheckpoint, close } from './c4-db.js';
 
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+// Instance-scoped checkpoint functions (optional)
+let _createCheckpointForInstance = null;
+let _getLastCheckpointForInstance = null;
+try {
+  const multiMod = await import('./c4-db-multi.js');
+  _createCheckpointForInstance = multiMod.createCheckpointForInstance;
+  _getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
+} catch {
+  // c4-db-multi.js not available — use global functions
+}
+
 function usage() {
   console.error('Usage: c4-checkpoint.js <command> [options]');
   console.error('  create <end_conversation_id> [--summary "<summary>"]');
@@ -54,8 +67,11 @@ function handleCreate(args) {
   }
 
   const summary = parseStringArg(args, '--summary');
+  const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
 
-  const result = createCheckpoint(endConversationId, summary);
+  const result = (targetInstance && _createCheckpointForInstance)
+    ? _createCheckpointForInstance(endConversationId, summary, targetInstance)
+    : createCheckpoint(endConversationId, summary);
   console.log('Checkpoint created:', JSON.stringify(result));
 }
 
@@ -73,7 +89,10 @@ function handleList(args) {
 }
 
 function handleLatest() {
-  const row = getLastCheckpoint();
+  const targetInstance = INSTANCE_ID;
+  const row = (targetInstance && _getLastCheckpointForInstance)
+    ? _getLastCheckpointForInstance(targetInstance)
+    : getLastCheckpoint();
   if (!row) {
     errorExit('no checkpoints found');
   }

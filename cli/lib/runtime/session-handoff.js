@@ -19,6 +19,7 @@ import os from 'node:os';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
 /**
  * Enqueue a new-session control message via C4 communication bridge.
@@ -32,9 +33,19 @@ const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-c
  * @param {number}  opts.ceiling     Token ceiling
  * @param {string}  [opts.runtime='claude']  Runtime id ('claude' | 'codex')
  * @param {number}  [opts.maxRetries=3]  Maximum enqueue attempts
+ * @param {string|null} [opts.instanceId] Target instance for the handoff control
+ * @param {Function} [opts.execFileSyncImpl] Test hook for subprocess execution
  * @returns {boolean} true if enqueued successfully
  */
-export function enqueueNewSession({ ratio = 0, used = 0, ceiling = 0, runtime = 'claude', maxRetries = 3 } = {}) {
+export function enqueueNewSession({
+  ratio = 0,
+  used = 0,
+  ceiling = 0,
+  runtime = 'claude',
+  maxRetries = 3,
+  instanceId = INSTANCE_ID,
+  execFileSyncImpl = execFileSync,
+} = {}) {
   const pct = Math.round(ratio * 100);
   const base =
     `Context usage at ${pct}% ` +
@@ -43,15 +54,21 @@ export function enqueueNewSession({ ratio = 0, used = 0, ceiling = 0, runtime = 
   const content = runtime === 'codex'
     ? `${base} Run $new-session now and follow SKILL.md in order. Write/send the session handoff summary before the final session-switch command; do not skip checklist steps. Send the full session handoff summary only to the internal web-console channel; do not post it to the active external user channel.`
     : `${base} Use the new-session skill to start a fresh session.`;
+  const args = [
+    C4_CONTROL, 'enqueue',
+    '--content', content,
+    '--priority', '1',
+    '--bypass-state',
+    '--block-queue-until-idle',
+    '--no-ack-suffix',
+  ];
+  if (instanceId) {
+    args.push('--target-instance', instanceId);
+  }
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      execFileSync('node', [C4_CONTROL, 'enqueue',
-        '--content', content,
-        '--priority', '1',
-        '--bypass-state',
-        '--no-ack-suffix',
-      ], { encoding: 'utf8', stdio: 'pipe', timeout: 10_000 });
+      execFileSyncImpl('node', args, { encoding: 'utf8', stdio: 'pipe', timeout: 10_000 });
       return true;
     } catch {
       if (attempt === maxRetries) return false;

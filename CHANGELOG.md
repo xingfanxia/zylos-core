@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fork
+- Rebased multi-session v2 + local activity-monitor/runtime patches onto upstream v0.5.3 (was v0.5.0). Adopted upstream's `smol-toml` codex-config rework, dropping the fork's superseded manual-TOML codex config. Multi-session, per-instance gh-config isolation, and the context hard-ceiling forced reset are preserved.
+
 ## [0.5.3] - 2026-06-17
 
 ### Added
