@@ -466,6 +466,9 @@ export function migrateMatcherSplit(installedSettings, templateSettings, { dryRu
   return count;
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// realpathSync handles symlinked invocation (e.g. ~/.local/bin/zylos -> ~/zylos-core/cli/zylos.js,
+// or when the CLI is installed via npm symlinks). Node resolves import.meta.url to the realpath
+// but leaves argv[1] as-passed.
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }

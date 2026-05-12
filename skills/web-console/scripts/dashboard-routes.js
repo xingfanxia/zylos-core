@@ -51,6 +51,23 @@ function resolveTilde(p) {
 }
 
 /**
+ * Parse the `RESULT: <json>` line emitted by c4-approve.js.
+ * Returns an empty object if absent or malformed (so callers can spread safely).
+ * @param {string} output - combined stdout from the approve script
+ * @returns {{instance?: string, chat_id?: string, released?: number, release_error?: string|null}}
+ */
+function parseApproveResult(output) {
+  if (!output) return {};
+  const match = output.match(/^RESULT: (.+)$/m);
+  if (!match) return {};
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return {};
+  }
+}
+
+/**
  * Check whether a tmux session with the given name exists.
  * @param {string} session - tmux session name
  * @returns {boolean}
@@ -649,10 +666,26 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
       const result = execFileSync('node', [approveScript, 'approve', chatId, '--name', instanceName], {
         encoding: 'utf8', timeout: 60000, stdio: 'pipe',
       });
-      res.json({ ok: true, instance: instanceName, output: result.trim() });
+      const output = result.trim();
+      const summary = parseApproveResult(output);
+      res.json({ ok: true, instance: instanceName, released: summary.released, output });
     } catch (err) {
+      // Exit code 2 from c4-approve.js = instance created but message release failed.
+      // Surface as a warning so the operator sees the instance exists but messages still need attention.
+      const stdout = err.stdout?.toString() || '';
       const stderr = err.stderr?.toString() || err.message;
-      res.status(500).json({ error: stderr });
+      if (err.status === 2) {
+        const summary = parseApproveResult(stdout);
+        return res.status(207).json({
+          ok: false,
+          instance: instanceName,
+          released: summary.released,
+          error: 'Instance created but message release failed',
+          output: stdout.trim(),
+          stderr: stderr.trim(),
+        });
+      }
+      res.status(500).json({ error: stderr, output: stdout.trim() });
     }
   });
 

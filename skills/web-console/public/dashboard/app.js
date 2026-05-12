@@ -91,12 +91,26 @@ class Dashboard {
         body: JSON.stringify(name ? { name } : {}),
       });
       const data = await res.json();
+      const verb = action === 'approve' ? 'Approved' : 'Denied';
       if (data.ok) {
-        alert(`${action === 'approve' ? 'Approved' : 'Denied'}: ${data.instance || chatId}`);
+        // For approve, surface the actual release count — "Approved" with 0 released usually
+        // means the messages were already delivered or the user re-sent before approval landed.
+        let detail = `${verb}: ${data.instance || chatId}`;
+        if (action === 'approve' && typeof data.released === 'number') {
+          detail += data.released === 0
+            ? '\n\n⚠ No held messages were released. The user may need to send a new message.'
+            : ` (${data.released} message${data.released === 1 ? '' : 's'} released)`;
+        }
+        alert(detail);
         this.fetchPendingUsers();
         this.fetchDashboard();
       } else {
-        alert(`Error: ${data.error}`);
+        // 207-style partial failure: instance exists but messages weren't released
+        const parts = [`Error: ${data.error || res.statusText}`];
+        if (data.instance) parts.push(`Instance: ${data.instance}`);
+        if (data.stderr) parts.push(`Details: ${data.stderr.split('\n').slice(-3).join('\n')}`);
+        alert(parts.join('\n'));
+        this.fetchPendingUsers();
       }
     } catch (err) {
       alert(`Failed: ${err.message}`);

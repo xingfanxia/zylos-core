@@ -674,7 +674,9 @@ export function close() {
 }
 
 // CLI mode
-const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// realpathSync handles symlinked invocation (e.g. ~/zylos -> /home/x_computelabs_ai/zylos):
+// Node resolves import.meta.url to the realpath but leaves argv[1] as-passed.
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
 
 if (isMainModule) {
   const args = process.argv.slice(2);

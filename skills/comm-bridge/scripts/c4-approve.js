@@ -129,6 +129,8 @@ async function approveUser(chatId, name) {
   }
 
   // 2. Release held messages: update pending_approval → pending with new target_instance
+  let releasedCount = 0;
+  let releaseError = null;
   try {
     const db = getDb();
     if (!db) {
@@ -153,9 +155,11 @@ async function approveUser(chatId, name) {
       for (const msg of held) {
         stmt.run(instanceName, msg.id);
       }
+      releasedCount = held.length;
       console.log(`Released ${held.length} held message(s) → instance "${instanceName}"`);
     }
   } catch (err) {
+    releaseError = err.message;
     console.error(`Failed to release messages: ${err.message}`);
   }
 
@@ -183,6 +187,24 @@ async function approveUser(chatId, name) {
   }
 
   close();
+
+  // Emit structured result for callers (dashboard, admin Claude) to parse
+  const summary = {
+    instance: instanceName,
+    chat_id: chatId,
+    released: releasedCount,
+    release_error: releaseError,
+  };
+  console.log(`RESULT: ${JSON.stringify(summary)}`);
+
+  if (releaseError) {
+    console.error('Approval finished but message release failed — see above.');
+    process.exit(2);
+  }
+  if (releasedCount === 0) {
+    console.log('Approval complete (no held messages to release — possibly already delivered or denied).');
+    process.exit(0);
+  }
   console.log('Approval complete.');
   process.exit(0);
 }
@@ -284,6 +306,9 @@ export function holdAndNotify(channel, endpoint, content, priority, targetInstan
   return record;
 }
 
-// Only run main() when executed directly, not when imported as a module
-const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+// Only run main() when executed directly, not when imported as a module.
+// realpathSync handles symlinked invocation (e.g. ~/zylos -> /home/x_computelabs_ai/zylos):
+// Node resolves import.meta.url to the realpath but leaves argv[1] as-passed, so without
+// realpath the two never matched and main() silently did nothing.
+const isDirectRun = process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isDirectRun) await main();

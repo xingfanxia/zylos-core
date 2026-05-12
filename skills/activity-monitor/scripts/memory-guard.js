@@ -110,7 +110,8 @@ async function main() {
 }
 
 // Only run main() when executed directly (not when imported for testing)
-const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
+// realpathSync handles symlinked invocation (e.g. ~/zylos -> /home/x_computelabs_ai/zylos).
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]);
 if (isMainModule) {
   main();
 }
