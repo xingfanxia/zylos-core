@@ -1,187 +1,162 @@
 #!/usr/bin/env node
 /**
- * Hook-based activity tracker — replaces fetch-preload.cjs
+ * Hook-based tool lifecycle recorder.
  *
- * Receives Claude Code hook events via stdin JSON, writes activity state
- * to ~/zylos/activity-monitor/api-activity.json so the activity monitor
- * can detect busy/idle/stuck states in real time.
+ * Receives Claude Code hook events via stdin JSON and appends lifecycle
+ * events to ~/zylos/activity-monitor/tool-events.jsonl. The activity monitor
+ * merges this stream into foreground/background session state and derives the
+ * external api-activity.json snapshot.
  *
- * Registered as an async hook on: UserPromptSubmit, PreToolUse,
- * PostToolUse, Stop, Notification(idle_prompt).
+ * Registered as an async hook on: UserPromptSubmit, PreToolUse, PostToolUse,
+ * PostToolUseFailure, Stop, Notification(idle_prompt).
  *
- * Safety: all writes are best-effort. Failures are silently ignored
- * to never interfere with Claude.
+ * Scope: phase 1 watchdog tracks only the root Claude agent. Nested subagent
+ * hook payloads carry agent_id and are ignored here because recovery actions
+ * operate on the whole tmux pane, not on an individual subagent.
+ *
+ * Safety: writes are best-effort and fail-open. Hook failures must never
+ * interfere with Claude.
  */
 
-import fs from 'fs';
-import path from 'path';
-import os from 'os';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { getClaudePid } from './claude-pid.js';
+import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-
-/**
- * Get Claude's actual PID by reading the grandparent PID.
- * Claude Code runs hooks via: claude -> bash -c '...' -> node hook.js
- * So process.ppid is bash (short-lived), and bash's ppid is claude.
- * Falls back to process.ppid if /proc is unavailable.
- */
-function getClaudePid() {
+// Multi-session (fork): instance-aware monitor directory.
+// When ZYLOS_INSTANCE_ID is set, the AM writes its state into a per-instance subdir;
+// hooks must mirror that so the right tool-events file is written.
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+let MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+if (INSTANCE_ID) {
   try {
-    const status = fs.readFileSync(`/proc/${process.ppid}/status`, 'utf8');
-    const match = status.match(/^PPid:\s*(\d+)/m);
-    if (match) return parseInt(match[1], 10);
-  } catch { /* best-effort */ }
-  return process.ppid;
+    const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+    MONITOR_DIR = getMonitorDir(INSTANCE_ID);
+  } catch { /* fall back to default single-session path */ }
 }
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
-const ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
-const STATE_FILE = path.join(MONITOR_DIR, 'hook-state.json');
-const STATE_LOCK_FILE = `${STATE_FILE}.lock`;
-const LOCK_RETRIES = 5;
-const LOCK_RETRY_MS = 10;
-const LOCK_STALE_MS = 5000;
+const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
+const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
 
-function sleepMs(ms) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
-    // Best-effort short spin wait.
-  }
-}
-
-function acquireStateLock() {
-  for (let attempt = 0; attempt < LOCK_RETRIES; attempt++) {
-    try {
-      const fd = fs.openSync(STATE_LOCK_FILE, 'wx');
-      fs.closeSync(fd);
-      return true;
-    } catch (err) {
-      if (err?.code !== 'EEXIST') {
-        return false;
-      }
-
-      try {
-        const stat = fs.statSync(STATE_LOCK_FILE);
-        if ((Date.now() - stat.mtimeMs) > LOCK_STALE_MS) {
-          fs.unlinkSync(STATE_LOCK_FILE);
-          continue;
-        }
-      } catch {
-        // Lock disappeared or stat failed; retry.
-      }
-
-      if (attempt < LOCK_RETRIES - 1) {
-        sleepMs(LOCK_RETRY_MS);
-      }
-    }
-  }
-
-  return false;
-}
-
-function releaseStateLock() {
+function appendError(message) {
   try {
-    fs.unlinkSync(STATE_LOCK_FILE);
+    fs.appendFileSync(HOOK_ERROR_LOG, `${new Date().toISOString()} ${message}\n`, 'utf8');
   } catch {
     // Best-effort.
   }
 }
 
-function readState() {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    }
-  } catch { /* best-effort */ }
-  return { active_tools: 0 };
+function readToolUseId(hookData) {
+  const raw = hookData?.tool_use_id;
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
 }
 
-function atomicWrite(filePath, data) {
-  const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(data));
-    fs.renameSync(tmp, filePath);
-  } catch (err) {
-    try {
-      if (fs.existsSync(tmp)) {
-        fs.unlinkSync(tmp);
-      }
-    } catch { /* best-effort */ }
-    throw err;
-  }
+function hasMeaningfulToolInput(toolInput) {
+  return Boolean(toolInput && typeof toolInput === 'object' && Object.keys(toolInput).length > 0);
 }
 
-let input = '';
-process.stdin.on('data', chunk => { input += chunk; });
-process.stdin.on('end', () => {
-  try {
-    const hookData = JSON.parse(input);
-    const event = hookData.hook_event_name;
+function isSubagentHook(hookData) {
+  return typeof hookData?.agent_id === 'string' && hookData.agent_id.trim().length > 0;
+}
 
-    if (!fs.existsSync(MONITOR_DIR)) {
-      fs.mkdirSync(MONITOR_DIR, { recursive: true });
+function buildToolEvent({ hookData, eventName, claudePid, nowMs }) {
+  const sessionId = hookData.session_id || process.env.CLAUDE_SESSION_ID || null;
+  if (!sessionId) return null;
+
+  const toolName = hookData.tool_name || null;
+  const toolInput = hookData.tool_input || {};
+  const toolUseId = readToolUseId(hookData);
+  const rule = toolName
+    ? findMatchingToolRule({ runtimeId: 'claude', toolName, toolInput, config: {} })
+    : null;
+
+  const base = {
+    ts: nowMs,
+    pid: claudePid,
+    session_id: sessionId,
+    event: eventName,
+  };
+
+  if (toolName) {
+    base.tool = toolName;
+    if (hasMeaningfulToolInput(toolInput)) {
+      base.summary = summarizeToolInput(toolName, toolInput);
     }
-
-    const hasLock = acquireStateLock();
-
-    try {
-      const state = readState();
-      let eventType, active, tool = null;
-
-      switch (event) {
-        case 'UserPromptSubmit':
-          eventType = 'prompt';
-          active = true;
-          state.active_tools = 0;
-          state.in_prompt = true;
-          break;
-        case 'PreToolUse':
-          eventType = 'pre_tool';
-          tool = hookData.tool_name || null;
-          state.active_tools = Math.max(0, state.active_tools) + 1;
-          active = true;
-          break;
-        case 'PostToolUse':
-          eventType = 'post_tool';
-          tool = hookData.tool_name || null;
-          state.active_tools = Math.max(0, state.active_tools - 1);
-          active = state.active_tools > 0;
-          break;
-        case 'Stop':
-          eventType = 'stop';
-          state.active_tools = 0;
-          state.in_prompt = false;
-          active = false;
-          break;
-        case 'Notification':
-          eventType = 'idle';
-          state.active_tools = 0;
-          state.in_prompt = false;
-          active = false;
-          break;
-        default:
-          return;
-      }
-
-      const claudePid = getClaudePid();
-      atomicWrite(ACTIVITY_FILE, {
-        version: 2,
-        pid: claudePid,
-        sessionId: process.env.CLAUDE_SESSION_ID || String(claudePid),
-        event: eventType,
-        tool,
-        active,
-        active_tools: state.active_tools,
-        in_prompt: state.in_prompt ?? false,
-        updated_at: Date.now()
-      });
-
-      atomicWrite(STATE_FILE, state);
-    } finally {
-      if (hasLock) {
-        releaseStateLock();
-      }
-    }
-  } catch {
-    // Best-effort — never interfere with Claude.
   }
-});
+
+  if (toolUseId) {
+    base.event_id = toolUseId;
+  } else if (eventName === 'pre_tool') {
+    base.event_id = `evt_${nowMs}_${randomBytes(4).toString('hex')}`;
+  }
+
+  if (eventName === 'pre_tool') {
+    if (rule?.id) {
+      base.rule_id = rule.id;
+    }
+  }
+
+  return base;
+}
+
+function appendJsonLine(filePath, record) {
+  fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+}
+
+export function handleHookActivity(hookData, { nowMs = Date.now(), claudePid = getClaudePid() } = {}) {
+  if (isSubagentHook(hookData)) return null;
+
+  const hookEventName = hookData?.hook_event_name;
+
+  let eventName = null;
+  switch (hookEventName) {
+    case 'UserPromptSubmit':
+      eventName = 'prompt';
+      break;
+    case 'PreToolUse':
+      eventName = 'pre_tool';
+      break;
+    case 'PostToolUse':
+      eventName = 'post_tool';
+      break;
+    case 'PostToolUseFailure':
+      eventName = 'post_tool_failure';
+      break;
+    case 'Stop':
+      eventName = 'stop';
+      break;
+    case 'Notification':
+      eventName = 'idle';
+      break;
+    default:
+      return null;
+  }
+
+  const record = buildToolEvent({ hookData, eventName, claudePid, nowMs });
+  if (!record) return null;
+
+  if (!fs.existsSync(MONITOR_DIR)) {
+    fs.mkdirSync(MONITOR_DIR, { recursive: true });
+  }
+  appendJsonLine(TOOL_EVENTS_FILE, record);
+  return record;
+}
+
+if (process.env.HOOK_ACTIVITY_DISABLE_MAIN !== '1') {
+  let input = '';
+  process.stdin.setEncoding('utf8');
+  process.stdin.on('data', (chunk) => {
+    input += chunk;
+  });
+
+  process.stdin.on('end', () => {
+    try {
+      const hookData = JSON.parse(input || '{}');
+      handleHookActivity(hookData);
+    } catch (err) {
+      appendError(err?.message || 'unknown_error');
+    }
+  });
+}

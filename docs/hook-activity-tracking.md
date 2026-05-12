@@ -58,11 +58,12 @@ Fields:
 - `active_tools`: Count of tools currently in flight (incremented on pre_tool, decremented on post_tool)
 - `updated_at`: Timestamp in milliseconds
 
-### Compatibility with readApiActivity()
+### Historical note
 
-The current `readApiActivity()` function reads:
-- `updated_at` → used for `apiUpdatedSec` (stuck detection timestamp) — **compatible**
-- `active_fetches` → used for `thinking` state — replaced by `active_tools` (activity-monitor.js needs a small update)
+This document describes the earlier hook-to-`api-activity.json` approach.
+The current watchdog implementation no longer uses `readApiActivity()`; it
+reconstructs session/tool state from `tool-events.jsonl` and then writes the
+derived `api-activity.json` snapshot from `activity-monitor.js`.
 
 ## Changes
 
@@ -189,7 +190,8 @@ Changes:
 - Update `monitorLoop()` to read `active_tools` instead of `active_fetches` (line 868)
 - Update log messages to reference "hook activity" instead of "fetch preload"
 
-The `readApiActivity()` function stays unchanged — it reads the same `api-activity.json` file.
+Current code no longer keeps a standalone `readApiActivity()` helper. The
+monitor owns both the event-stream replay and the derived activity snapshot.
 
 ### 4. Delete: `fetch-preload.cjs`
 
@@ -288,9 +290,9 @@ The hooks are **additive** — they don't replace conversation file mtime monito
 1. **Immediate idle detection** via Stop and idle_prompt (vs 3-second threshold)
 2. **Tool-level granularity** (knowing *what* Claude is doing, not just *that* something changed)
 
-### Stuck detection improvement
+### Activity detection improvement
 
-Current stuck detection uses `Math.max(activity, apiUpdatedSec)` where `apiUpdatedSec` was always 0 (fetch preload never worked). With hooks, `apiUpdatedSec` will have real data from tool events, improving stuck detection accuracy.
+Activity detection uses `Math.max(activity, apiUpdatedSec)` where `apiUpdatedSec` was always 0 (fetch preload never worked). With hooks, `apiUpdatedSec` has real data from tool events, improving monitor accuracy.
 
 ## Future: OTel as Optional Component
 
@@ -310,7 +312,7 @@ This would be an install-time choice that adds environment variables to Claude's
    - PreToolUse hook fires → `active_tools: 1`
    - PostToolUse hook fires → `active_tools: 0`
    - Stop hook fires → `active: false`
-3. **Stuck detection test:** Verify stuck detection uses hook timestamps
+3. **Activity detection test:** Verify activity detection uses hook timestamps
 4. **Settings merge test:** Verify post-install preserves existing user hooks
 5. **Performance test:** Confirm no observable latency from async hooks
 

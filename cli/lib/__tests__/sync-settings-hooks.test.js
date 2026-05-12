@@ -17,15 +17,32 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_SETTINGS_PATH = path.join(__dirname, '..', '..', '..', 'templates', '.claude', 'settings.json');
 
 describe('Claude settings template', () => {
-  it('defaults fresh installs to the Opus model', () => {
+  it('defaults fresh installs to Claude Opus 4.6', () => {
     const template = JSON.parse(fs.readFileSync(TEMPLATE_SETTINGS_PATH, 'utf8'));
-    assert.equal(template.model, 'opus');
+    assert.equal(template.model, 'claude-opus-4-6');
   });
 
   it('disables autoMemoryEnabled and autoDreamEnabled by default', () => {
     const template = JSON.parse(fs.readFileSync(TEMPLATE_SETTINGS_PATH, 'utf8'));
     assert.equal(template.autoMemoryEnabled, false);
     assert.equal(template.autoDreamEnabled, false);
+  });
+
+  it('includes session-foreground hooks for all SessionStart matchers', () => {
+    const template = JSON.parse(fs.readFileSync(TEMPLATE_SETTINGS_PATH, 'utf8'));
+    const groups = template.hooks.SessionStart;
+    assert.equal(groups.length, 3);
+    for (const group of groups) {
+      const commands = group.hooks.map(h => h.command);
+      assert.ok(commands.some(cmd => cmd.includes('session-foreground.js')));
+    }
+  });
+
+  it('includes PostToolUseFailure activity hook', () => {
+    const template = JSON.parse(fs.readFileSync(TEMPLATE_SETTINGS_PATH, 'utf8'));
+    const groups = template.hooks.PostToolUseFailure || [];
+    assert.equal(groups.length, 1);
+    assert.ok(groups[0].hooks.some(h => h.command.includes('hook-activity.js')));
   });
 });
 
@@ -35,14 +52,14 @@ describe('syncTemplateModelSetting', () => {
     const logs = [];
 
     const result = syncTemplateModelSetting({
-      templateSettings: { model: 'opus' },
+      templateSettings: { model: 'claude-opus-4-6' },
       installedSettings,
       log: (line) => logs.push(line),
     });
 
     assert.equal(result.changed, true);
-    assert.equal(installedSettings.model, 'opus');
-    assert.deepEqual(logs, ['  + model: opus']);
+    assert.equal(installedSettings.model, 'claude-opus-4-6');
+    assert.deepEqual(logs, ['  + model: claude-opus-4-6']);
   });
 
   it('preserves an existing user-configured model', () => {
@@ -437,14 +454,15 @@ describe('migrateMatcherSplit', () => {
 describe('syncHooks forward pass', () => {
   const noopLog = () => {};
 
-  it('does not modify user-owned matcher group (respects user intent)', () => {
+  it('adds missing template hooks to existing matcher groups while preserving user hooks', () => {
     const installed = {
       hooks: {
         SessionStart: [
-          makeMatcherGroup('startup', [
-            '~/zylos/.claude/skills/comm-bridge/scripts/c4-session-init.js',
-            '~/zylos/.claude/skills/zylos-memory/scripts/session-start-inject.js',
-          ]),
+          { matcher: 'startup', hooks: [
+            { type: 'command', command: 'node ~/zylos/.claude/skills/comm-bridge/scripts/c4-session-init.js', timeout: 10000 },
+            { type: 'command', command: 'node ~/zylos/.claude/skills/zylos-memory/scripts/session-start-inject.js', timeout: 10000 },
+            { type: 'command', command: 'node /custom/user-hook.js', timeout: 5000 },
+          ]},
         ],
       },
     };
@@ -472,9 +490,10 @@ describe('syncHooks forward pass', () => {
 
     const result = syncHooks(installed, template, { log: noopLog });
 
-    // startup should NOT gain a 3rd hook
     const startupGroup = installed.hooks.SessionStart.find(g => g.matcher === 'startup');
-    assert.equal(startupGroup.hooks.length, 2);
+    assert.equal(startupGroup.hooks.length, 4);
+    assert.ok(startupGroup.hooks.some(h => h.command.includes('session-start-prompt.js')));
+    assert.ok(startupGroup.hooks.some(h => h.command.includes('/custom/user-hook.js')));
 
     // clear and compact should be added
     assert.equal(installed.hooks.SessionStart.length, 3);
@@ -484,6 +503,67 @@ describe('syncHooks forward pass', () => {
     assert.ok(compactGroup);
     assert.equal(clearGroup.hooks.length, 3);
     assert.equal(compactGroup.hooks.length, 3);
+    assert.equal(result.added, 7);
+  });
+
+  it('registers ToolWatchdog activity hooks during upgrade when event matcher groups already exist', () => {
+    const installed = {
+      hooks: {
+        PreToolUse: [
+          { matcher: '', hooks: [
+            { type: 'command', command: 'node /custom/pre-tool.js', timeout: 5000 },
+          ]},
+        ],
+        PostToolUse: [
+          { matcher: '', hooks: [
+            { type: 'command', command: 'node /custom/post-tool.js', timeout: 5000 },
+          ]},
+        ],
+        PostToolUseFailure: [
+          { matcher: '', hooks: [
+            { type: 'command', command: 'node /custom/post-tool-failure.js', timeout: 5000 },
+          ]},
+        ],
+        Stop: [
+          { hooks: [
+            { type: 'command', command: 'node /custom/stop.js', timeout: 5000 },
+          ]},
+        ],
+      },
+    };
+    const template = {
+      hooks: {
+        PreToolUse: [
+          { matcher: '', hooks: [
+            { type: 'command', command: 'node ~/zylos/.claude/skills/activity-monitor/scripts/hook-activity.js', async: true, timeout: 5 },
+          ]},
+        ],
+        PostToolUse: [
+          { matcher: '', hooks: [
+            { type: 'command', command: 'node ~/zylos/.claude/skills/activity-monitor/scripts/hook-activity.js', async: true, timeout: 5 },
+          ]},
+        ],
+        PostToolUseFailure: [
+          { matcher: '', hooks: [
+            { type: 'command', command: 'node ~/zylos/.claude/skills/activity-monitor/scripts/hook-activity.js', async: true, timeout: 5 },
+          ]},
+        ],
+        Stop: [
+          { hooks: [
+            { type: 'command', command: 'node ~/zylos/.claude/skills/activity-monitor/scripts/hook-activity.js', async: true, timeout: 5 },
+          ]},
+        ],
+      },
+    };
+
+    const result = syncHooks(installed, template, { log: noopLog });
+
+    assert.equal(result.added, 4);
+    for (const event of ['PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'Stop']) {
+      const group = installed.hooks[event][0];
+      assert.ok(group.hooks.some(h => h.command.includes('hook-activity.js')));
+      assert.ok(group.hooks.some(h => h.command.includes('/custom/')));
+    }
   });
 
   it('adds missing matcher groups from template', () => {
@@ -615,10 +695,12 @@ describe('syncHooks forward pass', () => {
 
     syncHooks(installed, template, { log: noopLog });
 
-    // User's custom hook should still be there (startup group exists, not modified)
+    // User's custom hook should still be there, and the missing template hook
+    // should be registered in the same matcher group.
     const startupGroup = installed.hooks.SessionStart.find(g => g.matcher === 'startup');
-    assert.equal(startupGroup.hooks.length, 1);
-    assert.ok(startupGroup.hooks[0].command.includes('my-hook.js'));
+    assert.equal(startupGroup.hooks.length, 2);
+    assert.ok(startupGroup.hooks.some(h => h.command.includes('my-hook.js')));
+    assert.ok(startupGroup.hooks.some(h => h.command.includes('/skills/a/scripts/a.js')));
   });
 
   it('reverse pass removes core hook from one matcher when template removes it (matcher-aware)', () => {

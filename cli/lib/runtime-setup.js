@@ -303,42 +303,92 @@ export function saveClaudeBaseUrlToSettingsAndEnv(baseUrl) {
  * Render project-level .codex/config.toml with headless configuration.
  *
  * Contains settings required for zylos unattended operation: interactive prompt
- * suppression, feature flags, and model migration acknowledgements. These are
- * project requirements, not user preferences.
+ * suppression, feature flags, model migration acknowledgements, and runtime
+ * defaults (model, context window, reasoning effort).
+ *
+ * Preserves existing TOML content: user-added keys and non-managed sections
+ * are kept intact across regeneration.
  *
  * Written to <projectDir>/.codex/config.toml (Codex project-level config).
  *
+ * @param {string} existingContent - Existing config.toml contents (optional)
+ * @param {{ model?: string, modelContextWindow?: number, modelAutoCompactTokenLimit?: number, modelReasoningEffort?: string, personality?: string }} opts - Optional Codex config overrides
  * @returns {string}
  */
-export function renderCodexProjectConfig() {
-  return [
+export function renderCodexProjectConfig(existingContent = '', opts = {}) {
+  const runtimeSettings = resolveCodexRuntimeSettings(existingContent, opts);
+  const parsed = parseTomlBlocks(existingContent);
+
+  const managedTopLevel = [
     '# Zylos project-level Codex config — written by zylos, do not edit manually.',
     '# Re-generated on each `zylos init` / `zylos runtime codex`.',
     '# Headless operation: suppress all interactive prompts.',
+    '',
+    '# Runtime defaults / operator overrides',
+    `model = "${escapeTomlString(runtimeSettings.model)}"`,
+    `model_context_window = ${runtimeSettings.modelContextWindow}`,
+    `model_auto_compact_token_limit = ${runtimeSettings.modelAutoCompactTokenLimit}`,
+    `model_reasoning_effort = "${escapeTomlString(runtimeSettings.modelReasoningEffort)}"`,
+    `personality = "${escapeTomlString(runtimeSettings.personality)}"`,
     '',
     '# Disable startup checks',
     'check_for_update_on_startup = false',
     '',
     '# Acknowledge the latest model NUX so the "Introducing GPT-X" dialog',
     '# is not shown on startup.  Update this when Codex ships a new default model.',
-    'model_availability_nux = "gpt-5.4"',
-    '',
-    '# Enable Codex features required by Zylos runtime workflows.',
-    '[features]',
-    'multi_agent = true',
-    '',
-    '# Suppress all known interactive notice dialogs',
-    '[notice]',
-    'hide_full_access_warning = true',
-    'hide_world_writable_warning = true',
-    'hide_rate_limit_model_nudge = true',
-    'hide_gpt5_1_migration_prompt = true',
-    '"hide_gpt-5.1-codex-max_migration_prompt" = true',
-    '',
-    '# Acknowledge known model migrations so no migration prompt appears',
-    '[notice.model_migrations]',
-    '"gpt-5.3-codex" = "gpt-5.4"',
-  ].join('\n') + '\n';
+    `model_availability_nux = "${escapeTomlString(runtimeSettings.model)}"`,
+  ];
+
+  const preservedTopLevel = filterPreservedTopLevelLines(parsed.topLevelLines, new Set([
+    'model',
+    'model_context_window',
+    'model_auto_compact_token_limit',
+    'model_reasoning_effort',
+    'personality',
+    'check_for_update_on_startup',
+    'model_availability_nux',
+  ]));
+
+  const featuresBlock = renderMergedSectionBlock('features', parsed.sections.get('features')?.bodyLines || [], {
+    multi_agent: 'true',
+  }, {
+    comment: '# Enable Codex features required by Zylos runtime workflows.',
+  });
+
+  const noticeBlock = renderMergedSectionBlock('notice', parsed.sections.get('notice')?.bodyLines || [], {
+    hide_full_access_warning: 'true',
+    hide_world_writable_warning: 'true',
+    hide_rate_limit_model_nudge: 'true',
+    hide_gpt5_1_migration_prompt: 'true',
+    '"hide_gpt-5.1-codex-max_migration_prompt"': 'true',
+  }, {
+    comment: '# Suppress all known interactive notice dialogs',
+  });
+
+  const migrationsBlock = renderMergedSectionBlock('notice.model_migrations', parsed.sections.get('notice.model_migrations')?.bodyLines || [], {
+    '"gpt-5.3-codex"': '"gpt-5.4"',
+  }, {
+    comment: '# Acknowledge known model migrations so no migration prompt appears',
+  });
+
+  const preservedSectionBlocks = [];
+  for (const section of parsed.sectionOrder) {
+    if (section === 'features') continue;
+    if (section === 'notice') continue;
+    if (section === 'notice.model_migrations') continue;
+    preservedSectionBlocks.push(parsed.sections.get(section).raw.trimEnd());
+  }
+
+  const chunks = [
+    managedTopLevel.join('\n').trimEnd(),
+    preservedTopLevel.join('\n').trim(),
+    featuresBlock,
+    noticeBlock,
+    migrationsBlock,
+    preservedSectionBlocks.join('\n\n').trim(),
+  ].filter(Boolean);
+
+  return chunks.join('\n\n').trimEnd() + '\n';
 }
 
 /**
@@ -395,12 +445,17 @@ export function renderCodexGlobalConfig(projectDir, existingContent = '', opts =
  */
 export function writeCodexConfig(projectDir, opts = {}) {
   try {
-    // Write project-level config
+    // Write project-level config (with TOML preservation)
     const projectCodexDir = path.join(path.resolve(projectDir), '.codex');
+    const projectConfigPath = path.join(projectCodexDir, 'config.toml');
+    let existingProject = '';
+    try {
+      existingProject = fs.readFileSync(projectConfigPath, 'utf8');
+    } catch { /* new file — nothing to preserve */ }
     fs.mkdirSync(projectCodexDir, { recursive: true });
     fs.writeFileSync(
-      path.join(projectCodexDir, 'config.toml'),
-      renderCodexProjectConfig(),
+      projectConfigPath,
+      renderCodexProjectConfig(existingProject, opts),
       'utf8'
     );
 
@@ -422,6 +477,156 @@ export function writeCodexConfig(projectDir, opts = {}) {
   } catch {
     return false;
   }
+}
+
+const DEFAULT_CODEX_MODEL = 'gpt-5.4';
+const DEFAULT_CODEX_MODEL_CONTEXT_WINDOW = 1_000_000;
+const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT = 800_000;
+const DEFAULT_CODEX_REASONING_EFFORT = 'xhigh';
+const DEFAULT_CODEX_PERSONALITY = 'pragmatic';
+
+function resolveCodexRuntimeSettings(existingContent = '', opts = {}) {
+  return {
+    model:
+      opts.model ||
+      process.env.ZYLOS_CODEX_MODEL ||
+      readTomlString(existingContent, 'model') ||
+      DEFAULT_CODEX_MODEL,
+    modelContextWindow:
+      normalizePositiveInteger(opts.modelContextWindow) ||
+      normalizePositiveInteger(process.env.ZYLOS_CODEX_MODEL_CONTEXT_WINDOW) ||
+      readTomlInteger(existingContent, 'model_context_window') ||
+      DEFAULT_CODEX_MODEL_CONTEXT_WINDOW,
+    modelAutoCompactTokenLimit:
+      normalizePositiveInteger(opts.modelAutoCompactTokenLimit) ||
+      normalizePositiveInteger(process.env.ZYLOS_CODEX_AUTO_COMPACT_TOKEN_LIMIT) ||
+      readTomlInteger(existingContent, 'model_auto_compact_token_limit') ||
+      DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+    modelReasoningEffort:
+      opts.modelReasoningEffort ||
+      process.env.ZYLOS_CODEX_REASONING_EFFORT ||
+      readTomlString(existingContent, 'model_reasoning_effort') ||
+      DEFAULT_CODEX_REASONING_EFFORT,
+    personality:
+      opts.personality ||
+      process.env.ZYLOS_CODEX_PERSONALITY ||
+      readTomlString(existingContent, 'personality') ||
+      DEFAULT_CODEX_PERSONALITY,
+  };
+}
+
+function readTomlString(content = '', key) {
+  if (!content || !key) return null;
+  const match = content.match(new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*["']([^"']+)["']\\s*$`, 'm'));
+  return match?.[1] || null;
+}
+
+function readTomlInteger(content = '', key) {
+  if (!content || !key) return null;
+  const match = content.match(new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*(\\d+)\\s*$`, 'm'));
+  return normalizePositiveInteger(match?.[1]);
+}
+
+function normalizePositiveInteger(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number.parseInt(String(value), 10);
+  if (Number.isNaN(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function escapeTomlString(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseTomlBlocks(content = '') {
+  const lines = String(content || '').split('\n');
+  const topLevelLines = [];
+  const sections = new Map();
+  const sectionOrder = [];
+
+  let currentHeader = null;
+  let currentLines = [];
+
+  function flushCurrent() {
+    if (!currentHeader) return;
+    const raw = currentLines.join('\n').trimEnd();
+    const bodyLines = currentLines.slice(1);
+    sections.set(currentHeader, { raw, bodyLines });
+    sectionOrder.push(currentHeader);
+    currentHeader = null;
+    currentLines = [];
+  }
+
+  for (const line of lines) {
+    const match = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (match) {
+      flushCurrent();
+      currentHeader = match[1];
+      currentLines = [line];
+      continue;
+    }
+
+    if (currentHeader) {
+      currentLines.push(line);
+    } else {
+      topLevelLines.push(line);
+    }
+  }
+
+  flushCurrent();
+  return { topLevelLines, sections, sectionOrder };
+}
+
+function filterPreservedTopLevelLines(lines = [], managedKeys = new Set()) {
+  return lines.filter((line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith('#')) return false;
+    const match = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=/);
+    if (!match) return true;
+    return !managedKeys.has(match[1]);
+  });
+}
+
+function renderMergedSectionBlock(header, existingBodyLines = [], managedAssignments = {}, opts = {}) {
+  const managedKeys = new Set(Object.keys(managedAssignments));
+  const preserved = [];
+
+  for (const line of existingBodyLines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (preserved[preserved.length - 1] !== '') preserved.push('');
+      continue;
+    }
+    if (trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const match = trimmed.match(/^((?:"[^"]+"|[A-Za-z0-9_.-]+))\s*=/);
+    if (match && managedKeys.has(match[1])) {
+      continue;
+    }
+    preserved.push(line);
+  }
+
+  while (preserved[0] === '') preserved.shift();
+  while (preserved[preserved.length - 1] === '') preserved.pop();
+
+  const bodyLines = [
+    ...Object.entries(managedAssignments).map(([key, value]) => `${key} = ${value}`),
+    ...(preserved.length ? [''] : []),
+    ...preserved,
+  ];
+
+  return [
+    opts.comment || null,
+    `[${header}]`,
+    ...bodyLines,
+  ].filter((line) => line !== null).join('\n').trimEnd();
 }
 
 /**

@@ -14,6 +14,7 @@ import os from 'os';
 const startMs = Date.now();
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 let diagnosticModule;
 let diagnosticLoadAttempted = false;
 
@@ -71,12 +72,14 @@ async function main() {
     : 'session-start-prompt';
 
   try {
-    execFileSync('node', [
+    const enqueueArgs = [
       C4_CONTROL, 'enqueue',
       '--content', prompt,
       '--priority', '2',
       '--no-ack-suffix'
-    ], { stdio: 'pipe' });
+    ];
+    if (INSTANCE_ID) enqueueArgs.push('--target-instance', INSTANCE_ID);
+    execFileSync('node', enqueueArgs, { stdio: 'pipe' });
   } catch {
     // Silently fail — session still starts even if enqueue fails
   } finally {

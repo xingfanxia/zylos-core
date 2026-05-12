@@ -51,12 +51,11 @@ export const AGENT_STATUS_FILE = path.join(ACTIVITY_MONITOR_DIR, 'agent-status.j
 export const PROC_STATE_FILE = path.join(ACTIVITY_MONITOR_DIR, 'proc-state.json');
 export const API_ACTIVITY_FILE = path.join(ACTIVITY_MONITOR_DIR, 'api-activity.json');
 export const PENDING_CHANNELS_FILE = path.join(ACTIVITY_MONITOR_DIR, 'pending-channels.jsonl');
-export const USER_MESSAGE_SIGNAL_FILE = path.join(ACTIVITY_MONITOR_DIR, 'user-message-signal.json');
 export const ATTACHMENTS_DIR = path.join(DATA_DIR, 'attachments');
 export const SKILLS_DIR = path.join(ZYLOS_DIR, '.claude', 'skills');
 
 export const CHECKPOINT_THRESHOLD = 30;      // unsummarized conversation count to trigger Memory Sync
-export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by session-init when above threshold
+export const SESSION_INIT_RECENT_COUNT = 30;  // max conversations returned by session-init when above threshold
 
 export const STALE_STATUS_THRESHOLD = 5000; // ms
 export const TMUX_MISSING_WARN_THRESHOLD = 30;

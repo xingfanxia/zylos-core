@@ -40,14 +40,19 @@ const SKILL_ROOT = path.join(__dirname, '..');
 // --- Authentication ---
 import { parse as parseDotenv } from 'dotenv';
 
-function readEnvPassword() {
+function readEnv() {
   const envPath = path.join(ZYLOS_DIR, '.env');
   try {
-    const env = parseDotenv(fs.readFileSync(envPath, 'utf8'));
-    return env.ZYLOS_WEB_PASSWORD || env.WEB_CONSOLE_PASSWORD || '';
+    return parseDotenv(fs.readFileSync(envPath, 'utf8'));
   } catch {
-    return '';
+    return {};
   }
+}
+
+const ENV = readEnv();
+
+function readEnvPassword() {
+  return ENV.ZYLOS_WEB_PASSWORD || ENV.WEB_CONSOLE_PASSWORD || '';
 }
 
 const AUTH_PASSWORD = readEnvPassword();
@@ -391,7 +396,8 @@ app.get('/api/poll', (req, res) => {
 app.get('/api/auth', (req, res) => {
   res.json({
     required: AUTH_ENABLED,
-    authenticated: isAuthenticated(req)
+    authenticated: isAuthenticated(req),
+    timezone: ENV.TZ || null
   });
 });
 
@@ -400,7 +406,7 @@ app.get('/api/auth', (req, res) => {
  */
 app.post('/api/auth', (req, res) => {
   if (!AUTH_ENABLED) {
-    return res.json({ success: true });
+    return res.json({ success: true, timezone: ENV.TZ || null });
   }
 
   const { password } = req.body;
@@ -411,7 +417,7 @@ app.post('/api/auth', (req, res) => {
   const token = crypto.randomBytes(32).toString('hex');
   sessions.add(token);
   res.setHeader('Set-Cookie', `wc_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`);
-  res.json({ success: true });
+  res.json({ success: true, timezone: ENV.TZ || null });
 });
 
 /**
@@ -435,10 +441,23 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Serve index.html for root
+// Redirect root to dashboard
 app.get('/', (req, res) => {
-  res.sendFile(path.join(SKILL_ROOT, 'public', 'index.html'));
+  res.redirect('/dashboard/');
 });
+
+// Multi-session dashboard (optional module)
+await (async () => {
+  try {
+    const { registerDashboardRoutes } = await import('./dashboard-routes.js');
+    registerDashboardRoutes(app, { zylosDir: ZYLOS_DIR, skillRoot: SKILL_ROOT, skillsDir: SKILLS_DIR });
+    console.log(`Dashboard available at http://${process.env.WEB_CONSOLE_BIND || '127.0.0.1'}:${PORT}/dashboard/`);
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') {
+      console.error('Dashboard registration failed:', e.message);
+    }
+  }
+})();
 
 // Start server (bind to localhost only for security)
 const BIND_HOST = process.env.WEB_CONSOLE_BIND || '127.0.0.1';

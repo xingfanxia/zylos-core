@@ -23,11 +23,11 @@ import { execSync } from 'child_process';
 const SAMPLE_INTERVAL = 10;   // seconds between samples
 const FROZEN_THRESHOLD = 60;  // seconds of zero delta → frozen
 
-const PROC_STATE_FILE = path.join(
-  process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
-  'activity-monitor',
-  'proc-state.json'
-);
+const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const PROC_STATE_FILE = INSTANCE_ID
+  ? path.join(ZYLOS_DIR, 'activity-monitor', INSTANCE_ID, 'proc-state.json')
+  : path.join(ZYLOS_DIR, 'activity-monitor', 'proc-state.json');
 
 export class ProcSampler {
   /**

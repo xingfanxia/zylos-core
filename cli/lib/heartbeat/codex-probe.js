@@ -2,7 +2,7 @@
  * codex-probe.js — HeartbeatEngine probe for OpenAI Codex CLI runtime.
  *
  * Implements the runtime-specific deps subset for HeartbeatEngine:
- *   enqueueHeartbeat, getHeartbeatStatus, detectRateLimit,
+ *   enqueueHeartbeat, getHeartbeatStatus, detectRateLimit, detectApiError,
  *   readHeartbeatPending, clearHeartbeatPending
  *
  * Mechanism — C4 control queue (same as Claude):
@@ -33,9 +33,17 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { detectApiErrorText } from './api-error-patterns.js';
+import { tmuxCapturePaneText } from '../runtime/tmux-helpers.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
+const AUTH_FAILURE_PATTERNS = [
+  /authentication failed/i,
+  /not logged in/i,
+  /invalid api key/i,
+  /unauthorized/i,
+];
 
 /**
  * Create a Codex CLI heartbeat probe.
@@ -43,13 +51,14 @@ const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-c
  * @param {object} opts
  * @param {string}  opts.pendingFile       - Path to codex-heartbeat-pending.json
  * @param {number}  [opts.ackDeadline=300]      - ACK deadline for normal heartbeats (seconds)
- * @param {number}  [opts.stuckAckDeadline=120] - ACK deadline for stuck-phase heartbeats
+ * @param {number}  [opts.recoveryAckDeadline=120] - ACK deadline for recovery heartbeats
  * @returns {object} Partial HeartbeatEngine deps
  */
 export function createCodexProbe({
   pendingFile,
+  tmuxSession = 'codex-main',
   ackDeadline = 300,
-  stuckAckDeadline = 120,
+  recoveryAckDeadline = 120,
 }) {
   return {
 
@@ -57,11 +66,11 @@ export function createCodexProbe({
 
     /**
      * Enqueue a heartbeat control message via C4 and record the pending state.
-     * @param {string} phase - 'normal' | 'stuck'
+     * @param {string} phase
      * @returns {boolean}
      */
     enqueueHeartbeat(phase) {
-      const deadline = phase === 'stuck' ? stuckAckDeadline : ackDeadline;
+      const deadline = _getAckDeadline(phase, { ackDeadline, recoveryAckDeadline });
       const content = `Heartbeat check. [phase=${phase}]`;
       try {
         const out = execFileSync('node', [C4_CONTROL, 'enqueue',
@@ -118,6 +127,36 @@ export function createCodexProbe({
       return { detected: false };
     },
 
+    /**
+     * Detect auth-failure text in the Codex pane. HealthEngine verifies this
+     * with the adapter's live checkAuth probe before changing health state.
+     *
+     * @returns {{ detected: boolean, pattern?: string }}
+     */
+    detectAuthFailure() {
+      const pane = tmuxCapturePaneText(tmuxSession);
+      if (!pane) return { detected: false };
+
+      for (const p of AUTH_FAILURE_PATTERNS) {
+        const match = pane.match(p);
+        if (match) {
+          return { detected: true, pattern: match[0] };
+        }
+      }
+      return { detected: false };
+    },
+
+    /**
+     * Detect fatal API/context errors in the Codex pane. Used by HealthEngine
+     * to recover from sticky contexts such as oversized many-image requests.
+     *
+     * @returns {{ detected: boolean, pattern?: string }}
+     */
+    detectApiError() {
+      const pane = tmuxCapturePaneText(tmuxSession);
+      return detectApiErrorText(pane);
+    },
+
     // ── Pending state management ─────────────────────────────────────────────
 
     /**
@@ -141,6 +180,11 @@ export function createCodexProbe({
   };
 }
 
+function _getAckDeadline(phase, { ackDeadline, recoveryAckDeadline }) {
+  if (phase === 'recovery' || phase === 'post_restart') return recoveryAckDeadline;
+  return ackDeadline;
+}
+
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 function _writePending(file, data) {
@@ -153,3 +197,4 @@ function _writePending(file, data) {
     return false;
   }
 }
+

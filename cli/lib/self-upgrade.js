@@ -7,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import { SKILLS_DIR, ZYLOS_DIR, getZylosConfig } from './config.js';
 import { downloadArchive, downloadBranch } from './download.js';
 import { generateManifest, saveManifest, saveOriginals } from './manifest.js';
@@ -19,6 +19,19 @@ import { getAllowedTmpRoots } from './upgrade.js';
 import { runMigrations } from './migrate.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
+
+// Fork modules loaded lazily to avoid top-level await (breaks node:test imports)
+let _forkConfig;
+let _upstreamMerge;
+async function loadForkModules() {
+  if (_forkConfig === undefined) {
+    try { _forkConfig = await import('./fork-config.js'); } catch { _forkConfig = null; }
+  }
+  if (_forkConfig && _upstreamMerge === undefined) {
+    try { _upstreamMerge = await import('./upstream-merge.js'); } catch { _upstreamMerge = null; }
+  }
+  return { forkConfig: _forkConfig, upstreamMerge: _upstreamMerge };
+}
 
 const REPO = 'zylos-ai/zylos-core';
 
@@ -48,11 +61,15 @@ export function getCurrentVersion() {
  * @param {string} [opts.branch] - Branch to read from (reads package.json from branch)
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) tags
  */
-function getLatestVersion({ branch, beta = false } = {}) {
+async function getLatestVersion({ branch, beta = false } = {}) {
+  // Use fork repo when available, otherwise default upstream
+  const { forkConfig } = await loadForkModules();
+  const repo = (forkConfig?.isFork() && forkConfig.FORK_REPO) ? forkConfig.FORK_REPO : REPO;
+
   // When --branch is specified, read package.json from that branch
   if (branch) {
     try {
-      const content = fetchRawFile(REPO, 'package.json', branch);
+      const content = fetchRawFile(repo, 'package.json', branch);
       const pkg = JSON.parse(content);
       return { success: true, version: pkg.version };
     } catch (err) {
@@ -62,7 +79,7 @@ function getLatestVersion({ branch, beta = false } = {}) {
 
   // Default: tag-based detection (unified with component upgrades)
   try {
-    const tagVersion = fetchLatestTag(REPO, { includePrerelease: beta });
+    const tagVersion = fetchLatestTag(repo, { includePrerelease: beta });
     if (tagVersion) {
       return { success: true, version: tagVersion };
     }
@@ -84,13 +101,13 @@ function getLatestVersion({ branch, beta = false } = {}) {
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) versions
  * @returns {object} { success, hasUpdate, current, latest }
  */
-export function checkForCoreUpdates({ branch, beta = false } = {}) {
+export async function checkForCoreUpdates({ branch, beta = false } = {}) {
   const current = getCurrentVersion();
   if (!current.success) {
     return { success: false, error: 'version_not_found', message: current.error };
   }
 
-  const latest = getLatestVersion({ branch, beta });
+  const latest = await getLatestVersion({ branch, beta });
   if (!latest.success) {
     return { success: false, error: 'remote_version_failed', message: latest.error };
   }
@@ -99,11 +116,13 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
   // compareSemverDesc(a, b) > 0 means b is higher than a.
   const hasUpdate = compareSemverDesc(current.version, latest.version) > 0;
 
+  const { forkConfig } = await loadForkModules();
   return {
     success: true,
     hasUpdate,
     current: current.version,
     latest: latest.version,
+    needsUpstreamCheck: forkConfig?.needsUpstreamCheck() || false,
   };
 }
 
@@ -372,6 +391,7 @@ function syncClaudeMd(templateDir) {
  */
 function listTemplateFiles(templatesDir) {
   const files = [];
+  if (!templatesDir) return files;
   if (!fs.existsSync(templatesDir)) return files;
 
   function walk(dir, prefix = '') {
@@ -555,7 +575,7 @@ export function generateMigrationHints(templatesDir, deps = {}) {
 /**
  * Create self-upgrade context.
  */
-function createContext({ tempDir, newVersion, mode } = {}) {
+function createContext({ tempDir, newVersion, mode, mergeUpstream } = {}) {
   const coreDir = path.join(import.meta.dirname, '..', '..');
 
   return {
@@ -563,6 +583,7 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     tempDir: tempDir || null,
     newVersion: newVersion || null,
     mode: mode || 'merge',
+    skipUpstreamMerge: !mergeUpstream,
     // State tracking
     backupDir: null,
     servicesStopped: [],
@@ -1109,13 +1130,22 @@ function step9_syncSettingsHooks(ctx) {
  * @returns {string|null} Absolute path to the script, or null if not found.
  */
 function resolveInstalledSyncScript() {
+  return resolveInstalledPackageScript('cli', 'lib', 'sync-settings-hooks.js');
+}
+
+/**
+ * Resolve a script path in the globally installed package.
+ * Reads the package name from package.json to avoid hardcoding.
+ * @returns {string|null} Absolute path to the script, or null if not found.
+ */
+function resolveInstalledPackageScript(...parts) {
   try {
     // import.meta.dirname points to cli/lib/, go up two levels to package root
     const pkgPath = path.join(import.meta.dirname, '..', '..', 'package.json');
     const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
     const pkgName = pkg.name || 'zylos';
     const npmRoot = execSync('npm root -g', { encoding: 'utf8', stdio: 'pipe', timeout: 10000 }).trim();
-    const script = path.join(npmRoot, pkgName, 'cli', 'lib', 'sync-settings-hooks.js');
+    const script = path.join(npmRoot, pkgName, ...parts);
     return fs.existsSync(script) ? script : null;
   } catch {
     return null;
@@ -1165,6 +1195,7 @@ export function step11_startCoreServices(ctx, deps = {}) {
   const startTime = Date.now();
   const fsApi = deps.fs ?? fs;
   const restartFn = deps.restartManagedProcess ?? restartManagedProcess;
+  const exec = deps.execSync ?? execSync;
   const zylosDir = deps.zylosDir ?? ZYLOS_DIR;
 
   if (ctx.servicesWereRunning.length === 0) {
@@ -1212,6 +1243,33 @@ export function step11_startCoreServices(ctx, deps = {}) {
 
   if (failed.length > 0) {
     return { step: 11, name: 'start_core_services', status: 'failed', error: `Failed to restart: ${failed.join(', ')}`, duration: Date.now() - startTime };
+  }
+
+  if (started.includes('activity-monitor')) {
+    const verifyActivityMonitorEnv = deps.verifyActivityMonitorEnv ?? (() => {
+      const output = exec('pm2 jlist 2>/dev/null', {
+        encoding: 'utf8',
+        stdio: 'pipe',
+      });
+      const processes = JSON.parse(String(output));
+      const activityMonitor = processes.find(process => process.name === 'activity-monitor');
+      return Boolean(activityMonitor?.pm2_env?.ZYLOS_PACKAGE_ROOT);
+    });
+
+    try {
+      if (!verifyActivityMonitorEnv()) {
+        return { step: 11, name: 'start_core_services', status: 'failed', error: 'activity-monitor PM2 env missing ZYLOS_PACKAGE_ROOT after restart', duration: Date.now() - startTime };
+      }
+    } catch (err) {
+      const detail = err?.message ? `: ${err.message}` : '';
+      return { step: 11, name: 'start_core_services', status: 'failed', error: `failed to verify activity-monitor PM2 env after restart${detail}`, duration: Date.now() - startTime };
+    }
+  }
+
+  try {
+    exec('pm2 save 2>/dev/null', { stdio: 'pipe' });
+  } catch {
+    return { step: 11, name: 'start_core_services', status: 'failed', error: 'failed to save PM2 process list after core restart', duration: Date.now() - startTime };
   }
 
   return { step: 11, name: 'start_core_services', status: 'done', message: started.join(', '), duration: Date.now() - startTime };
@@ -1336,57 +1394,19 @@ export function rollbackSelf(ctx, deps = {}) {
 // Public: runSelfUpgrade
 // ---------------------------------------------------------------------------
 
-/**
- * Run the 11-step self-upgrade pipeline.
- * Template migration and Claude restart are handled by Claude after this completes.
- * Lock must be acquired by caller.
- *
- * @param {{ tempDir: string, newVersion: string, onStep?: function }} opts
- * @returns {object} Upgrade result
- */
-export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
-  const ctx = createContext({ tempDir, newVersion, mode });
+const POST_INSTALL_STEPS = [
+  step5_syncCoreSkills,
+  step6_installSkillDeps,
+  step7_syncClaudeMd,
+  step8_migrateStateMd,
+  step9_syncSettingsHooks,
+  step10_ensureCodexConfig,
+  step11_startCoreServices,
+  step12_verifyServices,
+];
 
-  const current = getCurrentVersion();
-  if (current.success) {
-    ctx.from = current.version;
-  }
-  ctx.to = newVersion || null;
-
-  const steps = [
-    step1_backupCoreSkills,
-    step2_preUpgradeHook,
-    step3_stopCoreServices,
-    step4_npmInstallGlobal,
-    step5_syncCoreSkills,
-    step6_installSkillDeps,
-    step7_syncClaudeMd,
-    step8_migrateStateMd,
-    step9_syncSettingsHooks,
-    step10_ensureCodexConfig,
-    step11_startCoreServices,
-    step12_verifyServices,
-  ];
-
-  const total = steps.length;
-  let failedStep = null;
-
-  for (const stepFn of steps) {
-    const result = stepFn(ctx);
-    result.total = total;
-    ctx.steps.push(result);
-    if (onStep) onStep(result);
-
-    if (result.status === 'failed') {
-      failedStep = result;
-      ctx.error = result.error;
-      break;
-    }
-  }
-
-  // If failed, rollback
+function buildSelfUpgradeResult(ctx, failedStep, rollbackResults = null, rollbackPerformed = Boolean(rollbackResults)) {
   if (failedStep) {
-    const rollbackResults = rollbackSelf(ctx);
     return {
       action: 'self_upgrade',
       success: false,
@@ -1395,12 +1415,12 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
       failedStep: failedStep.step,
       error: failedStep.error,
       steps: ctx.steps,
-      rollback: { performed: true, steps: rollbackResults },
+      rollback: { performed: rollbackPerformed, steps: rollbackResults || [] },
     };
   }
 
   // List template files for Claude to compare with local structure
-  const templatesDir = path.join(ctx.tempDir, 'templates');
+  const templatesDir = ctx.tempDir ? path.join(ctx.tempDir, 'templates') : null;
   const templates = listTemplateFiles(templatesDir);
 
   // Migration hints: step 8 already applied settings sync via the newly installed script.
@@ -1432,6 +1452,190 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}) {
     mergeConflicts: ctx.mergeConflicts.length > 0 ? ctx.mergeConflicts : null,
     mergedFiles: ctx.mergedFiles.length > 0 ? ctx.mergedFiles : null,
   };
+}
+
+export function createFinalizeState(ctx) {
+  return {
+    schemaVersion: 1,
+    tempDir: ctx.tempDir,
+    backupDir: ctx.backupDir,
+    servicesWereRunning: ctx.servicesWereRunning,
+    from: ctx.from,
+    to: ctx.to,
+    newVersion: ctx.newVersion,
+    mode: ctx.mode,
+  };
+}
+
+function writeFinalizeState(ctx) {
+  const statePath = path.join(ctx.tempDir, 'self-upgrade-finalize-state.json');
+  fs.writeFileSync(statePath, `${JSON.stringify(createFinalizeState(ctx), null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  return statePath;
+}
+
+function runInstalledFinalizer(ctx) {
+  const finalizeScript = resolveInstalledPackageScript('cli', 'lib', 'self-upgrade-finalize.js');
+  if (!finalizeScript) {
+    throw new Error('newly installed self-upgrade finalizer not found');
+  }
+
+  const statePath = writeFinalizeState(ctx);
+  const result = spawnSync(process.execPath, [finalizeScript, statePath], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 180000,
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  const output = String(result.stdout || '').trim();
+  if (!output) {
+    const err = String(result.stderr || '').trim() || `finalizer exited ${result.status}`;
+    throw new Error(err);
+  }
+
+  const parsed = JSON.parse(output);
+  if (result.status !== 0 && parsed?.success !== false) {
+    const err = String(result.stderr || '').trim() || `finalizer exited ${result.status}`;
+    throw new Error(err);
+  }
+
+  return parsed;
+}
+
+export function runSelfUpgradeFinalize(state = {}, deps = {}) {
+  if (state.schemaVersion !== undefined && state.schemaVersion !== 1) {
+    return {
+      action: 'self_upgrade',
+      success: false,
+      from: state.from || null,
+      to: null,
+      failedStep: 5,
+      error: `unsupported finalize state schemaVersion: ${state.schemaVersion}`,
+      steps: [],
+      rollback: { performed: false, steps: [] },
+    };
+  }
+
+  const ctx = createContext({
+    tempDir: state.tempDir,
+    newVersion: state.newVersion || state.to,
+    mode: state.mode,
+  });
+  ctx.backupDir = state.backupDir || null;
+  ctx.servicesWereRunning = Array.isArray(state.servicesWereRunning) ? [...state.servicesWereRunning] : [];
+  ctx.from = state.from || null;
+  ctx.to = state.to || state.newVersion || null;
+
+  const steps = deps.steps || POST_INSTALL_STEPS;
+  const total = deps.total || 12;
+  let failedStep = null;
+
+  for (const stepFn of steps) {
+    const result = stepFn(ctx);
+    result.total = total;
+    ctx.steps.push(result);
+
+    if (result.status === 'failed') {
+      failedStep = result;
+      ctx.error = result.error;
+      break;
+    }
+  }
+
+  if (failedStep) {
+    return buildSelfUpgradeResult(ctx, failedStep, null, false);
+  }
+
+  return buildSelfUpgradeResult(ctx, null);
+}
+
+/**
+ * Run the 12-step self-upgrade pipeline.
+ * Template migration and Claude restart are handled by Claude after this completes.
+ * Lock must be acquired by caller.
+ *
+ * Fork extension: when called with `mergeUpstream: true`, a step0_mergeUpstream
+ * pre-step is prepended to merge upstream/main into the fork before npm install.
+ *
+ * @param {{ tempDir: string, newVersion: string, mergeUpstream?: boolean, onStep?: function }} opts
+ * @returns {object} Upgrade result
+ */
+export async function runSelfUpgrade({ tempDir, newVersion, mode, mergeUpstream, onStep } = {}) {
+  const ctx = createContext({ tempDir, newVersion, mode, mergeUpstream });
+
+  const current = getCurrentVersion();
+  if (current.success) {
+    ctx.from = current.version;
+  }
+  ctx.to = newVersion || null;
+
+  const preInstallSteps = [
+    step1_backupCoreSkills,
+    step2_preUpgradeHook,
+    step3_stopCoreServices,
+    step4_npmInstallGlobal,
+  ];
+
+  // Fork: prepend upstream merge step when mergeUpstream is requested
+  const { forkConfig, upstreamMerge } = await loadForkModules();
+  if (forkConfig && mergeUpstream && upstreamMerge) {
+    preInstallSteps.unshift(upstreamMerge.step0_mergeUpstream);
+  }
+
+  const total = 12;
+  let failedStep = null;
+
+  for (const stepFn of preInstallSteps) {
+    const result = stepFn(ctx);
+    result.total = total;
+    ctx.steps.push(result);
+    if (onStep) onStep(result);
+
+    if (result.status === 'failed') {
+      failedStep = result;
+      ctx.error = result.error;
+      break;
+    }
+  }
+
+  if (failedStep) {
+    const rollbackResults = rollbackSelf(ctx);
+    return buildSelfUpgradeResult(ctx, failedStep, rollbackResults);
+  }
+
+  try {
+    const finalizeResult = runInstalledFinalizer(ctx);
+    const finalizeSteps = Array.isArray(finalizeResult.steps) ? finalizeResult.steps : [];
+    for (const step of finalizeSteps) {
+      ctx.steps.push(step);
+      if (onStep) onStep(step);
+    }
+    return {
+      ...finalizeResult,
+      from: ctx.from,
+      steps: ctx.steps,
+      backupDir: finalizeResult.backupDir || ctx.backupDir,
+    };
+  } catch (err) {
+    const error = err.stderr?.toString().trim() || err.message;
+    failedStep = {
+      step: 5,
+      name: 'run_new_upgrade_finalizer',
+      status: 'failed',
+      error,
+      total,
+      duration: 0,
+    };
+    ctx.steps.push(failedStep);
+    if (onStep) onStep(failedStep);
+    return buildSelfUpgradeResult(ctx, failedStep, null, false);
+  }
 }
 
 // ---------------------------------------------------------------------------

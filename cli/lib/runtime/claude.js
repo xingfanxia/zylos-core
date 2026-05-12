@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execSync, execFileSync, execFile } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -24,10 +24,21 @@ import { buildInstructionFile } from './instruction-builder.js';
 import { ClaudeContextMonitor } from './claude-context-monitor.js';
 import { createClaudeProbe } from '../heartbeat/claude-probe.js';
 import { ZYLOS_DIR } from '../config.js';
+import {
+  tmuxHasSession,
+  tmuxGetPanePid,
+  tmuxKillSession,
+  tmuxPasteBuffer,
+  tmuxDeleteBuffer,
+  tmuxNewSession,
+  getProcessName,
+  hasChildProcess,
+} from './tmux-helpers.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'claude-main';
+// Multi-session: allow ZYLOS_TMUX_SESSION env var to override the default
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'claude-main';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 // When CLAUDE_BYPASS_PERMISSIONS=false, skip --dangerously-skip-permissions.
@@ -41,6 +52,7 @@ const ENV_VARS_TO_STRIP = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT'];
 const ENV_CLEAN_PREFIX = 'env ' + ENV_VARS_TO_STRIP.map(v => `-u ${v}`).join(' ');
 
 const CREDENTIALS_FILE = path.join(os.homedir(), '.claude', '.credentials.json');
+const C4_CONTROL_PATH = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js');
 
 /**
  * Parse a value from a .env file, tolerating common formatting variations:
@@ -64,7 +76,7 @@ function _parseEnvValue(content, key) {
 export class ClaudeAdapter extends RuntimeAdapter {
   get displayName() { return 'Claude Code'; }
   get runtimeId() { return 'claude'; }
-  get sessionName()  { return 'claude-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -147,24 +159,15 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @returns {Promise<boolean>}
    */
   async isRunning() {
-    if (!_tmuxHasSession()) return false;
+    if (!tmuxHasSession(SESSION)) return false;
 
-    const panePid = parseInt(_getTmuxPanePid(), 10);
+    const panePid = tmuxGetPanePid(SESSION);
     if (!panePid) return false;
 
-    // Check direct process name
-    try {
-      const name = execSync(`ps -p ${panePid} -o comm= 2>/dev/null`, { encoding: 'utf8' }).trim();
-      if (name === 'claude') return true;
-    } catch { }
+    const name = getProcessName(panePid);
+    if (name === 'claude') return true;
 
-    // Check children of pane process
-    try {
-      execSync(`pgrep -P ${panePid} -f "claude" > /dev/null 2>&1`);
-      return true;
-    } catch { }
-
-    return false;
+    return hasChildProcess(panePid, 'claude');
   }
 
   /**
@@ -172,9 +175,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * Synchronous — HeartbeatEngine calls this without await.
    */
   stop() {
-    try {
-      execSync(`tmux kill-session -t "${SESSION}" 2>/dev/null`);
-    } catch { /* session may not exist */ }
+    tmuxKillSession(SESSION);
   }
 
   /**
@@ -192,15 +193,35 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     try {
       fs.writeFileSync(tmpFile, text);
-      execSync(`tmux load-buffer -b "${bufferName}" "${tmpFile}" 2>/dev/null`);
-      execSync(`sleep 0.1`);
-      execSync(`tmux paste-buffer -b "${bufferName}" -t "${SESSION}" 2>/dev/null`);
-      execSync(`sleep 0.2`);
-      execSync(`tmux send-keys -t "${SESSION}" Enter 2>/dev/null`);
+      tmuxPasteBuffer(SESSION, tmpFile, bufferName);
     } finally {
       try { fs.unlinkSync(tmpFile); fs.rmdirSync(tmpDir); } catch { }
-      try { execSync(`tmux delete-buffer -b "${bufferName}" 2>/dev/null`); } catch { }
+      tmuxDeleteBuffer(bufferName);
     }
+  }
+
+  clearStaleState() {
+    try {
+      this.getHeartbeatDeps()?.clearHeartbeatPending?.();
+    } catch { }
+    try { fs.unlinkSync('/tmp/context-alert-cooldown'); } catch { }
+    try { fs.unlinkSync('/tmp/context-compact-scheduled'); } catch { }
+  }
+
+  enqueueStartupPrompt() {
+    if (_hasStartupHook()) return;
+
+    const content = 'reply to your human partner if they are waiting for your reply, then continue your ongoing tasks using the startup memory and C4 context already injected in this session, and do not query c4.db for recent conversations unless explicitly required.';
+    try {
+      execFileSync('node', [
+        C4_CONTROL_PATH,
+        'enqueue',
+        '--content', content,
+        '--priority', '3',
+        '--available-in', '3',
+        '--no-ack-suffix'
+      ], { encoding: 'utf8', timeout: 10_000 });
+    } catch { }
   }
 
   // ── Launch ────────────────────────────────────────────────────────────────
@@ -222,8 +243,21 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // 1. Build instruction file before launching
     await this.buildInstructionFile();
 
+    // 1b. Resolve per-instance working directory (token tracking isolation)
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+      } catch (err) {
+        console.error(`[ClaudeAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
     // 2. Pre-accept onboarding/trust dialogs (all auth methods)
     _ensureOnboardingComplete(ZYLOS_DIR);
+    if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
 
     // 3. Detect auth method to avoid "Auth conflict" errors
     const useCredentialsFile = _hasCredentialsFile();
@@ -264,19 +298,31 @@ export class ClaudeAdapter extends RuntimeAdapter {
     const envStripFlags = hasNativeAuth
       ? ' -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY'
       : '';
+
+    // No --continue: CC's resume locks model to original session and double-injects
+    // context (zylos's c4-session-init hook already restores conversation history).
     const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'claude-exit.log');
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
-    if (_tmuxHasSession()) {
+    if (tmuxHasSession(SESSION)) {
       // Existing session — send command via tmux
-      const cmd = `cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New tmux session
-      const tmuxArgs = ['new-session', '-d', '-s', SESSION, '-e', `PATH=${process.env.PATH}`];
+      const dedupedPath = [...new Set((process.env.PATH || '').split(':').filter(Boolean))].join(':');
+      const tmuxArgs = ['new-session', '-d', '-s', SESSION, '-e', `PATH=${dedupedPath}`];
+      // Pass instance identity to CC process so hooks write to the correct paths (multi-session)
+      if (process.env.ZYLOS_INSTANCE_ID) tmuxArgs.push('-e', `ZYLOS_INSTANCE_ID=${process.env.ZYLOS_INSTANCE_ID}`);
+      if (process.env.ZYLOS_TMUX_SESSION) tmuxArgs.push('-e', `ZYLOS_TMUX_SESSION=${process.env.ZYLOS_TMUX_SESSION}`);
       if (process.getuid?.() === 0) tmuxArgs.push('-e', 'IS_SANDBOX=1');
 
       let shellCmd;
@@ -291,15 +337,15 @@ export class ClaudeAdapter extends RuntimeAdapter {
         if (baseUrlValue) envParts.push(`ANTHROPIC_BASE_URL='${baseUrlValue}'`);
         tmpEnv = path.join(os.tmpdir(), `.zylos-env-${process.pid}-${Date.now()}`);
         fs.writeFileSync(tmpEnv, envParts.join('\n') + '\n', { mode: 0o600 });
-        shellCmd = `set -a; . "${tmpEnv}"; set +a; rm -f "${tmpEnv}"; cd "${ZYLOS_DIR}" && ${claudeCmd}; ${exitLogSnippet}`;
+        shellCmd = `set -a; . "${tmpEnv}"; set +a; rm -f "${tmpEnv}"; cd "${instanceCwd}" && ${claudeCmd}; ${exitLogSnippet}`;
       } else {
-        shellCmd = `cd "${ZYLOS_DIR}" && ${claudeCmd}; ${exitLogSnippet}`;
+        shellCmd = `cd "${instanceCwd}" && ${claudeCmd}; ${exitLogSnippet}`;
       }
 
       tmuxArgs.push('--', shellCmd);
 
       try {
-        execFileSync('tmux', tmuxArgs);
+        tmuxNewSession(tmuxArgs);
       } catch (e) {
         if (tmpEnv) try { fs.unlinkSync(tmpEnv); } catch { }
         throw new Error(`Failed to create tmux session: ${e.message}`);
@@ -345,23 +391,20 @@ function _hasCredentialsFile() {
   }
 }
 
-function _tmuxHasSession() {
+function _hasStartupHook() {
   try {
-    execSync(`tmux has-session -t "${SESSION}" 2>/dev/null`);
-    return true;
+    const settingsPath = path.join(ZYLOS_DIR, '.claude', 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    const matchers = settings?.hooks?.SessionStart;
+    if (!Array.isArray(matchers)) return false;
+    return matchers.some(m =>
+      Array.isArray(m?.hooks) && m.hooks.some(
+        h => h?.type === 'command' && typeof h.command === 'string'
+          && /(?:^|[\\/])session-start-prompt\.js(?:["'\s]|$)/.test(h.command)
+      )
+    );
   } catch {
     return false;
-  }
-}
-
-function _getTmuxPanePid() {
-  try {
-    return execSync(
-      `tmux list-panes -t "${SESSION}" -F '#{pane_pid}' 2>/dev/null | head -1`,
-      { encoding: 'utf8' }
-    ).trim();
-  } catch {
-    return null;
   }
 }
 

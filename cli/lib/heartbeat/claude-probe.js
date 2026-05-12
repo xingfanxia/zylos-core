@@ -18,10 +18,12 @@
  *   // Merge with remaining HeartbeatEngine deps (killTmuxSession, etc.) in Phase 7.
  */
 
-import { execSync, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { detectApiErrorText } from './api-error-patterns.js';
+import { tmuxCapturePaneText } from '../runtime/tmux-helpers.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
@@ -33,15 +35,11 @@ const RATE_LIMIT_PATTERNS = [
   /you['']ve hit your limit/i,
 ];
 
-// Anthropic API error patterns — matched against tmux pane content to detect
-// fatal API errors (e.g. 400 from a corrupted image) that leave Claude Code
-// unresponsive. These patterns are specific to Claude Code's error display
-// to avoid false positives from conversation content containing "400".
-const API_ERROR_PATTERNS = [
-  /APIError:\s*\d{3}/,                                    // "APIError: 400 ..."
-  /\b(400|422)\b.*(?:bad request|invalid request)/i,      // "400 Bad Request"
-  /invalid_request_error/,                                 // Anthropic error type
-  /overloaded_error/,                                      // Anthropic overloaded
+const AUTH_FAILURE_PATTERNS = [
+  /authentication_error/i,
+  /auth(?:entication)? failed/i,
+  /invalid api key/i,
+  /unauthorized/i,
 ];
 
 /**
@@ -51,14 +49,14 @@ const API_ERROR_PATTERNS = [
  * @param {string}  opts.pendingFile       - Path to heartbeat-pending.json
  * @param {string}  [opts.tmuxSession='claude-main']
  * @param {number}  [opts.ackDeadline=300]      - ACK deadline for normal heartbeats (seconds)
- * @param {number}  [opts.stuckAckDeadline=120] - ACK deadline for stuck-phase heartbeats
+ * @param {number}  [opts.recoveryAckDeadline=120] - ACK deadline for recovery heartbeats
  * @returns {object} Partial HeartbeatEngine deps
  */
 export function createClaudeProbe({
   pendingFile,
   tmuxSession = 'claude-main',
   ackDeadline = 300,
-  stuckAckDeadline = 120,
+  recoveryAckDeadline = 120,
 }) {
   return {
 
@@ -66,21 +64,24 @@ export function createClaudeProbe({
 
     /**
      * Enqueue a heartbeat control message via C4 and record the pending state.
-     * @param {string} phase - 'normal' | 'stuck'
+     * @param {string} phase
      * @returns {boolean}
      */
     enqueueHeartbeat(phase) {
-      const deadline = phase === 'stuck' ? stuckAckDeadline : ackDeadline;
+      const deadline = _getAckDeadline(phase, { ackDeadline, recoveryAckDeadline });
       const content = `Heartbeat check. [phase=${phase}]`;
       try {
-        const out = execFileSync('node', [C4_CONTROL, 'enqueue',
+        const args = [C4_CONTROL, 'enqueue',
           '--content', content,
-          // Priority 0 = highest. Must not be lowered — heartbeat must jump
-          // the queue ahead of conversation messages to avoid false timeout kills.
           '--priority', '0',
           '--bypass-state',
           '--ack-deadline', String(deadline),
-        ], { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
+        ];
+        // Multi-session: route heartbeat to the correct instance
+        if (process.env.ZYLOS_INSTANCE_ID) {
+          args.push('--target-instance', process.env.ZYLOS_INSTANCE_ID);
+        }
+        const out = execFileSync('node', args, { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
 
         const match = out.match(/control\s+(\d+)/i);
         if (!match) return false;
@@ -124,7 +125,7 @@ export function createClaudeProbe({
      * @returns {{ detected: boolean, cooldownUntil?: number, resetTime?: string }}
      */
     detectRateLimit() {
-      const pane = _captureTmuxPane(tmuxSession);
+      const pane = tmuxCapturePaneText(tmuxSession);
       if (!pane) return { detected: false };
 
       const detected = RATE_LIMIT_PATTERNS.some(p => p.test(pane));
@@ -145,6 +146,25 @@ export function createClaudeProbe({
     },
 
     /**
+     * Detect auth-failure text in the tmux pane. HealthEngine verifies this
+     * with the adapter's live checkAuth probe before changing health state.
+     *
+     * @returns {{ detected: boolean, pattern?: string }}
+     */
+    detectAuthFailure() {
+      const pane = tmuxCapturePaneText(tmuxSession);
+      if (!pane) return { detected: false };
+
+      for (const p of AUTH_FAILURE_PATTERNS) {
+        const match = pane.match(p);
+        if (match) {
+          return { detected: true, pattern: match[0] };
+        }
+      }
+      return { detected: false };
+    },
+
+    /**
      * Detect Anthropic API errors (e.g. 400 from corrupted image) in the tmux pane.
      * Used for fast recovery: when a heartbeat is pending and the session appears
      * stuck, this check can trigger immediate recovery instead of waiting for the
@@ -153,16 +173,8 @@ export function createClaudeProbe({
      * @returns {{ detected: boolean, pattern?: string }}
      */
     detectApiError() {
-      const pane = _captureTmuxPane(tmuxSession);
-      if (!pane) return { detected: false };
-
-      for (const p of API_ERROR_PATTERNS) {
-        const match = pane.match(p);
-        if (match) {
-          return { detected: true, pattern: match[0] };
-        }
-      }
-      return { detected: false };
+      const pane = tmuxCapturePaneText(tmuxSession);
+      return detectApiErrorText(pane);
     },
 
     // ── Pending state management ─────────────────────────────────────────────
@@ -188,15 +200,12 @@ export function createClaudeProbe({
   };
 }
 
-// ── Private helpers ──────────────────────────────────────────────────────────
-
-function _captureTmuxPane(session) {
-  try {
-    return execSync(`tmux capture-pane -p -t "${session}" 2>/dev/null`, { encoding: 'utf8' });
-  } catch {
-    return null;
-  }
+function _getAckDeadline(phase, { ackDeadline, recoveryAckDeadline }) {
+  if (phase === 'recovery' || phase === 'post_restart') return recoveryAckDeadline;
+  return ackDeadline;
 }
+
+// ── Private helpers ──────────────────────────────────────────────────────────
 
 /**
  * Parse a time string like "7am", "7:30am", "3pm" into epoch seconds.

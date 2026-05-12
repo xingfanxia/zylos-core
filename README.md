@@ -171,11 +171,22 @@ This works from Windows, ChromeOS, or any platform that can run Claude Code loca
 
 </details>
 
+> **Node.js requirement:** Zylos requires Node.js 20 or later. We recommend installing via [nvm](https://github.com/nvm-sh/nvm) — the install script does this automatically. If you manage Node.js yourself, make sure to use a single, stable version and avoid switching versions after installation, as globally installed npm packages (including Zylos) are tied to the Node.js version that installed them.
+>
+> ```bash
+> # Recommended: let the install script handle it, or install manually via nvm
+> curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+> nvm install 24
+> nvm alias default 24
+> ```
+
 `zylos init` is idempotent and supports both interactive and non-interactive modes. It will:
 1. Install missing tools (tmux, git, PM2, Claude Code or Codex)
 2. Set up authentication (Claude: browser login, API key, or [setup token](https://code.claude.com/docs/en/authentication); Codex: API key or device auth)
 3. Create the `~/zylos/` directory with memory, skills, and services
 4. Start all background services and launch your AI agent in a tmux session
+
+For fork-based deployments and post-deploy validation, see the [Deployment Guide](docs/deployment.md). It includes live smoke-test commands for routing, cold-start recovery, and real channel roundtrips.
 
 **Talk to your agent:**
 
@@ -270,7 +281,7 @@ Other frameworks charge per API token. Community reports show monthly bills of $
 
 ### Powered by Best-in-Class AI Runtimes
 
-Zylos supports Claude Code (Anthropic) and Codex (OpenAI) as interchangeable AI runtimes. Start with one, switch to the other anytime with `zylos runtime codex` — your memory, skills, and channels are preserved. When AI providers ship new capabilities, your agent benefits automatically. And because both runtimes can program, your AI writes new skills, integrates services, and evolves with your needs.
+Zylos supports Claude Code (Anthropic) and Codex (OpenAI) as first-class runtimes. You can still do a global switch with `zylos runtime codex`, but current multi-session deployments can also mix runtimes per instance: for example `admin` on Claude while selected user or worker instances run Codex. Memory, skills, and channels stay shared at the Zylos layer, while runtime sessions, usage cards, and token history remain instance-aware. When AI providers ship new capabilities, your agent benefits automatically. And because both runtimes can program, your AI writes new skills, integrates services, and evolves with your needs.
 
 ---
 
