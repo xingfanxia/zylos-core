@@ -92,16 +92,18 @@ function getPm2Processes() {
 
 function getDiskUsage() {
   try {
-    const output = execSync('df -h / --output=size,used,avail,pcent 2>/dev/null | tail -1', {
+    const target = fs.existsSync(ZYLOS_DIR) ? ZYLOS_DIR : os.homedir();
+    const output = execFileSync('df', ['-h', target, '--output=size,used,avail,pcent'], {
       encoding: 'utf8',
       timeout: 15000,
-    }).trim();
+    }).trim().split('\n').pop();
     const parts = output.split(/\s+/);
     return {
       total: parts[0] || 'unknown',
       used: parts[1] || 'unknown',
       available: parts[2] || 'unknown',
       used_percent: parts[3] || 'unknown',
+      path: target,
     };
   } catch {
     return null;
