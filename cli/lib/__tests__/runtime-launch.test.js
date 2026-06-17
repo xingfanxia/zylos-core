@@ -17,6 +17,8 @@ const savedEnv = {
   CODEX_BIN: process.env.CODEX_BIN,
   CLAUDE_BYPASS_PERMISSIONS: process.env.CLAUDE_BYPASS_PERMISSIONS,
   CODEX_BYPASS_PERMISSIONS: process.env.CODEX_BYPASS_PERMISSIONS,
+  ZYLOS_INSTANCE_ID: process.env.ZYLOS_INSTANCE_ID,
+  ZYLOS_TMUX_SESSION: process.env.ZYLOS_TMUX_SESSION,
 };
 
 process.env.HOME = fakeHome;
@@ -123,6 +125,8 @@ beforeEach(() => {
   calls.execSync.length = 0;
   calls.execFileSync.length = 0;
   tmuxSessionExists = false;
+  delete process.env.ZYLOS_INSTANCE_ID;
+  delete process.env.ZYLOS_TMUX_SESSION;
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -235,6 +239,19 @@ describe('Claude launch — new session', () => {
       fs.unlinkSync(credFile);
     }
   });
+
+  it('sets per-instance GH_CONFIG_DIR when launched for an instance', async () => {
+    tmuxSessionExists = false;
+    process.env.ZYLOS_INSTANCE_ID = 'user-pan';
+
+    await makeAdapter(ClaudeAdapter).launch({ bypassPermissions: false });
+    const env = readSpecEnv();
+    assert.ok(env, 'spec should be written');
+    assert.equal(env.GH_CONFIG_DIR, path.join(fakeZylosDir, 'instances', 'user-pan', '.config', 'gh'));
+    assert.equal(env.GH_PROMPT_DISABLED, '1');
+    assert.equal(env.ZYLOS_INSTANCE_ID, 'user-pan');
+    assert.ok(fs.existsSync(env.GH_CONFIG_DIR), 'per-instance gh config dir should be created');
+  });
 });
 
 describe('Claude launch — existing session', () => {
@@ -258,6 +275,19 @@ describe('Claude launch — existing session', () => {
 
     assert.ok(sent.length > 0, 'sendMessage should be called');
     assert.ok(sent.includes('claude'), 'sent command should reference claude');
+  });
+
+  it('exports per-instance GH_CONFIG_DIR before reusing a session', async () => {
+    tmuxSessionExists = true;
+    process.env.ZYLOS_INSTANCE_ID = 'user-limh';
+    let sent = '';
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.sendMessage = async (text) => { sent = text; };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.ok(sent.includes("export GH_CONFIG_DIR='"));
+    assert.ok(sent.includes(path.join(fakeZylosDir, 'instances', 'user-limh', '.config', 'gh')));
   });
 });
 
@@ -336,6 +366,19 @@ describe('Codex launch — new session', () => {
     assert.deepEqual(spec.args, []);
     assert.ok(!JSON.stringify(spec).includes('session-start-inject.js'));
   });
+
+  it('sets per-instance GH_CONFIG_DIR when launched for an instance', async () => {
+    tmuxSessionExists = false;
+    process.env.ZYLOS_INSTANCE_ID = 'yanzi';
+
+    await makeAdapter(CodexAdapter).launch({ bypassPermissions: false });
+    const env = readSpecEnv();
+    assert.ok(env, 'spec should be written');
+    assert.equal(env.GH_CONFIG_DIR, path.join(fakeZylosDir, 'instances', 'yanzi', '.config', 'gh'));
+    assert.equal(env.GH_PROMPT_DISABLED, '1');
+    assert.equal(env.ZYLOS_INSTANCE_ID, 'yanzi');
+    assert.ok(fs.existsSync(env.GH_CONFIG_DIR), 'per-instance gh config dir should be created');
+  });
 });
 
 describe('Codex launch — existing session', () => {
@@ -361,5 +404,18 @@ describe('Codex launch — existing session', () => {
     assert.ok(sent.includes('codex'), 'sent command should reference codex');
     assert.ok(!sent.includes('_p=$(cat'), 'existing-session command should not load bootstrap prompt');
     assert.ok(!sent.includes('session-start-inject.js'), 'existing-session command should not run text bootstrap');
+  });
+
+  it('exports per-instance GH_CONFIG_DIR before reusing a session', async () => {
+    tmuxSessionExists = true;
+    process.env.ZYLOS_INSTANCE_ID = 'scheduler';
+    let sent = '';
+    const adapter = makeAdapter(CodexAdapter);
+    adapter.sendMessage = async (text) => { sent = text; };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.ok(sent.includes("export GH_CONFIG_DIR='"));
+    assert.ok(sent.includes(path.join(fakeZylosDir, 'instances', 'scheduler', '.config', 'gh')));
   });
 });

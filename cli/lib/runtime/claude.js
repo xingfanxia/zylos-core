@@ -34,7 +34,13 @@ import {
   getProcessName,
   hasChildProcess,
 } from './tmux-helpers.js';
-import { buildCleanEnv, buildCompatEnv, loadRuntimeEnvManifest, writeLaunchSpec } from './tmux-env.js';
+import {
+  buildCleanEnv,
+  buildCompatEnv,
+  ensureInstanceGhConfigDir,
+  loadRuntimeEnvManifest,
+  writeLaunchSpec,
+} from './tmux-env.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -261,6 +267,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // 2. Pre-accept onboarding/trust dialogs (all auth methods)
     _ensureOnboardingComplete(ZYLOS_DIR);
     if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
+    const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
     // 3. Detect auth method to avoid "Auth conflict" errors
     const useCredentialsFile = _hasCredentialsFile();
@@ -313,6 +320,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
       const envExports = [
         process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
         process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+        ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
+        ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
       const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}; ${exitLogSnippet}`;
@@ -334,6 +343,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       // so its hooks/skills write to the correct per-instance paths.
       if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
       if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
+      if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
 
       // Inject auth tokens
       if (hasNativeAuth) {

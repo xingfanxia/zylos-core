@@ -40,7 +40,13 @@ import {
   getProcessName,
   hasChildProcess,
 } from './tmux-helpers.js';
-import { buildCleanEnv, buildCompatEnv, loadRuntimeEnvManifest, writeLaunchSpec } from './tmux-env.js';
+import {
+  buildCleanEnv,
+  buildCompatEnv,
+  ensureInstanceGhConfigDir,
+  loadRuntimeEnvManifest,
+  writeLaunchSpec,
+} from './tmux-env.js';
 import { classifyCodexLoginStatus } from '../auth-parsers.js';
 import { ensureCodexHooksTrusted } from '../codex-hooks.js';
 
@@ -263,8 +269,9 @@ export class CodexAdapter extends RuntimeAdapter {
         try { writeCodexConfig(instanceCwd); } catch { /* best effort */ }
       }
     }
+    const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
-    // 1.5. Ensure .agents/skills → .claude/skills symlink for Codex skill discovery.
+    // 1.5. Ensure .agents/skills -> .claude/skills symlink for Codex skill discovery.
     const agentsDir = path.join(ZYLOS_DIR, '.agents');
     const agentsSkillsPath = path.join(agentsDir, 'skills');
     let agentsSkillsExists = false;
@@ -306,6 +313,8 @@ export class CodexAdapter extends RuntimeAdapter {
       const envExports = [
         process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
         process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+        ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
+        ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
       const cmd = `${envPrefix}cd "${instanceCwd}"; ${codexCmd}; ${exitLogSnippet}`;
@@ -324,8 +333,9 @@ export class CodexAdapter extends RuntimeAdapter {
       // so its hooks/skills write to the correct per-instance paths.
       if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
       if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
+      if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
 
-      // Build launch spec — Codex reads auth from ~/.codex/auth.json via HOME
+      // Build launch spec - Codex reads auth from ~/.codex/auth.json via HOME
       const args = [];
       if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox');
 

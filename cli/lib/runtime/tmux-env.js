@@ -125,6 +125,17 @@ export function parsePathManifest(value, warnings, keyName) {
 }
 
 /**
+ * Give each Zylos instance its own GitHub CLI config directory.
+ * This prevents per-instance agents from inheriting the operator's ~/.config/gh.
+ */
+export function ensureInstanceGhConfigDir(instanceCwd) {
+  const ghConfigDir = path.join(instanceCwd, '.config', 'gh');
+  fs.mkdirSync(ghConfigDir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(ghConfigDir, 0o700); } catch { /* best effort */ }
+  return ghConfigDir;
+}
+
+/**
  * Parse a comma-separated manifest string into validated variable names.
  * Invalid names are skipped and recorded in warnings.
  */
