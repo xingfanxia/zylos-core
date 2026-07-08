@@ -111,7 +111,16 @@ The memory layer is now hardened for future mixed-runtime use.
 | Shared identity / references / shared reference docs | `memory/shared/...` | primary instance or scheduler |
 | Archive | `memory/archive/...` | primary instance or scheduler |
 | Per-instance working state | `memory/instances/<id>/...` | owning instance only |
+| Per-group memory (ZY-GRP-1) | `memory/groups/<group_key>/...` | the group instance (`type:group`) only |
 | User profile | `memory/users/<uid>/profile.md` | any instance |
+
+**Per-group memory (ZY-GRP-1):** the group instance serves many chats, so its
+session-init injects history SEGMENTED into one labeled section per chat
+(keyed on `groupKeyFromEndpoint()` = the endpoint id before the first `|`),
+most-recently-active first, capped per group. Durable per-chat memory lives
+under `memory/groups/<group_key>/`; that tier is writable only by the group
+instance (memory-guard code check + unix perms — `2770 zylos-group`, other
+agents denied by `verify-isolation.sh`).
 
 ### Enforcement Paths
 

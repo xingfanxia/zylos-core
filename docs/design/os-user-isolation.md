@@ -67,7 +67,14 @@ dirs + POSIX default ACLs (`u:<service>:rwX`, `u:<agent>:rwX`), and a
 Known limitation: the shared sqlite has no row-level isolation — any agent can
 read other instances' conversation rows. Follow-up design: broker c4 send/query
 through the per-instance activity-monitor socket so the DB handle stays with
-the service user.
+the service user. (Shipped as ZY-ISO-2 — the C4 broker; see the deployment plan.)
+
+Per-group memory tier (ZY-GRP-1): `memory/groups/<group_key>/` is owned by the
+group user (`2770 zylos-group` + setgid + service-user default ACL, provision
+step 8b). Only the group instance may write it — other agents are not in the
+`zylos-group` primary group and get no ACL, so they can't even traverse in;
+`verify-isolation.sh` asserts both directions, and `memory-guard.js` enforces
+the same rule at the code layer.
 
 ## Deployment-side pieces (live in the deployment's `scripts/ops/`)
 
