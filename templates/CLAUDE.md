@@ -108,8 +108,25 @@ Route user-specific preferences to the correct profile file. Bot identity stays 
 **Shared vs Instance-specific files:**
 - **Shared** (in `shared/`): identity.md, references.md, reference/*.md, users/ — common across all instances
 - **Instance-specific** (in `instances/<id>/`): state.md, sessions/ — unique per running instance
+- **Group** (in `groups/<group_key>/`): per-chat memory owned by the group instance ONLY (ZY-GRP-1) — other instances are denied this tier.
 
 When in doubt, write to sessions/current.md.
+
+### Single-Owner & Scoping Rules (ZY-MEM-1)
+
+- **One loop, one owner.** A per-user work loop lives in exactly ONE place: the
+  owning user instance's `instances/<id>/state.md`. The primary/admin instance's
+  state.md is a cross-instance COORDINATION tracker — it may REFERENCE another
+  instance's loops with a short pointer, but must not re-copy their full detail
+  (duplicated detail drifts and there's no single source of truth).
+- **Instance-scoped c4 view ≠ full history.** A user instance's `c4-fetch` /
+  session-init only sees conversations tagged `target_instance=<its id>`.
+  Messages that predate multi-session targeting won't appear even though they
+  happened — so cross-check `memory/users/<chat_id>/profile.md` before writing
+  "no conversations / dormant". An instance that is `enabled` in instances.json
+  IS approved, regardless of any stale "awaiting approval" note in a profile;
+  reconcile state.md/profile against instances.json rather than trusting a stale
+  claim.
 
 ### Instance Approval Flow
 
