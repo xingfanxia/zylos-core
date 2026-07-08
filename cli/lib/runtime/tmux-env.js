@@ -165,10 +165,6 @@ function _buildPath(processEnv, platform, pathPrepend, pathAppend, execPath) {
     path.join(home, '.claude', 'bin'),
   ];
 
-  // Pin the node binary that's running core — guarantees tmux child processes
-  // use the same node even when the caller's PATH lacks nvm (e.g. PM2).
-  const execDir = execPath ? [path.dirname(execPath)] : [];
-
   const currentParts = (processEnv.PATH || '').split(':').filter(Boolean);
   const nvmParts = currentParts.filter(p => p.includes('.nvm'));
 
@@ -182,6 +178,17 @@ function _buildPath(processEnv, platform, pathPrepend, pathAppend, execPath) {
     '/usr/sbin', '/usr/bin',
     '/sbin', '/bin',
   ];
+
+  // Pin the node binary that's running core — guarantees tmux child processes
+  // use the same node even when the caller's PATH lacks nvm (e.g. PM2).
+  // When node IS a platform/system binary, skip the pin: hoisting a whole
+  // system dir here would shadow its later position and break the documented
+  // "PREPEND before platform/system base paths" contract (dedup keeps the
+  // first occurrence).
+  const execDir = execPath
+    ? [path.dirname(execPath)].filter(
+        d => !systemPaths.includes(d) && !platformPaths.includes(d))
+    : [];
 
   const allParts = [
     ...userDirs, ...execDir, ...nvmParts,

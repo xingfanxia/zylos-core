@@ -128,6 +128,27 @@ async function approveUser(chatId, name) {
     console.error(`Warning: failed to set auto_suspend (${err.message})`);
   }
 
+  // 1e. OS-level isolation: dedicated unix user for the new instance
+  // (docs/design/agent-os-isolation.md). Provision script is idempotent.
+  // Runs from the admin session (service user, passwordless sudo).
+  try {
+    const provisionScript = path.join(ZYLOS_DIR, 'scripts', 'ops', 'provision-agent-user.sh');
+    if (fs.existsSync(provisionScript)) {
+      execFileSync('bash', [provisionScript, instanceName], { stdio: 'pipe', timeout: 120_000 });
+      const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
+      const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
+      if (config.instances[instanceName]) {
+        config.instances[instanceName].os_user = `zylos-${instanceName.replace(/^user-/, '')}`;
+        fs.writeFileSync(instancesFile, JSON.stringify(config, null, 2) + '\n');
+        console.log(`OS isolation: ${instanceName} -> ${config.instances[instanceName].os_user}`);
+      }
+    } else {
+      console.error('Warning: provision-agent-user.sh missing — instance will run as the service user');
+    }
+  } catch (err) {
+    console.error(`Warning: OS-user provisioning failed (${err.message}) — instance will run as the service user`);
+  }
+
   // 2. Release held messages: update pending_approval → pending with new target_instance
   let releasedCount = 0;
   let releaseError = null;

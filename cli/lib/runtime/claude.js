@@ -255,18 +255,34 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // 1b. Resolve per-instance working directory (token tracking isolation)
     const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
     let instanceCwd = ZYLOS_DIR;
+    let osUser = null;
     if (instanceId) {
       try {
-        const { ensureInstanceCwd } = await import('../../../skills/multi-session/instance-config.js');
+        const { ensureInstanceCwd, getInstanceDef } = await import('../../../skills/multi-session/instance-config.js');
         instanceCwd = ensureInstanceCwd(instanceId);
+        // OS-level isolation (docs/design/agent-os-isolation.md): instances with
+        // an os_user run Claude as that dedicated unix user instead of the
+        // service user. Provisioned by scripts/ops/provision-agent-user.sh.
+        const candidate = getInstanceDef(instanceId)?.os_user || null;
+        if (candidate) {
+          if (/^[a-z_][a-z0-9_-]{0,31}$/.test(candidate)) {
+            osUser = candidate;
+          } else {
+            console.error(`[ClaudeAdapter] ignoring invalid os_user "${candidate}" for "${instanceId}"`);
+          }
+        }
       } catch (err) {
         console.error(`[ClaudeAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
       }
     }
 
-    // 2. Pre-accept onboarding/trust dialogs (all auth methods)
-    _ensureOnboardingComplete(ZYLOS_DIR);
-    if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
+    // 2. Pre-accept onboarding/trust dialogs (all auth methods).
+    // os_user instances: provisioning owns /home/<os_user>/.claude.json — the
+    // service user cannot (and must not) write into the agent home.
+    if (!osUser) {
+      _ensureOnboardingComplete(ZYLOS_DIR);
+      if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
+    }
     const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
     // 3. Detect auth method to avoid "Auth conflict" errors
@@ -314,6 +330,13 @@ export class ClaudeAdapter extends RuntimeAdapter {
     const exitLogFile = path.join(monitorDir, 'claude-exit.log');
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
+    // os_user instances: a leftover pane belongs to the agent user (or is a
+    // stale service-user shell) — neither can be reused for a privileged
+    // relaunch. Kill and rebuild through the clean new-session pipeline.
+    if (osUser && tmuxHasSession(SESSION)) {
+      tmuxKillSession(SESSION);
+    }
+
     if (tmuxHasSession(SESSION)) {
       // Existing session — send command via sendMessage, no env rebuild.
       // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
@@ -355,6 +378,15 @@ export class ClaudeAdapter extends RuntimeAdapter {
         if (baseUrlValue) env.ANTHROPIC_BASE_URL = baseUrlValue;
       }
 
+      // os_user instances: the agent process gets the agent's own HOME so its
+      // ~/zylos farm dir (per-instance .env + symlinks), credentials symlink,
+      // transcripts, and hook `~` expansion all resolve inside the agent home.
+      if (osUser) {
+        env.HOME = `/home/${osUser}`;
+        env.USER = osUser;
+        env.LOGNAME = osUser;
+      }
+
       // Build launch spec
       const args = [];
       if (bypassPermissions) args.push('--dangerously-skip-permissions');
@@ -368,13 +400,28 @@ export class ClaudeAdapter extends RuntimeAdapter {
         exitLogFile,
       });
 
+      // Spec is 0600 in /tmp (sticky): hand it to the agent user so the
+      // launcher (running as os_user) can read + unlink it.
+      if (osUser) {
+        try {
+          execFileSync('sudo', ['-n', 'chown', `${osUser}:${osUser}`, specPath], { timeout: 10_000 });
+        } catch (e) {
+          try { fs.unlinkSync(specPath); } catch { }
+          throw new Error(`Failed to chown launch spec to ${osUser}: ${e.message}`);
+        }
+      }
+
+      const launchCmd = osUser
+        ? `sudo -n -u ${osUser} -H -- "${process.execPath}" "${launcherPath}" "${specPath}"`
+        : `"${process.execPath}" "${launcherPath}" "${specPath}"`;
+
       // tmux args — only pass minimal env for launcher itself to start
       const tmuxArgs = [
         'new-session', '-d', '-E', '-s', SESSION,
         '-e', `PATH=${env.PATH}`,
         '-e', `HOME=${env.HOME}`,
         '-e', `TERM=${env.TERM || 'xterm-256color'}`,
-        '--', `"${process.execPath}" "${launcherPath}" "${specPath}"`,
+        '--', launchCmd,
       ];
 
       try {
