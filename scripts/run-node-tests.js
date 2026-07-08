@@ -10,6 +10,7 @@ const TEST_ROOTS = [
   path.join(ROOT, 'skills', 'activity-monitor', 'scripts', '__tests__'),
   path.join(ROOT, 'skills', 'comm-bridge', 'scripts', '__tests__'),
   path.join(ROOT, 'skills', 'web-console', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'scheduler', 'scripts', '__tests__'),
 ];
 
 // ZY-TEST-1 (2026-07-08): the previously-excluded comm-bridge CLI suites are
@@ -40,6 +41,7 @@ function isNodeTest(file) {
   if (rel.startsWith('cli/lib/runtime/__tests__/')) return true;
   if (rel.startsWith('skills/activity-monitor/scripts/__tests__/')) return true;
   if (rel.startsWith('skills/web-console/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/scheduler/scripts/__tests__/')) return true;
   if (rel.startsWith('skills/comm-bridge/scripts/__tests__/')) {
     return !COMM_BRIDGE_EXCLUDED_TESTS.has(path.basename(file));
   }

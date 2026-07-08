@@ -28,6 +28,7 @@ fs.writeFileSync(instancesFile, JSON.stringify({
 const approve = await import('../c4-approve.js');
 const dbMod = await import('../c4-db.js');
 const db = dbMod.getDb();
+const memoryDir = path.join(tmpDir, 'memory');
 
 after(() => {
   try { dbMod.close(); } catch { /* ignore */ }
@@ -51,7 +52,7 @@ describe('checkAndHoldForApproval', () => {
 
 describe('holdAndNotify', () => {
   it('inserts the message as pending_approval and notifies admin', () => {
-    const record = approve.holdAndNotify('feishu', 'stranger|type:p2p', 'hi there ---- reply via foo', 3, 'admin');
+    const record = approve.holdAndNotify('feishu', 'stranger|type:p2p', 'hi there ---- reply via foo', 3, 'admin', { sendMessage: () => true });
     const row = db.prepare('SELECT status, channel FROM conversations WHERE id=?').get(record.id);
     assert.equal(row.status, 'pending_approval');
     assert.equal(row.channel, 'feishu');
@@ -61,6 +62,31 @@ describe('holdAndNotify', () => {
     ).get();
     assert.ok(note && /pending approval/i.test(note.content));
     assert.ok(note.content.includes('stranger')); // chat id surfaced to admin
+  });
+
+  it('sends a hold-ack to the user ONCE (first held message only)', () => {
+    const sends = [];
+    const sendMessage = (channel, endpoint, msg) => { sends.push({ channel, endpoint, msg }); return true; };
+    // First contact from a brand-new chat → ack.
+    approve.holdAndNotify('telegram', 'newbie-chat', '你好，请帮我', 3, 'admin', { sendMessage });
+    assert.equal(sends.length, 1);
+    assert.equal(sends[0].endpoint, 'newbie-chat');
+    assert.match(sends[0].msg, /你好|管理员/); // zh ack (CJK detected)
+    // Second held message from the SAME chat → no second ack.
+    approve.holdAndNotify('telegram', 'newbie-chat', 'still waiting', 3, 'admin', { sendMessage });
+    assert.equal(sends.length, 1);
+  });
+});
+
+describe('seedUserProfile', () => {
+  it('writes a profile skeleton under memory/users/<chat_id>/', () => {
+    const p = approve.seedUserProfile('user-9', 'Alice', { memoryDir, now: '2026-07-08', firstMessage: 'hello world' });
+    assert.ok(p.endsWith(path.join('users', 'user-9', 'profile.md')));
+    const text = fs.readFileSync(p, 'utf8');
+    assert.match(text, /User Profile — Alice/);
+    assert.match(text, /Chat ID: user-9/);
+    assert.match(text, /2026-07-08/);
+    assert.match(text, /hello world/);
   });
 });
 

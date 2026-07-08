@@ -36,6 +36,62 @@ function resolvePackageRoot() {
 
 // Import DB functions
 import { getDb, close, insertConversation, insertControl } from './c4-db.js';
+import { SKILLS_DIR } from './c4-config.js';
+import { renderOnboardingMessage, detectLang } from './onboarding-messages.js';
+
+// ZY-UX-1: default daily token quota for a newly-approved user (notify-only).
+export const DEFAULT_QUOTA_TOKENS_DAILY = 5_000_000;
+
+/**
+ * Best-effort: deliver an onboarding message to a user's channel via that
+ * channel's send.js (the same script the reply path uses). Runs server-side as
+ * the service user (holds channel creds). Never throws — onboarding UX must not
+ * block approval/hold.
+ * @returns {boolean} true if the send script ran successfully
+ */
+export function sendChannelMessage(channel, endpoint, message) {
+  try {
+    if (!channel || !endpoint || !message) return false;
+    const script = path.join(SKILLS_DIR, channel, 'scripts', 'send.js');
+    if (!fs.existsSync(script)) return false;
+    execFileSync('node', [script, endpoint, message], { stdio: 'pipe', timeout: 30000 });
+    return true;
+  } catch (err) {
+    console.error(`Warning: onboarding message send failed (${channel}): ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Seed a new user's profile + state memory. Pure-ish (IO injectable for tests).
+ * @returns {string} the profile path written
+ */
+export function seedUserProfile(chatId, name, {
+  memoryDir = path.join(ZYLOS_DIR, 'memory'),
+  firstMessage = '',
+  now = '',
+  writeFileSync = fs.writeFileSync,
+  mkdirSync = fs.mkdirSync,
+} = {}) {
+  const userDir = path.join(memoryDir, 'users', String(chatId));
+  mkdirSync(userDir, { recursive: true });
+  const date = now || 'unknown';
+  const excerpt = String(firstMessage).replace(/\s+/g, ' ').slice(0, 160);
+  const profile = [
+    `# User Profile — ${name || chatId}`,
+    '',
+    `- Chat ID: ${chatId}`,
+    `- Approved: ${date}`,
+    excerpt ? `- First message: "${excerpt}"` : '- First message: (none captured)',
+    '',
+    '## Notes',
+    '- Onboarding pending — build this out as you learn about the user.',
+    '',
+  ].join('\n');
+  const profilePath = path.join(userDir, 'profile.md');
+  writeFileSync(profilePath, profile);
+  return profilePath;
+}
 
 function usage() {
   console.log('Usage:');
@@ -113,6 +169,14 @@ async function approveUser(chatId, name) {
     console.error(`Warning: failed to create memory directory (${err.message})`);
   }
 
+  // 1c-2. ZY-UX-1: seed a user profile skeleton (memory/users/<chat_id>/profile.md)
+  try {
+    const profilePath = seedUserProfile(chatId, instanceName, { now: new Date().toISOString().slice(0, 10) });
+    console.log(`User profile seeded: ${profilePath}`);
+  } catch (err) {
+    console.error(`Warning: failed to seed user profile (${err.message})`);
+  }
+
   // 1d. Set auto_suspend + idle_timeout (CLI doesn't have these flags).
   // Route through the router's atomic temp+rename writer — raw writeFileSync
   // on instances.json can be seen truncated by concurrent readers (dispatcher,
@@ -124,9 +188,10 @@ async function approveUser(chatId, name) {
       config.instances[instanceName].type = 'user';
       config.instances[instanceName].auto_suspend = true;
       config.instances[instanceName].idle_timeout_min = 360;
+      config.instances[instanceName].quota_tokens_daily = DEFAULT_QUOTA_TOKENS_DAILY; // ZY-UX-1 (notify-only)
       return config;
     });
-    console.log(`Set auto_suspend=true, idle_timeout_min=360 for ${instanceName}`);
+    console.log(`Set auto_suspend=true, idle_timeout_min=360, quota_tokens_daily=${DEFAULT_QUOTA_TOKENS_DAILY} for ${instanceName}`);
   } catch (err) {
     console.error(`Warning: failed to set auto_suspend (${err.message})`);
   }
@@ -167,6 +232,7 @@ async function approveUser(chatId, name) {
   // 2. Release held messages: update pending_approval → pending with new target_instance
   let releasedCount = 0;
   let releaseError = null;
+  let welcomeTarget = null; // {channel, endpoint, content} of the user's first held msg (ZY-UX-1)
   try {
     const db = getDb();
     if (!db) {
@@ -176,10 +242,14 @@ async function approveUser(chatId, name) {
 
     // Find held messages for this chat_id
     const held = db.prepare(`
-      SELECT id, endpoint_id FROM conversations
+      SELECT id, endpoint_id, channel, content FROM conversations
       WHERE status = 'pending_approval'
         AND endpoint_id LIKE ?
+      ORDER BY id ASC
     `).all(`${chatId}%`);
+    if (held.length > 0 && held[0].endpoint_id) {
+      welcomeTarget = { channel: held[0].channel, endpoint: held[0].endpoint_id, content: held[0].content || '' };
+    }
 
     if (held.length === 0) {
       console.log('No held messages to release.');
@@ -220,6 +290,20 @@ async function approveUser(chatId, name) {
     console.log(`PM2: started activity-monitor-${instanceName}`);
   } catch (err) {
     console.error(`Warning: PM2 start failed (${err.message}). Run manually: ZYLOS_INSTANCE_ID=${instanceName} pm2 start <am-script> --name activity-monitor-${instanceName}`);
+  }
+
+  // 4. ZY-UX-1: welcome the newly-approved user in their language (best-effort).
+  // Replaces the old "admin remembers to type a greeting" step. The agent still
+  // runs its own Onboarding security-disclosure flow on the first real message.
+  if (welcomeTarget?.endpoint) {
+    try {
+      const welcome = renderOnboardingMessage('welcome', { lang: detectLang(welcomeTarget.content) });
+      if (sendChannelMessage(welcomeTarget.channel, welcomeTarget.endpoint, welcome)) {
+        console.log(`Welcome message sent to ${chatId} via ${welcomeTarget.channel}`);
+      }
+    } catch (err) {
+      console.error(`Warning: welcome send failed (${err.message})`);
+    }
   }
 
   close();
@@ -315,12 +399,28 @@ export async function checkAndHoldForApproval(endpoint, targetInstance, noReply,
  * @param {number} priority - Message priority
  * @param {string|null} targetInstance - Resolved target (fallback default)
  */
-export function holdAndNotify(channel, endpoint, content, priority, targetInstance) {
+export function holdAndNotify(channel, endpoint, content, priority, targetInstance, { sendMessage = sendChannelMessage } = {}) {
+  // 2. Extract chat_id for admin notification
+  const chatId = endpoint ? endpoint.split('|')[0] : 'unknown';
+
+  // ZY-UX-1: ack the user once, on first contact (before this insert there are
+  // no prior pending_approval rows for the chat). Best-effort; never blocks hold.
+  const db0 = getDb();
+  const alreadyHeld = endpoint
+    ? db0.prepare("SELECT 1 FROM conversations WHERE status='pending_approval' AND endpoint_id LIKE ? LIMIT 1").get(`${chatId}%`)
+    : true;
+
   // 1. Insert message as pending_approval
   const record = insertConversation('in', channel, endpoint, content, 'pending_approval', priority, false, targetInstance);
 
-  // 2. Extract chat_id for admin notification
-  const chatId = endpoint ? endpoint.split('|')[0] : 'unknown';
+  if (!alreadyHeld && endpoint) {
+    try {
+      const ack = renderOnboardingMessage('hold-ack', { lang: detectLang(content) });
+      sendMessage(channel, endpoint, ack);
+    } catch (err) {
+      console.error(`Warning: hold-ack render/send failed: ${err.message}`);
+    }
+  }
 
   // 3. Notify admin via control queue
   const preview = content.substring(0, 200).replace(/----.*$/, '').trim();
