@@ -137,12 +137,18 @@ describe('context observability helpers', () => {
 
 describe('instance burn enrichment', () => {
   it('adds today/7d token burn and context observability to instance rows', () => {
+    // buildInstanceTokenBurnMap buckets against the real clock — derive dates
+    // dynamically so the test doesn't rot (it was frozen at 2026-04-01 once).
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const within7d = new Date();
+    within7d.setDate(within7d.getDate() - 2);
+    const within7dStr = within7d.toISOString().slice(0, 10);
     const tokenCache = {
       instances: {
         admin: {
           daily: [
-            { date: '2026-03-30', total_tokens: 100, cost_usd: 1 },
-            { date: '2026-04-01', total_tokens: 200, cost_usd: 2, input_tokens: 50, output_tokens: 50, cache_read: 100, cache_write: 0 },
+            { date: within7dStr, total_tokens: 100, cost_usd: 1 },
+            { date: todayStr, total_tokens: 200, cost_usd: 2, input_tokens: 50, output_tokens: 50, cache_read: 100, cache_write: 0 },
           ],
         },
       },

@@ -9,11 +9,17 @@ const TEST_ROOTS = [
   path.join(ROOT, 'cli', 'lib', 'runtime', '__tests__'),
   path.join(ROOT, 'skills', 'activity-monitor', 'scripts', '__tests__'),
   path.join(ROOT, 'skills', 'comm-bridge', 'scripts', '__tests__'),
+  path.join(ROOT, 'skills', 'web-console', 'scripts', '__tests__'),
 ];
 
-const COMM_BRIDGE_ROOT_TESTS = new Set([
-  'c4-dispatcher-pure.test.js',
-  'c4-receive.test.js',
+// Known-red comm-bridge CLI suites, excluded until fixed (2026-07-08 audit):
+// c4-send-cli (broadcast/validation/failed-channel), c4-fetch-cli
+// (--unsummarized), c4-session-init-cli — 8 real assertion failures against
+// current CLI behavior. Every other file in the dir runs.
+const COMM_BRIDGE_EXCLUDED_TESTS = new Set([
+  'c4-send-cli.test.js',
+  'c4-fetch-cli.test.js',
+  'c4-session-init-cli.test.js',
 ]);
 
 function walk(dir, files = []) {
@@ -34,8 +40,9 @@ function isNodeTest(file) {
   if (rel.startsWith('cli/lib/__tests__/')) return true;
   if (rel.startsWith('cli/lib/runtime/__tests__/')) return true;
   if (rel.startsWith('skills/activity-monitor/scripts/__tests__/')) return true;
+  if (rel.startsWith('skills/web-console/scripts/__tests__/')) return true;
   if (rel.startsWith('skills/comm-bridge/scripts/__tests__/')) {
-    return COMM_BRIDGE_ROOT_TESTS.has(path.basename(file));
+    return !COMM_BRIDGE_EXCLUDED_TESTS.has(path.basename(file));
   }
   return false;
 }
