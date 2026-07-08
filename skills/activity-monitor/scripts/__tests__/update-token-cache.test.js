@@ -190,7 +190,7 @@ describe('runUpdateOnce', () => {
       zylosDir: tmpDir,
       now: new Date('2026-04-01T12:00:00.000Z'),
       execFileSyncImpl: (cmd) => {
-        if (cmd === 'ccusage') {
+        if (String(cmd).endsWith('ccusage')) {
           return JSON.stringify({ projects: {} });
         }
         if (cmd === 'npx') {
@@ -245,7 +245,7 @@ describe('runUpdateOnce', () => {
       zylosDir: tmpDir,
       now: new Date('2026-04-01T12:00:00.000Z'),
       execFileSyncImpl: (cmd) => {
-        if (cmd === 'ccusage') return JSON.stringify({ projects: {} });
+        if (String(cmd).endsWith('ccusage')) return JSON.stringify({ projects: {} });
         if (cmd === 'npx') {
           return JSON.stringify({
             sessions: [
