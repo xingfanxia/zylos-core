@@ -52,6 +52,21 @@ after(() => {
   try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
+describe('runPendingMigrations', () => {
+  it('records applied migrations and is idempotent (running twice does not error)', () => {
+    // getDb() already ran the migrations on init; re-running must be a clean no-op.
+    assert.doesNotThrow(() => multi.runPendingMigrations(db));
+    assert.doesNotThrow(() => multi.runPendingMigrations(db));
+    const names = db.prepare('SELECT name FROM _migrations ORDER BY name').all().map(r => r.name);
+    assert.ok(names.length >= 1, 'at least one migration recorded');
+    // target_instance columns exist on all three tables (idempotent dup-column handling).
+    for (const table of ['conversations', 'control_queue', 'checkpoints']) {
+      const cols = db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name);
+      assert.ok(cols.includes('target_instance'), `${table}.target_instance present`);
+    }
+  });
+});
+
 describe('getNextPendingForInstance', () => {
   it('returns messages targeting the instance OR legacy NULL, by priority', () => {
     conv({ content: 'admin-low', target: 'admin', priority: 3 });
