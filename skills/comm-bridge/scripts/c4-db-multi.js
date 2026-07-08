@@ -247,7 +247,13 @@ export function markControlRejected(id) {
 
 /**
  * Get the most recent checkpoint for a specific instance.
- * Falls back to global (NULL) checkpoints for backward compatibility.
+ *
+ * STRICTLY instance-scoped: NULL-targeted checkpoints are NOT returned. They
+ * were a "legacy compatibility" fallback, but the checkpoint-creation path now
+ * writes NULL-targeted rows in practice (247 observed 2026-07-08), so the
+ * fallback leaked one instance's summary into another's session-init (e.g. limh
+ * receiving Elaine's summary). New checkpoints are always instance-scoped
+ * (broker forces target_instance = caller); legacy NULL rows are inert.
  *
  * @param {string} instanceId - the instance ID to filter by
  * @returns {object|null} checkpoint record or null
@@ -257,7 +263,7 @@ export function getLastCheckpointForInstance(instanceId) {
   return db.prepare(
     `SELECT id, timestamp, summary, start_conversation_id, end_conversation_id, target_instance
      FROM checkpoints
-     WHERE target_instance = ? OR target_instance IS NULL
+     WHERE target_instance = ?
      ORDER BY id DESC LIMIT 1`
   ).get(instanceId) || null;
 }
@@ -273,7 +279,7 @@ export function getLastCheckpointForInstance(instanceId) {
 export function createCheckpointForInstance(endConversationId, summary, instanceId) {
   const db = getDb();
   const prevCheckpoint = db.prepare(
-    'SELECT end_conversation_id FROM checkpoints WHERE (target_instance = ? OR target_instance IS NULL) ORDER BY id DESC LIMIT 1'
+    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? ORDER BY id DESC LIMIT 1'
   ).get(instanceId);
   const startId = prevCheckpoint ? (prevCheckpoint.end_conversation_id || 0) + 1 : 1;
   const stmt = db.prepare('INSERT INTO checkpoints (summary, start_conversation_id, end_conversation_id, target_instance) VALUES (?, ?, ?, ?)');
@@ -301,7 +307,7 @@ export function createCheckpointForInstance(endConversationId, summary, instance
 export function getUnsummarizedRangeForInstance(instanceId) {
   const db = getDb();
   const lastCheckpoint = db.prepare(
-    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? OR target_instance IS NULL ORDER BY id DESC LIMIT 1'
+    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? ORDER BY id DESC LIMIT 1'
   ).get(instanceId);
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
@@ -333,7 +339,7 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
   const limit = opts?.limit ?? null;
 
   const lastCheckpoint = db.prepare(
-    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? OR target_instance IS NULL ORDER BY id DESC LIMIT 1'
+    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? ORDER BY id DESC LIMIT 1'
   ).get(instanceId);
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
