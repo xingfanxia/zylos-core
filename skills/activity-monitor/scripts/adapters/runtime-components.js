@@ -55,10 +55,12 @@ export function createHealthEngine(activeAdapter, initialStatus, {
 export function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, {
   apiActivityFile,
   hookStateFile,
+  monitorDir,
   log,
 }) {
   return new Guardian(activeAdapter, {
     log,
+    monitorDir, // ZY-LIFE-1: enables the auto-suspend gate
     initialRuntimeLaunchAtMs,
     resetToolLifecycleState: () => {
       activeToolPipeline.reset({ clearFiles: true });

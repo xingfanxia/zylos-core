@@ -74,8 +74,8 @@ const autoStartedAt = new Map();
 /** Grace period after auto-start before retrying delivery (CC needs time to boot). */
 const AUTO_START_GRACE_MS = 60 * 1000;
 
-/** Default idle timeout before auto-stopping a non-primary instance (30 min). */
-const IDLE_REAP_TIMEOUT_MS = 30 * 60 * 1000;
+/** Fallback idle timeout (minutes) when an instance has no idle_timeout_min. */
+const DEFAULT_IDLE_TIMEOUT_MIN = 30;
 
 /**
  * Signal the Activity Monitor to start an instance session.
@@ -124,19 +124,22 @@ export function requestInstanceStop(instanceId) {
 }
 
 /**
- * Reap non-primary instances that haven't received a message in IDLE_REAP_TIMEOUT_MS.
- * Called once per dispatch cycle.
+ * Reap idle instances that opted into auto-suspend. Only instances with
+ * `auto_suspend: true` are eligible (never the primary), and the idle window is
+ * the instance's own `idle_timeout_min` (falling back to the 30-min default) —
+ * NOT a single hardcoded timeout. Called once per dispatch cycle. ZY-LIFE-1: the
+ * guardian now honors the resulting suspend-signal, so this actually suspends.
  */
 export function reapIdleInstances() {
   const now = Date.now();
   for (const [instanceId, lastTs] of lastDeliveryAt) {
-    if (now - lastTs < IDLE_REAP_TIMEOUT_MS) continue;
-
     const def = getInstanceDef(instanceId);
-    if (!def || def.primary) continue; // never reap primary
+    if (!def || def.primary) continue;           // never reap primary
+    if (def.auto_suspend !== true) continue;      // only opted-in instances
+    if (!def.tmux_session) continue;
 
-    const session = def.tmux_session;
-    if (!session) continue;
+    const idleMs = (Number(def.idle_timeout_min) > 0 ? Number(def.idle_timeout_min) : DEFAULT_IDLE_TIMEOUT_MIN) * 60_000;
+    if (now - lastTs < idleMs) continue;
 
     requestInstanceStop(instanceId);
   }

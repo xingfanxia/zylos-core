@@ -408,6 +408,10 @@ export function registerDashboardRoutes(app, { zylosDir, skillRoot, skillsDir })
         suspended_by: 'dashboard',
         last_check_human: new Date().toISOString(),
       }, null, 2) + '\n');
+      // ZY-LIFE-1: durable suspend-signal so the guardian keeps it down (agent-status
+      // can be overwritten by the AM; the signal file is the robust marker). The
+      // dispatcher clears it — and this status — when a wake-signal arrives.
+      try { fs.writeFileSync(path.join(stateDir, 'suspend-signal'), new Date().toISOString()); } catch { /* best effort */ }
 
       res.json({ ok: true, id, status: 'suspended' });
     } catch (err) {
