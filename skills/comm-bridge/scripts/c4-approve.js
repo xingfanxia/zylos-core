@@ -148,6 +148,15 @@ async function approveUser(chatId, name) {
         return config;
       });
       console.log(`OS isolation: ${instanceName} -> ${osUser}`);
+
+      // Nudge the C4 broker (ZY-ISO-2) to open a socket for the new isolated
+      // instance immediately. Without this it appears on the next 30s re-scan;
+      // a socketless isolated instance can't send/query until then. Non-fatal.
+      try {
+        execFileSync('pm2', ['sendSignal', 'SIGHUP', 'c4-broker'], { stdio: 'pipe', timeout: 15000 });
+      } catch (err) {
+        console.error(`Warning: could not SIGHUP c4-broker (${err.message}) — socket appears within 30s`);
+      }
     } else {
       console.error('Warning: provision-agent-user.sh missing — instance will run as the service user');
     }

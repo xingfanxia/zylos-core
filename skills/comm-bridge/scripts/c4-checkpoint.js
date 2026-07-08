@@ -84,6 +84,13 @@ async function handleCreate(args) {
 }
 
 function handleList(args) {
+  // `list` reads ALL instances' checkpoints (no instance filter). Isolated
+  // agents must not use it as an un-brokered cross-tenant read path (MEDIUM-1);
+  // there is no broker op for the global list. shouldUseBroker() also throws
+  // loudly (SPOF) if an isolated agent's broker is down.
+  if (shouldUseBroker()) {
+    errorExit('checkpoint list is not available for isolated instances (admin-only; use `latest`)');
+  }
   const limit = parseNumberArg(args, '--limit');
   if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
     errorExit('--limit must be a positive integer');

@@ -165,4 +165,7 @@ async function main() {
   });
 }
 
-main();
+main().catch((err) => {
+  console.error(`[C4] ${err?.message || err}`);
+  process.exit(1);
+});

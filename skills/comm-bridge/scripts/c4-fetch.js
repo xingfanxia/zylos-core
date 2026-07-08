@@ -15,7 +15,7 @@ import {
   formatConversations,
   close
 } from './c4-db.js';
-import { shouldUseBroker, brokerCall } from './c4-client.js';
+import { shouldUseBroker, brokerCall, instanceIsIsolated } from './c4-client.js';
 
 const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
@@ -96,8 +96,15 @@ async function main() {
   const args = process.argv.slice(2);
   const allInstances = args.includes('--all-instances');
 
-  // Isolated agents route through the broker (always self-scoped;
-  // --all-instances is an admin/debug flag that stays on the legacy path).
+  // MEDIUM-1: --all-instances is an un-instance-filtered cross-tenant read.
+  // Isolated agents must never reach it (it would silently drop to the legacy
+  // direct-DB path, bypassing the broker + the loud SPOF discipline).
+  if (allInstances && instanceIsIsolated()) {
+    console.error('--all-instances is not available for isolated instances');
+    process.exit(1);
+  }
+
+  // Isolated agents route through the broker (always self-scoped).
   let useBroker = false;
   try { useBroker = !allInstances && shouldUseBroker(); }
   catch (err) { console.error(err.message); process.exit(1); }

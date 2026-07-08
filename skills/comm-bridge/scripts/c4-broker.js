@@ -44,6 +44,7 @@ import {
   ackControl,
   formatConversations,
   expireTimedOutControls,
+  getDb,
   close as closeDb,
 } from './c4-db.js';
 import {
@@ -55,7 +56,7 @@ import {
 import { initC4Session } from './c4-session-init.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { sourceTierRoots, checkPathViolation, mediaPathFromContent } from './egress-policy.js';
-import { getAllInstances, getMonitorDir } from '../../multi-session/instance-config.js';
+import { getAllInstances, getMonitorDir, getInstanceDef } from '../../multi-session/instance-config.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const WORKSPACE_DIR = path.join(ZYLOS_DIR, 'workspace');
@@ -63,6 +64,28 @@ const SOCKET_NAME = 'c4-broker.sock';
 const PID_PATH = path.join(DATA_DIR, 'c4-broker.pid');
 const SOCKET_MODE = 0o660;
 const RESCAN_INTERVAL_MS = 30_000;
+const CONN_IDLE_MS = 30_000;
+const MAX_LINE_BYTES = 1_000_000;
+
+// Real outbound messaging channels the broker will spawn on an agent's behalf.
+// The existence of a `<channel>/scripts/send.js` is NOT authorization
+// (security CRITICAL-1): internal skills like `shell` also ship a send.js that
+// writes arbitrary bytes to an arbitrary unix socket — routed through the
+// privileged broker that becomes a cross-instance impersonation / SSRF
+// primitive. Default-deny; extend this set deliberately when adding a channel.
+const MESSAGING_CHANNELS = new Set(['feishu', 'telegram', 'wechat', 'web-console']);
+
+// sourceTierRoots() shells out getent + does a readdir/stat sweep; cache it so a
+// long-lived singleton broker doesn't stall its event loop on every send (M4).
+let _rootsCache = { at: 0, roots: null };
+const ROOTS_TTL_MS = 60_000;
+function cachedSourceTierRoots() {
+  const nowMs = Date.now();
+  if (_rootsCache.roots && (nowMs - _rootsCache.at) < ROOTS_TTL_MS) return _rootsCache.roots;
+  const roots = sourceTierRoots(WORKSPACE_DIR);
+  _rootsCache = { at: nowMs, roots };
+  return roots;
+}
 
 let isShuttingDown = false;
 /** @type {Map<string, net.Server>} instanceId -> server */
@@ -90,8 +113,14 @@ function ensureSocket(instanceId) {
 
   const server = net.createServer((conn) => handleConnection(conn, instanceId));
   // SPOF guard: a socket the broker can't serve means that agent loses DB +
-  // creds. Fail loud in the log; keep the other instances' sockets alive.
-  server.on('error', (err) => log(`FATAL socket server error for ${instanceId}: ${err.message}`));
+  // creds. Fail loud in the log; keep the other instances' sockets alive. Drop
+  // the dead server from the map so the next scan/SIGHUP retries the bind (M2)
+  // — otherwise a transient bind failure is permanent until a full restart.
+  server.on('error', (err) => {
+    log(`FATAL socket server error for ${instanceId}: ${err.message}`);
+    if (servers.get(instanceId) === server) servers.delete(instanceId);
+    try { server.close(); } catch { /* best effort */ }
+  });
   server.listen(sockPath, () => {
     try { fs.chmodSync(sockPath, SOCKET_MODE); }
     catch (err) { log(`WARN chmod socket ${instanceId}: ${err.message}`); }
@@ -139,9 +168,18 @@ function writeRes(conn, obj) {
 
 function handleConnection(conn, instanceId) {
   conn.setEncoding('utf8');
+  // Idle/oversize hardening (L2): drop a client that connects and never sends a
+  // newline (fd/buffer leak). Threat is local-only (0660 socket), so this is
+  // belt-and-braces, but a long-lived singleton shouldn't accumulate them.
+  conn.setTimeout(CONN_IDLE_MS, () => { try { conn.destroy(); } catch { /* gone */ } });
   let buf = '';
   conn.on('data', (chunk) => {
     buf += chunk;
+    if (buf.length > MAX_LINE_BYTES) {
+      writeRes(conn, { id: null, ok: false, error: 'request_too_large' });
+      try { conn.destroy(); } catch { /* gone */ }
+      return;
+    }
     let idx;
     while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx).trim();
@@ -183,6 +221,31 @@ async function handleRequest(req, caller) {
 
 // ── Ops ─────────────────────────────────────────────────────────────
 
+function endpointChatId(endpoint) {
+  return String(endpoint ?? '').split('|')[0];
+}
+
+/**
+ * HIGH-1: an isolated agent may only send to endpoints it is authorized for —
+ * its own bound chat_ids, the controlled web-console channel, or a chat that has
+ * previously messaged it (the reply flow, and the group instance's dynamically
+ * discovered groups). Blocks one tenant messaging another tenant's users with
+ * the centralized bot creds the broker holds after B3.
+ */
+function endpointAuthorized(channel, endpoint, caller) {
+  if (channel === 'web-console') return true; // controlled admin/console channel
+  const chatId = endpointChatId(endpoint);
+  if (!chatId) return false;
+  const def = getInstanceDef(caller);
+  if (Array.isArray(def?.chat_ids) && def.chat_ids.includes(chatId)) return true;
+  try {
+    const row = getDb().prepare(
+      "SELECT 1 FROM conversations WHERE target_instance = ? AND direction = 'in' AND (endpoint_id = ? OR endpoint_id LIKE ?) LIMIT 1"
+    ).get(caller, chatId, `${chatId}|%`);
+    return Boolean(row);
+  } catch { return false; }
+}
+
 async function opSend(p, caller) {
   const channel = p.channel;
   const endpoint = p.endpoint ?? null;
@@ -192,15 +255,24 @@ async function opSend(p, caller) {
     : (p.attachments ? [p.attachments] : []);
 
   if (typeof content !== 'string' || content.length === 0) return { ok: false, error: 'content_required' };
+  // CRITICAL-1: allowlist real messaging channels before anything else.
+  if (!MESSAGING_CHANNELS.has(channel)) return { ok: false, error: `channel_not_allowed:${channel}` };
   try { validateChannel(channel, true); } catch (e) { return { ok: false, error: `invalid_channel:${e.message}` }; }
   if (endpoint != null) {
     try { validateEndpoint(endpoint); } catch (e) { return { ok: false, error: `invalid_endpoint:${e.message}` }; }
+    // HIGH-1: bind the endpoint to the caller.
+    if (!endpointAuthorized(channel, endpoint, caller)) {
+      log(`ENDPOINT BLOCKED ${caller} -> ${channel}:${endpoint}`);
+      return { ok: false, error: `endpoint_not_authorized: ${caller} may not send to that endpoint` };
+    }
   }
 
   // Egress policy — the confused-deputy fix. Reject any source-tier path,
   // whether it arrives as an explicit attachment or a [MEDIA:...] prefix on
-  // the message (the feishu send.js media convention).
-  const roots = sourceTierRoots(WORKSPACE_DIR);
+  // the message (the feishu send.js media convention). Note: the current
+  // send.js path forwards only [MEDIA:] content, not `attachments` — the
+  // attachments check is defense for a future channel that reads them (INFO-1).
+  const roots = cachedSourceTierRoots();
   const mediaPath = mediaPathFromContent(content);
   const candidates = [...attachments.map(String), ...(mediaPath ? [mediaPath] : [])];
   for (const c of candidates) {
@@ -211,10 +283,12 @@ async function opSend(p, caller) {
     }
   }
 
-  // Durable out-message audit row, scoped to caller (parity with c4-send).
+  // Durable out-message audit row. target_instance = NULL (parity with c4-send):
+  // scoping out-rows to the caller would replay the agent's own replies into its
+  // SessionStart injection and inflate its unsummarized count (M3).
   let conversationId = null;
   try {
-    const row = insertConversation('out', channel, endpoint, content, null, 3, false, null, caller);
+    const row = insertConversation('out', channel, endpoint, content, null, 3, false, null, null);
     conversationId = row.id;
   } catch (e) {
     log(`WARN audit insert failed (${caller}): ${e.message}`);

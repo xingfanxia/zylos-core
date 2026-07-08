@@ -32,7 +32,16 @@ export function sourceTierRoots(workspaceDir) {
   let srcGid = null;
   try {
     srcGid = execSync('getent group zylos-src', { encoding: 'utf8', timeout: 2000 }).split(':')[2];
-  } catch { /* group absent — no source tier configured */ }
+  } catch (err) {
+    // getent exits 2 when the group simply doesn't exist (a valid "no source
+    // tier" state). Any other failure (getent missing, timeout) means the
+    // egress check may be silently disabled — warn loudly. Fail-open is
+    // deliberate: the primary control is unix perms (only zylos-src members can
+    // read source at all); this guard is a bar-raiser on top (LOW-3).
+    if (err && err.status !== 2) {
+      try { process.stderr.write(`[egress-policy] WARN: getent group zylos-src failed (${err.message}); source-tier egress check disabled\n`); } catch { /* ignore */ }
+    }
+  }
   if (srcGid == null || String(srcGid).trim() === '') return roots;
   const wantGid = String(srcGid).trim();
 

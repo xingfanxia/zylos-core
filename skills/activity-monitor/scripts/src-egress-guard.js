@@ -22,9 +22,10 @@
  * Detection: Bash commands matching an outbound-send pattern
  * (send/upload channel scripts, curl form/upload flags) where any token
  * resolves to a path inside a source-tier repo. Source-tier repos are
- * discovered dynamically: workspace/<dir> owned by group `zylos-src`, plus
- * any workspace/<dir> that is mode-750 service-user-locked (defense in depth
- * for repos an instance shouldn't even read).
+ * discovered dynamically by egress-policy.sourceTierRoots(): workspace/<dir>
+ * owned by unix group `zylos-src` (the tier the triage instance can read but
+ * must never egress). Repos merely service-locked to 750 are unreadable to
+ * isolated agents anyway — unix perms cover those.
  *
  * Known residual (documented in docs/design/agent-os-isolation.md): message
  * TEXT egress (pasting code into a reply) and raw-API sends using channel

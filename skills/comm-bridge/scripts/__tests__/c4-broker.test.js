@@ -29,19 +29,25 @@ fs.mkdirSync(path.join(tmpDir, 'activity-monitor'), { recursive: true });
 fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({
   version: 1,
   instances: {
-    'inst-a': { os_user: 'fake-a', state_dir: stateDir('inst-a'), tmux_session: 'claude-inst-a' },
+    'inst-a': { os_user: 'fake-a', state_dir: stateDir('inst-a'), tmux_session: 'claude-inst-a', chat_ids: ['chat-a-1'] },
     'inst-b': { os_user: 'fake-b', state_dir: stateDir('inst-b'), tmux_session: 'claude-inst-b' },
     'admin':  { primary: true, state_dir: stateDir('admin'), tmux_session: 'claude-main' },
   },
 }));
 
-// Fake channel so opSend can exercise the spawn path without real creds.
-const chanDir = path.join(tmpDir, '.claude', 'skills', 'testchan', 'scripts');
-fs.mkdirSync(chanDir, { recursive: true });
-fs.writeFileSync(path.join(chanDir, 'send.js'), 'process.exit(0);\n');
-const failChanDir = path.join(tmpDir, '.claude', 'skills', 'failchan', 'scripts');
-fs.mkdirSync(failChanDir, { recursive: true });
-fs.writeFileSync(path.join(failChanDir, 'send.js'), 'process.exit(3);\n');
+// Fake channels so opSend can exercise the spawn path without real creds.
+//   web-console → exit 0 (allowlisted, always endpoint-authorized)
+//   telegram    → exit 3 (allowlisted, endpoint-authorized via chat_ids)
+//   shell       → exit 0 but NOT allowlisted (CRITICAL-1: must be rejected
+//                 despite having a send.js)
+function fakeChannel(name, exitCode) {
+  const d = path.join(tmpDir, '.claude', 'skills', name, 'scripts');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'send.js'), `process.exit(${exitCode});\n`);
+}
+fakeChannel('web-console', 0);
+fakeChannel('telegram', 3);
+fakeChannel('shell', 0);
 
 // ── Dynamic imports (now see the sandbox env) ───────────────────────
 const broker = await import('../c4-broker.js');
@@ -140,17 +146,34 @@ describe('broker handleRequest', () => {
     assert.equal(noContent.ok, false);
   });
 
-  it('send: happy path via a fake channel, and channel failure surfaces', async () => {
-    const ok = await broker.handleRequest({ op: 'send', params: { channel: 'testchan', endpoint: 'e1', content: 'hello' } }, 'inst-a');
+  it('send: happy path via web-console (allowlisted, endpoint always authorized)', async () => {
+    const ok = await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'hello' } }, 'inst-a');
     assert.equal(ok.ok, true, ok.error);
     assert.equal(ok.data.sent, true);
+  });
 
-    const fail = await broker.handleRequest({ op: 'send', params: { channel: 'failchan', endpoint: 'e1', content: 'hello' } }, 'inst-a');
-    assert.equal(fail.ok, false);
-    assert.match(fail.error, /channel_send_failed/);
+  it('send: CRITICAL-1 — non-messaging channel (shell) is rejected despite having a send.js', async () => {
+    const r = await broker.handleRequest({ op: 'send', params: { channel: 'shell', endpoint: '/tmp/x.sock', content: 'payload' } }, 'inst-a');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /channel_not_allowed/);
+  });
 
-    const missing = await broker.handleRequest({ op: 'send', params: { channel: 'nochan', content: 'x' } }, 'inst-a');
-    assert.equal(missing.ok, false);
+  it('send: HIGH-1 — endpoint must be authorized to the caller', async () => {
+    // inst-a has chat_ids: ['chat-a-1'] → authorized; telegram send.js exits 3.
+    const authed = await broker.handleRequest({ op: 'send', params: { channel: 'telegram', endpoint: 'chat-a-1', content: 'hi' } }, 'inst-a');
+    assert.equal(authed.ok, false);
+    assert.match(authed.error, /channel_send_failed/); // passed auth, reached the (failing) channel
+
+    const denied = await broker.handleRequest({ op: 'send', params: { channel: 'telegram', endpoint: 'chat-someone-else', content: 'hi' } }, 'inst-a');
+    assert.equal(denied.ok, false);
+    assert.match(denied.error, /endpoint_not_authorized/);
+  });
+
+  it('send: M3 — out-row is NULL-targeted (not replayed into the caller\'s unsummarized)', async () => {
+    const before = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
+    await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'reply text' } }, 'inst-a');
+    const after = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
+    assert.equal(after, before, 'own outbound message must not count toward unsummarized');
   });
 });
 
