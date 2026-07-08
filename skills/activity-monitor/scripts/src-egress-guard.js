@@ -61,11 +61,17 @@ function isIsolatedInstance() {
   }
 }
 
-/** Resolve source-tier repo roots (realpath'd) from workspace dir metadata. */
+/**
+ * Resolve source-tier repo roots (realpath'd): workspace dirs group-owned by
+ * `zylos-src`. (Dirs merely service-locked to 750 are unreadable to isolated
+ * agents anyway — unix perms cover them; this guard only needs the tier the
+ * current instance can legitimately read.)
+ */
 function sourceTierRoots() {
   const roots = [];
   let srcGid = null;
   try { srcGid = execSync('getent group zylos-src', { encoding: 'utf8', timeout: 2000 }).split(':')[2]; } catch { }
+  if (srcGid == null || String(srcGid).trim() === '') return roots;
   let entries = [];
   try { entries = fs.readdirSync(WORKSPACE_DIR, { withFileTypes: true }); } catch { return roots; }
   for (const e of entries) {
@@ -73,10 +79,7 @@ function sourceTierRoots() {
     const p = path.join(WORKSPACE_DIR, e.name);
     try {
       const st = fs.statSync(p);
-      const mode = st.mode & 0o777;
-      const isSrcGroup = srcGid !== null && String(st.gid) === String(srcGid).trim();
-      const isServiceLocked = (mode & 0o007) === 0 && !isSrcGroup && (mode & 0o070) === 0;
-      if (isSrcGroup || isServiceLocked) {
+      if (String(st.gid) === String(srcGid).trim()) {
         try { roots.push(fs.realpathSync(p)); } catch { roots.push(p); }
       }
     } catch { /* unreadable entry — not our concern */ }
@@ -84,13 +87,26 @@ function sourceTierRoots() {
   return roots;
 }
 
-/** Extract candidate filesystem paths from a shell command string. */
+/**
+ * Extract candidate filesystem paths from a shell command string.
+ * Deliberately position-agnostic and over-inclusive: a send command that
+ * merely MENTIONS a source path may false-block — for a bar-raiser,
+ * over-blocking is the safe direction.
+ */
 function candidatePaths(command) {
   const tokens = command.split(/[\s"'`;|&()<>]+/).filter(Boolean);
   const out = [];
-  for (const t of tokens) {
-    if (t.startsWith('-')) continue;
-    if (t.startsWith('/') || t.startsWith('~/') || t.startsWith('./') || t.includes('/workspace/')) {
+  for (let t of tokens) {
+    // --flag=/path carries the path in the same token — inspect the value
+    if (t.startsWith('-')) {
+      const eq = t.indexOf('=');
+      if (eq === -1) continue;
+      t = t.slice(eq + 1);
+      if (!t) continue;
+    }
+    t = t.replace(/^(file|attachment|media|document)=@?/, '').replace(/^@/, '');
+    if (t.startsWith('/') || t.startsWith('~/') || t.startsWith('./')
+        || t.startsWith('workspace/') || t.includes('/workspace/')) {
       out.push(t.replace(/^~\//, `${os.homedir()}/`));
     }
   }
