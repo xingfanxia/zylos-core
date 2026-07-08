@@ -176,7 +176,7 @@ const _runtimeIndexPath = (() => {
 })();
 const _runtimeDirPath = path.dirname(_runtimeIndexPath);
 const _sessionHandoffPath = path.join(_runtimeDirPath, 'session-handoff.js');
-const { getActiveAdapter } = await import(_runtimeIndexPath);
+const { getActiveAdapter, findRuntimePidUnderPane } = await import(_runtimeIndexPath);
 const { enqueueNewSession } = await import(_sessionHandoffPath);
 
 const __filename = fileURLToPath(import.meta.url);
@@ -649,27 +649,9 @@ function getTmuxPanePid(sessionName) {
 function getTmuxClaudePid(sessionName) {
   const panePid = getTmuxPanePid(sessionName);
   if (!panePid) return 0;
-
-  try {
-    const name = execSync(`ps -p ${panePid} -o comm= 2>/dev/null`, {
-      encoding: 'utf8',
-      timeout: 3000
-    }).trim();
-    if (name === 'claude') return panePid;
-  } catch {
-    // Ignore and fall through.
-  }
-
-  try {
-    const out = execSync(`pgrep -P ${panePid} -f "claude" | head -1`, {
-      encoding: 'utf8',
-      timeout: 3000
-    }).trim();
-    const childPid = Number.parseInt(out, 10);
-    return Number.isInteger(childPid) && childPid > 0 ? childPid : 0;
-  } catch {
-    return 0;
-  }
+  // Shared util: pane pid itself when it IS the runtime (non-os_user), else the
+  // runtime descendant (os_user nests it under sudo -> sudo -> node -> claude).
+  return findRuntimePidUnderPane(panePid, 'claude');
 }
 
 function writeWatchdogState() {
@@ -1037,7 +1019,7 @@ function init() {
     readConfigObject,
     createToolPipeline,
     readWatchdogState: () => readJsonFileSafe(TOOL_WATCHDOG_STATE_FILE),
-    createProcSampler: (activeAdapter) => createRuntimeProcSampler(activeAdapter, { log }),
+    createProcSampler: (activeAdapter) => createRuntimeProcSampler(activeAdapter, { log, findRuntimePidUnderPane }),
     loadInitialHealth,
     createHealthEngine,
     createGuardian,

@@ -11,8 +11,8 @@ export function createUsageMonitor(activeAdapter, options) {
   return new UsageMonitor(activeAdapter, options);
 }
 
-export function createProcSampler(activeAdapter, { log }) {
-  return new ProcSampler({ sessionName: activeAdapter.sessionName, log });
+export function createProcSampler(activeAdapter, { log, findRuntimePidUnderPane }) {
+  return new ProcSampler({ sessionName: activeAdapter.sessionName, log, findRuntimePidUnderPane });
 }
 
 export function createToolPipeline(activeAdapter, config, {

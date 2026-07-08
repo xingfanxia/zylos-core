@@ -14,6 +14,11 @@
 import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { getZylosConfig } from '../config.js';
+
+// Re-export the process-tree util so deployed skill scripts (activity-monitor's
+// monitor.js / proc-sampler.js) can reach it through the same resolved runtime
+// index path they already import the adapter from.
+export { buildProcessTree, findDescendantPid, hasDescendantProcess, findRuntimePidUnderPane } from './process-tree.js';
 import { getInstanceRuntime } from '../../../skills/multi-session/runtime-files.js';
 
 // ── Runtime registry ──────────────────────────────────────────────────────
