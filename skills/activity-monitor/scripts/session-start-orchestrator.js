@@ -75,8 +75,10 @@ export function readStdinPayload({
         finish({});
       }
     };
+    // Ref'd on purpose: finish() always clears it, so it can't outlive the read.
+    // If unref'd, a stdin that never emits 'end' would let the loop drain before
+    // the timeout fires, so readStdinPayload would hang instead of timing out.
     const timer = setTimeout(() => finish({}), timeoutMs);
-    timer.unref?.();
     stdin.setEncoding?.('utf8');
     stdin.on?.('data', onData);
     stdin.on?.('end', onEnd);
@@ -103,7 +105,11 @@ function withTimeout(promise, timeoutMs, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
-    timer.unref?.();
+    // Do NOT unref: this timer is always cleared in .finally() once the race
+    // settles, so it can never outlive the step. It must stay ref'd so it can
+    // actually fire and enforce the budget when the action hangs — an unref'd
+    // timeout would let the event loop drain before firing (the timeout would
+    // silently never enforce, and node:test cancels the pending step).
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
