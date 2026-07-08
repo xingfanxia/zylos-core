@@ -31,7 +31,7 @@ fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({
   instances: {
     'inst-a': { os_user: 'fake-a', state_dir: stateDir('inst-a'), tmux_session: 'claude-inst-a', chat_ids: ['chat-a-1'] },
     'inst-b': { os_user: 'fake-b', state_dir: stateDir('inst-b'), tmux_session: 'claude-inst-b' },
-    'admin':  { primary: true, state_dir: stateDir('admin'), tmux_session: 'claude-main' },
+    'admin':  { primary: true, state_dir: stateDir('admin'), tmux_session: 'claude-main', chat_ids: ['owner-chat'] },
   },
 }));
 
@@ -167,6 +167,11 @@ describe('broker handleRequest', () => {
     const denied = await broker.handleRequest({ op: 'send', params: { channel: 'telegram', endpoint: 'chat-someone-else', content: 'hi' } }, 'inst-a');
     assert.equal(denied.ok, false);
     assert.match(denied.error, /endpoint_not_authorized/);
+
+    // Escalation to the operator (primary instance's chat) is always allowed.
+    const toOwner = await broker.handleRequest({ op: 'send', params: { channel: 'telegram', endpoint: 'owner-chat', content: 'escalation' } }, 'inst-a');
+    assert.equal(toOwner.ok, false);
+    assert.match(toOwner.error, /channel_send_failed/); // passed auth, reached the (failing) channel
   });
 
   it('send: M3 — out-row is NULL-targeted (not replayed into the caller\'s unsummarized)', async () => {

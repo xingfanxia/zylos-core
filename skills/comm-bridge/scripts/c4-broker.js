@@ -225,12 +225,20 @@ function endpointChatId(endpoint) {
   return String(endpoint ?? '').split('|')[0];
 }
 
+/** Chat ids of the operator/owner (primary instances) — always a valid destination. */
+function ownerChatIds() {
+  try {
+    return getAllInstances().filter((i) => i.primary).flatMap((i) => i.chat_ids || []);
+  } catch { return []; }
+}
+
 /**
  * HIGH-1: an isolated agent may only send to endpoints it is authorized for —
- * its own bound chat_ids, the controlled web-console channel, or a chat that has
- * previously messaged it (the reply flow, and the group instance's dynamically
- * discovered groups). Blocks one tenant messaging another tenant's users with
- * the centralized bot creds the broker holds after B3.
+ * its own bound chat_ids, the operator's chat (escalation is always allowed),
+ * the controlled web-console channel, or a chat that has previously messaged it
+ * (the reply flow, and the group instance's dynamically discovered groups).
+ * Blocks one tenant messaging ANOTHER tenant's end users with the centralized
+ * bot creds; it deliberately does NOT block notifying the owner.
  */
 function endpointAuthorized(channel, endpoint, caller) {
   if (channel === 'web-console') return true; // controlled admin/console channel
@@ -238,6 +246,7 @@ function endpointAuthorized(channel, endpoint, caller) {
   if (!chatId) return false;
   const def = getInstanceDef(caller);
   if (Array.isArray(def?.chat_ids) && def.chat_ids.includes(chatId)) return true;
+  if (ownerChatIds().includes(chatId)) return true; // any instance may escalate to the operator
   try {
     const row = getDb().prepare(
       "SELECT 1 FROM conversations WHERE target_instance = ? AND direction = 'in' AND (endpoint_id = ? OR endpoint_id LIKE ?) LIMIT 1"
