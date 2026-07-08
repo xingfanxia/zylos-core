@@ -14,6 +14,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { getDb } from './c4-db.js';
+import { groupKeyFromEndpoint } from '../../multi-session/c4-helpers.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -379,4 +380,71 @@ export function getConversationsByRangeForInstance(begin, end, instanceId) {
       AND target_instance = ?
     ORDER BY id ASC
   `).all(begin, end, instanceId);
+}
+
+// ---------------------------------------------------------------------------
+// Group-instance segmentation (pure — no DB)
+// ---------------------------------------------------------------------------
+
+/**
+ * Segment a flat list of conversation rows into per-group buckets for the group
+ * instance's session-init injection. Pure — no DB access, so it unit-tests with
+ * synthetic rows.
+ *
+ * Grouping key = groupKeyFromEndpoint(row.endpoint_id). Rows with a null key
+ * (system/scheduler notifications targeting the group instance) collapse into a
+ * single trailing "(system / ungrouped)" bucket. Buckets are ordered
+ * most-recently-active first (by the max row id seen), with the null-key bucket
+ * always sunk to the end. Each bucket keeps only its most recent `perGroupLimit`
+ * rows, restored to ascending (oldest-first) order. At most `maxGroups` buckets
+ * are returned; the remainder are counted in `omittedGroups`.
+ *
+ * @param {Array<{id:number, endpoint_id?:string|null}>} conversations - id-ascending rows
+ * @param {{ perGroupLimit?: number, maxGroups?: number }} [opts]
+ * @returns {{ buckets: Array<{key:string|null, label:string, lastId:number, count:number, conversations:object[]}>, omittedGroups: number, totalGroups: number }}
+ */
+export function groupConversationsByGroup(conversations, opts = {}) {
+  const perGroupLimit = opts.perGroupLimit ?? Infinity;
+  const maxGroups = opts.maxGroups ?? Infinity;
+
+  // Map keyed on the group key (null included — Map handles null keys) so all
+  // system/ungrouped rows share one bucket.
+  const map = new Map();
+  for (const row of conversations || []) {
+    const key = groupKeyFromEndpoint(row.endpoint_id);
+    let bucket = map.get(key);
+    if (!bucket) {
+      bucket = { key, rows: [], lastId: 0 };
+      map.set(key, bucket);
+    }
+    bucket.rows.push(row);
+    if (row.id > bucket.lastId) bucket.lastId = row.id;
+  }
+
+  // Order most-recently-active first; the null-key (system) bucket sinks last.
+  const ordered = [...map.values()].sort((a, b) => {
+    const aSys = a.key === null;
+    const bSys = b.key === null;
+    if (aSys !== bSys) return aSys ? 1 : -1;
+    return b.lastId - a.lastId;
+  });
+
+  const shown = ordered.slice(0, maxGroups);
+  const omittedGroups = ordered.length - shown.length;
+
+  const buckets = shown.map((b) => {
+    const count = b.rows.length;
+    const kept = (perGroupLimit === Infinity || count <= perGroupLimit)
+      ? b.rows
+      : b.rows.slice(count - perGroupLimit);
+    return {
+      key: b.key,
+      label: b.key === null ? '(system / ungrouped)' : b.key,
+      lastId: b.lastId,
+      count,
+      conversations: kept,
+    };
+  });
+
+  return { buckets, omittedGroups, totalGroups: ordered.length };
 }

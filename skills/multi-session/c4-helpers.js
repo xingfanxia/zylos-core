@@ -29,3 +29,22 @@ export function buildC4ControlArgs(baseArgs, instanceId) {
   }
   return result;
 }
+
+/**
+ * Extract the stable group/chat key from a conversation `endpoint_id`.
+ *
+ * The group instance serves MANY chats through one instance; the chat is
+ * identified by the leading segment of endpoint_id (everything before the first
+ * `|`). Feishu group endpoints look like
+ * `oc_<chat>|type:group|root:...|parent:...|msg:...`; telegram/other channels
+ * with a bare chat id (no `|`) return the whole id. Used to segment injected
+ * session-init history and to key `memory/groups/<group_key>/`.
+ *
+ * @param {string | null | undefined} endpointId
+ * @returns {string | null} the group key, or null for system/null endpoints
+ */
+export function groupKeyFromEndpoint(endpointId) {
+  if (endpointId == null) return null;
+  const key = String(endpointId).split('|', 1)[0].trim();
+  return key.length > 0 ? key : null;
+}

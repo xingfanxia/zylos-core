@@ -22,9 +22,19 @@
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
+import { getInstanceDef } from '../../multi-session/instance-config.js';
 import { fileURLToPath } from 'node:url';
 
 const ENV_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+/** Whether an instance is the group instance (type:'group'); fails safe to false. */
+function isGroupInstanceId(instanceId) {
+  try {
+    return getInstanceDef(instanceId)?.type === 'group';
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Build the SessionStart context string for one instance.
@@ -47,12 +57,18 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
       close: closeDbFn,
     } = await import('./c4-db.js');
     close = closeDbFn;
-    const { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } = await import('./c4-config.js');
+    const {
+      CHECKPOINT_THRESHOLD,
+      SESSION_INIT_RECENT_COUNT,
+      SESSION_INIT_GROUP_PER_GROUP,
+      SESSION_INIT_GROUP_MAX_GROUPS,
+    } = await import('./c4-config.js');
 
     // Instance-scoped query overrides (loaded lazily, graceful degradation).
     let getLastCheckpointForInstance = null;
     let getUnsummarizedRangeForInstance = null;
     let getUnsummarizedConversationsForInstance = null;
+    let groupConversationsByGroup = null;
     let multiLoadFailed = false;
     if (INSTANCE_ID) {
       try {
@@ -60,11 +76,14 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
         getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
         getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
         getUnsummarizedConversationsForInstance = multiMod.getUnsummarizedConversationsForInstance;
+        groupConversationsByGroup = multiMod.groupConversationsByGroup;
       } catch (err) {
         multiLoadFailed = true;
         console.error(`[c4-session-init] WARN: c4-db-multi.js import failed: ${err.message}`);
       }
     }
+
+    const isGroup = INSTANCE_ID ? isGroupInstanceId(INSTANCE_ID) : false;
 
     const checkpoint = (INSTANCE_ID && getLastCheckpointForInstance)
       ? getLastCheckpointForInstance(INSTANCE_ID)
@@ -105,6 +124,37 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
     }
 
     const needsSync = range.count > CHECKPOINT_THRESHOLD;
+
+    // Group instance: segment injected history by chat so one busy group can't
+    // crowd out others and cross-group context never blends. Each chat gets its
+    // own labeled section (most-recently-active first), capped per group.
+    if (isGroup && getUnsummarizedConversationsForInstance && groupConversationsByGroup) {
+      const allConvos = getUnsummarizedConversationsForInstance(INSTANCE_ID);
+      const { buckets, omittedGroups } = groupConversationsByGroup(allConvos, {
+        perGroupLimit: SESSION_INIT_GROUP_PER_GROUP,
+        maxGroups: SESSION_INIT_GROUP_MAX_GROUPS,
+      });
+
+      for (const bucket of buckets) {
+        const label = bucket.count > bucket.conversations.length
+          ? `GROUP ${bucket.label} (showing ${bucket.conversations.length} of ${bucket.count})`
+          : `GROUP ${bucket.label}`;
+        sections.push(formatSection(label, formatConversations(bucket.conversations)));
+      }
+      if (omittedGroups > 0) {
+        sections.push(formatSection(
+          'MORE GROUPS',
+          `${omittedGroups} less-recently-active group(s) omitted from this injection.`,
+        ));
+      }
+      if (needsSync) {
+        sections.push(formatSection(
+          'ACTION REQUIRED',
+          `There are ${range.count} unsummarized conversations across all groups (conversation id ${range.begin_id} ~ ${range.end_id}). Please use zylos-memory skill to process them, keeping each chat's memory under memory/groups/<group_key>/.`,
+        ));
+      }
+      return `${sections.join('\n\n')}\n`;
+    }
 
     // Get conversations: all if under threshold, last N if over.
     const getConvos = (INSTANCE_ID && getUnsummarizedConversationsForInstance)

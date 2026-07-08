@@ -37,6 +37,25 @@ export function isPrimaryInstance({
   return config.instances?.[instanceId]?.primary === true;
 }
 
+/**
+ * Whether `instanceId` is the group instance (type:'group' in instances.json).
+ * The group instance serves many chats and owns the memory/groups/** tier;
+ * every other instance is denied that tier. Fails closed (false) if config is
+ * unreadable — memory/groups writes are then blocked for everyone.
+ *
+ * @returns {boolean}
+ */
+export function isGroupInstance({
+  instanceId = process.env.ZYLOS_INSTANCE_ID || null,
+  instancesFilePath = DEFAULT_INSTANCES_FILE,
+  readFileSync = fs.readFileSync,
+} = {}) {
+  if (!instanceId) return false;
+  const config = readInstancesConfig(instancesFilePath, readFileSync);
+  if (!config) return false;
+  return config.instances?.[instanceId]?.type === 'group';
+}
+
 function isInside(basePath, targetPath) {
   return targetPath === basePath || targetPath.startsWith(basePath + path.sep);
 }
@@ -131,6 +150,18 @@ function validateResolvedMemoryPath(resolvedPath, {
     return validateSharedLikePath(segments, { instanceId, instancesFilePath, readFileSync });
   }
 
+  if (segments[0] === 'groups') {
+    // Only the group instance owns memory/groups/<group_key>/...; every other
+    // instance is denied so per-group memory can't leak across instances.
+    if (!isGroupInstance({ instanceId, instancesFilePath, readFileSync })) {
+      return `Instance '${instanceId}' cannot write group memory (memory/groups/**) — only the group instance may`;
+    }
+    if (!segments[1]) {
+      return 'Use groups/<group_key>/... when writing group memory';
+    }
+    return null;
+  }
+
   return `Direct writes to top-level memory path '${segments[0]}' are not allowed in multi-session mode`;
 }
 
@@ -180,6 +211,15 @@ export function describeMemoryWritePolicy({
 
   const isPrimary = isPrimaryInstance({ instanceId, instancesFilePath, readFileSync });
   const isScheduler = isSchedulerInstance({ instanceId, instancesFilePath, readFileSync });
+  const isGroup = isGroupInstance({ instanceId, instancesFilePath, readFileSync });
+
+  if (isGroup) {
+    return [
+      `Instance '${instanceId}' is the group instance (serves many chats).`,
+      `Allowed writes: memory/instances/${instanceId}/..., memory/groups/<group_key>/... (per-chat memory), and memory/users/<id>/profile.md.`,
+      'Keep each chat\'s memory under its own memory/groups/<group_key>/ — never cross-reference groups or write another instance\'s memory.',
+    ].join('\n');
+  }
 
   if (isPrimary) {
     return [

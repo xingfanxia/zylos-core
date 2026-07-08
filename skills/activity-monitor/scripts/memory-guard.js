@@ -21,6 +21,7 @@ import { fileURLToPath } from 'url';
 import {
   isPrimaryInstance as isPrimaryInstancePolicy,
   isSchedulerInstance as isSchedulerInstancePolicy,
+  isGroupInstance as isGroupInstancePolicy,
   validateMemoryWrite as validateMemoryWritePolicy,
 } from '../../multi-session/memory-policy.js';
 
@@ -52,6 +53,19 @@ export function isSchedulerInstance() {
  */
 export function isPrimary() {
   return isPrimaryInstancePolicy({
+    instanceId: INSTANCE_ID,
+    instancesFilePath: INSTANCES_FILE,
+  });
+}
+
+/**
+ * Check whether the current instance is the group instance (type:'group').
+ * The group instance owns the memory/groups/** tier.
+ *
+ * @returns {boolean}
+ */
+export function isGroupInstance() {
+  return isGroupInstancePolicy({
     instanceId: INSTANCE_ID,
     instancesFilePath: INSTANCES_FILE,
   });
