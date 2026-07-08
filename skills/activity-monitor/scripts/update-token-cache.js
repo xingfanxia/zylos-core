@@ -37,6 +37,35 @@ const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
 const CODEX_USAGE_BIN = process.env.CCUSAGE_CODEX_BIN || 'npx';
 const CODEX_USAGE_PACKAGE = process.env.CCUSAGE_CODEX_PACKAGE || '@ccusage/codex@latest';
 
+// ccusage pinned per-skill: v19+ dropped `--instances` and the `projects`
+// output shape this parser consumes (a global v20 upgrade silently broke the
+// hourly cache refresh on 2026-07-08). Prefer the skill-local pin, fall back
+// to PATH for deployments without one.
+const SKILL_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), '..');
+const PINNED_CCUSAGE = path.join(SKILL_DIR, 'node_modules', '.bin', 'ccusage');
+const CCUSAGE_BIN = process.env.CCUSAGE_BIN
+  || (fs.existsSync(PINNED_CCUSAGE) ? PINNED_CCUSAGE : 'ccusage');
+
+/**
+ * OS-isolated instances write transcripts under their own HOME
+ * (/home/<os_user>/.claude/projects), not the service user's. ccusage honors
+ * comma-separated CLAUDE_CONFIG_DIR — scan every home we know about.
+ * Requires service-user read ACLs on the agent .claude dirs (provisioned by
+ * scripts/ops/provision-agent-user.sh).
+ */
+function buildClaudeConfigDirs(zylosDir = ZYLOS_DIR) {
+  const dirs = [path.join(os.homedir(), '.claude')];
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
+    for (const inst of Object.values(config?.instances || {})) {
+      if (inst?.claude_config_dir && !dirs.includes(inst.claude_config_dir)) {
+        dirs.push(inst.claude_config_dir);
+      }
+    }
+  } catch { /* single-session or unreadable config — service home only */ }
+  return dirs.filter((d) => { try { return fs.existsSync(d); } catch { return false; } });
+}
+
 function loadKnownInstanceIds(zylosDir = ZYLOS_DIR) {
   try {
     const config = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
@@ -443,10 +472,11 @@ function fetchClaudeTokenCacheData({
 
   let raw;
   try {
-    raw = execFileSyncImpl('ccusage', ['daily', '--json', '--instances', '--breakdown', '--since', since, '--offline'], {
+    raw = execFileSyncImpl(CCUSAGE_BIN, ['daily', '--json', '--instances', '--breakdown', '--since', since, '--offline'], {
       encoding: 'utf8',
       timeout: 120_000,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, CLAUDE_CONFIG_DIR: buildClaudeConfigDirs().join(',') },
     });
   } catch (err) {
     const detail = err.stderr ? String(err.stderr).trim() : err.message;
