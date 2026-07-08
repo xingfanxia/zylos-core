@@ -15,6 +15,7 @@ import os from 'node:os';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { bold, dim, green, red, yellow, cyan, heading } from '../lib/colors.js';
+import { withFileLock } from '../../skills/multi-session/file-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,12 +37,17 @@ function loadInstances() {
 }
 
 /**
- * Atomic instances.json write: write-to-temp-then-rename to prevent corruption.
+ * Atomic instances.json write: write-to-temp-then-rename to prevent corruption,
+ * under the same advisory lock the daemon writers use (ZY-LOCK-1) so a CLI write
+ * and a concurrent c4-approve/dashboard `updateInstancesConfig` can't interleave
+ * their commit and clobber each other.
  */
 function saveInstances(config) {
-  const tmp = `${INSTANCES_FILE}.tmp.${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n');
-  fs.renameSync(tmp, INSTANCES_FILE);
+  withFileLock(INSTANCES_FILE + '.lock', () => {
+    const tmp = `${INSTANCES_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(config, null, 2) + '\n');
+    fs.renameSync(tmp, INSTANCES_FILE);
+  });
 }
 
 function tmuxSessionExists(session) {

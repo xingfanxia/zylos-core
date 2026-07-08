@@ -12,6 +12,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getAllInstances } from '../../multi-session/instance-config.js';
+import { withFileLock } from '../../multi-session/file-lock.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -225,20 +226,35 @@ export function isMultiSession() {
 }
 
 /**
- * Atomically update instances.json via write-to-temp-then-rename pattern.
+ * Atomically update instances.json under a cross-process advisory lock.
  *
- * @param {function} mutator - Receives a deep clone of config, returns the updated config.
+ * The entire read-modify-write runs inside `withFileLock` (ZY-LOCK-1): without
+ * it, two writers (c4-approve, the dashboard, the CLI) each read the file,
+ * mutate their own copy, and the second rename clobbers the first's change —
+ * a lost update. The read here is a FRESH read of the file under the lock (not
+ * the mtime-cached `config`), so the mutator always sees any concurrent writer's
+ * committed change.
+ *
+ * @param {function} mutator - Receives a deep clone of the on-disk config
+ *   (null in legacy/no-file mode), returns the updated config or a falsy value
+ *   to decline the write.
  */
 export function updateInstancesConfig(mutator) {
-  loadConfig(); // ensure fresh
-  const input = config ? structuredClone(config) : null;
-  const updated = mutator(input);
-  if (!updated) return; // mutator declined the update
-  const tmpPath = INSTANCES_FILE + '.tmp';
-  fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2) + '\n');
-  fs.renameSync(tmpPath, INSTANCES_FILE);
-  config = updated; // update in-memory
-  lastMtime = fs.statSync(INSTANCES_FILE).mtimeMs; // use actual filesystem mtime
+  return withFileLock(INSTANCES_FILE + '.lock', () => {
+    let input = null;
+    try {
+      input = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
+    } catch {
+      input = null; // missing/corrupt → legacy mode, mutator decides
+    }
+    const updated = mutator(input);
+    if (!updated) return; // mutator declined the update
+    const tmpPath = INSTANCES_FILE + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2) + '\n');
+    fs.renameSync(tmpPath, INSTANCES_FILE);
+    config = updated; // update in-memory
+    lastMtime = fs.statSync(INSTANCES_FILE).mtimeMs; // use actual filesystem mtime
+  });
 }
 
 /**
