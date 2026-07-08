@@ -38,7 +38,10 @@ const COST_LOG_FILE = path.join(AM_DIR, 'cost-log.jsonl');
 const CONTEXT_WINDOW_FILE = path.join(AM_DIR, 'context-window.json');
 const LAST_CONTEXT_HANDOFF_FILE = path.join(AM_DIR, 'last-context-handoff.json');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
-const C4_DB = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-db.js');
+// Routing-aware unsummarized-count read: isolated agents go through the broker,
+// admin/scheduler read c4-db directly. Never touch c4-db.js here (it is a pure
+// library with no broker routing — an isolated agent has no DB access post-B3).
+const C4_CLIENT = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-client.js');
 const CONFIG_FILE = path.join(ZYLOS_DIR, '.zylos', 'config.json');
 
 // Thresholds — configurable via config.json `new_session_threshold` (default 70)
@@ -283,7 +286,7 @@ function maybeEnqueueMemorySync(usedPct, state, now) {
  */
 function getUnsummarizedCount() {
   try {
-    const output = execFileSync('node', [C4_DB, 'unsummarized'], {
+    const output = execFileSync('node', [C4_CLIENT, 'unsummarized'], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
     const range = JSON.parse(output);

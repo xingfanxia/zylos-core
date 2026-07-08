@@ -22,6 +22,7 @@ import { spawn } from 'child_process';
 import { insertConversation, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 function printUsage() {
   console.log('Usage: node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
@@ -101,6 +102,28 @@ async function main() {
       validateEndpoint(endpoint);
     } catch (err) {
       console.error(`[C4] Invalid endpoint: ${err.stack}`);
+      process.exit(1);
+    }
+  }
+
+  // Isolated agents: route the send + audit through the broker (which holds the
+  // channel creds and enforces egress policy). Admin/scheduler fall through to
+  // the legacy direct path. A missing broker socket for an isolated agent is a
+  // loud failure, never a silent legacy fallback.
+  let useBroker;
+  try {
+    useBroker = shouldUseBroker();
+  } catch (err) {
+    console.error(`[C4] ${err.message}`);
+    process.exit(1);
+  }
+  if (useBroker) {
+    try {
+      await brokerCall('send', { channel, endpoint, content: message });
+      console.log(`[C4] Message sent via ${channel} (broker)`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`[C4] Broker send failed: ${err.message}`);
       process.exit(1);
     }
   }

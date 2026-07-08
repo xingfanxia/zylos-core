@@ -41,7 +41,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execSync } from 'child_process';
+import { sourceTierRoots, checkPathViolation } from '../../comm-bridge/scripts/egress-policy.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
@@ -59,32 +59,6 @@ function isIsolatedInstance() {
   } catch {
     return false;
   }
-}
-
-/**
- * Resolve source-tier repo roots (realpath'd): workspace dirs group-owned by
- * `zylos-src`. (Dirs merely service-locked to 750 are unreadable to isolated
- * agents anyway — unix perms cover them; this guard only needs the tier the
- * current instance can legitimately read.)
- */
-function sourceTierRoots() {
-  const roots = [];
-  let srcGid = null;
-  try { srcGid = execSync('getent group zylos-src', { encoding: 'utf8', timeout: 2000 }).split(':')[2]; } catch { }
-  if (srcGid == null || String(srcGid).trim() === '') return roots;
-  let entries = [];
-  try { entries = fs.readdirSync(WORKSPACE_DIR, { withFileTypes: true }); } catch { return roots; }
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    const p = path.join(WORKSPACE_DIR, e.name);
-    try {
-      const st = fs.statSync(p);
-      if (String(st.gid) === String(srcGid).trim()) {
-        try { roots.push(fs.realpathSync(p)); } catch { roots.push(p); }
-      }
-    } catch { /* unreadable entry — not our concern */ }
-  }
-  return roots;
 }
 
 /**
@@ -115,23 +89,11 @@ function candidatePaths(command) {
 
 function findViolation(command) {
   if (!SEND_PATTERN.test(command)) return null;
-  const roots = sourceTierRoots();
+  const roots = sourceTierRoots(WORKSPACE_DIR);
   if (roots.length === 0) return null;
-  const rootNames = new Set(roots.map((r) => path.basename(r)));
   for (const cand of candidatePaths(command)) {
-    let resolved = cand;
-    try { resolved = fs.realpathSync(cand); } catch { /* keep literal — checks below */ }
-    for (const root of roots) {
-      if (resolved === root || resolved.startsWith(root + path.sep)) {
-        return { path: resolved, root };
-      }
-    }
-    // Textual fallback for paths realpath can't resolve from this process
-    // (farm-dir symlinks, relative paths): any …/workspace/<src-repo>/ segment.
-    const m = cand.match(/(?:^|\/)workspace\/([^/]+)/);
-    if (m && rootNames.has(m[1])) {
-      return { path: cand, root: m[1] };
-    }
+    const v = checkPathViolation(cand, roots);
+    if (v) return v;
   }
   return null;
 }

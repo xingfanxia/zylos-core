@@ -21,11 +21,22 @@
 
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 import { fileURLToPath } from 'node:url';
 
-const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const ENV_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
-export async function initC4Session() {
+/**
+ * Build the SessionStart context string for one instance.
+ *
+ * @param {string|null} [instanceId] - target instance; defaults to the env
+ *   (standalone hook use). The C4 broker passes the authenticated caller so it
+ *   can serve isolated agents that no longer open the DB directly.
+ * @param {{ closeDb?: boolean }} [opts] - closeDb:false keeps the shared c4-db
+ *   connection open (the broker reuses one handle across requests).
+ */
+export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: closeDbAfter = true } = {}) {
+  const INSTANCE_ID = instanceId;
   let close = () => {};
   try {
     const {
@@ -33,9 +44,9 @@ export async function initC4Session() {
       getUnsummarizedRange,
       getUnsummarizedConversations,
       formatConversations,
-      close: closeDb,
+      close: closeDbFn,
     } = await import('./c4-db.js');
-    close = closeDb;
+    close = closeDbFn;
     const { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } = await import('./c4-config.js');
 
     // Instance-scoped query overrides (loaded lazily, graceful degradation).
@@ -119,7 +130,7 @@ export async function initC4Session() {
     wrapped.cause = err;
     throw wrapped;
   } finally {
-    close();
+    if (closeDbAfter) close();
   }
 }
 
@@ -127,7 +138,12 @@ function main() {
   const startMs = Date.now();
   (async () => {
     try {
-      process.stdout.write(await initC4Session());
+      // Isolated agents fetch their session context from the broker (they no
+      // longer open c4.db directly). Admin/scheduler compute it in-process.
+      const output = shouldUseBroker()
+        ? (await brokerCall('session-init')).context
+        : await initC4Session();
+      process.stdout.write(output);
     } catch (err) {
       console.error(err.cause?.stack || err.stack || err.message);
       process.exitCode = 1;

@@ -15,6 +15,7 @@ import {
   formatConversations,
   close
 } from './c4-db.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
@@ -48,7 +49,7 @@ function outputConversations(beginId, endId, { allInstances = false } = {}) {
     : getLastCheckpoint();
   const useInstanceFilter = !allInstances && INSTANCE_ID && _getConversationsByRangeForInstance;
   const conversations = useInstanceFilter
-    ? _getConversationsByRangeForInstance(INSTANCE_ID, beginId, endId)
+    ? _getConversationsByRangeForInstance(beginId, endId, INSTANCE_ID)
     : getConversationsByRange(beginId, endId);
   const lines = [];
 
@@ -68,9 +69,55 @@ function outputConversations(beginId, endId, { allInstances = false } = {}) {
   console.log(lines.join('\n'));
 }
 
-function main() {
+/** Print a broker fetch response ({checkpoint, range, conversations, formatted}). */
+function printBrokerFetch(data, { unsummarized }) {
+  if (unsummarized) {
+    if (!data.range || data.range.count === 0) {
+      console.log('No unsummarized conversations.');
+      return;
+    }
+    console.log(`[Unsummarized Range] end_id=${data.range.end_id} count=${data.range.count}`);
+  }
+  const lines = [];
+  if (data.checkpoint?.summary) {
+    lines.push(`[Last Checkpoint Summary] ${data.checkpoint.summary}`);
+    lines.push('');
+  }
+  lines.push(`[Conversations] (id ${data.range.begin_id} ~ ${data.range.end_id})`);
+  if (!data.conversations || data.conversations.length === 0) {
+    lines.push('No conversations in this range.');
+  } else {
+    lines.push(data.formatted);
+  }
+  console.log(lines.join('\n'));
+}
+
+async function main() {
   const args = process.argv.slice(2);
   const allInstances = args.includes('--all-instances');
+
+  // Isolated agents route through the broker (always self-scoped;
+  // --all-instances is an admin/debug flag that stays on the legacy path).
+  let useBroker = false;
+  try { useBroker = !allInstances && shouldUseBroker(); }
+  catch (err) { console.error(err.message); process.exit(1); }
+
+  if (useBroker) {
+    if (args.includes('--unsummarized')) {
+      const data = await brokerCall('fetch', { unsummarized: true });
+      printBrokerFetch(data, { unsummarized: true });
+      return;
+    }
+    let b = null, e = null;
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '--begin') b = parseInt(args[++i]);
+      else if (args[i] === '--end') e = parseInt(args[++i]);
+    }
+    if (b == null || e == null || isNaN(b) || isNaN(e)) usage();
+    const data = await brokerCall('fetch', { begin: b, end: e });
+    printBrokerFetch(data, { unsummarized: false });
+    return;
+  }
 
   if (args.includes('--unsummarized')) {
     try {
@@ -117,4 +164,7 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

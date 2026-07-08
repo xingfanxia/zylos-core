@@ -10,6 +10,7 @@
  */
 
 import { createCheckpoint, getCheckpoints, getLastCheckpoint, close } from './c4-db.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
@@ -56,7 +57,7 @@ function parseNumberArg(args, flag) {
   return value;
 }
 
-function handleCreate(args) {
+async function handleCreate(args) {
   if (args.length < 1 || args[0].startsWith('--')) {
     errorExit('create requires <end_conversation_id>');
   }
@@ -67,8 +68,15 @@ function handleCreate(args) {
   }
 
   const summary = parseStringArg(args, '--summary');
-  const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
 
+  // Isolated agents route through the broker (checkpoint forced to caller).
+  if (shouldUseBroker()) {
+    const result = await brokerCall('checkpoint', { endId: endConversationId, summary });
+    console.log('Checkpoint created:', JSON.stringify(result));
+    return;
+  }
+
+  const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
   const result = (targetInstance && _createCheckpointForInstance)
     ? _createCheckpointForInstance(endConversationId, summary, targetInstance)
     : createCheckpoint(endConversationId, summary);
@@ -88,7 +96,13 @@ function handleList(args) {
   console.log(JSON.stringify(rows, null, 2));
 }
 
-function handleLatest() {
+async function handleLatest() {
+  if (shouldUseBroker()) {
+    const row = await brokerCall('checkpoint', { latest: true });
+    if (!row) errorExit('no checkpoints found');
+    console.log(JSON.stringify(row, null, 2));
+    return;
+  }
   const targetInstance = INSTANCE_ID;
   const row = (targetInstance && _getLastCheckpointForInstance)
     ? _getLastCheckpointForInstance(targetInstance)
@@ -99,7 +113,7 @@ function handleLatest() {
   console.log(JSON.stringify(row, null, 2));
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
 
@@ -111,13 +125,13 @@ function main() {
   try {
     switch (command) {
       case 'create':
-        handleCreate(args.slice(1));
+        await handleCreate(args.slice(1));
         break;
       case 'list':
         handleList(args.slice(1));
         break;
       case 'latest':
-        handleLatest();
+        await handleLatest();
         break;
       default:
         usage();
@@ -128,4 +142,7 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

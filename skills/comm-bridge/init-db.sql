@@ -7,10 +7,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     summary TEXT,
     start_conversation_id INTEGER, -- first conversation id in this checkpoint's range
-    end_conversation_id INTEGER    -- last conversation id in this checkpoint's range
+    end_conversation_id INTEGER,   -- last conversation id in this checkpoint's range
+    target_instance TEXT DEFAULT NULL -- target zylos instance for multi-session isolation (mirrors migration 002)
 );
 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_timestamp ON checkpoints(timestamp);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_target_instance ON checkpoints(target_instance);
 
 -- Conversations table
 CREATE TABLE IF NOT EXISTS conversations (

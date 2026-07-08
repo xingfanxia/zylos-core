@@ -38,6 +38,7 @@ export const CORE_MANAGED_HOOKS = new Set([
   'skills/activity-monitor/scripts/hook-activity.js',
   'skills/activity-monitor/scripts/hook-auth-prompt.js',
   'skills/activity-monitor/scripts/memory-guard.js',
+  'skills/activity-monitor/scripts/src-egress-guard.js',
   'skills/activity-monitor/scripts/session-start-orchestrator.js',
   // Retired SessionStart hooks replaced by the orchestrator.
   'skills/zylos-memory/scripts/session-start-inject.js',

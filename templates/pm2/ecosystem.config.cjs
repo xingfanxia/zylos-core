@@ -114,7 +114,7 @@ function loadInstanceMonitors() {
 
 // Core service names — components must not collide with these
 const CORE_SERVICE_NAMES = new Set([
-  'scheduler', 'web-console', 'c4-dispatcher', 'activity-monitor', 'caddy',
+  'scheduler', 'web-console', 'c4-dispatcher', 'c4-broker', 'activity-monitor', 'caddy',
 ]);
 
 // Parse SKILL.md YAML frontmatter service block.
@@ -264,6 +264,21 @@ module.exports = {
     {
       name: 'c4-dispatcher',
       script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-dispatcher.js'),
+      cwd: path.join(SKILLS_DIR, 'comm-bridge', 'scripts'),
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production'
+      },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s'
+    },
+    {
+      // ZY-ISO-2: mediates isolated agents' c4.db access + channel sends over
+      // per-instance unix sockets. Same env as c4-dispatcher so channel sends
+      // resolve the cred-bearing root .env via $HOME/zylos/.env.
+      name: 'c4-broker',
+      script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-broker.js'),
       cwd: path.join(SKILLS_DIR, 'comm-bridge', 'scripts'),
       env: {
         PATH: ENHANCED_PATH,
