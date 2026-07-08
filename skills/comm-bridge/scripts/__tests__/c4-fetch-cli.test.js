@@ -9,6 +9,21 @@ import { fileURLToPath } from 'node:url';
 const CLI_PATH = fileURLToPath(new URL('../c4-fetch.js', import.meta.url));
 const RECEIVE_PATH = fileURLToPath(new URL('../c4-receive.js', import.meta.url));
 const CHECKPOINT_PATH = fileURLToPath(new URL('../c4-checkpoint.js', import.meta.url));
+const DB_MODULE = fileURLToPath(new URL('../c4-db.js', import.meta.url));
+
+// Seed a DELIVERED inbound conversation — the state that exists AFTER the
+// dispatcher has delivered a message to the agent. `--unsummarized` counts only
+// delivered rows (undelivered/pending messages the agent hasn't seen yet are not
+// conversation history to summarize), so a freshly-`receive`d message (which is
+// correctly 'pending' until dispatched) is the wrong precondition for it.
+function insertDelivered(content, env = {}) {
+  const code = `const { insertConversation, close } = await import(${JSON.stringify(DB_MODULE)});`
+    + ` insertConversation('in','system',null,${JSON.stringify(content)},'delivered'); close();`;
+  return spawnSync('node', ['--input-type=module', '-e', code], {
+    env: { ...process.env, ...env },
+    encoding: 'utf8',
+  });
+}
 
 function cli(args, env = {}) {
   const result = spawnSync('node', [CLI_PATH, ...args], {
@@ -57,8 +72,8 @@ describe('c4-fetch --unsummarized', () => {
 
   it('fetches unsummarized conversations', () => {
     withTmpDir(({ env }) => {
-      receive(['--channel', 'system', '--no-reply', '--content', 'msg1'], env);
-      receive(['--channel', 'system', '--no-reply', '--content', 'msg2'], env);
+      insertDelivered('msg1', env);
+      insertDelivered('msg2', env);
 
       const { stdout, status } = cli(['--unsummarized'], env);
       assert.equal(status, 0);
@@ -71,9 +86,9 @@ describe('c4-fetch --unsummarized', () => {
 
   it('includes last checkpoint summary', () => {
     withTmpDir(({ env }) => {
-      receive(['--channel', 'system', '--no-reply', '--content', 'old msg'], env);
+      insertDelivered('old msg', env);
       checkpoint(['create', '1', '--summary', 'First sync done'], env);
-      receive(['--channel', 'system', '--no-reply', '--content', 'new msg'], env);
+      insertDelivered('new msg', env);
 
       const { stdout, status } = cli(['--unsummarized'], env);
       assert.equal(status, 0);

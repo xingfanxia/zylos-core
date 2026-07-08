@@ -35,7 +35,16 @@ function _runMigrations(database) {
       if (applied) continue;
 
       const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-      database.exec(sql);
+      try {
+        database.exec(sql);
+      } catch (err) {
+        // init-db.sql now creates the multi-session columns/indexes up front, so
+        // on a fresh DB these ADD COLUMN migrations hit "duplicate column name".
+        // That means the migration's effect is already present — mark it applied
+        // and continue instead of aborting the whole chain (which used to leave
+        // later migrations unapplied and spam the error every run).
+        if (!/duplicate column name/i.test(err.message)) throw err;
+      }
       database.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
     }
   } catch (err) {

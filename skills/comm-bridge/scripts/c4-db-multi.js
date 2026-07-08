@@ -56,7 +56,14 @@ export function runPendingMigrations(database) {
     if (applied.has(file)) continue;
     try {
       const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
-      db.exec(sql);
+      try {
+        db.exec(sql);
+      } catch (err) {
+        // Idempotent: init-db.sql creates the multi-session columns up front, so
+        // ADD COLUMN migrations hit "duplicate column name" on a fresh DB — the
+        // effect already exists, so mark applied and continue rather than aborting.
+        if (!/duplicate column name/i.test(err.message)) throw err;
+      }
       db.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
       console.log(`[C4-DB] Applied migration: ${file}`);
     } catch (err) {

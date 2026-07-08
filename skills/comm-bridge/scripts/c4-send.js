@@ -63,9 +63,18 @@ async function main() {
   let message = null;
 
   if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
-    // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin
-    endpoint = cleanArgs[1];
-    message = (await readStdin()).trimEnd();
+    // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin.
+    // But a non-interactive stdin (cron, spawn) may simply be empty — in that case
+    // fall back to the documented 2-arg CLI form (channel + message, no endpoint /
+    // broadcast) instead of erroring, so the [endpoint_id]-optional contract works
+    // outside a TTY too.
+    const stdinData = (await readStdin()).trimEnd();
+    if (stdinData) {
+      endpoint = cleanArgs[1];
+      message = stdinData;
+    } else {
+      message = cleanArgs[1].replace(/\\n/g, '\n');
+    }
   } else if (cleanArgs.length === 1 && (stdinAvailable || hasStdinFlag)) {
     // 1 arg (channel only) with piped stdin: read from stdin
     message = (await readStdin()).trimEnd();

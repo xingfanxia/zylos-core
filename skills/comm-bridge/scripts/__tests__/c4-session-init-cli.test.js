@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CLI_PATH = fileURLToPath(new URL('../c4-session-init.js', import.meta.url));
-const RECEIVE_PATH = fileURLToPath(new URL('../c4-receive.js', import.meta.url));
+const DB_MODULE = fileURLToPath(new URL('../c4-db.js', import.meta.url));
 const CHECKPOINT_PATH = fileURLToPath(new URL('../c4-checkpoint.js', import.meta.url));
 
 function cli(args, env = {}) {
@@ -18,10 +18,16 @@ function cli(args, env = {}) {
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
 }
 
-function receive(args, env = {}) {
-  return spawnSync('node', [RECEIVE_PATH, ...args], {
+// Seed a DELIVERED inbound conversation — the post-dispatch state session-init
+// injects. A freshly-`receive`d message is correctly 'pending' until the
+// dispatcher delivers it, and session-init counts only delivered rows, so
+// delivered is the right precondition here.
+function insertDelivered(content, env = {}) {
+  const code = `const { insertConversation, close } = await import(${JSON.stringify(DB_MODULE)});`
+    + ` insertConversation('in','system',null,${JSON.stringify(content)},'delivered'); close();`;
+  return spawnSync('node', ['--input-type=module', '-e', code], {
     env: { ...process.env, ...env },
-    encoding: 'utf8'
+    encoding: 'utf8',
   });
 }
 
@@ -57,9 +63,9 @@ describe('c4-session-init', () => {
 
   it('outputs last checkpoint summary', () => {
     withTmpDir(({ env }) => {
-      receive(['--channel', 'system', '--no-reply', '--content', 'msg1'], env);
+      insertDelivered('msg1', env);
       checkpoint(['create', '1', '--summary', 'Synced first batch'], env);
-      receive(['--channel', 'system', '--no-reply', '--content', 'msg2'], env);
+      insertDelivered('msg2', env);
 
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
@@ -72,10 +78,10 @@ describe('c4-session-init', () => {
 
   it('emits a fallback block when the last checkpoint has no summary', () => {
     withTmpDir(({ env }) => {
-      receive(['--channel', 'system', '--no-reply', '--content', 'msg1'], env);
+      insertDelivered('msg1', env);
       // Checkpoint created without --summary → summary is null.
       checkpoint(['create', '1'], env);
-      receive(['--channel', 'system', '--no-reply', '--content', 'msg2'], env);
+      insertDelivered('msg2', env);
 
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
@@ -90,7 +96,7 @@ describe('c4-session-init', () => {
   it('shows recent conversations when under threshold', () => {
     withTmpDir(({ env }) => {
       for (let i = 1; i <= 3; i++) {
-        receive(['--channel', 'system', '--no-reply', '--content', `msg${i}`], env);
+        insertDelivered(`msg${i}`, env);
       }
 
       const { stdout, status } = cli([], env);
@@ -109,7 +115,7 @@ describe('c4-session-init', () => {
     withTmpDir(({ env }) => {
       // CHECKPOINT_THRESHOLD is 15; insert 31 messages (well over threshold)
       for (let i = 1; i <= 31; i++) {
-        receive(['--channel', 'system', '--no-reply', '--content', `msg${i}`], env);
+        insertDelivered(`msg${i}`, env);
       }
 
       const { stdout, status } = cli([], env);
