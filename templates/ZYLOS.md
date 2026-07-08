@@ -123,6 +123,22 @@ Route user-specific preferences to the correct profile file. Bot identity stays 
 
 When in doubt, write to sessions/current.md.
 
+### Single-Owner & Scoping Rules
+
+- **One loop, one owner.** A per-user work loop lives in exactly ONE place: the
+  owning user instance's `instances/<id>/state.md`. The primary/admin state.md is
+  a cross-instance COORDINATION tracker — it may REFERENCE another instance's
+  loops with a short pointer, but must not re-copy their full detail (duplicated
+  detail drifts; keep one source of truth).
+- **Group memory** lives in `memory/groups/<group_key>/`, owned by the group
+  instance only.
+- **Instance-scoped c4 view ≠ full history.** A user instance's `c4-fetch` /
+  session-init only sees rows tagged `target_instance=<its id>`; messages that
+  predate multi-session targeting won't appear even though they happened.
+  Cross-check `memory/users/<chat_id>/profile.md` before writing "no
+  conversations / dormant", and treat an `enabled` instance in instances.json as
+  approved regardless of a stale "awaiting approval" note.
+
 ### On-Demand Memory Loading
 
 Always-loaded files (identity, state, references) are intentionally lean summaries. On-demand files hold the full context. When you lack sufficient context to act confidently, read the relevant memory file before proceeding — a file read is far cheaper than a wrong assumption.
