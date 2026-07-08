@@ -24,7 +24,9 @@ This file provides guidance to Claude Code when working in this directory.
 
 ## Environment Overview
 
-This is a Zylos-managed workspace for an autonomous AI agent. You have full control of this environment — sudo access, Docker, network, and all installed tools.
+This is a Zylos-managed workspace for an autonomous AI agent. By default you have full control of this environment — sudo access, Docker, network, and all installed tools.
+
+**OS-isolated instances** (deployments that set `os_user` in instances.json — see `docs/design/os-user-isolation.md`): you run as a dedicated unix user without sudo. Check with `whoami`. Permission-denied on protected paths (other instances' dirs, operator config, locked source repos) is BY DESIGN — do not retry or work around it; say so in your reply if a task genuinely needs an admin-only resource.
 
 Be resourceful: when a user makes a request, don't give up easily. If you can do it yourself, do it — save the user's effort. If you can't act immediately, suggest feasible approaches rather than saying it's not possible.
 

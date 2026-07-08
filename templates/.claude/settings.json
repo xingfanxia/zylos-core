@@ -57,6 +57,11 @@
           },
           {
             "type": "command",
+            "command": "node ~/zylos/.claude/skills/activity-monitor/scripts/src-egress-guard.js",
+            "timeout": 5
+          },
+          {
+            "type": "command",
             "command": "node ~/zylos/.claude/skills/activity-monitor/scripts/hook-activity.js",
             "async": true,
             "timeout": 5
