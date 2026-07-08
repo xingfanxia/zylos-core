@@ -113,35 +113,41 @@ async function approveUser(chatId, name) {
     console.error(`Warning: failed to create memory directory (${err.message})`);
   }
 
-  // 1d. Set auto_suspend + idle_timeout (CLI doesn't have these flags)
+  // 1d. Set auto_suspend + idle_timeout (CLI doesn't have these flags).
+  // Route through the router's atomic temp+rename writer — raw writeFileSync
+  // on instances.json can be seen truncated by concurrent readers (dispatcher,
+  // dashboard) and corrupts the routing source of truth on a mid-write crash.
   try {
-    const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
-    const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
-    if (config.instances[instanceName]) {
+    const { updateInstancesConfig } = await import('./c4-instance-router.js');
+    updateInstancesConfig((config) => {
+      if (!config?.instances?.[instanceName]) return null;
       config.instances[instanceName].type = 'user';
       config.instances[instanceName].auto_suspend = true;
       config.instances[instanceName].idle_timeout_min = 360;
-      fs.writeFileSync(instancesFile, JSON.stringify(config, null, 2) + '\n');
-      console.log(`Set auto_suspend=true, idle_timeout_min=360 for ${instanceName}`);
-    }
+      return config;
+    });
+    console.log(`Set auto_suspend=true, idle_timeout_min=360 for ${instanceName}`);
   } catch (err) {
     console.error(`Warning: failed to set auto_suspend (${err.message})`);
   }
 
   // 1e. OS-level isolation: dedicated unix user for the new instance
-  // (docs/design/agent-os-isolation.md). Provision script is idempotent.
+  // (fork doc: docs/design/os-user-isolation.md; the provisioning script is
+  // deployment-local, shipped under $ZYLOS_DIR/scripts/ops/). Idempotent.
   // Runs from the admin session (service user, passwordless sudo).
   try {
     const provisionScript = path.join(ZYLOS_DIR, 'scripts', 'ops', 'provision-agent-user.sh');
     if (fs.existsSync(provisionScript)) {
       execFileSync('bash', [provisionScript, instanceName], { stdio: 'pipe', timeout: 120_000 });
-      const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
-      const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
-      if (config.instances[instanceName]) {
-        config.instances[instanceName].os_user = `zylos-${instanceName.replace(/^user-/, '')}`;
-        fs.writeFileSync(instancesFile, JSON.stringify(config, null, 2) + '\n');
-        console.log(`OS isolation: ${instanceName} -> ${config.instances[instanceName].os_user}`);
-      }
+      const osUser = `zylos-${instanceName.replace(/^user-/, '')}`;
+      const { updateInstancesConfig } = await import('./c4-instance-router.js');
+      updateInstancesConfig((config) => {
+        if (!config?.instances?.[instanceName]) return null;
+        config.instances[instanceName].os_user = osUser;
+        config.instances[instanceName].claude_config_dir = `/home/${osUser}/.claude`;
+        return config;
+      });
+      console.log(`OS isolation: ${instanceName} -> ${osUser}`);
     } else {
       console.error('Warning: provision-agent-user.sh missing — instance will run as the service user');
     }

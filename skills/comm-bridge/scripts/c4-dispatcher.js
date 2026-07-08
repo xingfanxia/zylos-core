@@ -6,7 +6,11 @@
 
 import { execFileSync } from 'child_process';
 import path from 'path';
-import { readFileSync, existsSync, statSync } from 'fs';
+import {
+  readFileSync, existsSync, statSync,
+  openSync as fsOpenSync, writeSync as fsWriteSync,
+  closeSync as fsCloseSync, unlinkSync as fsUnlinkSync,
+} from 'fs';
 import net from 'net';
 import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
 import {
@@ -47,6 +51,7 @@ import {
   REQUIRE_IDLE_EXECUTION_POLL_MS,
   ACTIVE_RUNTIME,
   TMUX_SESSION,
+  DB_PATH,
   ACTIVITY_MONITOR_DIR,
   AGENT_STATUS_FILE,
   PROC_STATE_FILE,
@@ -824,7 +829,49 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
+/**
+ * Singleton guard. WAL + guarded-UPDATE claims make double-DELIVERY of one
+ * row impossible, but two dispatchers can still claim different rows for the
+ * same instance and interleave tmux keystrokes into one pane, and duplicate
+ * the in-memory lifecycle signals (wake/suspend/auto-start). PM2 fork-mode is
+ * the only thing preventing that today — this pidfile makes it a code
+ * guarantee. Stale pidfiles (dead pid) are reclaimed automatically.
+ */
+function acquireSingletonLock() {
+  const lockPath = path.join(path.dirname(DB_PATH), 'c4-dispatcher.pid');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fsOpenSync(lockPath, 'wx');
+      fsWriteSync(fd, String(process.pid));
+      fsCloseSync(fd);
+      const cleanup = () => { try { fsUnlinkSync(lockPath); } catch { /* best-effort */ } };
+      process.on('exit', cleanup);
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') { log(`Singleton lock error: ${err.message} — continuing without lock`); return true; }
+      let holderPid = 0;
+      try { holderPid = Number.parseInt(readFileSync(lockPath, 'utf8'), 10); } catch { }
+      let holderAlive = false;
+      if (Number.isInteger(holderPid) && holderPid > 0 && holderPid !== process.pid) {
+        try { process.kill(holderPid, 0); holderAlive = true; }
+        catch (e) { holderAlive = e?.code === 'EPERM'; }
+      }
+      if (holderAlive) {
+        log(`Another dispatcher is running (pid ${holderPid}) — exiting.`);
+        return false;
+      }
+      try { fsUnlinkSync(lockPath); } catch { }
+    }
+  }
+  log('Could not acquire singleton lock after stale-cleanup retry — exiting.');
+  return false;
+}
+
 async function main() {
+  if (!acquireSingletonLock()) {
+    close();
+    process.exit(1);
+  }
   log('=== C4 Dispatcher Started ===');
   log(`Tmux session: ${TMUX_SESSION}`);
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);
