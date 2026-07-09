@@ -305,11 +305,13 @@ export class CodexAdapter extends RuntimeAdapter {
     // exits, the parent shell is still alive); we keep that behavior. For the
     // multi-session fork we additionally propagate instance identity into env
     // and use the per-instance cwd.
+    const kickPrompt = 'hello';
+
     if (tmuxHasSession(SESSION)) {
-      // Existing tmux session — start a fresh Codex process; the native
-      // SessionStart hook fires and bootstraps startup context. Re-export
-      // instance identity so subsequent in-session restarts inherit it, and
-      // cd to the per-instance cwd.
+      // Existing tmux session — start a fresh Codex process with kick prompt
+      // to trigger the SessionStart hook immediately. Re-export instance
+      // identity so subsequent in-session restarts inherit it, and cd to the
+      // per-instance cwd.
       const envExports = [
         process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
         process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
@@ -317,7 +319,7 @@ export class CodexAdapter extends RuntimeAdapter {
         ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
-      const cmd = `${envPrefix}cd "${instanceCwd}"; ${codexCmd}; ${exitLogSnippet}`;
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${codexCmd} "${kickPrompt}"; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
@@ -338,6 +340,7 @@ export class CodexAdapter extends RuntimeAdapter {
       // Build launch spec - Codex reads auth from ~/.codex/auth.json via HOME
       const args = [];
       if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox');
+      args.push(kickPrompt);
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
       const specPath = writeLaunchSpec({
@@ -377,6 +380,7 @@ export class CodexAdapter extends RuntimeAdapter {
         }
       } catch { /* non-fatal */ }
     }, 8000);
+
   }
 
   // ── Heartbeat / context (Phase 5) ─────────────────────────────────────────

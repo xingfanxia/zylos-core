@@ -495,10 +495,12 @@ app.get('/api/conversations', (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const channel = req.query.channel || 'web-console';
 
+    // channel is caller-controlled; 'void' is the internal record-only
+    // channel (#689) and must never reach a display surface.
     const stmt = db.prepare(`
       SELECT id, direction, channel, endpoint_id, content, timestamp
       FROM conversations
-      WHERE channel = ?
+      WHERE channel = ? AND channel != 'void'
       ORDER BY timestamp DESC
       LIMIT ?
     `);

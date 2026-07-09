@@ -341,6 +341,7 @@ export function multiSessionDispatch(item, helpers) {
  * @param {(message: string) => void} helpers.log
  * @param {(ms: number) => Promise<void>} helpers.sleep
  * @param {() => number} helpers.nowSeconds
+ * @param {(item: object) => string} helpers.getDeliveryContent
  * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingForInstances
  * @param {(instanceIds: string[]) => object[]} helpers.getPendingTargetInstancesNeedingWake
  * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingControlForInstances
@@ -367,6 +368,7 @@ export async function processWithMultiSession(helpers) {
     log,
     sleep,
     nowSeconds,
+    getDeliveryContent,
     markRejected,
     markControlRejected,
     getNextPendingForInstances,
@@ -488,7 +490,10 @@ export async function processWithMultiSession(helpers) {
       (targetInstance ? ` -> ${targetInstance}` : '')
     );
 
-    const deliveryContent = item.content || '';
+    // Clean-store model (#618): stored conversation rows carry no reply-via —
+    // reconstruct it here (and the "Meanwhile, " prefix for non-slash controls),
+    // same as the single-session path.
+    const deliveryContent = getDeliveryContent(item);
     const result = await sendToTmux(deliveryContent, {
       session,
       strictVerify: item.type === 'conversation',

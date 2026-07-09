@@ -52,7 +52,7 @@ export function enqueueNewSession({
     `(${used.toLocaleString()} / ${ceiling.toLocaleString()} tokens), ` +
     'exceeding threshold.';
   const content = runtime === 'codex'
-    ? `${base} Run $new-session now and follow SKILL.md in order. Write/send the session handoff summary before the final session-switch command; do not skip checklist steps. Send the full session handoff summary only to the internal web-console channel; do not post it to the active external user channel.`
+    ? `${base} Run $new-session now and follow SKILL.md in order. Write/send the session handoff summary before the final session-switch command; do not skip checklist steps. Send the full session handoff summary only to the internal void channel (c4-send "void" "session-handoff"); do not post it to the active external user channel.`
     : `${base} Use the new-session skill to start a fresh session.`;
   const args = [
     C4_CONTROL, 'enqueue',

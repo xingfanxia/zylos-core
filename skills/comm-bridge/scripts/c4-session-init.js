@@ -53,7 +53,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
       getLastCheckpoint,
       getUnsummarizedRange,
       getUnsummarizedConversations,
-      formatConversations,
+      formatConversationsForAgent,
       close: closeDbFn,
     } = await import('./c4-db.js');
     close = closeDbFn;
@@ -139,7 +139,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
         const label = bucket.count > bucket.conversations.length
           ? `GROUP ${bucket.label} (showing ${bucket.conversations.length} of ${bucket.count})`
           : `GROUP ${bucket.label}`;
-        sections.push(formatSection(label, formatConversations(bucket.conversations)));
+        sections.push(formatSection(label, formatConversationsForAgent(bucket.conversations)));
       }
       if (omittedGroups > 0) {
         sections.push(formatSection(
@@ -164,7 +164,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
       ? getConvos(SESSION_INIT_RECENT_COUNT)
       : getConvos();
 
-    sections.push(formatSection('RECENT CONVERSATIONS', formatConversations(conversations)));
+    sections.push(formatSection('RECENT CONVERSATIONS', formatConversationsForAgent(conversations)));
 
     // If over threshold, append Memory Sync instruction.
     if (needsSync) {

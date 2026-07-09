@@ -9,6 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DATA_DIR, DB_PATH, CONTROL_MAX_RETRIES } from './c4-config.js';
+import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -80,6 +81,7 @@ export function getDb() {
     ensureConversationsSchema(db);
     ensureControlQueueSchema(db);
     ensureStatusNoticeCooldownSchema(db);
+    ensureVoidChannelMigration(db);
   }
   return db;
 }
@@ -140,6 +142,21 @@ function ensureConversationsSchema(database) {
   if (!columnNames.has('delivery_action')) {
     database.exec('ALTER TABLE conversations ADD COLUMN delivery_action TEXT');
   }
+}
+
+/**
+ * #689: session-handoff summaries used to be piggybacked on the web-console
+ * channel (channel='web-console', endpoint_id='session-handoff'). They now
+ * live on the internal record-only 'void' channel; re-tag existing rows so
+ * display surfaces no longer need endpoint-name special cases. Idempotent —
+ * once re-tagged, no rows match.
+ */
+function ensureVoidChannelMigration(database) {
+  database.prepare(`
+    UPDATE conversations
+    SET channel = 'void'
+    WHERE channel = 'web-console' AND endpoint_id = 'session-handoff'
+  `).run();
 }
 
 function ensureStatusNoticeCooldownSchema(database) {
@@ -428,7 +445,8 @@ export function insertControl(content, options = {}) {
 
     let finalContent = content;
     if (appendAckSuffix) {
-      // Auto-append ack suffix (like c4-receive appends "reply via")
+      // Control acknowledgements are stored with the queued control item so
+      // the ack ID remains attached to the exact work item being delivered.
       const controlScriptPath = path.join(__dirname, 'c4-control.js');
       const ackSuffix = ` ---- ack via: node ${controlScriptPath} ack --id ${id}`;
       finalContent = content + ackSuffix;
@@ -784,6 +802,36 @@ export function formatConversations(conversations) {
     const endpoint = conv.endpoint_id ? `:${conv.endpoint_id}` : '';
     lines.push(`[${conv.timestamp}] ${dir} (${conv.channel}${endpoint}):`);
     lines.push(conv.content);
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Format conversation records for agent-facing context. Unlike
+ * formatConversations(), this adds reply routing only while each original
+ * record is still available, never by post-processing the flattened output.
+ * @param {array} conversations - array of conversation records
+ * @returns {string} - formatted text for agent delivery/session init
+ */
+export function formatConversationsForAgent(conversations) {
+  if (!conversations || conversations.length === 0) {
+    return '';
+  }
+
+  const lines = [];
+  for (const conv of conversations) {
+    const dir = conv.direction === 'in' ? 'IN' : 'OUT';
+    const endpoint = conv.endpoint_id ? `:${conv.endpoint_id}` : '';
+    const content = conv.content || '';
+    const replyViaSuffix = (
+      conv.direction === 'in' &&
+      conv.endpoint_id &&
+      !hasLegacyReplyViaSuffix(content)
+    ) ? buildReplyViaSuffix(conv.channel, conv.endpoint_id) : '';
+    lines.push(`[${conv.timestamp}] ${dir} (${conv.channel}${endpoint}):`);
+    lines.push(truncateForDelivery(content, replyViaSuffix));
     lines.push('');
   }
 
