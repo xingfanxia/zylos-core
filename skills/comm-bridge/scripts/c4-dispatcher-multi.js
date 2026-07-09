@@ -374,6 +374,7 @@ export async function processWithMultiSession(helpers) {
     getNextPendingForInstances,
     getPendingTargetInstancesNeedingWake,
     getNextPendingControlForInstances,
+    notifyMessageDelivered,
   } = helpers;
 
   // Reap idle non-primary instances before processing.
@@ -503,6 +504,21 @@ export async function processWithMultiSession(helpers) {
       if (item.type === 'conversation') {
         markDelivered(item.id);
         log(`Conversation id=${item.id} delivered`);
+        // Notify the TARGET instance's Activity Monitor (its own am.sock) so its
+        // HealthEngine.onUserMessageDelivered fires — the event-driven auth /
+        // rate-limit / sticky-error check. The single-session path notifies the
+        // default socket; multi-session must target the per-instance socket or
+        // the check never runs for isolated instances (each AM listens on its
+        // own am.sock under getMonitorDir(instance)). Best-effort — a down AM
+        // just means the periodic heartbeat is the only health signal.
+        if (notifyMessageDelivered && targetInstance) {
+          const monDir = getMonitorDir(targetInstance) || path.join(ZYLOS_DIR, 'activity-monitor', targetInstance);
+          notifyMessageDelivered({
+            conversationId: item.id,
+            channel: item.channel,
+            socketPath: path.join(monDir, 'am.sock'),
+          }).catch((err) => log(`Warning: failed to notify AM of delivery: ${err.message}`));
+        }
       } else {
         const hasAck = (item.content || '').includes('---- ack via:');
         if (hasAck) {

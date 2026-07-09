@@ -121,3 +121,71 @@ describe('writeWakeSignal', () => {
     assert.ok(fs.existsSync(path.join(stateDir('admin'), 'wake-signal')));
   });
 });
+
+describe('processWithMultiSession — per-instance delivery notify', () => {
+  // Minimal helper set that drives one claimed item all the way to delivery.
+  function baseHelpers({ item, notifyCalls, sendResult = 'submitted' }) {
+    let claimed = false;
+    return {
+      getAgentState: () => ({ state: 'active', health: 'ok', idleSeconds: 0 }),
+      isStatusFresh: () => true,
+      sendToTmux: async () => sendResult,
+      claimNextItem: () => { if (claimed) return null; claimed = true; return item; },
+      releaseItem: () => {},
+      isBypassState: () => false,
+      shouldAutoAckHeartbeat: () => false,
+      handleConversationDeliveryFailure: async () => {},
+      handleControlDeliveryFailure: async () => {},
+      waitForRequireIdleSettlement: async () => {},
+      markDelivered: () => {},
+      ackControl: () => {},
+      readProcState: () => ({ alive: true }),
+      isAgentConfirmedActive: () => false,
+      log: () => {},
+      sleep: async () => {},
+      nowSeconds: () => 0,
+      getDeliveryContent: (i) => i.content,
+      markRejected: () => {},
+      markControlRejected: () => {},
+      getNextPendingForInstances: () => null,
+      getPendingTargetInstancesNeedingWake: () => [],
+      getNextPendingControlForInstances: () => null,
+      notifyMessageDelivered: (arg) => { notifyCalls.push(arg); return Promise.resolve(); },
+    };
+  }
+
+  it('fires notifyMessageDelivered to the target instance am.sock after a conversation delivery', async () => {
+    const notifyCalls = [];
+    const item = {
+      id: 42, type: 'conversation', channel: 'feishu',
+      target_instance: 'user-betty', content: 'hi', endpoint_id: 'oc_A|type:group',
+    };
+    const res = await disp.processWithMultiSession(baseHelpers({ item, notifyCalls }));
+    assert.equal(res.delivered, true);
+    assert.equal(notifyCalls.length, 1);
+    assert.equal(notifyCalls[0].conversationId, 42);
+    assert.equal(notifyCalls[0].channel, 'feishu');
+    // Must target THIS instance's socket, not the global default.
+    assert.ok(notifyCalls[0].socketPath.includes('user-betty'), notifyCalls[0].socketPath);
+    assert.ok(notifyCalls[0].socketPath.endsWith('am.sock'), notifyCalls[0].socketPath);
+  });
+
+  it('does NOT notify for control-item deliveries (no user reply to health-check)', async () => {
+    const notifyCalls = [];
+    const item = {
+      id: 7, type: 'control', priority: 2, target_instance: 'user-betty', content: '/status',
+    };
+    await disp.processWithMultiSession(baseHelpers({ item, notifyCalls }));
+    assert.equal(notifyCalls.length, 0);
+  });
+
+  it('does NOT notify when delivery is not submitted', async () => {
+    const notifyCalls = [];
+    const item = {
+      id: 43, type: 'conversation', channel: 'feishu',
+      target_instance: 'user-betty', content: 'hi', endpoint_id: 'oc_A|type:group',
+    };
+    await disp.processWithMultiSession(baseHelpers({ item, notifyCalls, sendResult: 'verify_failed' }));
+    assert.equal(notifyCalls.length, 0);
+  });
+});

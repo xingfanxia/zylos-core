@@ -82,9 +82,9 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now() } = {}) {
+export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now(), socketPath = AM_SOCKET_PATH } = {}) {
   return new Promise((resolve) => {
-    const socket = net.createConnection(AM_SOCKET_PATH);
+    const socket = net.createConnection(socketPath);
     let settled = false;
 
     function settle() {
@@ -678,7 +678,7 @@ async function processNextMessage() {
       markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
       getNextPendingForInstances, getPendingTargetInstancesNeedingWake,
       getNextPendingControlForInstances,
-      markRejected, markControlRejected,
+      markRejected, markControlRejected, notifyMessageDelivered,
     });
   } catch (e) {
     if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session error: ${e.message}`);
