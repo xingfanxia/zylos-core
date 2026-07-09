@@ -410,8 +410,10 @@ export function holdAndNotify(channel, endpoint, content, priority, targetInstan
     ? db0.prepare("SELECT 1 FROM conversations WHERE status='pending_approval' AND endpoint_id LIKE ? LIMIT 1").get(`${chatId}%`)
     : true;
 
-  // 1. Insert message as pending_approval
-  const record = insertConversation('in', channel, endpoint, content, 'pending_approval', priority, false, targetInstance);
+  // 1. Insert message as pending_approval. deliveryAction (8th param) is null —
+  // targetInstance is the 9th; passing it 8th polluted delivery_action and left
+  // target_instance NULL on held rows (masked because approve-release re-sets it).
+  const record = insertConversation('in', channel, endpoint, content, 'pending_approval', priority, false, null, targetInstance);
 
   if (!alreadyHeld && endpoint) {
     try {
