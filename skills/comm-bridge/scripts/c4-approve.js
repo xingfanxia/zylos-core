@@ -395,7 +395,9 @@ export async function checkAndHoldForApproval(endpoint, targetInstance, noReply,
  *
  * @param {string} channel - Message channel
  * @param {string} endpoint - Sender endpoint
- * @param {string} content - Full message content (with reply-via suffix)
+ * @param {string} content - Raw message content (clean-store model, #618):
+ *   reply-via is NOT baked in here; it is reconstructed at delivery. The
+ *   `----`-stripping in the preview below is thus a harmless no-op on held rows.
  * @param {number} priority - Message priority
  * @param {string|null} targetInstance - Resolved target (fallback default)
  */
