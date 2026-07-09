@@ -210,6 +210,7 @@ async function handleRequest(req, caller) {
   switch (op) {
     case 'ping':         return { ok: true, data: { pong: true, instance: caller } };
     case 'send':         return await opSend(p, caller);
+    case 'void':         return opVoid(p, caller);
     case 'fetch':        return opFetch(p, caller);
     case 'unsummarized': return opUnsummarized(caller);
     case 'checkpoint':   return opCheckpoint(p, caller);
@@ -312,6 +313,29 @@ async function opSend(p, caller) {
   const code = await spawnSend(channelScript, endpoint, content);
   if (code === 0) return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
   return { ok: false, error: `channel_send_failed:exit_${code}`, data: { conversation_id: conversationId } };
+}
+
+/**
+ * Record-only 'void' channel (#689) for isolated agents. The void endpoint is a
+ * topic label (e.g. 'session-handoff'), never a real chat, so it deliberately
+ * skips MESSAGING_CHANNELS / endpointAuthorized / egress-policy — none apply to
+ * a message that is never dispatched. Unlike real out-rows (NULL target_instance
+ * to avoid replaying replies), the void row is SCOPED TO THE CALLER: its whole
+ * purpose is to be read back by that same instance's next session-init.
+ */
+function opVoid(p, caller) {
+  const endpoint = p.endpoint ?? null;
+  const content = p.content;
+  if (typeof content !== 'string' || content.length === 0) return { ok: false, error: 'content_required' };
+  if (!endpoint) return { ok: false, error: 'endpoint_required' };
+  try { validateEndpoint(endpoint); } catch (e) { return { ok: false, error: `invalid_endpoint:${e.message}` }; }
+  try {
+    const row = insertConversation('out', 'void', endpoint, content, null, 3, false, null, caller);
+    return { ok: true, data: { recorded: true, conversation_id: row.id } };
+  } catch (e) {
+    log(`WARN void record failed (${caller}): ${e.message}`);
+    return { ok: false, error: `void_record_failed:${e.message}` };
+  }
 }
 
 function spawnSend(channelScript, endpoint, content) {

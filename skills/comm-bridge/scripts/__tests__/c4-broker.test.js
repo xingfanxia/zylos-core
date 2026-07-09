@@ -53,7 +53,7 @@ fakeChannel('shell', 0);
 const broker = await import('../c4-broker.js');
 const egress = await import('../egress-policy.js');
 const client = await import('../c4-client.js');
-const { close: closeDb } = await import('../c4-db.js');
+const { close: closeDb, getDb } = await import('../c4-db.js');
 
 const openedSockets = [];
 function open(id) { broker.ensureSocket(id); openedSockets.push(id); }
@@ -179,6 +179,40 @@ describe('broker handleRequest', () => {
     await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'reply text' } }, 'inst-a');
     const after = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
     assert.equal(after, before, 'own outbound message must not count toward unsummarized');
+  });
+});
+
+// ── broker void op (record-only, caller-scoped) ─────────────────────
+describe('broker void op', () => {
+  it('records a caller-scoped, delivered handoff row without needing a channel script', async () => {
+    const r = await broker.handleRequest({ op: 'void', params: { endpoint: 'session-handoff', content: 'handoff summary A' } }, 'inst-a');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.data.recorded, true);
+    assert.ok(Number.isInteger(r.data.conversation_id));
+    // Void is scoped to the caller (target_instance = caller) and 'delivered', so
+    // that instance's own next session-init reads the handoff back — unlike
+    // real-channel out-rows which are NULL-targeted (M3). Assert the row shape
+    // directly (immune to the sibling checkpoint's id boundary).
+    const row = getDb().prepare('SELECT direction, channel, status, target_instance FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    assert.equal(row.channel, 'void');
+    assert.equal(row.direction, 'out');
+    assert.equal(row.status, 'delivered');
+    assert.equal(row.target_instance, 'inst-a', 'void handoff must be scoped to the calling instance');
+  });
+
+  it('scopes each caller\'s handoff to itself (no cross-instance bleed)', async () => {
+    const rb = await broker.handleRequest({ op: 'void', params: { endpoint: 'session-handoff', content: 'handoff for B' } }, 'inst-b');
+    const row = getDb().prepare('SELECT target_instance FROM conversations WHERE id = ?').get(rb.data.conversation_id);
+    assert.equal(row.target_instance, 'inst-b');
+  });
+
+  it('requires both endpoint and content', async () => {
+    const noEp = await broker.handleRequest({ op: 'void', params: { content: 'x' } }, 'inst-a');
+    assert.equal(noEp.ok, false);
+    assert.match(noEp.error, /endpoint_required/);
+    const noContent = await broker.handleRequest({ op: 'void', params: { endpoint: 'session-handoff' } }, 'inst-a');
+    assert.equal(noContent.ok, false);
+    assert.match(noContent.error, /content_required/);
   });
 });
 
