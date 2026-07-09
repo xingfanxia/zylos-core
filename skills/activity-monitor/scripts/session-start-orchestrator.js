@@ -167,9 +167,12 @@ async function runMemoryInject(payload) {
   return injectMemory(payload);
 }
 
-async function runC4SessionInit(payload) {
+async function runC4SessionInit() {
   const { initC4Session } = await import('../../comm-bridge/scripts/c4-session-init.js');
-  return initC4Session(payload);
+  // initC4Session takes an INSTANCE ID, not the SessionStart payload — let it
+  // default to ZYLOS_INSTANCE_ID from the env. (Passing the payload object here
+  // bound an object as a SQL param → "too few parameter values".)
+  return initC4Session();
 }
 
 async function runForeground(payload) {
