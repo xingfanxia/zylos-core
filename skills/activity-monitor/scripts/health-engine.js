@@ -441,6 +441,15 @@ export class HealthEngine {
       return;
     }
 
+    // auth_failed is an upstream credential condition, same class as
+    // rate_limited: killing and restarting the session cannot fix it and just
+    // thrashes the pane. Recovery happens via checkAuth probes (runRecoveryProbe)
+    // and heartbeat ACKs once credentials are restored.
+    if (this.healthState === 'auth_failed') {
+      this.deps.log(`Heartbeat recovery skipped in AUTH_FAILED state (${reason})`);
+      return;
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
     if (this.healthState === 'ok') {
@@ -474,6 +483,25 @@ export class HealthEngine {
       const rateLimit = this.deps.detectRateLimit();
       if (rateLimit.detected) {
         this.enterRateLimited(rateLimit.cooldownUntil, rateLimit.resetTime);
+        return;
+      }
+    }
+
+    // Same dual-signal for auth failures: a heartbeat timing out because the
+    // session sits on a login screen used to be misclassified as 'unavailable'
+    // and entered an endless kill+restart loop (each restart lands on the same
+    // login screen). Behavioral signal = this heartbeat failure; text signal =
+    // auth-failure pane text. Enter auth_failed instead: no kill, recovery via
+    // checkAuth probes / heartbeat ACK once credentials are restored — a false
+    // positive self-heals through the next heartbeat ACK (heartbeats bypass the
+    // health gate).
+    if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState)) && this.deps.detectAuthFailure) {
+      const authFailure = this.deps.detectAuthFailure();
+      if (authFailure.detected) {
+        this.restartFailureCount = 0;
+        this.recoveringStartedAt = 0;
+        this.signalDetectedAt = 0;
+        this.setHealth('auth_failed', `${phase}_${status}:${authFailure.pattern || 'auth_text'}`);
         return;
       }
     }

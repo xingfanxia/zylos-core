@@ -474,6 +474,66 @@ describe('HealthEngine', () => {
 
       assert.ok(calls.log.some(m => m.includes('next backoff')));
     });
+
+    it('does nothing in auth_failed state (no kill+restart thrash on a login screen)', () => {
+      const { deps, calls } = createMockDeps();
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'auth_failed' });
+
+      engine.triggerRecovery('heartbeat_timeout');
+
+      assert.equal(calls.killTmuxSession, 0);
+      assert.equal(engine.restartFailureCount, 0);
+      assert.equal(engine.health, 'auth_failed');
+      assert.ok(calls.log.some(m => m.includes('AUTH_FAILED')));
+    });
+  });
+
+  describe('onHeartbeatFailure — auth dual-signal', () => {
+    it('enters auth_failed (no kill) when a heartbeat fails with auth text in the pane', () => {
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'Not logged in' });
+      const engine = new HeartbeatEngine(deps);
+
+      engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+
+      assert.equal(engine.health, 'auth_failed');
+      assert.equal(calls.killTmuxSession, 0, 'must not kill a session that just needs credentials');
+    });
+
+    it('enters auth_failed from a recovering state too (breaks the restart loop)', () => {
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'run /login' });
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'recovering' });
+      engine.restartFailureCount = 3;
+
+      engine.onHeartbeatFailure({ phase: 'recovery' }, 'timeout');
+
+      assert.equal(engine.health, 'auth_failed');
+      assert.equal(engine.restartFailureCount, 0);
+      assert.equal(calls.killTmuxSession, 0);
+    });
+
+    it('rate limit takes precedence over auth text when both are detected', () => {
+      const { deps } = createMockDeps();
+      deps.detectRateLimit = () => ({ detected: true, cooldownUntil: Math.floor(Date.now() / 1000) + 60, resetTime: '3am' });
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'unauthorized' });
+      const engine = new HeartbeatEngine(deps);
+
+      engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+
+      assert.equal(engine.health, 'rate_limited');
+    });
+
+    it('still triggers normal kill+restart recovery when no auth text is present', () => {
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: false });
+      const engine = new HeartbeatEngine(deps);
+
+      engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+
+      assert.equal(engine.health, 'unavailable');
+      assert.equal(calls.killTmuxSession, 1);
+    });
   });
 
   describe('process signal acceleration', () => {
