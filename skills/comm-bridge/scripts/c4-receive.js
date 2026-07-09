@@ -248,7 +248,10 @@ function emitError(json, code, message, exitCode = 1) {
 }
 
 function sendUnhealthyMessage(channel, endpoint, message) {
-  const args = [path.join(__dirname, 'c4-send.js'), channel];
+  // Tag the audit row as a status-notice: this auto-reply exists BECAUSE the
+  // inbound wasn't processed, so getUnansweredDeliveredForInstance must not
+  // count it as an answer to that inbound.
+  const args = [path.join(__dirname, 'c4-send.js'), '--delivery-action=status-notice', channel];
   if (endpoint) args.push(endpoint);
   const result = spawnSync('node', args, {
     input: message,
@@ -387,7 +390,13 @@ async function main() {
     }
   } catch { /* approval module not available */ }
 
-  const dbStatus = route.recovered ? 'pending' : 'delivered';
+  // Unhealthy + replyable: store 'delivered' (context-only) and tell the user
+  // to resend below — leaving it pending would double-deliver when they do.
+  // Unhealthy + no-reply (scheduler task prompts, system notices): NOBODY is
+  // told anything, so 'delivered' silently swallowed the message forever —
+  // leave it 'pending' so the dispatcher's health gate holds it and delivers
+  // once the instance recovers.
+  const dbStatus = (route.recovered || noReply) ? 'pending' : 'delivered';
   let cooldown = null;
 
   if (!route.recovered && !noReply) {
@@ -413,7 +422,7 @@ async function main() {
   try {
     const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, null, targetInstance);
     if (route.recovered || noReply) {
-      emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered');
+      emitSuccess(json, record.id, 'queued');
       return;
     }
 

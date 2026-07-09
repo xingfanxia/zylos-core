@@ -433,24 +433,47 @@ export function getUnansweredDeliveredForInstance(instanceId) {
   `).all(instanceId, afterId);
   if (inbound.length === 0) return [];
 
-  // All outbound from the earliest candidate onward, keyed by chat, tells us
-  // which chats have since been replied to (and how recently).
-  const outbound = db.prepare(
-    "SELECT id, endpoint_id FROM conversations WHERE direction = 'out' AND id >= ?"
-  ).all(inbound[0].id);
+  // Outbound rows from the earliest candidate onward tell us which chats have
+  // since been replied to (and how recently). Only rows that could plausibly be
+  // a real answer count:
+  //  - real channels only (a void handoff / system row is never a user reply)
+  //  - status != 'failed' (c4-send/broker mark rows whose channel send failed —
+  //    the user never received those, so they must not mask the inbound)
+  //  - not a health status-notice (the automated "please resend" auto-reply is
+  //    sent precisely BECAUSE the message wasn't processed — counting it as an
+  //    answer would hide exactly the messages this function exists to find)
+  // Keyed by channel+chat so a chat-id collision across channels (telegram
+  // numeric id vs another channel's prefix) can't cross-mask.
+  const outbound = db.prepare(`
+    SELECT id, channel, endpoint_id FROM conversations
+    WHERE direction = 'out' AND id >= ?
+      AND channel NOT IN ('void', 'system')
+      AND status != 'failed'
+      AND (delivery_action IS NULL OR delivery_action != 'status-notice')
+  `).all(inbound[0].id);
   const lastReplyIdByChat = new Map();
   for (const o of outbound) {
     const chat = groupKeyFromEndpoint(o.endpoint_id);
     if (!chat) continue;
-    const prev = lastReplyIdByChat.get(chat) || 0;
-    if (o.id > prev) lastReplyIdByChat.set(chat, o.id);
+    const key = `${o.channel}:${chat}`;
+    const prev = lastReplyIdByChat.get(key) || 0;
+    if (o.id > prev) lastReplyIdByChat.set(key, o.id);
   }
 
   // Unanswered iff no outbound to this chat has a later id than the message.
+  //
+  // Known conservative limits (deliberate — reply provenance does not exist in
+  // the schema: an out-row does not say WHICH inbound it answers):
+  //  - per-chat granularity: a real later reply to the same chat also clears
+  //    earlier unanswered messages in that chat (two questions, one answer —
+  //    the earlier asker is not re-surfaced). Fixing this needs reply-to
+  //    metadata threaded through every channel send.
+  //  - checkpoint boundary: once Memory Sync summarizes past a message it is
+  //    treated as handled (the agent demonstrably saw it during sync).
   return inbound.filter((m) => {
     const chat = groupKeyFromEndpoint(m.endpoint_id);
     if (!chat) return false;
-    return (lastReplyIdByChat.get(chat) || 0) <= m.id;
+    return (lastReplyIdByChat.get(`${m.channel}:${chat}`) || 0) <= m.id;
   });
 }
 

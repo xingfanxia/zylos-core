@@ -28,7 +28,7 @@
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
-import { insertConversation, close } from './c4-db.js';
+import { insertConversation, markFailed, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
@@ -62,9 +62,21 @@ async function main() {
     printUsage();
   }
 
-  // Remove --stdin flag if present (backward compat)
-  const cleanArgs = args.filter(a => a !== '--stdin');
-  const hasStdinFlag = cleanArgs.length !== args.length;
+  // Flags are removed from the positional args:
+  //  --stdin                  force stdin mode (backward compat)
+  //  --delivery-action=<tag>  tag the out-row audit record (e.g. c4-receive's
+  //                           unhealthy auto-reply uses 'status-notice' so the
+  //                           unanswered-message re-surface ignores it)
+  const hasStdinFlag = args.includes('--stdin');
+  let deliveryAction = null;
+  const cleanArgs = args.filter((a) => {
+    if (a === '--stdin') return false;
+    if (a.startsWith('--delivery-action=')) {
+      deliveryAction = a.slice('--delivery-action='.length) || null;
+      return false;
+    }
+    return true;
+  });
   const stdinAvailable = !process.stdin.isTTY;
 
   const channel = cleanArgs[0];
@@ -197,8 +209,9 @@ async function main() {
     }
   }
 
+  let outRecord = null;
   try {
-    insertConversation('out', channel, endpoint, message);
+    outRecord = insertConversation('out', channel, endpoint, message, null, 3, false, deliveryAction);
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {
@@ -224,6 +237,12 @@ async function main() {
       console.log(`[C4] Message sent via ${channel}`);
     } else {
       console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);
+      // Mark the audit row failed: the user never received this, so it must
+      // not count as an answer for the unanswered-message re-surface.
+      if (outRecord?.id != null) {
+        try { markFailed(outRecord.id); } catch { /* audit-only, best effort */ }
+        try { close(); } catch { /* reopened by markFailed */ }
+      }
     }
     process.exit(code);
   });

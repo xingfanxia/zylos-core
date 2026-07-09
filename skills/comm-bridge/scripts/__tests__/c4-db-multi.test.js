@@ -210,6 +210,41 @@ describe('getUnansweredDeliveredForInstance', () => {
     assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0);
   });
 
+  it('a FAILED outbound to the same chat does not count as an answer', () => {
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'reply-that-never-sent', status: 'failed', target: null });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
+  it('the unhealthy status-notice auto-reply does not count as an answer', () => {
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    db.prepare(
+      `INSERT INTO conversations (direction, channel, endpoint_id, content, status, delivery_action, target_instance)
+       VALUES ('out','feishu','oc_A|type:group','请稍后重发','delivered','status-notice',NULL)`
+    ).run();
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
+  it('an outbound on a DIFFERENT channel with a colliding chat key does not cross-mask', () => {
+    const id = conv({ dir: 'in', channel: 'telegram', endpoint: '12345|msg:3', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: '12345|type:group', content: 'unrelated', status: 'delivered', target: null });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
+  it('a VOID outbound (session handoff) does not count as an answer', () => {
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'void', endpoint: 'oc_A', content: 'handoff', status: 'delivered', target: 'group' });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
   it('is instance-scoped (no cross-instance bleed) and ignores pending/summarized', () => {
     conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'for group', status: 'delivered', target: 'group' });
     assert.equal(multi.getUnansweredDeliveredForInstance('user-elaine').length, 0); // wrong instance

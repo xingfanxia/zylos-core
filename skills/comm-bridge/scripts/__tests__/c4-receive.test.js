@@ -373,7 +373,7 @@ describe('c4-receive health gating', () => {
     });
   });
 
-  it('fallback marks no-reply unhealthy messages delivered without error', () => {
+  it('fallback queues no-reply unhealthy messages as pending (delivered on recovery, never lost)', () => {
     withTmpDir(({ tmpDir, env }) => {
       fs.writeFileSync(path.join(tmpDir, 'activity-monitor', 'agent-status.json'), JSON.stringify({ health: 'recovering' }));
 
@@ -381,13 +381,17 @@ describe('c4-receive health gating', () => {
       assert.equal(r.status, 0);
       const out = parseJsonStdout(r.stdout);
       assert.equal(out.ok, true);
-      assert.equal(out.action, 'delivered');
+      assert.equal(out.action, 'queued');
 
       const db = openDb(tmpDir);
       const row = db.prepare('SELECT status, content FROM conversations WHERE id = ?').get(Number(out.id));
       db.close();
 
-      assert.equal(row.status, 'delivered');
+      // 'pending' — nobody is told to resend a no-reply message (scheduler
+      // prompts, system notices), so marking it 'delivered' at ingestion
+      // silently swallowed it. Pending rows are held by the dispatcher's
+      // health gate and delivered once the instance recovers.
+      assert.equal(row.status, 'pending');
       assert.ok(row.content.includes('recovering msg'));
     });
   });
@@ -678,13 +682,15 @@ describe('c4-receive MessageRouter IPC route', () => {
         const r = await cliRawAsync(['--no-reply', '--json', '--content', 'silent blocked msg'], env);
         assert.equal(r.status, 0);
         const out = parseJsonStdout(r.stdout);
-        assert.equal(out.action, 'delivered');
+        assert.equal(out.action, 'queued');
 
         const db = openDb(tmpDir);
         const inbound = db.prepare("SELECT status, content FROM conversations WHERE direction = 'in'").get();
         const outboundCount = db.prepare("SELECT count(*) AS count FROM conversations WHERE direction = 'out'").get();
         db.close();
-        assert.equal(inbound.status, 'delivered');
+        // Unhealthy + no-reply stays 'pending' (delivered on recovery) — see
+        // the health-gating suite for the rationale.
+        assert.equal(inbound.status, 'pending');
         assert.equal(outboundCount.count, 0);
       });
     });
