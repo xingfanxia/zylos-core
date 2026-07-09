@@ -103,6 +103,8 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id>
 ```
 
 Replace `<end_id>` with the value from Step 1's `[Unsummarized Range]` output.
+Checkpoints are instance-scoped: run this inside an instance session (where
+`ZYLOS_INSTANCE_ID` is set) or add `--target-instance <id>`.
 
 If no conversations were fetched, skip this step.
 

@@ -51,3 +51,16 @@ describe('c4-db recent', () => {
     });
   });
 });
+
+describe('c4-db checkpoint (disabled)', () => {
+  it('refuses to create checkpoints and points at c4-checkpoint.js', () => {
+    withTmpDir(({ env }) => {
+      // This subcommand wrote unscoped NULL-target rows (2026-07-08 incident);
+      // creation is centralized in c4-checkpoint.js, which forces a scope.
+      const { stderr, status } = dbCli(['checkpoint', '10', 'orphan summary'], env);
+      assert.equal(status, 1);
+      assert.ok(stderr.includes('disabled'));
+      assert.ok(stderr.includes('c4-checkpoint.js'));
+    });
+  });
+});

@@ -9,7 +9,7 @@
  *
  */
 
-import { createCheckpoint, getCheckpoints, getLastCheckpoint, close } from './c4-db.js';
+import { getCheckpoints, close } from './c4-db.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
@@ -27,9 +27,9 @@ try {
 
 function usage() {
   console.error('Usage: c4-checkpoint.js <command> [options]');
-  console.error('  create <end_conversation_id> [--summary "<summary>"]');
+  console.error('  create <end_conversation_id> [--summary "<summary>"] [--target-instance <id>]');
   console.error('  list [--limit <n>]');
-  console.error('  latest');
+  console.error('  latest [--target-instance <id>]');
 }
 
 function errorExit(message) {
@@ -76,10 +76,18 @@ async function handleCreate(args) {
     return;
   }
 
+  // Checkpoints MUST be instance-scoped. Readers are strictly scoped
+  // (WHERE target_instance = <id>), so an unscoped NULL-target row is
+  // invisible to every instance AND used to bleed via legacy fallbacks —
+  // never write one silently (2026-07-08 NULL-row incident).
   const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
-  const result = (targetInstance && _createCheckpointForInstance)
-    ? _createCheckpointForInstance(endConversationId, summary, targetInstance)
-    : createCheckpoint(endConversationId, summary);
+  if (!targetInstance) {
+    errorExit('no target instance: set ZYLOS_INSTANCE_ID or pass --target-instance <id> (unscoped NULL-target checkpoints are forbidden)');
+  }
+  if (!_createCheckpointForInstance) {
+    errorExit('c4-db-multi.js unavailable — cannot create an instance-scoped checkpoint');
+  }
+  const result = _createCheckpointForInstance(endConversationId, summary, targetInstance);
   console.log('Checkpoint created:', JSON.stringify(result));
 }
 
@@ -103,17 +111,24 @@ function handleList(args) {
   console.log(JSON.stringify(rows, null, 2));
 }
 
-async function handleLatest() {
+async function handleLatest(args) {
   if (shouldUseBroker()) {
     const row = await brokerCall('checkpoint', { latest: true });
     if (!row) errorExit('no checkpoints found');
     console.log(JSON.stringify(row, null, 2));
     return;
   }
-  const targetInstance = INSTANCE_ID;
-  const row = (targetInstance && _getLastCheckpointForInstance)
-    ? _getLastCheckpointForInstance(targetInstance)
-    : getLastCheckpoint();
+  // Same scoping rule as create: a global "latest" crosses instances (that
+  // global fallback is how one instance's summary leaked into another's
+  // context) — require an explicit scope instead of silently widening.
+  const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
+  if (!targetInstance) {
+    errorExit('no target instance: set ZYLOS_INSTANCE_ID or pass --target-instance <id>');
+  }
+  if (!_getLastCheckpointForInstance) {
+    errorExit('c4-db-multi.js unavailable — cannot read an instance-scoped checkpoint');
+  }
+  const row = _getLastCheckpointForInstance(targetInstance);
   if (!row) {
     errorExit('no checkpoints found');
   }
@@ -138,7 +153,7 @@ async function main() {
         handleList(args.slice(1));
         break;
       case 'latest':
-        await handleLatest();
+        await handleLatest(args.slice(1));
         break;
       default:
         usage();

@@ -4,8 +4,11 @@
  * Instance-filtered database operations for multi-session mode.
  * Imports getDb() from c4-db.js — does not manage its own connection.
  *
- * All queries include a `target_instance IS NULL` fallback so legacy
- * (pre-multi-session) rows are still returned to any requesting instance.
+ * Dispatch queries (getNextPending*) include a `target_instance IS NULL`
+ * fallback so legacy pre-multi-session rows still get delivered. Checkpoint,
+ * unsummarized, and range queries are STRICTLY scoped (target_instance = id,
+ * no NULL fallback) — the fallback there leaked one instance's context into
+ * another's session-init (fixed 2026-07-08).
  *
  * @module c4-db-multi
  */
@@ -307,7 +310,8 @@ export function createCheckpointForInstance(endConversationId, summary, instance
 
 /**
  * Get range and count of unsummarized conversations for a specific instance.
- * Includes conversations targeting this instance OR legacy NULL target_instance.
+ * Strictly scoped: only rows with target_instance = instanceId (NULL-target
+ * rows are excluded to prevent cross-instance context bleed).
  *
  * @param {string} instanceId - the instance ID to filter by
  * @returns {{ begin_id: number|null, end_id: number|null, count: number }}
@@ -336,7 +340,8 @@ export function getUnsummarizedRangeForInstance(instanceId) {
 
 /**
  * Get unsummarized conversations for a specific instance.
- * Includes conversations targeting this instance OR legacy NULL target_instance.
+ * Strictly scoped: only rows with target_instance = instanceId (NULL-target
+ * rows are excluded to prevent cross-instance context bleed).
  *
  * @param {string} instanceId - the instance ID to filter by
  * @param {{ limit?: number }} [opts] - optional limit for most recent N records
@@ -372,7 +377,8 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
 
 /**
  * Get conversations by id range for a specific instance (inclusive).
- * Includes conversations targeting this instance OR legacy NULL target_instance.
+ * Strictly scoped: only rows with target_instance = instanceId (NULL-target
+ * rows are excluded to prevent cross-instance context bleed).
  *
  * @param {number} begin - start conversation id (inclusive)
  * @param {number} end - end conversation id (inclusive)

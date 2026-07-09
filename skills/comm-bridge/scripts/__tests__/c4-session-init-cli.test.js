@@ -23,8 +23,10 @@ function cli(args, env = {}) {
 // dispatcher delivers it, and session-init counts only delivered rows, so
 // delivered is the right precondition here.
 function insertDelivered(content, env = {}) {
+  // Tagged with the fixture instance — scoped reads are strict (NULL-target
+  // rows are excluded to prevent cross-instance bleed), same as dispatcher rows.
   const code = `const { insertConversation, close } = await import(${JSON.stringify(DB_MODULE)});`
-    + ` insertConversation('in','system',null,${JSON.stringify(content)},'delivered'); close();`;
+    + ` insertConversation('in','system',null,${JSON.stringify(content)},'delivered',3,false,null,'test-instance'); close();`;
   return spawnSync('node', ['--input-type=module', '-e', code], {
     env: { ...process.env, ...env },
     encoding: 'utf8',
@@ -40,7 +42,9 @@ function checkpoint(args, env = {}) {
 
 function withTmpDir(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-session-init-'));
-  const env = { ZYLOS_DIR: tmpDir };
+  // Explicit instance scope: checkpoint create/latest refuse to run unscoped,
+  // and pinning it here keeps results identical across runner environments.
+  const env = { ZYLOS_DIR: tmpDir, ZYLOS_INSTANCE_ID: 'test-instance' };
   // Warm up DB
   checkpoint(['latest'], env);
   try {

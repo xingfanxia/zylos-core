@@ -651,6 +651,10 @@ export function cleanupControlQueue(cutoff) {
 
 /**
  * Create a checkpoint
+ * @deprecated Writes an UNSCOPED (NULL target_instance) checkpoint row —
+ * invisible to every strictly-scoped reader and the cause of the 2026-07-08
+ * cross-instance bleed. Use c4-db-multi's createCheckpointForInstance().
+ * Retained only for the c4-db-checkpoint unit tests; no production caller.
  * @param {number} endConversationId - last conversation id covered by this checkpoint (caller determines the boundary)
  * @param {string|null} summary - checkpoint summary
  * @returns {object} - checkpoint record with id, start/end conversation ids
@@ -822,19 +826,12 @@ if (isMainModule) {
       break;
 
     case 'checkpoint':
-      // checkpoint <end_conversation_id> [summary]
-      if (args.length < 2) {
-        console.error('Usage: c4-db.js checkpoint <end_conversation_id> [summary]');
-        process.exit(1);
-      }
-      const cpEndId = parseInt(args[1]);
-      if (isNaN(cpEndId)) {
-        console.error('end_conversation_id must be a number');
-        process.exit(1);
-      }
-      const cpSummary = args[2] || null;
-      const cp = createCheckpoint(cpEndId, cpSummary);
-      console.log('Checkpoint created:', JSON.stringify(cp));
+      // Disabled: this wrote UNSCOPED (NULL target_instance) checkpoint rows,
+      // which strictly-scoped readers can never see. c4-checkpoint.js is the
+      // one creation surface — it forces an instance scope.
+      console.error('c4-db.js checkpoint is disabled: it created unscoped (NULL-target) checkpoint rows.');
+      console.error('Use: c4-checkpoint.js create <end_conversation_id> [--summary "..."] [--target-instance <id>]');
+      process.exit(1);
       break;
 
     case 'unsummarized':
