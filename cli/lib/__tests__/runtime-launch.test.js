@@ -363,7 +363,9 @@ describe('Codex launch — new session', () => {
 
     const spec = readLaunchSpec();
     assert.ok(spec, 'spec should be written');
-    assert.deepEqual(spec.args, []);
+    // #681: the only arg is the short "hello" kick that triggers the native
+    // SessionStart hook — not the retired text bootstrap prompt.
+    assert.deepEqual(spec.args, ['hello']);
     assert.ok(!JSON.stringify(spec).includes('session-start-inject.js'));
   });
 

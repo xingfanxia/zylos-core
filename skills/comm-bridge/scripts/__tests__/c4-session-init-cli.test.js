@@ -22,11 +22,11 @@ function cli(args, env = {}) {
 // injects. A freshly-`receive`d message is correctly 'pending' until the
 // dispatcher delivers it, and session-init counts only delivered rows, so
 // delivered is the right precondition here.
-function insertDelivered(content, env = {}) {
+function insertDelivered(content, env = {}, { channel = 'system', endpoint = null } = {}) {
   // Tagged with the fixture instance — scoped reads are strict (NULL-target
   // rows are excluded to prevent cross-instance bleed), same as dispatcher rows.
   const code = `const { insertConversation, close } = await import(${JSON.stringify(DB_MODULE)});`
-    + ` insertConversation('in','system',null,${JSON.stringify(content)},'delivered',3,false,null,'test-instance'); close();`;
+    + ` insertConversation('in',${JSON.stringify(channel)},${JSON.stringify(endpoint)},${JSON.stringify(content)},'delivered',3,false,null,'test-instance'); close();`;
   return spawnSync('node', ['--input-type=module', '-e', code], {
     env: { ...process.env, ...env },
     encoding: 'utf8',
@@ -115,10 +115,13 @@ describe('c4-session-init', () => {
     });
   });
 
+  // The four #618 cases below seed rows directly (fork idiom — scoped reads
+  // only see instance-tagged delivered rows). The receive-side contract (clean
+  // store, --no-reply nulls endpoint_id) is covered by c4-receive.test.js;
+  // these verify the agent-facing formatting session-init applies on read.
   it('adds reply routing for inbound endpoint messages', () => {
-    withTmpDir(({ tmpDir, env }) => {
-      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'telegram'), { recursive: true });
-      receive(['--channel', 'telegram', '--endpoint', '123', '--content', 'hello'], env);
+    withTmpDir(({ env }) => {
+      insertDelivered('hello', env, { channel: 'telegram', endpoint: '123' });
 
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
@@ -129,7 +132,7 @@ describe('c4-session-init', () => {
 
   it('does not add reply routing for no-reply messages', () => {
     withTmpDir(({ env }) => {
-      receive(['--channel', 'system', '--no-reply', '--content', 'system note'], env);
+      insertDelivered('system note', env);
 
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
@@ -139,9 +142,11 @@ describe('c4-session-init', () => {
   });
 
   it('does not add reply routing for no-reply messages even when endpoint was provided', () => {
-    withTmpDir(({ tmpDir, env }) => {
-      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'telegram'), { recursive: true });
-      receive(['--channel', 'telegram', '--endpoint', '123', '--no-reply', '--content', 'no callback'], env);
+    withTmpDir(({ env }) => {
+      // receive --no-reply stores endpoint_id NULL even when --endpoint was
+      // passed (c4-receive.test.js covers that); the read side must treat the
+      // NULL endpoint as non-replyable regardless of channel.
+      insertDelivered('no callback', env, { channel: 'telegram', endpoint: null });
 
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
@@ -151,13 +156,12 @@ describe('c4-session-init', () => {
   });
 
   it('does not duplicate legacy stored reply routing', () => {
-    withTmpDir(({ tmpDir, env }) => {
-      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'telegram'), { recursive: true });
-      receive([
-        '--channel', 'telegram',
-        '--endpoint', '123',
-        '--content', 'legacy ---- reply via: node /tmp/c4-send.js "telegram" "123"'
-      ], env);
+    withTmpDir(({ env }) => {
+      insertDelivered(
+        'legacy ---- reply via: node /tmp/c4-send.js "telegram" "123"',
+        env,
+        { channel: 'telegram', endpoint: '123' }
+      );
 
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);

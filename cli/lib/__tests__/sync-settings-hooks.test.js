@@ -710,7 +710,9 @@ describe('syncHooks SessionStart orchestrator convergence', () => {
 
     const result = syncHooks(installed, makeOrchestratorTemplate(), { log: noopLog });
 
-    assert.deepEqual(result, { added: 10, updated: 0, removed: 12 });
+    // 12 = upstream's 10 + the two fork PreToolUse guards (memory-guard,
+    // src-egress-guard) that desiredClaudeHooks() now manages.
+    assert.deepEqual(result, { added: 12, updated: 0, removed: 12 });
     assertSessionStartUsesOrchestrator(installed);
   });
 
