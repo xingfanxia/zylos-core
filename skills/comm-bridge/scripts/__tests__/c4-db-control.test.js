@@ -605,3 +605,40 @@ describe('status notice cooldowns', () => {
     assert.equal(mod.getStatusNoticeCooldowns().length, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// resetOrphanedRunning — startup reclaim of rows a dead dispatcher left in-flight
+// ---------------------------------------------------------------------------
+describe('resetOrphanedRunning', () => {
+  beforeEach(resetTables);
+
+  it('returns orphaned running conversations and controls to pending', () => {
+    const conv = mod.insertConversation('in', 'feishu', 'oc_A|type:group', 'lost mid-delivery');
+    mod.claimConversation(conv.id);
+    const ctl = mod.insertControl('Heartbeat check. [phase=primary]', { priority: 0 });
+    mod.claimControl(ctl.id);
+
+    const result = mod.resetOrphanedRunning();
+
+    assert.equal(result.conversations, 1);
+    assert.equal(result.controls, 1);
+    assert.equal(db.prepare('SELECT status FROM conversations WHERE id=?').get(conv.id).status, 'pending');
+    const ctlRow = db.prepare('SELECT status, last_error FROM control_queue WHERE id=?').get(ctl.id);
+    assert.equal(ctlRow.status, 'pending');
+    assert.equal(ctlRow.last_error, 'ORPHANED_BY_DISPATCHER_RESTART');
+  });
+
+  it('leaves terminal and pending rows untouched', () => {
+    const delivered = mod.insertConversation('in', 'feishu', 'oc_A', 'done', 'delivered');
+    const pending = mod.insertConversation('in', 'feishu', 'oc_B', 'waiting');
+    const out = mod.insertConversation('out', 'feishu', 'oc_A', 'reply');
+
+    const result = mod.resetOrphanedRunning();
+
+    assert.equal(result.conversations, 0);
+    assert.equal(result.controls, 0);
+    assert.equal(db.prepare('SELECT status FROM conversations WHERE id=?').get(delivered.id).status, 'delivered');
+    assert.equal(db.prepare('SELECT status FROM conversations WHERE id=?').get(pending.id).status, 'pending');
+    assert.equal(db.prepare('SELECT status FROM conversations WHERE id=?').get(out.id).status, 'delivered');
+  });
+});

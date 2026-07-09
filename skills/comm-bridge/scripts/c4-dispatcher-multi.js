@@ -252,14 +252,17 @@ export function multiSessionDispatch(item, helpers) {
   const { getClaudeState, isBypassState } = helpers;
   let targetInstance = item.target_instance || null;
   if (!targetInstance) {
-    // Controls without target (heartbeats from adapter) → route to primary/default
-    if (item.type === 'control') {
-      const all = getAllInstances();
-      const primary = all.find(i => i.primary === true) ?? all[0];
-      if (primary) targetInstance = primary.id;
-    }
+    // No target → route to primary/default. Controls: heartbeats from the
+    // adapter. Conversations: legacy pre-multi-session rows, which
+    // getNextPendingForInstances deliberately still surfaces — rejecting them
+    // here (as this used to) silently dropped exactly the rows that query
+    // promises to deliver. Primary matches single-session semantics: legacy
+    // rows were always delivered to the one (primary) session.
+    const all = getAllInstances();
+    const primary = all.find(i => i.primary === true) ?? all[0];
+    if (primary) targetInstance = primary.id;
     if (!targetInstance) {
-      return { action: 'reject', reason: 'no target_instance (every message must be routed to an instance)' };
+      return { action: 'reject', reason: 'no target_instance and no primary instance configured' };
     }
   }
   const bypass = isBypassState(item);
@@ -375,6 +378,9 @@ export async function processWithMultiSession(helpers) {
     getPendingTargetInstancesNeedingWake,
     getNextPendingControlForInstances,
     notifyMessageDelivered,
+    sendKeystroke,
+    isKeystrokeControl,
+    parseKeystrokeKey,
   } = helpers;
 
   // Reap idle non-primary instances before processing.
@@ -386,8 +392,10 @@ export async function processWithMultiSession(helpers) {
   const onlineIds = getOnlineInstanceIds(getAgentState);
 
   if (onlineIds === null) {
-    // Fallback: caller should use the single-session processNextMessage instead.
-    return { delivered: false, state: 'unknown' };
+    // Legacy mode (no instances.json): the caller must fall back to the
+    // single-session processNextMessage. `legacy: true` is the explicit signal
+    // — the caller must not treat this as a normal "nothing delivered" result.
+    return { delivered: false, state: 'unknown', legacy: true };
   }
 
   // Wake offline targets with pending inbound conversations before claiming
@@ -421,143 +429,171 @@ export async function processWithMultiSession(helpers) {
   // Skip-loop: try up to MAX_SKIP_ATTEMPTS items.
   // Track items held in 'running' state so we can release them at the end.
   // Items must stay 'running' during the loop to prevent re-claiming the same item.
+  // try/finally guarantees release on EVERY exit path — a throw mid-loop must
+  // never strand claimed items in 'running' (they'd be invisible to all
+  // pending queries and silently lost).
   const heldItems = [];
 
-  for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
-    const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
-    if (!item) {
-      for (const held of heldItems) releaseItem(held);
-      return { delivered: false, state: 'idle' };
-    }
-
-    const decision = multiSessionDispatch(item, { getClaudeState: getAgentState, isStatusFresh, isBypassState });
-
-    // ── reject ──
-    if (decision.action === 'reject') {
-      if (item.type === 'control') {
-        markControlRejected(item.id);
-      } else {
-        markRejected(item.id);
+  try {
+    for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
+      const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
+      if (!item) {
+        return { delivered: false, state: 'idle' };
       }
-      log(`Rejected ${item.type} id=${item.id}: ${decision.reason}`);
-      continue;
-    }
 
-    // ── requeue ──
-    if (decision.action === 'requeue') {
-      releaseItem(item);
-      log(`Requeued ${item.type} id=${item.id}: ${decision.reason}`);
-      continue;
-    }
+      const decision = multiSessionDispatch(item, { getClaudeState: getAgentState, isStatusFresh, isBypassState });
 
-    // ── skip ── (hold in running state to prevent re-claim in this cycle)
-    if (decision.action === 'skip') {
-      heldItems.push(item);
-      continue;
-    }
+      // ── reject ──
+      if (decision.action === 'reject') {
+        if (item.type === 'control') {
+          markControlRejected(item.id);
+        } else {
+          markRejected(item.id);
+        }
+        log(`Rejected ${item.type} id=${item.id}: ${decision.reason}`);
+        continue;
+      }
 
-    // ── deliver ──
-    const { session, statusFile, claudeState } = decision;
-    const bypass = isBypassState(item);
+      // ── requeue ── (hold like a skip: an immediate release would let the
+      // very next claimNextItem re-claim the same row, spinning the whole
+      // MAX_SKIP_ATTEMPTS budget on one suspended instance's message and
+      // starving delivery to every healthy instance this cycle. The finally
+      // block releases it back to pending at cycle end — same requeue effect.)
+      if (decision.action === 'requeue') {
+        heldItems.push(item);
+        log(`Held for requeue ${item.type} id=${item.id}: ${decision.reason}`);
+        continue;
+      }
 
-    // require_idle gate (must be idle with sufficient duration).
-    // Hold the item to prevent re-claim, then continue to try other items.
-    if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
-      heldItems.push(item);
-      continue;
-    }
+      // ── skip ── (hold in running state to prevent re-claim in this cycle)
+      if (decision.action === 'skip') {
+        heldItems.push(item);
+        continue;
+      }
 
-    // Heartbeat auto-ack shortcut.
-    if (bypass) {
-      const procState = readProcState();
-      const confirmed = isAgentConfirmedActive();
-      // Starvation guard: if a require_idle control is already held in this
-      // cycle (skipped above), widen the auto-ack gate so heartbeats don't
-      // bump the idle counter and starve the waiting /clear.
-      const requireIdleWaiting = heldItems.some((h) => h.require_idle === 1);
-      if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
-        ackControl(item.id);
-        log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}${requireIdleWaiting ? ' (require_idle waiting)' : ''}`);
-        for (const held of heldItems) releaseItem(held);
+      // ── deliver ──
+      const { session, statusFile, claudeState } = decision;
+      const bypass = isBypassState(item);
+
+      // require_idle gate (must be idle with sufficient duration).
+      // Hold the item to prevent re-claim, then continue to try other items.
+      if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
+        heldItems.push(item);
+        continue;
+      }
+
+      // Heartbeat auto-ack shortcut.
+      if (bypass) {
+        const procState = readProcState();
+        const confirmed = isAgentConfirmedActive();
+        // Starvation guard: if a require_idle control is already held in this
+        // cycle (skipped above), widen the auto-ack gate so heartbeats don't
+        // bump the idle counter and starve the waiting /clear.
+        const requireIdleWaiting = heldItems.some((h) => h.require_idle === 1);
+        if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
+          ackControl(item.id);
+          log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}${requireIdleWaiting ? ' (require_idle waiting)' : ''}`);
+          return { delivered: true, state: claudeState.state };
+        }
+      }
+
+      const targetInstance = item.target_instance || null;
+
+      // Keystroke controls send a raw key to the per-instance session — never
+      // a buffer paste. Without this branch (it existed only in the
+      // single-session path), [KEYSTROKE] controls were pasted into the pane
+      // as literal chat text, so auto-approve Enter / watchdog keys never
+      // functioned in multi-session mode.
+      if (isKeystrokeControl && sendKeystroke && isKeystrokeControl(item)) {
+        const key = parseKeystrokeKey(item.content || '');
+        log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority}${targetInstance ? ` -> ${targetInstance}` : ''})`);
+        try {
+          sendKeystroke(session, key);
+          ackControl(item.id);
+          log(`Keystroke delivered: key=${key} (control id=${item.id})`);
+          return { delivered: true, state: claudeState.state };
+        } catch (err) {
+          log(`Keystroke delivery error: ${err.message}`);
+          await handleControlDeliveryFailure(item, `KEYSTROKE_ERROR: ${err.message}`);
+          return { delivered: false, state: claudeState.state };
+        }
+      }
+
+      // Actual tmux delivery.
+      log(
+        `Delivering ${item.type} id=${item.id}` +
+        (item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`) +
+        (targetInstance ? ` -> ${targetInstance}` : '')
+      );
+
+      // Clean-store model (#618): stored conversation rows carry no reply-via —
+      // reconstruct it here (and the "Meanwhile, " prefix for non-slash controls),
+      // same as the single-session path.
+      const deliveryContent = getDeliveryContent(item);
+      const result = await sendToTmux(deliveryContent, {
+        session,
+        statusFile,
+        strictVerify: item.type === 'conversation',
+      });
+
+      if (result === 'submitted') {
+        if (item.type === 'conversation') {
+          markDelivered(item.id);
+          log(`Conversation id=${item.id} delivered`);
+          // Notify the TARGET instance's Activity Monitor (its own am.sock) so its
+          // HealthEngine.onUserMessageDelivered fires — the event-driven auth /
+          // rate-limit / sticky-error check. The single-session path notifies the
+          // default socket; multi-session must target the per-instance socket or
+          // the check never runs for isolated instances (each AM listens on its
+          // own am.sock under getMonitorDir(instance)). Best-effort — a down AM
+          // just means the periodic heartbeat is the only health signal.
+          if (notifyMessageDelivered && targetInstance) {
+            const monDir = getMonitorDir(targetInstance) || path.join(ZYLOS_DIR, 'activity-monitor', targetInstance);
+            notifyMessageDelivered({
+              conversationId: item.id,
+              channel: item.channel,
+              socketPath: path.join(monDir, 'am.sock'),
+            }).catch((err) => log(`Warning: failed to notify AM of delivery: ${err.message}`));
+          }
+        } else {
+          const hasAck = (item.content || '').includes('---- ack via:');
+          if (hasAck) {
+            log(`Control id=${item.id} submitted, waiting ack`);
+          } else {
+            ackControl(item.id);
+            log(`Control id=${item.id} submitted (no-ack mode), marked done`);
+          }
+        }
+
+        if (item.require_idle === 1) {
+          await waitForRequireIdleSettlement(item.id, statusFile);
+        }
+
+        // Track delivery time for idle reaping; clear boot grace period.
+        if (targetInstance) {
+          lastDeliveryAt.set(targetInstance, Date.now());
+          autoStartedAt.delete(targetInstance);
+        }
+
         return { delivered: true, state: claudeState.state };
       }
-    }
 
-    // Actual tmux delivery.
-    const targetInstance = item.target_instance || null;
-    log(
-      `Delivering ${item.type} id=${item.id}` +
-      (item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`) +
-      (targetInstance ? ` -> ${targetInstance}` : '')
-    );
+      // Delivery failed.
+      const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
+      log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
 
-    // Clean-store model (#618): stored conversation rows carry no reply-via —
-    // reconstruct it here (and the "Meanwhile, " prefix for non-slash controls),
-    // same as the single-session path.
-    const deliveryContent = getDeliveryContent(item);
-    const result = await sendToTmux(deliveryContent, {
-      session,
-      strictVerify: item.type === 'conversation',
-    });
-
-    if (result === 'submitted') {
-      if (item.type === 'conversation') {
-        markDelivered(item.id);
-        log(`Conversation id=${item.id} delivered`);
-        // Notify the TARGET instance's Activity Monitor (its own am.sock) so its
-        // HealthEngine.onUserMessageDelivered fires — the event-driven auth /
-        // rate-limit / sticky-error check. The single-session path notifies the
-        // default socket; multi-session must target the per-instance socket or
-        // the check never runs for isolated instances (each AM listens on its
-        // own am.sock under getMonitorDir(instance)). Best-effort — a down AM
-        // just means the periodic heartbeat is the only health signal.
-        if (notifyMessageDelivered && targetInstance) {
-          const monDir = getMonitorDir(targetInstance) || path.join(ZYLOS_DIR, 'activity-monitor', targetInstance);
-          notifyMessageDelivered({
-            conversationId: item.id,
-            channel: item.channel,
-            socketPath: path.join(monDir, 'am.sock'),
-          }).catch((err) => log(`Warning: failed to notify AM of delivery: ${err.message}`));
-        }
+      if (item.type === 'control') {
+        await handleControlDeliveryFailure(item, reason);
       } else {
-        const hasAck = (item.content || '').includes('---- ack via:');
-        if (hasAck) {
-          log(`Control id=${item.id} submitted, waiting ack`);
-        } else {
-          ackControl(item.id);
-          log(`Control id=${item.id} submitted (no-ack mode), marked done`);
-        }
+        await handleConversationDeliveryFailure(item, statusFile);
       }
 
-      if (item.require_idle === 1) {
-        await waitForRequireIdleSettlement(item.id, statusFile);
-      }
-
-      // Track delivery time for idle reaping; clear boot grace period.
-      if (targetInstance) {
-        lastDeliveryAt.set(targetInstance, Date.now());
-        autoStartedAt.delete(targetInstance);
-      }
-
-      for (const held of heldItems) releaseItem(held);
-      return { delivered: true, state: claudeState.state };
+      return { delivered: false, state: claudeState.state };
     }
 
-    // Delivery failed.
-    const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
-    log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
-
-    if (item.type === 'control') {
-      await handleControlDeliveryFailure(item, reason);
-    } else {
-      await handleConversationDeliveryFailure(item, statusFile);
-    }
-
+    // Exhausted skip attempts — all tried items were for offline/busy instances.
+    return { delivered: false, state: 'skip_exhausted' };
+  } finally {
     for (const held of heldItems) releaseItem(held);
-    return { delivered: false, state: claudeState.state };
   }
-
-  // Exhausted skip attempts — all tried items were for offline/busy instances.
-  for (const held of heldItems) releaseItem(held);
-  return { delivered: false, state: 'skip_exhausted' };
 }

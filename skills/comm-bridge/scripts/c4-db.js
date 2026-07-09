@@ -325,6 +325,35 @@ export function requeueConversation(id) {
 }
 
 /**
+ * Reclaim rows orphaned in 'running' by a dispatcher that died mid-delivery.
+ *
+ * claimConversation/claimControl flip a row to 'running' before the (up to
+ * multi-second) tmux paste+verify window; a SIGKILL / OOM / pm2 kill_timeout in
+ * that window leaves the row 'running' forever — invisible to every pending
+ * query, so the message is silently lost. ONLY safe to call while holding the
+ * dispatcher singleton lock (no other live dispatcher can own a claim).
+ *
+ * Worst case is a duplicate delivery of a message that was pasted but not yet
+ * marked — strictly better than silent loss for user messages.
+ *
+ * @returns {{ conversations: number, controls: number }} reclaimed row counts
+ */
+export function resetOrphanedRunning() {
+  const database = getDb();
+  const conversations = database.prepare(`
+    UPDATE conversations
+    SET status = 'pending'
+    WHERE direction = 'in' AND status = 'running'
+  `).run().changes || 0;
+  const controls = database.prepare(`
+    UPDATE control_queue
+    SET status = 'pending', updated_at = ?, last_error = COALESCE(last_error, 'ORPHANED_BY_DISPATCHER_RESTART')
+    WHERE status = 'running'
+  `).run(nowSeconds()).changes || 0;
+  return { conversations, controls };
+}
+
+/**
  * Mark a message as delivered
  * @param {number} id - message id
  */
