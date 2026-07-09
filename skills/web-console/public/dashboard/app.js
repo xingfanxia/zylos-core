@@ -2224,7 +2224,11 @@ class Dashboard {
     if (!str) return '';
     var div = document.createElement('div');
     div.textContent = String(str);
-    return div.innerHTML;
+    // innerHTML escapes & < > but NOT quotes; esc() is also used inside
+    // title="…"/value="…" attributes (e.g. the scheduler calendar tooltip
+    // renders agent-controlled task names), so escape quotes too to prevent
+    // an attribute breakout / stored XSS in the admin dashboard.
+    return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 }
 

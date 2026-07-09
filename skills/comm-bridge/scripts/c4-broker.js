@@ -57,6 +57,8 @@ import { initC4Session } from './c4-session-init.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { sourceTierRoots, checkPathViolation, mediaPathFromContent } from './egress-policy.js';
 import { getAllInstances, getMonitorDir, getInstanceDef } from '../../multi-session/instance-config.js';
+import * as taskOps from '../../scheduler/scripts/task-ops.js';
+import { getDb as getSchedulerDb, generateId as generateTaskId, now as taskNow } from '../../scheduler/scripts/database.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const WORKSPACE_DIR = path.join(ZYLOS_DIR, 'workspace');
@@ -215,6 +217,7 @@ async function handleRequest(req, caller) {
     case 'ack':          return opAck(p, caller);
     case 'get':          return opGet(p, caller);
     case 'session-init': return await opSessionInit(caller);
+    case 'scheduler':    return opScheduler(p, caller);
     default:             return { ok: false, error: `unknown_op:${op ?? '(none)'}` };
   }
 }
@@ -402,6 +405,117 @@ async function opSessionInit(caller) {
   // closeDb:false — keep the broker's shared connection open across requests.
   const context = await initC4Session(caller, { closeDb: false });
   return { ok: true, data: { context } };
+}
+
+/**
+ * Scheduler surface for isolated agents (scheduler.db is service-user-only
+ * post ISO-2 follow-up; agents lost the interim group-rw). Every action runs
+ * the SAME task-ops the CLI uses, with scope forced to the socket-derived
+ * caller — an agent can only see/ack/mutate its own tasks, `add` can only
+ * target itself, and `update` cannot retarget (that would be a controlled
+ * cross-instance message primitive we deliberately don't grant).
+ * Domain outcomes ({ok:false,error:'not_found'|...}) are returned as data;
+ * transport-level failures use the broker's ok:false envelope.
+ */
+// Per-instance guards on the agent-facing scheduler surface (availability).
+const MAX_ACTIVE_TASKS_PER_INSTANCE = 200;
+const MIN_INTERVAL_SECONDS = 60;
+
+/**
+ * A scheduled task's reply_channel/reply_endpoint are later handed to the
+ * scheduler DAEMON (service user, root creds), which spawns
+ * `<reply_channel>/scripts/send.js <reply_endpoint> ...` OUTSIDE the broker's
+ * opSend guards — `shell/scripts/send.js` writes bytes to an arbitrary unix
+ * socket, and channel sends bypass endpointAuthorized. So apply the SAME
+ * CRITICAL-1 (channel allowlist) + HIGH-1 (endpoint bound to caller) controls
+ * here, at ingestion. Returns an error string or null.
+ */
+function validateReplyTarget(obj, caller) {
+  if (obj.reply_channel != null && !MESSAGING_CHANNELS.has(obj.reply_channel)) {
+    return `reply_channel_not_allowed:${obj.reply_channel}`;
+  }
+  if (obj.reply_endpoint != null && !endpointAuthorized(obj.reply_channel, obj.reply_endpoint, caller)) {
+    return 'reply_endpoint_not_authorized';
+  }
+  return null;
+}
+
+function opScheduler(p, caller) {
+  // LOW-1: the entire tenant filter rests on a truthy scope — a falsy caller
+  // would silently drop every `AND target_instance = ?`. Not reachable today
+  // (caller is a socket-bound instance id) but make the invariant explicit.
+  if (typeof caller !== 'string' || caller.length === 0) {
+    return { ok: false, error: 'no_caller' };
+  }
+
+  const action = p.action;
+  let sdb;
+  try {
+    sdb = getSchedulerDb();
+  } catch (e) {
+    return { ok: false, error: `scheduler_db_unavailable:${e.message}` };
+  }
+
+  const needsPrefix = new Set(['done', 'remove', 'pause', 'resume', 'update']);
+  if (needsPrefix.has(action) && (typeof p.prefix !== 'string' || p.prefix.length === 0)) {
+    return { ok: false, error: 'prefix_required' };
+  }
+  const scoped = { scope: caller };
+
+  switch (action) {
+    case 'list':    return { ok: true, data: taskOps.listTasks(sdb, scoped) };
+    case 'next':    return { ok: true, data: taskOps.nextTasks(sdb, scoped) };
+    case 'running': return { ok: true, data: taskOps.runningTasks(sdb, scoped) };
+    case 'history': return { ok: true, data: taskOps.taskHistory(sdb, { scope: caller, prefix: typeof p.prefix === 'string' && p.prefix ? p.prefix : null }) };
+    case 'done':    return { ok: true, data: taskOps.completeTask(sdb, p.prefix, scoped) };
+    case 'remove':  return { ok: true, data: taskOps.removeTask(sdb, p.prefix, scoped) };
+    case 'pause':   return { ok: true, data: taskOps.pauseTask(sdb, p.prefix, scoped) };
+    case 'resume':  return { ok: true, data: taskOps.resumeTask(sdb, p.prefix, scoped) };
+    case 'update': {
+      const updates = (p.updates && typeof p.updates === 'object' && !Array.isArray(p.updates)) ? p.updates : {};
+      const replyErr = validateReplyTarget(updates, caller);
+      if (replyErr) return { ok: false, error: replyErr };
+      return { ok: true, data: taskOps.applyTaskUpdates(sdb, p.prefix, updates, { scope: caller, allowRetarget: false }) };
+    }
+    case 'add': {
+      const spec = (p.spec && typeof p.spec === 'object' && !Array.isArray(p.spec)) ? { ...p.spec } : null;
+      if (!spec || typeof spec.prompt !== 'string' || spec.prompt.length === 0) {
+        return { ok: false, error: 'spec_required' };
+      }
+      // HIGH-1: gate the daemon-executed reply target (channel allowlist +
+      // endpoint bound to caller) at ingestion.
+      const replyErr = validateReplyTarget(spec, caller);
+      if (replyErr) return { ok: false, error: replyErr };
+      // MEDIUM-1: per-instance active-task cap (shared daemon + shared disk).
+      if (taskOps.countActiveTasks(sdb, scoped) >= MAX_ACTIVE_TASKS_PER_INSTANCE) {
+        return { ok: false, error: `task_cap_reached:${MAX_ACTIVE_TASKS_PER_INSTANCE}` };
+      }
+      // MEDIUM-1: floor sub-minute intervals (constant daemon churn).
+      if (spec.type === 'interval' && Number(spec.interval_seconds) < MIN_INTERVAL_SECONDS) {
+        return { ok: false, error: `interval_too_small:min=${MIN_INTERVAL_SECONDS}s` };
+      }
+      // Server-side authority: id, timestamps, and above all the target.
+      const t = taskNow();
+      spec.id = generateTaskId();
+      spec.created_at = t;
+      spec.updated_at = t;
+      spec.target_instance = caller;
+      // next_run_at has no CHECK constraint; a non-numeric value would store
+      // as text and never dispatch (self-DoS via raw socket payload) — coerce
+      // and reject instead of persisting junk.
+      spec.next_run_at = Number(spec.next_run_at);
+      if (!Number.isFinite(spec.next_run_at) || spec.next_run_at < 0) {
+        return { ok: false, error: 'invalid_spec:next_run_at must be a unix timestamp' };
+      }
+      try {
+        return { ok: true, data: taskOps.insertTask(sdb, spec) };
+      } catch (e) {
+        // DB CHECK constraints are the validation backstop (type/priority/status).
+        return { ok: false, error: `invalid_spec:${e.message}` };
+      }
+    }
+    default: return { ok: false, error: `unknown_scheduler_action:${action ?? '(none)'}` };
+  }
 }
 
 // ── Singleton lock (mirrors c4-dispatcher) ──────────────────────────

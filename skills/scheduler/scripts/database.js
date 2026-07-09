@@ -25,6 +25,10 @@ export function getDb() {
 
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');  // Better concurrent access
+    // Two long-lived writers share this DB (scheduler daemon + c4-broker);
+    // without a busy_timeout a write collision fails immediately with
+    // SQLITE_BUSY instead of briefly queueing.
+    db.pragma('busy_timeout = 5000');
     initSchema();
   }
   return db;

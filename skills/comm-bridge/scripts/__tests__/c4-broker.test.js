@@ -254,3 +254,140 @@ describe('c4-client shouldUseBroker', () => {
     delete process.env.ZYLOS_INSTANCE_ID;
   });
 });
+
+describe('broker scheduler op', () => {
+  const specFor = (prompt, overrides = {}) => ({
+    prompt,
+    name: prompt,
+    type: 'one-time',
+    next_run_at: Math.floor(Date.now() / 1000) + 3600,
+    priority: 3,
+    require_idle: 0,
+    miss_threshold: 300,
+    timezone: 'UTC',
+    ...overrides,
+  });
+
+  it('add forces target_instance = caller (client-supplied target/id ignored)', async () => {
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('task for a', { target_instance: 'inst-b', id: 'task-evil-fixed-id' }) },
+    }, 'inst-a');
+    assert.equal(res.ok, true);
+    assert.equal(res.data.ok, true);
+    assert.equal(res.data.task.target_instance, 'inst-a');
+    assert.notEqual(res.data.task.id, 'task-evil-fixed-id');
+  });
+
+  it('list is scoped to the caller', async () => {
+    const a = await broker.handleRequest({ op: 'scheduler', params: { action: 'list' } }, 'inst-a');
+    const b = await broker.handleRequest({ op: 'scheduler', params: { action: 'list' } }, 'inst-b');
+    assert.equal(a.ok, true);
+    assert.ok(a.data.some(t => t.prompt === 'task for a'));
+    assert.equal(b.ok, true);
+    assert.equal(b.data.length, 0);
+  });
+
+  it('done refuses another instance\'s task, completes own', async () => {
+    const added = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('ackable task') },
+    }, 'inst-a');
+    const id = added.data.task.id;
+
+    const cross = await broker.handleRequest({ op: 'scheduler', params: { action: 'done', prefix: id } }, 'inst-b');
+    assert.equal(cross.ok, true);
+    assert.equal(cross.data.ok, false);
+    assert.equal(cross.data.error, 'not_found');
+
+    const own = await broker.handleRequest({ op: 'scheduler', params: { action: 'done', prefix: id } }, 'inst-a');
+    assert.equal(own.ok, true);
+    assert.equal(own.data.ok, true);
+    assert.equal(own.data.task.id, id);
+  });
+
+  it('update cannot retarget a task', async () => {
+    const added = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('retarget attempt') },
+    }, 'inst-a');
+    const id = added.data.task.id;
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'update', prefix: id, updates: { target_instance: 'inst-b' } },
+    }, 'inst-a');
+    assert.equal(res.ok, true);
+    assert.equal(res.data.ok, false);
+    assert.equal(res.data.error, 'retarget_forbidden');
+  });
+
+  it('mutating actions require a prefix', async () => {
+    const res = await broker.handleRequest({ op: 'scheduler', params: { action: 'done' } }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'prefix_required');
+  });
+
+  it('add without a usable spec is refused', async () => {
+    const res = await broker.handleRequest({ op: 'scheduler', params: { action: 'add' } }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'spec_required');
+  });
+
+  it('unknown scheduler action is refused', async () => {
+    const res = await broker.handleRequest({ op: 'scheduler', params: { action: 'drop-all' } }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.match(res.error, /unknown_scheduler_action/);
+  });
+
+  it('add rejects a non-messaging reply_channel (shell → arbitrary socket)', async () => {
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('confused deputy', { reply_channel: 'shell', reply_endpoint: '/tmp/evil.sock' }) },
+    }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.match(res.error, /reply_channel_not_allowed/);
+  });
+
+  it('add rejects an unauthorized reply_endpoint (cross-tenant chat)', async () => {
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('spam attempt', { reply_channel: 'telegram', reply_endpoint: 'someone-elses-chat' }) },
+    }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.match(res.error, /reply_endpoint_not_authorized/);
+  });
+
+  it('add allows an authorized reply target (own bound chat)', async () => {
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('legit notify', { reply_channel: 'telegram', reply_endpoint: 'chat-a-1' }) },
+    }, 'inst-a');
+    assert.equal(res.ok, true);
+    assert.equal(res.data.ok, true);
+  });
+
+  it('update rejects a shell reply_channel too', async () => {
+    const added = await broker.handleRequest({ op: 'scheduler', params: { action: 'add', spec: specFor('to-hijack') } }, 'inst-a');
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'update', prefix: added.data.task.id, updates: { reply_channel: 'shell', reply_endpoint: '/tmp/x.sock' } },
+    }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.match(res.error, /reply_channel_not_allowed/);
+  });
+
+  it('add floors sub-minute interval tasks', async () => {
+    const res = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'add', spec: specFor('churn', { type: 'interval', interval_seconds: 1 }) },
+    }, 'inst-a');
+    assert.equal(res.ok, false);
+    assert.match(res.error, /interval_too_small/);
+  });
+
+  it('empty caller is refused (scope invariant)', async () => {
+    const res = await broker.handleRequest({ op: 'scheduler', params: { action: 'list' } }, '');
+    assert.equal(res.ok, false);
+    assert.equal(res.error, 'no_caller');
+  });
+});
