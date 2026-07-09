@@ -180,3 +180,45 @@ describe('checkpoints — strictly instance-scoped (no NULL bleed)', () => {
     assert.equal(created.target_instance, 'admin');
   });
 });
+
+describe('getUnansweredDeliveredForInstance', () => {
+  it('returns a delivered replyable message with no later reply to its chat', () => {
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'k线保存失败', status: 'delivered', target: 'group' });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
+  it('excludes a message once a later outbound to the same chat exists', () => {
+    conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'reply', status: 'delivered', target: null });
+    assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0);
+  });
+
+  it('a reply to a DIFFERENT chat does not clear this one', () => {
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_B|type:group', content: 'reply-elsewhere', status: 'delivered', target: null });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
+  it('excludes void/system and null-endpoint (non-replyable) rows', () => {
+    conv({ dir: 'in', channel: 'void', endpoint: 'session-handoff', content: 'h', status: 'delivered', target: 'group' });
+    conv({ dir: 'in', channel: 'system', endpoint: null, content: 's', status: 'delivered', target: 'group' });
+    conv({ dir: 'in', channel: 'feishu', endpoint: null, content: 'noreply', status: 'delivered', target: 'group' });
+    assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0);
+  });
+
+  it('is instance-scoped (no cross-instance bleed) and ignores pending/summarized', () => {
+    conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'for group', status: 'delivered', target: 'group' });
+    assert.equal(multi.getUnansweredDeliveredForInstance('user-elaine').length, 0); // wrong instance
+    reset();
+    conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_2', content: 'still pending', status: 'pending', target: 'group' });
+    assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0); // not yet delivered
+    reset();
+    const oldId = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_3', content: 'old', status: 'delivered', target: 'group' });
+    checkpoint({ summary: 's', start: oldId, end: oldId, target: 'group' });
+    assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0); // already summarized
+  });
+});

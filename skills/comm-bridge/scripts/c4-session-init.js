@@ -69,6 +69,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
     let getUnsummarizedRangeForInstance = null;
     let getUnsummarizedConversationsForInstance = null;
     let groupConversationsByGroup = null;
+    let getUnansweredDeliveredForInstance = null;
     let multiLoadFailed = false;
     if (INSTANCE_ID) {
       try {
@@ -77,6 +78,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
         getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
         getUnsummarizedConversationsForInstance = multiMod.getUnsummarizedConversationsForInstance;
         groupConversationsByGroup = multiMod.groupConversationsByGroup;
+        getUnansweredDeliveredForInstance = multiMod.getUnansweredDeliveredForInstance;
       } catch (err) {
         multiLoadFailed = true;
         console.error(`[c4-session-init] WARN: c4-db-multi.js import failed: ${err.message}`);
@@ -84,6 +86,42 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
     }
 
     const isGroup = INSTANCE_ID ? isGroupInstanceId(INSTANCE_ID) : false;
+
+    // Delivered-but-unanswered user messages (lost to an interruption — restart,
+    // not-logged-in, frozen) get an explicit ACTION-REQUIRED flag so a fresh
+    // session actually replies instead of treating them as passive history.
+    // Built once here; appended to whichever delivery path returns below.
+    let unansweredSection = null;
+    if (INSTANCE_ID && getUnansweredDeliveredForInstance) {
+      try {
+        const unanswered = getUnansweredDeliveredForInstance(INSTANCE_ID);
+        if (unanswered && unanswered.length > 0) {
+          const MAX = 5;
+          const lines = unanswered.slice(-MAX).map((m) => {
+            const chat = String(m.endpoint_id || '').split('|')[0];
+            // Strip any reply-routing suffix from the preview: this section is a
+            // pointer, not a second copy of the routing (the full message with
+            // its reply path is in the conversation sections above).
+            const preview = String(m.content || '')
+              .replace(/----\s*reply via:.*$/is, '')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 100);
+            return `- [${m.channel} ${chat}] "${preview}" (${m.timestamp})`;
+          });
+          const more = unanswered.length > MAX ? `\n(+${unanswered.length - MAX} more earlier)` : '';
+          unansweredSection = formatSection(
+            'ACTION REQUIRED — POSSIBLY UNANSWERED',
+            'These user message(s) were delivered but have NO reply yet — likely delivered during an '
+            + 'interruption (restart / not-logged-in / frozen) and never processed. Read the full text in '
+            + 'the conversation sections above and REPLY if still relevant, using the reply path shown '
+            + `with each message above:\n${lines.join('\n')}${more}`,
+          );
+        }
+      } catch (err) {
+        console.error(`[c4-session-init] WARN: unanswered-delivered check failed: ${err.message}`);
+      }
+    }
 
     const checkpoint = (INSTANCE_ID && getLastCheckpointForInstance)
       ? getLastCheckpointForInstance(INSTANCE_ID)
@@ -153,6 +191,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
           `There are ${range.count} unsummarized conversations across all groups (conversation id ${range.begin_id} ~ ${range.end_id}). Please use zylos-memory skill to process them, keeping each chat's memory under memory/groups/<group_key>/.`,
         ));
       }
+      if (unansweredSection) sections.push(unansweredSection);
       return `${sections.join('\n\n')}\n`;
     }
 
@@ -174,6 +213,7 @@ export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: clo
       ));
     }
 
+    if (unansweredSection) sections.push(unansweredSection);
     return `${sections.join('\n\n')}\n`;
   } catch (err) {
     const wrapped = new Error(`Error in session init: ${err.message}`);
