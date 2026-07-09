@@ -42,6 +42,15 @@ import {
   writeLaunchSpec,
 } from './tmux-env.js';
 
+// Multi-session: heartbeat pending state must be per-instance. With the shared
+// path, two instances' health engines overwrite each other's pending pointer,
+// each polls the other's control id, and both kill healthy sessions on the
+// resulting false timeouts (2026-07-09 scheduler/user-elaine heartbeat storm).
+// getMonitorDir() honors ZYLOS_INSTANCE_ID + instances.json state_dir and falls
+// back to the shared dir for single-session deployments.
+const { getMonitorDir: _getMonitorDir } =
+  await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 // Multi-session: allow ZYLOS_TMUX_SESSION env var to override the default
@@ -443,7 +452,10 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @returns {object}
    */
   getHeartbeatDeps() {
-    const pendingFile = path.join(ZYLOS_DIR, 'activity-monitor', 'heartbeat-pending.json');
+    const monitorDir = _getMonitorDir
+      ? _getMonitorDir()
+      : path.join(ZYLOS_DIR, 'activity-monitor');
+    const pendingFile = path.join(monitorDir, 'heartbeat-pending.json');
     return createClaudeProbe({ pendingFile, tmuxSession: SESSION });
   }
 

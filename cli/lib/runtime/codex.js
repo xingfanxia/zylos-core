@@ -50,6 +50,12 @@ import {
 import { classifyCodexLoginStatus } from '../auth-parsers.js';
 import { ensureCodexHooksTrusted } from '../codex-hooks.js';
 
+// Multi-session: heartbeat pending state must be per-instance (see claude.js —
+// shared-path pending files let instances overwrite each other's pointer and
+// kill healthy sessions). Falls back to the shared dir for single-session.
+const { getMonitorDir: _getMonitorDir } =
+  await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
+
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const SESSION = process.env.ZYLOS_TMUX_SESSION || 'codex-main';
@@ -395,7 +401,10 @@ export class CodexAdapter extends RuntimeAdapter {
    * @returns {object}
    */
   getHeartbeatDeps() {
-    const pendingFile = path.join(ZYLOS_DIR, 'activity-monitor', 'codex-heartbeat-pending.json');
+    const monitorDir = _getMonitorDir
+      ? _getMonitorDir()
+      : path.join(ZYLOS_DIR, 'activity-monitor');
+    const pendingFile = path.join(monitorDir, 'codex-heartbeat-pending.json');
     return createCodexProbe({ pendingFile, tmuxSession: SESSION });
   }
 
