@@ -200,7 +200,7 @@ async function main() {
 
   if (useBroker) {
     try {
-      await brokerCall('send', { channel, endpoint, content: message });
+      await brokerCall('send', { channel, endpoint, content: message, deliveryAction });
       console.log(`[C4] Message sent via ${channel} (broker)`);
       process.exit(0);
     } catch (err) {
@@ -232,17 +232,28 @@ async function main() {
     stdio: 'inherit'
   });
 
+  // Mark the audit row failed on any non-delivery: the user never received
+  // this, so it must not count as an answer for the unanswered-message
+  // re-surface. Covers both a non-zero exit ('close') and a spawn failure
+  // ('error' — script unreadable / node missing — where 'close' never fires).
+  const markAuditFailed = () => {
+    if (outRecord?.id == null) return;
+    try { markFailed(outRecord.id); } catch { /* audit-only, best effort */ }
+    try { close(); } catch { /* reopened by markFailed */ }
+  };
+
+  child.on('error', (err) => {
+    console.error(`[C4] Failed to spawn channel script: ${err.message}`);
+    markAuditFailed();
+    process.exit(1);
+  });
+
   child.on('close', (code) => {
     if (code === 0) {
       console.log(`[C4] Message sent via ${channel}`);
     } else {
       console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);
-      // Mark the audit row failed: the user never received this, so it must
-      // not count as an answer for the unanswered-message re-surface.
-      if (outRecord?.id != null) {
-        try { markFailed(outRecord.id); } catch { /* audit-only, best effort */ }
-        try { close(); } catch { /* reopened by markFailed */ }
-      }
+      markAuditFailed();
     }
     process.exit(code);
   });

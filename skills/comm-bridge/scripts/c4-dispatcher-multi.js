@@ -431,8 +431,14 @@ export async function processWithMultiSession(helpers) {
   // Items must stay 'running' during the loop to prevent re-claiming the same item.
   // try/finally guarantees release on EVERY exit path — a throw mid-loop must
   // never strand claimed items in 'running' (they'd be invisible to all
-  // pending queries and silently lost).
+  // pending queries and silently lost). `inFlight` covers the item currently
+  // being delivered (never in heldItems): if markDelivered/ackControl/
+  // handle*DeliveryFailure throws (e.g. SQLITE_BUSY), the finally releases it.
+  // Every normal path clears inFlight once the item reaches its resolved state
+  // — including ack-waiting controls, which deliberately STAY 'running' until
+  // the agent acks and must never be requeued by the finally.
   const heldItems = [];
+  let inFlight = null;
 
   try {
     for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
@@ -440,6 +446,7 @@ export async function processWithMultiSession(helpers) {
       if (!item) {
         return { delivered: false, state: 'idle' };
       }
+      inFlight = item;
 
       const decision = multiSessionDispatch(item, { getClaudeState: getAgentState, isStatusFresh, isBypassState });
 
@@ -451,6 +458,7 @@ export async function processWithMultiSession(helpers) {
           markRejected(item.id);
         }
         log(`Rejected ${item.type} id=${item.id}: ${decision.reason}`);
+        inFlight = null;
         continue;
       }
 
@@ -461,6 +469,7 @@ export async function processWithMultiSession(helpers) {
       // block releases it back to pending at cycle end — same requeue effect.)
       if (decision.action === 'requeue') {
         heldItems.push(item);
+        inFlight = null;
         log(`Held for requeue ${item.type} id=${item.id}: ${decision.reason}`);
         continue;
       }
@@ -468,6 +477,7 @@ export async function processWithMultiSession(helpers) {
       // ── skip ── (hold in running state to prevent re-claim in this cycle)
       if (decision.action === 'skip') {
         heldItems.push(item);
+        inFlight = null;
         continue;
       }
 
@@ -479,6 +489,7 @@ export async function processWithMultiSession(helpers) {
       // Hold the item to prevent re-claim, then continue to try other items.
       if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
         heldItems.push(item);
+        inFlight = null;
         continue;
       }
 
@@ -492,6 +503,7 @@ export async function processWithMultiSession(helpers) {
         const requireIdleWaiting = heldItems.some((h) => h.require_idle === 1);
         if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
           ackControl(item.id);
+          inFlight = null;
           log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}${requireIdleWaiting ? ' (require_idle waiting)' : ''}`);
           return { delivered: true, state: claudeState.state };
         }
@@ -510,11 +522,19 @@ export async function processWithMultiSession(helpers) {
         try {
           sendKeystroke(session, key);
           ackControl(item.id);
+          inFlight = null;
           log(`Keystroke delivered: key=${key} (control id=${item.id})`);
+          // A keystroke is a real delivery to this instance — refresh the
+          // idle-reap clock and clear boot grace, same as the paste path.
+          if (targetInstance) {
+            lastDeliveryAt.set(targetInstance, Date.now());
+            autoStartedAt.delete(targetInstance);
+          }
           return { delivered: true, state: claudeState.state };
         } catch (err) {
           log(`Keystroke delivery error: ${err.message}`);
           await handleControlDeliveryFailure(item, `KEYSTROKE_ERROR: ${err.message}`);
+          inFlight = null;
           return { delivered: false, state: claudeState.state };
         }
       }
@@ -565,6 +585,12 @@ export async function processWithMultiSession(helpers) {
           }
         }
 
+        // Terminal (or deliberately-held-for-ack) state reached — the finally
+        // must NOT requeue this item even if a later await throws. NOTE the
+        // ack-waiting control above intentionally STAYS 'running' until the
+        // agent acks; releasing it would redeliver in a loop.
+        inFlight = null;
+
         if (item.require_idle === 1) {
           await waitForRequireIdleSettlement(item.id, statusFile);
         }
@@ -587,6 +613,7 @@ export async function processWithMultiSession(helpers) {
       } else {
         await handleConversationDeliveryFailure(item, statusFile);
       }
+      inFlight = null; // failure handler owns the row now (requeued or failed)
 
       return { delivered: false, state: claudeState.state };
     }
@@ -594,6 +621,10 @@ export async function processWithMultiSession(helpers) {
     // Exhausted skip attempts — all tried items were for offline/busy instances.
     return { delivered: false, state: 'skip_exhausted' };
   } finally {
+    // inFlight is non-null ONLY when a throw escaped mid-delivery, before the
+    // item reached a terminal (or deliberately ack-held) state — release it so
+    // the row isn't stranded in 'running' until the next dispatcher restart.
+    if (inFlight) releaseItem(inFlight);
     for (const held of heldItems) releaseItem(held);
   }
 }

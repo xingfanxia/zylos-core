@@ -489,28 +489,70 @@ describe('HealthEngine', () => {
   });
 
   describe('onHeartbeatFailure — auth dual-signal', () => {
-    it('enters auth_failed (no kill) when a heartbeat fails with auth text in the pane', () => {
+    it('enters auth_failed (no kill) when a heartbeat fails with auth text and checkAuth confirms', async () => {
       const { deps, calls } = createMockDeps();
       deps.detectAuthFailure = () => ({ detected: true, pattern: 'Not logged in' });
+      deps.checkAuth = async () => ({ status: 'failure', reason: 'cli_probe_not_logged_in' });
       const engine = new HeartbeatEngine(deps);
 
       engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+      await engine._authVerifyPromise;
 
       assert.equal(engine.health, 'auth_failed');
       assert.equal(calls.killTmuxSession, 0, 'must not kill a session that just needs credentials');
     });
 
-    it('enters auth_failed from a recovering state too (breaks the restart loop)', () => {
+    it('enters auth_failed from a recovering state too (breaks the restart loop)', async () => {
       const { deps, calls } = createMockDeps();
       deps.detectAuthFailure = () => ({ detected: true, pattern: 'run /login' });
+      deps.checkAuth = async () => ({ status: 'failure', reason: 'still_broken' });
       const engine = new HeartbeatEngine(deps, { initialHealth: 'recovering' });
       engine.restartFailureCount = 3;
 
       engine.onHeartbeatFailure({ phase: 'recovery' }, 'timeout');
+      await engine._authVerifyPromise;
 
       assert.equal(engine.health, 'auth_failed');
       assert.equal(engine.restartFailureCount, 0);
       assert.equal(calls.killTmuxSession, 0);
+    });
+
+    it('escapes a false positive: checkAuth success means hung agent → kill+restart resumes', async () => {
+      // Pane text said "not logged in" (echoed tool output) but credentials are
+      // actually fine — the agent is hung. Without this escape it would be
+      // parked in auth_failed forever (a hung agent never ACKs).
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'not logged in' });
+      deps.checkAuth = async () => ({ status: 'success', reason: 'cli_probe' });
+      const engine = new HeartbeatEngine(deps);
+
+      engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+      await engine._authVerifyPromise;
+
+      assert.equal(engine.health, 'unavailable');
+      assert.equal(calls.killTmuxSession, 1, 'hung session must still be restarted');
+      assert.ok(engine.recoveringStartedAt > 0, 'continuous-failure clock started');
+    });
+
+    it('uncertain checkAuth stays auth_failed, and a later failed heartbeat re-verifies', async () => {
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'not logged in' });
+      let probeResult = { status: 'uncertain', reason: 'network_flake' };
+      deps.checkAuth = async () => probeResult;
+      const engine = new HeartbeatEngine(deps);
+
+      engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+      await engine._authVerifyPromise;
+      assert.equal(engine.health, 'auth_failed');
+      assert.equal(calls.killTmuxSession, 0);
+
+      // Next failed heartbeat while auth_failed re-runs the verify; the probe
+      // now resolves 'success' → hang confirmed → restart.
+      probeResult = { status: 'success', reason: 'cli_probe' };
+      engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
+      await engine._authVerifyPromise;
+      assert.equal(engine.health, 'unavailable');
+      assert.equal(calls.killTmuxSession, 1);
     });
 
     it('rate limit takes precedence over auth text when both are detected', () => {

@@ -264,6 +264,13 @@ async function opSend(p, caller) {
   const channel = p.channel;
   const endpoint = p.endpoint ?? null;
   const content = p.content;
+  // Audit tag (e.g. 'status-notice' from c4-receive's unhealthy auto-reply) —
+  // must survive the broker hop or getUnansweredDeliveredForInstance counts the
+  // auto-reply as a real answer. Coerced to a short string; it only ever lands
+  // in the delivery_action audit column, never in routing decisions.
+  const deliveryAction = typeof p.deliveryAction === 'string' && p.deliveryAction
+    ? p.deliveryAction.slice(0, 64)
+    : null;
   const attachments = Array.isArray(p.attachments)
     ? p.attachments
     : (p.attachments ? [p.attachments] : []);
@@ -302,7 +309,7 @@ async function opSend(p, caller) {
   // SessionStart injection and inflate its unsummarized count (M3).
   let conversationId = null;
   try {
-    const row = insertConversation('out', channel, endpoint, content, null, 3, false, null, null);
+    const row = insertConversation('out', channel, endpoint, content, null, 3, false, deliveryAction, null);
     conversationId = row.id;
   } catch (e) {
     log(`WARN audit insert failed (${caller}): ${e.message}`);
