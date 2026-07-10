@@ -15,11 +15,11 @@ const DB_MODULE = fileURLToPath(new URL('../c4-db.js', import.meta.url));
 // delivered rows (undelivered/pending messages the agent hasn't seen yet are not
 // conversation history to summarize), so a freshly-`receive`d message (which is
 // correctly 'pending' until dispatched) is the wrong precondition for it.
-function insertDelivered(content, env = {}) {
+function insertDelivered(content, env = {}, { channel = 'system', endpoint = null } = {}) {
   // Tagged with the fixture instance — scoped reads are strict (NULL-target
   // rows are excluded to prevent cross-instance bleed), same as dispatcher rows.
   const code = `const { insertConversation, close } = await import(${JSON.stringify(DB_MODULE)});`
-    + ` insertConversation('in','system',null,${JSON.stringify(content)},'delivered',3,false,null,'test-instance'); close();`;
+    + ` insertConversation('in',${JSON.stringify(channel)},${JSON.stringify(endpoint)},${JSON.stringify(content)},'delivered',3,false,null,'test-instance'); close();`;
   return spawnSync('node', ['--input-type=module', '-e', code], {
     env: { ...process.env, ...env },
     encoding: 'utf8',
@@ -81,9 +81,12 @@ describe('c4-fetch --unsummarized', () => {
   });
 
   it('keeps inbound endpoint content clean without reply routing', () => {
-    withTmpDir(({ tmpDir, env }) => {
-      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'telegram'), { recursive: true });
-      receive(['--channel', 'telegram', '--endpoint', '123', '--content', 'clean msg'], env);
+    withTmpDir(({ env }) => {
+      // #618: stored rows carry no reply-via even with an endpoint, and
+      // c4-fetch output stays clean (delivery-side formatting adds routing).
+      // Seeded directly (fork idiom): scoped reads only see instance-tagged
+      // delivered rows, which a bare c4-receive call would not produce here.
+      insertDelivered('clean msg', env, { channel: 'telegram', endpoint: '123' });
 
       const { stdout, status } = cli(['--unsummarized'], env);
       assert.equal(status, 0);

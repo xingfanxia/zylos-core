@@ -53,9 +53,13 @@ describe('checkAndHoldForApproval', () => {
 describe('holdAndNotify', () => {
   it('inserts the message as pending_approval and notifies admin', () => {
     const record = approve.holdAndNotify('feishu', 'stranger|type:p2p', 'hi there ---- reply via foo', 3, 'admin', { sendMessage: () => true });
-    const row = db.prepare('SELECT status, channel FROM conversations WHERE id=?').get(record.id);
+    const row = db.prepare('SELECT status, channel, target_instance, delivery_action FROM conversations WHERE id=?').get(record.id);
     assert.equal(row.status, 'pending_approval');
     assert.equal(row.channel, 'feishu');
+    // Regression guard: targetInstance is the 9th insertConversation param —
+    // passing it 8th used to land in delivery_action and leave target NULL.
+    assert.equal(row.target_instance, 'admin');
+    assert.equal(row.delivery_action, null);
     // Admin gets a control-queue notification mentioning the pending user.
     const note = db.prepare(
       "SELECT content FROM control_queue WHERE target_instance='admin' ORDER BY id DESC LIMIT 1"
