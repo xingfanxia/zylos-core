@@ -35,11 +35,23 @@ const RATE_LIMIT_PATTERNS = [
   /you[''’]ve hit your (?:\w+ )?limit/i,
 ];
 
+// Auth-failure text signatures. HealthEngine.onUserMessageDelivered verifies
+// every hit here with the adapter's live checkAuth() probe before flipping
+// health to auth_failed, so these can be inclusive without risking a false
+// flip from a user message that merely mentions "unauthorized" etc.
+// "not logged in" / "run /login" / token-expired are the credential-expiry
+// signatures Claude Code shows when a shared OAuth token goes stale
+// mid-session (the credential-farm outage). They were previously missing here
+// — present only in the codex probe — so a logged-out Claude session never
+// tripped auth detection and the dispatcher kept delivering into a dead pane.
 const AUTH_FAILURE_PATTERNS = [
   /authentication_error/i,
   /auth(?:entication)? failed/i,
   /invalid api key/i,
   /unauthorized/i,
+  /not logged in/i,
+  /run\s+`?\/login/i,
+  /(?:oauth|login|session|credential) token (?:has )?expired/i,
 ];
 
 /**
@@ -254,7 +266,7 @@ function _parseResetTime(timeStr, dateStr) {
   return Math.floor(target.getTime() / 1000);
 }
 
-export { RATE_LIMIT_PATTERNS as _RATE_LIMIT_PATTERNS, _parseResetTime };
+export { RATE_LIMIT_PATTERNS as _RATE_LIMIT_PATTERNS, AUTH_FAILURE_PATTERNS as _AUTH_FAILURE_PATTERNS, _parseResetTime };
 
 function _writePending(file, data) {
   try {

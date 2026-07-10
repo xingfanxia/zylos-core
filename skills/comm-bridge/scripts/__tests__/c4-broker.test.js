@@ -180,6 +180,31 @@ describe('broker handleRequest', () => {
     const after = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
     assert.equal(after, before, 'own outbound message must not count toward unsummarized');
   });
+
+  it('send: deliveryAction survives the broker hop into the audit row', async () => {
+    // The status-notice tag must not be dropped by the broker path, or the
+    // unhealthy auto-reply masks the very unanswered inbound it apologizes for.
+    const ok = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'web-console', endpoint: 'console-1', content: 'please resend', deliveryAction: 'status-notice' },
+    }, 'inst-a');
+    assert.equal(ok.ok, true, ok.error);
+    const row = getDb().prepare('SELECT delivery_action, status FROM conversations WHERE id = ?').get(ok.data.conversation_id);
+    assert.equal(row.delivery_action, 'status-notice');
+    assert.equal(row.status, 'delivered');
+  });
+
+  it('send: a failed channel send marks the audit out-row failed', async () => {
+    // telegram send.js in this harness exits 3.
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'telegram', endpoint: 'chat-a-1', content: 'never arrives' },
+    }, 'inst-a');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /channel_send_failed/);
+    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    assert.equal(row.status, 'failed');
+  });
 });
 
 // ── broker void op (record-only, caller-scoped) ─────────────────────

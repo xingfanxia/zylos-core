@@ -17,6 +17,7 @@ import {
   getNextPending,
   claimConversation,
   requeueConversation,
+  resetOrphanedRunning,
   markDelivered,
   getPendingCount,
   getPendingControlCount,
@@ -82,9 +83,9 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now() } = {}) {
+export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now(), socketPath = AM_SOCKET_PATH } = {}) {
   return new Promise((resolve) => {
-    const socket = net.createConnection(AM_SOCKET_PATH);
+    const socket = net.createConnection(socketPath);
     let settled = false;
 
     function settle() {
@@ -440,6 +441,9 @@ async function submitAndVerify(session = TMUX_SESSION) {
 async function sendToTmux(message, options = {}) {
   const strictVerify = options.strictVerify === true;
   const session = options.session || TMUX_SESSION;
+  // Multi-session: the "is the agent actually dead" fallback below must consult
+  // the TARGET instance's status files, not the primary's defaults.
+  const statusFile = options.statusFile || AGENT_STATUS_FILE;
   const acceptShutdownAfterSubmit = options.acceptShutdownAfterSubmit === true;
   const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
@@ -479,8 +483,8 @@ async function sendToTmux(message, options = {}) {
   // For non-conversation controls, preserve prior permissive behavior when the
   // process is confirmed alive (only hard-fail if process is dead/offline).
   if (!verifyResult.verified) {
-    const procState = readProcState();
-    const agentState = getAgentState();
+    const procState = readProcState(statusFile);
+    const agentState = getAgentState(statusFile);
     if ((procState && procState.alive === false) ||
         agentState.state === 'offline' || agentState.state === 'stopped') {
       if (acceptShutdownAfterSubmit) {
@@ -505,6 +509,17 @@ export function isKeystrokeControl(item) {
 
 export function parseKeystrokeKey(content) {
   return (content || '').slice('[KEYSTROKE]'.length).trim();
+}
+
+/**
+ * Send a raw key to a tmux session (no buffer paste, no verify). Used for
+ * [KEYSTROKE] controls (auto-approve Enter, watchdog interrupts). Injected into
+ * the multi-session path so per-instance sessions get real keypresses too.
+ * @param {string} session - tmux session name
+ * @param {string} key - tmux send-keys key name (e.g. 'Enter', 'Escape')
+ */
+export function sendKeystroke(session, key) {
+  execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 });
 }
 
 export function isCodexExitLifecycleControl(item, activeRuntime = ACTIVE_RUNTIME) {
@@ -660,7 +675,21 @@ function maybeCleanupControlQueue() {
 }
 
 async function processNextMessage() {
-  // Multi-session dispatch hook
+  // Control maintenance sweeps run in BOTH modes. They used to sit below the
+  // multi-session hook (which returns early), so in multi-session deployments
+  // control timeouts never fired and control_queue retention never ran.
+  maybeCleanupControlQueue();
+  const timedOut = expireTimedOutControls();
+  if (timedOut > 0) {
+    log(`Control timeout sweep marked ${timedOut} record(s) as timeout`);
+  }
+
+  // Multi-session dispatch hook. Module-load failure (modules absent) falls
+  // through to single-session; a RUNTIME error inside multi-session dispatch
+  // must NOT — falling through would paste instance-targeted messages into the
+  // default primary pane (cross-instance mis-delivery). Legacy mode (no
+  // instances.json) is signalled via `legacy: true` and falls through cleanly.
+  let multi = null;
   try {
     const { processWithMultiSession } = await import('./c4-dispatcher-multi.js');
     const {
@@ -670,25 +699,41 @@ async function processNextMessage() {
       markRejected,
       markControlRejected
     } = await import('./c4-db-multi.js');
-    return await processWithMultiSession({
-      getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
-      releaseItem, isBypassState, shouldAutoAckHeartbeat,
-      handleConversationDeliveryFailure, handleControlDeliveryFailure,
-      waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
-      markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
-      getNextPendingForInstances, getPendingTargetInstancesNeedingWake,
+    multi = {
+      processWithMultiSession,
+      getNextPendingForInstances,
+      getPendingTargetInstancesNeedingWake,
       getNextPendingControlForInstances,
-      markRejected, markControlRejected,
-    });
+      markRejected,
+      markControlRejected,
+    };
   } catch (e) {
-    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session error: ${e.message}`);
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session module load error: ${e.message}`);
     // Fall through to single-session logic below
   }
 
-  maybeCleanupControlQueue();
-  const timedOut = expireTimedOutControls();
-  if (timedOut > 0) {
-    log(`Control timeout sweep marked ${timedOut} record(s) as timeout`);
+  if (multi) {
+    try {
+      const result = await multi.processWithMultiSession({
+        getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+        releaseItem, isBypassState, shouldAutoAckHeartbeat,
+        handleConversationDeliveryFailure, handleControlDeliveryFailure,
+        waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+        markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
+        sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
+        getNextPendingForInstances: multi.getNextPendingForInstances,
+        getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
+        getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
+        markRejected: multi.markRejected,
+        markControlRejected: multi.markControlRejected,
+        notifyMessageDelivered,
+      });
+      if (!result?.legacy) return result;
+      // legacy mode (no instances.json): fall through to single-session
+    } catch (e) {
+      log(`Multi-session dispatch error: ${e.message}`);
+      return { delivered: false, state: 'multi_error' };
+    }
   }
 
   const agentState = getAgentState();
@@ -886,6 +931,19 @@ async function main() {
   log('=== C4 Dispatcher Started ===');
   log(`Tmux session: ${TMUX_SESSION}`);
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);
+
+  // Reclaim rows a previous dispatcher left in 'running' (killed mid-delivery).
+  // Safe here: the singleton lock is held, so no other dispatcher owns a claim.
+  // Without this, a message claimed right before a SIGKILL/pm2 kill_timeout is
+  // invisible to every pending query forever — silent loss.
+  try {
+    const orphaned = resetOrphanedRunning();
+    if (orphaned.conversations > 0 || orphaned.controls > 0) {
+      log(`Reclaimed orphaned in-flight rows from a prior dispatcher: ${orphaned.conversations} conversation(s), ${orphaned.controls} control(s)`);
+    }
+  } catch (err) {
+    log(`Warning: orphaned-running reclaim failed: ${err.message}`);
+  }
 
   const pendingControl = getPendingControlCount();
   const pendingConversation = getPendingCount();

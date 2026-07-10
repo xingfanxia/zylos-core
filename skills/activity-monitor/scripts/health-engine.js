@@ -114,6 +114,9 @@ export class HealthEngine {
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
 
+    // In-flight async verify of a text-triggered auth_failed entry (tests await it)
+    this._authVerifyPromise = null;
+
     // Cold-start grace period: skip heartbeat processing during warmup (fork)
     this.warmupUntil = 0;
 
@@ -441,6 +444,18 @@ export class HealthEngine {
       return;
     }
 
+    // auth_failed is an upstream credential condition, same class as
+    // rate_limited: killing and restarting the session cannot fix it and just
+    // thrashes the pane. Recovery paths out of auth_failed: heartbeat ACK once
+    // credentials are restored (heartbeats bypass the health gate), the
+    // user-message-triggered probe (notifyUserMessage → runRecoveryProbe), the
+    // post-restart probe, and _verifyAuthFailedEntry's false-positive escape
+    // (live checkAuth OK → hang → restart) on each failed heartbeat.
+    if (this.healthState === 'auth_failed') {
+      this.deps.log(`Heartbeat recovery skipped in AUTH_FAILED state (${reason})`);
+      return;
+    }
+
     const now = Math.floor(Date.now() / 1000);
 
     if (this.healthState === 'ok') {
@@ -476,6 +491,40 @@ export class HealthEngine {
         this.enterRateLimited(rateLimit.cooldownUntil, rateLimit.resetTime);
         return;
       }
+    }
+
+    // Same dual-signal for auth failures: a heartbeat timing out because the
+    // session sits on a login screen used to be misclassified as 'unavailable'
+    // and entered an endless kill+restart loop (each restart lands on the same
+    // login screen). Behavioral signal = this heartbeat failure; text signal =
+    // auth-failure pane text. Enter auth_failed instead of killing.
+    // Pane text alone can false-positive (a genuinely HUNG agent whose pane
+    // echoes "not logged in" from tool output would otherwise be parked in
+    // auth_failed forever, since a hung agent never ACKs), so the flip is
+    // verified asynchronously with the adapter's live checkAuth() — a
+    // confirmed-good credential means this was a hang: resume kill+restart.
+    // (Intentionally NOT checked in rate_limited: the rate-limit branch above
+    // takes precedence there.)
+    if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState)) && this.deps.detectAuthFailure) {
+      const authFailure = this.deps.detectAuthFailure();
+      if (authFailure.detected) {
+        this.restartFailureCount = 0;
+        this.recoveringStartedAt = 0;
+        this.signalDetectedAt = 0;
+        this.setHealth('auth_failed', `${phase}_${status}:${authFailure.pattern || 'auth_text'}`);
+        this._authVerifyPromise = this._verifyAuthFailedEntry(`${phase}_${status}`);
+        return;
+      }
+    }
+
+    // Already auth_failed and another heartbeat failed: re-verify. This is the
+    // bounded escape for a hung-agent false positive whose first verify came
+    // back 'uncertain' (network flake) — every subsequent failed heartbeat
+    // re-runs the live probe until it resolves to broken creds (stay) or good
+    // creds (hang → restart).
+    if (this.healthState === 'auth_failed') {
+      this._authVerifyPromise = this._verifyAuthFailedEntry(`${phase}_${status}`);
+      return;
     }
 
     if (this.healthState === 'rate_limited') {
@@ -683,6 +732,29 @@ export class HealthEngine {
       return await this.deps.checkAuth();
     } catch (err) {
       return { status: 'failure', reason: err?.message || 'auth_check_failed' };
+    }
+  }
+
+  /**
+   * Verify a text-triggered auth_failed entry with the adapter's live checkAuth
+   * probe. Pane text alone can false-positive on a genuinely HUNG agent whose
+   * pane merely echoes auth-ish output ("gh auth status", curled API bodies) —
+   * and a hung agent never ACKs, so without this it would be parked in
+   * auth_failed forever. checkAuth 'success' = credentials are fine, the
+   * heartbeat failure was a real hang → resume normal kill+restart recovery.
+   * 'failure' confirms auth_failed. 'uncertain' stays put — every subsequent
+   * failed heartbeat re-runs this verify, and a live agent heals via ACK.
+   */
+  async _verifyAuthFailedEntry(reason) {
+    const result = await this._checkAuth();
+    if (this.healthState !== 'auth_failed') return; // recovered (ACK) or moved on meanwhile
+    if (result?.status === 'success') {
+      this.deps.log(`auth_failed was a text false positive (live checkAuth OK) — treating as hung session (${reason})`);
+      this.setHealth('unavailable', `${reason}:auth_text_false_positive`);
+      // Mirror triggerRecovery's from-ok bookkeeping: start the continuous-
+      // failure clock (it only sets this when transitioning from 'ok').
+      this.recoveringStartedAt = Math.floor(this.now() / 1000);
+      this.triggerRecovery(`${reason}:hung_with_auth_text`);
     }
   }
 

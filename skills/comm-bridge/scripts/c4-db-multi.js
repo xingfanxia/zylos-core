@@ -395,6 +395,88 @@ export function getConversationsByRangeForInstance(begin, end, instanceId) {
   `).all(begin, end, instanceId);
 }
 
+/**
+ * Find delivered-but-unanswered inbound user messages for an instance.
+ *
+ * A message can be marked 'delivered' (the dispatcher pasted keystrokes and
+ * verified the input box cleared) yet never actually be PROCESSED — if the
+ * instance was not-logged-in, frozen, or got restarted before acting on it.
+ * Such a message is then silently lost: on the next session it reappears only
+ * as passive RECENT-CONVERSATIONS context, not as something needing a reply
+ * (this is exactly how a group @-mention went unanswered on 2026-07-09). This
+ * surfaces those so session-init can flag them as ACTION-REQUIRED.
+ *
+ * "Unanswered" = no outbound row to the same chat (groupKeyFromEndpoint) with a
+ * later id. Scoped to the instance, replyable (endpoint_id not null), real
+ * channels only (void/system excluded), and only since the last checkpoint so
+ * once answered or summarized they drop off (no perpetual nagging).
+ *
+ * @param {string} instanceId
+ * @returns {object[]} unanswered inbound rows, chronological
+ */
+export function getUnansweredDeliveredForInstance(instanceId) {
+  const db = getDb();
+  const lastCheckpoint = db.prepare(
+    'SELECT end_conversation_id FROM checkpoints WHERE target_instance = ? ORDER BY id DESC LIMIT 1'
+  ).get(instanceId);
+  const afterId = lastCheckpoint?.end_conversation_id || 0;
+
+  const inbound = db.prepare(`
+    SELECT id, channel, endpoint_id, content, timestamp
+    FROM conversations
+    WHERE direction = 'in' AND status = 'delivered'
+      AND endpoint_id IS NOT NULL
+      AND target_instance = ?
+      AND channel NOT IN ('void', 'system')
+      AND id > ?
+    ORDER BY id ASC
+  `).all(instanceId, afterId);
+  if (inbound.length === 0) return [];
+
+  // Outbound rows from the earliest candidate onward tell us which chats have
+  // since been replied to (and how recently). Only rows that could plausibly be
+  // a real answer count:
+  //  - real channels only (a void handoff / system row is never a user reply)
+  //  - status != 'failed' (c4-send/broker mark rows whose channel send failed —
+  //    the user never received those, so they must not mask the inbound)
+  //  - not a health status-notice (the automated "please resend" auto-reply is
+  //    sent precisely BECAUSE the message wasn't processed — counting it as an
+  //    answer would hide exactly the messages this function exists to find)
+  // Keyed by channel+chat so a chat-id collision across channels (telegram
+  // numeric id vs another channel's prefix) can't cross-mask.
+  const outbound = db.prepare(`
+    SELECT id, channel, endpoint_id FROM conversations
+    WHERE direction = 'out' AND id >= ?
+      AND channel NOT IN ('void', 'system')
+      AND status != 'failed'
+      AND (delivery_action IS NULL OR delivery_action != 'status-notice')
+  `).all(inbound[0].id);
+  const lastReplyIdByChat = new Map();
+  for (const o of outbound) {
+    const chat = groupKeyFromEndpoint(o.endpoint_id);
+    if (!chat) continue;
+    const key = `${o.channel}:${chat}`;
+    const prev = lastReplyIdByChat.get(key) || 0;
+    if (o.id > prev) lastReplyIdByChat.set(key, o.id);
+  }
+
+  // Unanswered iff no outbound to this chat has a later id than the message.
+  //
+  // Known conservative limits (deliberate — reply provenance does not exist in
+  // the schema: an out-row does not say WHICH inbound it answers):
+  //  - per-chat granularity: a real later reply to the same chat also clears
+  //    earlier unanswered messages in that chat (two questions, one answer —
+  //    the earlier asker is not re-surfaced). Fixing this needs reply-to
+  //    metadata threaded through every channel send.
+  //  - checkpoint boundary: once Memory Sync summarizes past a message it is
+  //    treated as handled (the agent demonstrably saw it during sync).
+  return inbound.filter((m) => {
+    const chat = groupKeyFromEndpoint(m.endpoint_id);
+    if (!chat) return false;
+    return (lastReplyIdByChat.get(`${m.channel}:${chat}`) || 0) <= m.id;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Group-instance segmentation (pure — no DB)
 // ---------------------------------------------------------------------------

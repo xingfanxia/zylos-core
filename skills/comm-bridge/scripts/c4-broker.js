@@ -45,6 +45,7 @@ import {
   formatConversations,
   expireTimedOutControls,
   getDb,
+  markFailed,
   close as closeDb,
 } from './c4-db.js';
 import {
@@ -263,6 +264,13 @@ async function opSend(p, caller) {
   const channel = p.channel;
   const endpoint = p.endpoint ?? null;
   const content = p.content;
+  // Audit tag (e.g. 'status-notice' from c4-receive's unhealthy auto-reply) —
+  // must survive the broker hop or getUnansweredDeliveredForInstance counts the
+  // auto-reply as a real answer. Coerced to a short string; it only ever lands
+  // in the delivery_action audit column, never in routing decisions.
+  const deliveryAction = typeof p.deliveryAction === 'string' && p.deliveryAction
+    ? p.deliveryAction.slice(0, 64)
+    : null;
   const attachments = Array.isArray(p.attachments)
     ? p.attachments
     : (p.attachments ? [p.attachments] : []);
@@ -301,17 +309,29 @@ async function opSend(p, caller) {
   // SessionStart injection and inflate its unsummarized count (M3).
   let conversationId = null;
   try {
-    const row = insertConversation('out', channel, endpoint, content, null, 3, false, null, null);
+    const row = insertConversation('out', channel, endpoint, content, null, 3, false, deliveryAction, null);
     conversationId = row.id;
   } catch (e) {
     log(`WARN audit insert failed (${caller}): ${e.message}`);
   }
 
+  // On any send failure, mark the audit row failed: the user never received
+  // it, so it must not count as an answer for the unanswered-message re-surface
+  // (and the audit trail stays truthful).
+  const markAuditFailed = () => {
+    if (conversationId == null) return;
+    try { markFailed(conversationId); } catch (e) { log(`WARN audit markFailed(${conversationId}) failed: ${e.message}`); }
+  };
+
   const channelScript = path.join(SKILLS_DIR, channel, 'scripts', 'send.js');
-  if (!fs.existsSync(channelScript)) return { ok: false, error: `channel_script_missing:${channelScript}` };
+  if (!fs.existsSync(channelScript)) {
+    markAuditFailed();
+    return { ok: false, error: `channel_script_missing:${channelScript}` };
+  }
 
   const code = await spawnSend(channelScript, endpoint, content);
   if (code === 0) return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
+  markAuditFailed();
   return { ok: false, error: `channel_send_failed:exit_${code}`, data: { conversation_id: conversationId } };
 }
 
