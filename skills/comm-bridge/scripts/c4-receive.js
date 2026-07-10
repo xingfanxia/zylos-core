@@ -25,6 +25,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const ROUTER_IPC_TIMEOUT_MS = 30000;
+
+/**
+ * Resolve the TARGET instance's AM socket + status file for the route query.
+ * The query must reach the instance that will answer the message — asking the
+ * global/admin AM "are you healthy?" about someone else's session meant a
+ * rate_limited/auth_failed instance NEVER received notifyUserMessage, so user
+ * messages could not trigger its recovery and sat pending forever (2026-07-10
+ * incident: group parked rate_limited 5h past its cooldown while users
+ * re-@-ed the bot). Falls back to the global paths in single-session mode or
+ * when instance resolution is unavailable.
+ */
+async function resolveInstanceMonitorPaths(targetInstance) {
+  if (targetInstance) {
+    try {
+      const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+      const dir = getMonitorDir(targetInstance);
+      if (dir) {
+        return { socketPath: path.join(dir, 'am.sock'), statusFile: path.join(dir, 'agent-status.json') };
+      }
+    } catch { /* single-session / module unavailable */ }
+  }
+  return { socketPath: AM_SOCKET_PATH, statusFile: AGENT_STATUS_FILE };
+}
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
@@ -93,16 +116,16 @@ function parseArgs(args) {
   return result;
 }
 
-function readHealthStatusFile() {
+function readHealthStatusFile(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!fs.existsSync(AGENT_STATUS_FILE)) {
+    if (!fs.existsSync(statusFile)) {
       return { health: 'ok' };
     }
     let status = null;
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        status = JSON.parse(fs.readFileSync(AGENT_STATUS_FILE, 'utf8'));
+        status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
         break;
       } catch (err) {
         lastErr = err;
@@ -138,8 +161,8 @@ function buildFallbackMessage(status) {
   return "I'm temporarily unavailable but should be back shortly. Please try again in a moment!";
 }
 
-function fallbackFileRoute() {
-  const status = readHealthStatusFile();
+function fallbackFileRoute(statusFile = AGENT_STATUS_FILE) {
+  const status = readHealthStatusFile(statusFile);
   const health = publicHealth(status?.health);
   if (!status || typeof status.health !== 'string' || health === 'ok') {
     return { recovered: true, health: 'ok', fallback: true };
@@ -153,9 +176,9 @@ function fallbackFileRoute() {
   };
 }
 
-function ipcRoute(request) {
+function ipcRoute(request, socketPath = AM_SOCKET_PATH) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(AM_SOCKET_PATH);
+    const socket = net.createConnection(socketPath);
     let data = '';
     let settled = false;
 
@@ -203,7 +226,9 @@ function isValidRouteDecision(decision, noReply) {
   return typeof decision.userMessage === 'string' && decision.userMessage.length > 0;
 }
 
-async function queryRoute(channel, endpoint, noReply) {
+async function queryRoute(channel, endpoint, noReply, monitorPaths = null) {
+  const socketPath = monitorPaths?.socketPath ?? AM_SOCKET_PATH;
+  const statusFile = monitorPaths?.statusFile ?? AGENT_STATUS_FILE;
   try {
     const decision = await ipcRoute({
       version: 1,
@@ -213,13 +238,13 @@ async function queryRoute(channel, endpoint, noReply) {
       endpoint,
       noReply,
       receivedAt: Date.now()
-    });
+    }, socketPath);
     if (!isValidRouteDecision(decision, noReply)) {
       throw new Error('IPC response invalid route decision');
     }
     return decision;
   } catch {
-    return fallbackFileRoute();
+    return fallbackFileRoute(statusFile);
   }
 }
 
@@ -353,13 +378,11 @@ async function main() {
     }
   }
 
-  // Health check via AM v3 message-router IPC (with file fallback).
-  // Replaces the old inline readHealthStatus() / recordPendingChannel pattern —
-  // those helpers were removed in v0.4.13; the AM router now owns recovery routing.
-  const route = await queryRoute(channel, endpoint, noReply);
-  // Resolve target instance for multi-session routing (fork extension).
-  // Uses the raw endpoint: instance routing is orthogonal to replyability —
-  // a --no-reply message still routes to the endpoint's instance.
+  // Resolve target instance FIRST for multi-session routing (fork extension) —
+  // the health/route query below must be addressed to the TARGET instance's
+  // Activity Monitor, not the global/admin one. Uses the raw endpoint:
+  // instance routing is orthogonal to replyability — a --no-reply message
+  // still routes to the endpoint's instance.
   let targetInstance = explicitTargetInstance;
   if (!targetInstance) {
     try {
@@ -367,6 +390,13 @@ async function main() {
       targetInstance = resolveInstance(endpoint);
     } catch { /* instance router not available */ }
   }
+
+  // Health check via AM v3 message-router IPC (with file fallback), against
+  // the target instance's own am.sock / status file. This is what lets a user
+  // message trigger a rate_limited/auth_failed instance's recovery probe
+  // (notifyUserMessage) — routed at the global AM it never reached them.
+  const monitorPaths = await resolveInstanceMonitorPaths(targetInstance);
+  const route = await queryRoute(channel, endpoint, noReply, monitorPaths);
 
   // Clean-store model (#618): the DB keeps content exactly as received; reply
   // routing is reconstructed at delivery (dispatcher getDeliveryContent) and

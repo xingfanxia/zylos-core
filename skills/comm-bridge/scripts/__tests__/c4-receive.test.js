@@ -723,3 +723,54 @@ describe('c4-receive fail-open', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// per-instance route targeting (2026-07-10 incident: rate_limited instance
+// never received notifyUserMessage because the route query hit the global AM)
+// ---------------------------------------------------------------------------
+describe('c4-receive per-instance route targeting', () => {
+  it('sends the route query to the TARGET instance am.sock, not the global one', async () => {
+    await withTmpDirAsync(async ({ tmpDir, env }) => {
+      // instances.json maps chat oc_inst to instance 'user-x' with its own state_dir.
+      const stateDir = path.join(tmpDir, 'state', 'user-x');
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.mkdirSync(path.join(tmpDir, '.claude', 'skills', 'feishu'), { recursive: true });
+      fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({
+        version: 1,
+        instances: {
+          admin: { primary: true, tmux_session: 'claude-main' },
+          'user-x': { tmux_session: 'claude-x', state_dir: stateDir, chat_ids: ['oc_inst'] },
+        },
+      }));
+
+      // Route server on the INSTANCE socket only — no global am.sock exists.
+      const instSocket = path.join(stateDir, 'am.sock');
+      const seen = [];
+      const server = net.createServer((socket) => {
+        let data = '';
+        socket.on('data', (chunk) => {
+          data += chunk;
+          if (!data.includes('\n')) return;
+          const request = JSON.parse(data.slice(0, data.indexOf('\n')));
+          seen.push(request);
+          socket.write(`${JSON.stringify({ version: 1, requestId: request.requestId, recovered: true, health: 'ok' })}\n`);
+        });
+      });
+      await new Promise((resolve, reject) => { server.once('error', reject); server.listen(instSocket, resolve); });
+
+      try {
+        const r = await cliRawAsync([
+          '--channel', 'feishu',
+          '--endpoint', 'oc_inst|type:group|msg:om_1',
+          '--json', '--content', 'route me to my own AM',
+        ], env);
+        assert.equal(r.status, 0);
+        assert.equal(parseJsonStdout(r.stdout).ok, true);
+        assert.equal(seen.length, 1, 'route query must reach the instance socket');
+        assert.equal(seen[0].type, 'route');
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+  });
+});
