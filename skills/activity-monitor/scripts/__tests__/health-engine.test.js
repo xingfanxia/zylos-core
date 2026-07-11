@@ -291,9 +291,15 @@ describe('HealthEngine', () => {
       assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
     });
 
-    it('retries indefinitely in recovering state (no max failures)', () => {
+    it('retries indefinitely in recovering state below the flap ceiling (no max failures)', () => {
       const { deps, calls } = createMockDeps();
-      const engine = new HeartbeatEngine(deps, { initialHealth: 'recovering', downDegradeThreshold: 999999 });
+      // High ceiling: this test pins "no maxRestartFailures cap / no DOWN
+      // degradation"; the flap-escalation describe covers the cycle ceiling.
+      const engine = new HeartbeatEngine(deps, {
+        initialHealth: 'recovering',
+        downDegradeThreshold: 999999,
+        flapCeilingPerHour: 100,
+      });
 
       // Simulate 20 failures — should stay in recovering (not down)
       for (let i = 0; i < 20; i++) {
@@ -993,6 +999,266 @@ describe('HealthEngine', () => {
 
       assert.deepStrictEqual(calls.enqueueHeartbeat, []);
     });
+
+    it('keeps recovery backoff and cycle window mid-flap (reset only on functional ACK)', () => {
+      const { deps } = createMockDeps();
+      const nowSec = 500_000;
+      const engine = new HeartbeatEngine(deps, { now: () => nowSec * 1000 });
+
+      engine.triggerRecovery('heartbeat_timeout'); // cycle 1 of a flap
+      assert.equal(engine.restartFailureCount, 1);
+      const lastRecoveryAt = engine.lastRecoveryAt;
+
+      engine.onProcessRestarted(nowSec + 10);
+
+      assert.equal(engine.restartFailureCount, 1, 'guardian restart must not reset the failure count mid-flap');
+      assert.equal(engine.lastRecoveryAt, lastRecoveryAt);
+      assert.equal(engine.restartCycleTimestamps.length, 1);
+      assert.ok(engine.postRestartProbeTimer, 'post-restart probe must still be scheduled');
+      engine.destroy();
+    });
+  });
+
+  describe('flap escalation ceiling (degraded)', () => {
+    function createFlapEngine({ nowRef, options = {} } = {}) {
+      const { deps, calls } = createMockDeps();
+      calls.degradedAlerts = [];
+      deps.notifyDegraded = (details) => calls.degradedAlerts.push(details);
+      const engine = new HeartbeatEngine(deps, {
+        now: () => nowRef.value * 1000,
+        ...options,
+      });
+      return { engine, deps, calls };
+    }
+
+    // Reproduces the group incident loop: every heartbeat times out (agent parks
+    // alive on a login screen), the guardian relaunches after each kill, ~127s cadence.
+    function runFlapCycles(engine, nowRef, cycles, stepSec = 127) {
+      for (let i = 0; i < cycles; i++) {
+        engine.onHeartbeatFailure({ phase: 'recovery' }, 'timeout');
+        nowRef.value += stepSec;
+      }
+    }
+
+    it('enters degraded at the flap ceiling, stops killing, and alerts exactly once', () => {
+      const nowRef = { value: 1_000_000 };
+      const { engine, calls } = createFlapEngine({ nowRef });
+
+      runFlapCycles(engine, nowRef, 6);
+      assert.equal(calls.killTmuxSession, 6);
+      assert.equal(engine.health, 'unavailable');
+      assert.equal(calls.degradedAlerts.length, 0);
+      assert.equal(engine.restartCycleTimestamps.length, 6);
+
+      // 7th kill-restart cycle in the rolling hour trips the ceiling (default 6).
+      engine.onHeartbeatFailure({ phase: 'recovery' }, 'timeout');
+      assert.equal(engine.health, 'degraded');
+      assert.equal(calls.killTmuxSession, 6, 'the tripping cycle must not kill again');
+      assert.equal(calls.degradedAlerts.length, 1);
+      assert.equal(calls.degradedAlerts[0].cycleCount, 7);
+      assert.equal(calls.degradedAlerts[0].ceiling, 6);
+
+      // Further recovery triggers are short-circuited: no kills, no repeat alert.
+      engine.triggerRecovery('still_flapping');
+      assert.equal(calls.killTmuxSession, 6);
+      assert.equal(calls.degradedAlerts.length, 1);
+      assert.equal(engine.health, 'degraded');
+    });
+
+    it('prunes cycles older than the rolling hour window (slow failures never degrade)', () => {
+      const nowRef = { value: 2_000_000 };
+      const { engine, calls } = createFlapEngine({ nowRef });
+
+      runFlapCycles(engine, nowRef, 6, 700); // 6 cycles spread over ~70min
+      nowRef.value += 3600; // everything ages out
+      engine.onHeartbeatFailure({ phase: 'recovery' }, 'timeout');
+
+      assert.equal(engine.health, 'unavailable');
+      assert.equal(calls.degradedAlerts.length, 0);
+      assert.ok(engine.restartCycleTimestamps.length < 7);
+    });
+
+    it('functional heartbeat ACK resets the cycle window; a fresh episode re-alerts', () => {
+      const nowRef = { value: 3_000_000 };
+      const { engine, deps, calls } = createFlapEngine({ nowRef });
+
+      runFlapCycles(engine, nowRef, 7);
+      assert.equal(engine.health, 'degraded');
+
+      deps._pending = { control_id: 5, phase: 'recovery', created_at: nowRef.value };
+      deps._heartbeatStatus = 'done';
+      engine.processHeartbeat(true, nowRef.value);
+
+      assert.equal(engine.health, 'ok');
+      assert.equal(engine.restartCycleTimestamps.length, 0);
+      assert.equal(engine.lastDegradedProbeAt, 0);
+
+      deps._pending = null;
+      deps._heartbeatStatus = 'pending';
+      runFlapCycles(engine, nowRef, 7);
+      assert.equal(engine.health, 'degraded');
+      assert.equal(calls.degradedAlerts.length, 2);
+    });
+
+    it('self-probes after degraded_probe_interval with zero user traffic and recovers on ACK', async () => {
+      const nowRef = { value: 4_000_000 };
+      const { engine, deps, calls } = createFlapEngine({
+        nowRef,
+        options: { degradedProbeInterval: 1200, postRestartProbeDelayMs: 0 },
+      });
+      deps.enqueueHeartbeat = (phase) => {
+        calls.enqueueHeartbeat.push(phase);
+        deps._pending = { control_id: 8, phase, created_at: nowRef.value };
+        return true;
+      };
+
+      runFlapCycles(engine, nowRef, 7);
+      assert.equal(engine.health, 'degraded');
+      deps._pending = null;
+
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), false);
+      nowRef.value += 1200;
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), true);
+
+      // Guardian relaunches once for the probe window → post-restart probe → ACK → ok.
+      const enqueuesBefore = calls.enqueueHeartbeat.length;
+      deps._heartbeatStatus = 'done';
+      engine.onProcessRestarted(nowRef.value);
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), false, 'relaunch consumes the probe window');
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      assert.equal(calls.enqueueHeartbeat.length, enqueuesBefore + 1);
+      assert.equal(engine.health, 'ok');
+      assert.equal(engine.restartCycleTimestamps.length, 0);
+      engine.destroy();
+    });
+
+    it('a failed degraded probe kills the session once and stays degraded until the next window', async () => {
+      const nowRef = { value: 5_000_000 };
+      const { engine, deps, calls } = createFlapEngine({
+        nowRef,
+        options: { degradedProbeInterval: 1200, postRestartProbeDelayMs: 0 },
+      });
+      deps.enqueueHeartbeat = (phase) => {
+        calls.enqueueHeartbeat.push(phase);
+        deps._pending = { control_id: 9, phase, created_at: nowRef.value };
+        return true;
+      };
+
+      runFlapCycles(engine, nowRef, 7);
+      deps._pending = null;
+      const killsAtDegrade = calls.killTmuxSession;
+
+      nowRef.value += 1200;
+      deps._heartbeatStatus = 'timeout';
+      engine.onProcessRestarted(nowRef.value);
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      assert.equal(engine.health, 'degraded');
+      assert.equal(calls.killTmuxSession, killsAtDegrade + 1, 'exactly one kill per failed probe window');
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), false, 'next probe waits a full interval');
+
+      // The maintenance loop stays quiescent while degraded (no extra heartbeats/kills).
+      const enqueues = calls.enqueueHeartbeat.length;
+      deps._pending = null;
+      engine.lastHeartbeatAt = 0;
+      engine.processHeartbeat(true, nowRef.value + 600);
+      assert.equal(calls.enqueueHeartbeat.length, enqueues);
+      assert.equal(calls.killTmuxSession, killsAtDegrade + 1);
+      engine.destroy();
+    });
+
+    it('notifyUserMessage while degraded makes the self-probe immediately due', () => {
+      const nowRef = { value: 6_000_000 };
+      const { engine } = createFlapEngine({ nowRef });
+
+      runFlapCycles(engine, nowRef, 7);
+      assert.equal(engine.health, 'degraded');
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), false);
+
+      const result = engine.notifyUserMessage(nowRef.value);
+
+      assert.equal(result, true);
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), true);
+    });
+
+    it('degraded entered with the session ALIVE self-probes via maintenance and recovers on ACK', () => {
+      // The ceiling trips BEFORE a kill, so the last flap session is still
+      // parked alive (login screen) — the dominant prod entry mode. The
+      // guardian's probe window only exists on the not-running path, so the
+      // maintenance cycle must drive the probe here.
+      const nowRef = { value: 7_000_000 };
+      const { engine, deps, calls } = createFlapEngine({
+        nowRef,
+        options: { degradedProbeInterval: 1200 },
+      });
+      deps.enqueueHeartbeat = (phase) => {
+        calls.enqueueHeartbeat.push(phase);
+        deps._pending = { control_id: 11, phase, created_at: nowRef.value };
+        return true;
+      };
+      deps.clearHeartbeatPending = () => {
+        calls.clearHeartbeatPending++;
+        deps._pending = null;
+      };
+
+      runFlapCycles(engine, nowRef, 7);
+      assert.equal(engine.health, 'degraded');
+      deps._pending = null;
+
+      // No probe before the interval elapses.
+      engine.runMaintenanceCycle(true, nowRef.value);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, []);
+
+      nowRef.value += 1200;
+      deps._heartbeatStatus = 'done';
+      engine.runMaintenanceCycle(true, nowRef.value); // enqueues the probe
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+
+      engine.runMaintenanceCycle(true, nowRef.value + 1); // processes the ACK
+      assert.equal(engine.health, 'ok');
+      assert.equal(engine.restartCycleTimestamps.length, 0);
+      assert.equal(calls.killTmuxSession, 6, 'no SessionStart burn when the alive session ACKs');
+    });
+
+    it('degraded-alive probe timeout kills once, stays degraded; next window opens the guardian path', () => {
+      const nowRef = { value: 8_000_000 };
+      const { engine, deps, calls } = createFlapEngine({
+        nowRef,
+        options: { degradedProbeInterval: 1200 },
+      });
+      deps.enqueueHeartbeat = (phase) => {
+        calls.enqueueHeartbeat.push(phase);
+        deps._pending = { control_id: 12, phase, created_at: nowRef.value };
+        return true;
+      };
+      deps.clearHeartbeatPending = () => {
+        calls.clearHeartbeatPending++;
+        deps._pending = null;
+      };
+
+      runFlapCycles(engine, nowRef, 7);
+      const killsAtDegrade = calls.killTmuxSession;
+      deps._pending = null;
+
+      nowRef.value += 1200;
+      deps._heartbeatStatus = 'timeout';
+      engine.runMaintenanceCycle(true, nowRef.value); // probe enqueued, window consumed
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), false, 'window consumed at enqueue');
+
+      // Ack deadline expires → exactly one kill, stay degraded.
+      engine.runMaintenanceCycle(true, nowRef.value + 1);
+      assert.equal(engine.health, 'degraded');
+      assert.equal(calls.killTmuxSession, killsAtDegrade + 1);
+
+      // Session now dead: maintenance stays quiescent, and the NEXT window is
+      // consumed by the guardian relaunch path (covered by the probe tests).
+      engine.runMaintenanceCycle(false, nowRef.value + 2);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+      nowRef.value += 1200;
+      assert.equal(engine.isDegradedProbeDue(nowRef.value), true);
+    });
   });
 
   describe('setHealth', () => {
@@ -1101,7 +1367,7 @@ describe('HealthEngine', () => {
       assert.equal(calls.killTmuxSession, 0);
     });
 
-    it('keeps session alive and waits for recovery trigger when cooldown expires', () => {
+    it('keeps session alive and enqueues one recovery probe when cooldown expires', () => {
       const { deps, calls } = createMockDeps();
       const engine = new HeartbeatEngine(deps);
 
@@ -1111,19 +1377,74 @@ describe('HealthEngine', () => {
       assert.equal(calls.killTmuxSession, 0);
       assert.equal(engine.health, 'rate_limited');
       assert.equal(engine.cooldownUntil, 0);
-      assert.ok(calls.log.some(m => m.includes('waiting for next recovery trigger')));
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+      assert.ok(calls.log.some(m => m.includes('probing to verify recovery')));
     });
 
-    it('expires rate-limit cooldown without a monitor tick and keeps session alive', async () => {
+    it('expires rate-limit cooldown without a monitor tick; next running tick probes', async () => {
       const { deps, calls } = createMockDeps();
       const engine = new HeartbeatEngine(deps, { now: () => 1000 });
 
       engine.enterRateLimited(1, '7am');
       await new Promise(resolve => setTimeout(resolve, 0));
 
+      // Timer expiry clears the cooldown but does not probe (probes need a
+      // running agent and fire from the maintenance cycle).
       assert.equal(calls.killTmuxSession, 0);
       assert.equal(engine.health, 'rate_limited');
       assert.equal(engine.cooldownUntil, 0);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, []);
+
+      engine.processHeartbeat(true, 2);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+      assert.equal(calls.killTmuxSession, 0);
+    });
+
+    it('throttles the expiry probe with the rate_limit_probe_interval floor and retries later', () => {
+      const { deps, calls } = createMockDeps();
+      let nowSec = 10_000;
+      const engine = new HeartbeatEngine(deps, {
+        now: () => nowSec * 1000,
+        rateLimitProbeInterval: 900,
+      });
+
+      engine.enterRateLimited(nowSec + 100, '7am');
+      engine.lastRecoveryAt = nowSec - 50; // a probe ran 50s ago (< 900s floor)
+      nowSec += 101;
+      engine.processHeartbeat(true, nowSec);
+
+      assert.equal(engine.cooldownUntil, 0);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, []);
+
+      // Once the floor elapses, the maintenance cycle retries the probe on its own
+      // (zero user traffic — this is the self-driven recovery path).
+      nowSec += 900;
+      engine.processHeartbeat(true, nowSec);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+      assert.equal(calls.killTmuxSession, 0);
+    });
+
+    it('re-extends cooldown when the expiry probe still sees the rate limit', () => {
+      const { deps, calls } = createMockDeps();
+      let nowSec = 20_000;
+      deps.detectRateLimit = () => ({ detected: true, cooldownUntil: nowSec + 3600, resetTime: '9am' });
+      deps.enqueueHeartbeat = (phase) => {
+        calls.enqueueHeartbeat.push(phase);
+        deps._pending = { control_id: 3, phase, created_at: nowSec };
+        return true;
+      };
+      deps._heartbeatStatus = 'failed';
+      const engine = new HeartbeatEngine(deps, { now: () => nowSec * 1000 });
+
+      engine.enterRateLimited(nowSec + 10, '8am');
+      nowSec += 11;
+      engine.processHeartbeat(true, nowSec);
+
+      assert.deepStrictEqual(calls.enqueueHeartbeat, ['recovery']);
+      assert.equal(engine.health, 'rate_limited');
+      assert.equal(engine.cooldownUntil, nowSec + 3600);
+      assert.equal(calls.killTmuxSession, 0);
+      engine.destroy();
     });
 
     it('recovers to ok on heartbeat success after rate limit', () => {

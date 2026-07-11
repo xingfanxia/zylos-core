@@ -249,6 +249,9 @@ describe('processWithMultiSession — per-instance delivery notify', () => {
     assert.equal(res.delivered, true);
     assert.deepEqual(claims, [1, 2], 'each item claimed exactly once — no spin on the suspended item');
     assert.deepEqual(released, [1], 'suspended item released back at cycle end');
+    // The heartbeat reads these to report WHY nothing (or only some) shipped.
+    assert.equal(res.held, 1);
+    assert.deepEqual(res.heldReasons, { suspended: 1 });
   });
 
   it('signals legacy mode with legacy:true instead of a plain not-delivered result', () => {
@@ -268,5 +271,102 @@ describe('processWithMultiSession — per-instance delivery notify', () => {
     } finally {
       fs.rmSync(legacyDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('multiSessionDispatch — reasonCategory (held-reason accounting)', () => {
+  // The verbose `reason` string stays for logs; `reasonCategory` is the compact
+  // key the dispatcher heartbeat aggregates into a held breakdown.
+  it('tags a suspended requeue with reasonCategory=suspended', () => {
+    const r = disp.multiSessionDispatch(
+      { target_instance: 'user-betty', type: 'conversation' },
+      helpers({ state: 'suspended', health: 'ok' }),
+    );
+    assert.equal(r.action, 'requeue');
+    assert.equal(r.reasonCategory, 'suspended');
+  });
+
+  it('tags an offline skip with reasonCategory=offline', () => {
+    const r = disp.multiSessionDispatch(
+      { target_instance: 'user-betty', type: 'conversation' },
+      helpers({ state: 'offline', health: 'ok' }),
+    );
+    assert.equal(r.action, 'skip');
+    assert.equal(r.reasonCategory, 'offline');
+  });
+
+  it('tags an unhealthy skip with reasonCategory=unhealthy', () => {
+    const r = disp.multiSessionDispatch(
+      { target_instance: 'user-betty', type: 'conversation' },
+      helpers({ state: 'active', health: 'degraded' }),
+    );
+    assert.equal(r.action, 'skip');
+    assert.equal(r.reasonCategory, 'unhealthy');
+  });
+});
+
+describe('processWithMultiSession — held-reason accounting', () => {
+  // Minimal helper set that drives a claim queue with no real delivery. Held
+  // items stay 'running' during the cycle, so claimNextItem naturally returns
+  // null once the single queued item is held, ending the cycle in 'idle'.
+  function heldHelpers({ queue, agentStateByFile, released }) {
+    return {
+      getAgentState: agentStateByFile,
+      isStatusFresh: () => true,
+      sendToTmux: async () => 'submitted',
+      claimNextItem: () => queue.shift() || null,
+      releaseItem: (it) => released.push(it.id),
+      isBypassState: () => false,
+      shouldAutoAckHeartbeat: () => false,
+      handleConversationDeliveryFailure: async () => {},
+      handleControlDeliveryFailure: async () => {},
+      waitForRequireIdleSettlement: async () => {},
+      markDelivered: () => {},
+      ackControl: () => {},
+      readProcState: () => ({ alive: true }),
+      isAgentConfirmedActive: () => false,
+      log: () => {},
+      sleep: async () => {},
+      nowSeconds: () => 0,
+      getDeliveryContent: (i) => i.content,
+      markRejected: () => {},
+      markControlRejected: () => {},
+      getNextPendingForInstances: () => null,
+      getPendingTargetInstancesNeedingWake: () => [],
+      getNextPendingControlForInstances: () => null,
+      notifyMessageDelivered: () => Promise.resolve(),
+    };
+  }
+
+  // betty in the given state, every other instance healthy.
+  const bettyState = (state, health = 'ok') => (f) =>
+    (String(f).includes('user-betty')
+      ? { state, health, idleSeconds: 0 }
+      : { state: 'active', health: 'ok', idleSeconds: 0 });
+
+  it('reports held=1 heldReasons.unhealthy for a single unhealthy skip', async () => {
+    const released = [];
+    const queue = [{ id: 1, type: 'conversation', channel: 'feishu', target_instance: 'user-betty', content: 'a' }];
+    const res = await disp.processWithMultiSession(heldHelpers({ queue, agentStateByFile: bettyState('active', 'degraded'), released }));
+    assert.equal(res.delivered, false);
+    assert.equal(res.held, 1);
+    assert.deepEqual(res.heldReasons, { unhealthy: 1 });
+    assert.deepEqual(released, [1]);
+  });
+
+  it('reports heldReasons.offline for an offline skip', async () => {
+    const released = [];
+    const queue = [{ id: 2, type: 'conversation', channel: 'feishu', target_instance: 'user-betty', content: 'a' }];
+    const res = await disp.processWithMultiSession(heldHelpers({ queue, agentStateByFile: bettyState('offline'), released }));
+    assert.equal(res.held, 1);
+    assert.deepEqual(res.heldReasons, { offline: 1 });
+  });
+
+  it('reports heldReasons.suspended for a suspended requeue', async () => {
+    const released = [];
+    const queue = [{ id: 3, type: 'conversation', channel: 'feishu', target_instance: 'user-betty', content: 'a' }];
+    const res = await disp.processWithMultiSession(heldHelpers({ queue, agentStateByFile: bettyState('suspended'), released }));
+    assert.equal(res.held, 1);
+    assert.deepEqual(res.heldReasons, { suspended: 1 });
   });
 });

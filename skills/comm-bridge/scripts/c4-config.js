@@ -69,3 +69,15 @@ export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by se
 
 export const STALE_STATUS_THRESHOLD = 5000; // ms
 export const TMUX_MISSING_WARN_THRESHOLD = 30;
+
+// Dispatcher loop observability (WS-A / REL-2). Env-overridable following the
+// ZYLOS_DIR `process.env.X || default` idiom above.
+// HEARTBEAT_INTERVAL_MS: the dispatcher emits one `dispatcher alive: ...` line
+// per interval unconditionally, so a silent log means a dead/hung loop (the
+// 6h04m un-diagnosable silence on 2026-07-09 had no positive liveness signal).
+export const HEARTBEAT_INTERVAL_MS = Number(process.env.C4_HEARTBEAT_INTERVAL_MS) || 60000;
+// WATCHDOG_MAX_TICK_MS: defense-in-depth stuck-tick guard. Must exceed the
+// legitimate worst-case tick (waitForRequireIdleSettlement's 120s deadline plus
+// retry backoffs); 300s is safely above it. On expiry the dispatcher exits(1)
+// so pm2 autorestart reclaims it (resetOrphanedRunning recovers in-flight rows).
+export const WATCHDOG_MAX_TICK_MS = Number(process.env.C4_WATCHDOG_MAX_TICK_MS) || 300000;

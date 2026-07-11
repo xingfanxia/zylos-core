@@ -49,6 +49,21 @@ fakeChannel('web-console', 0);
 fakeChannel('telegram', 3);
 fakeChannel('shell', 0);
 
+// feishu is an allowlisted MESSAGING_CHANNEL; this fake appends one byte per
+// invocation to a log file so the attachment-readability tests (REL-5) can prove
+// whether the child send.js was spawned. It always exits 0 when it IS reached.
+const feishuSpawnLog = path.join(tmpDir, 'feishu-spawns.log');
+(function fakeFeishuChannel() {
+  const d = path.join(tmpDir, '.claude', 'skills', 'feishu', 'scripts');
+  fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, 'send.js'),
+    `const fs=require('fs');fs.appendFileSync(${JSON.stringify(feishuSpawnLog)}, 'x');process.exit(0);\n`);
+})();
+function feishuSpawnCount() {
+  try { return fs.readFileSync(feishuSpawnLog, 'utf8').length; }
+  catch { return 0; }
+}
+
 // ── Dynamic imports (now see the sandbox env) ───────────────────────
 const broker = await import('../c4-broker.js');
 const egress = await import('../egress-policy.js');
@@ -204,6 +219,103 @@ describe('broker handleRequest', () => {
     assert.match(r.error, /channel_send_failed/);
     const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
     assert.equal(row.status, 'failed');
+  });
+});
+
+// ── broker attachment readability gate (REL-5) ──────────────────────
+describe('broker attachment readability gate', () => {
+  // inst-a is authorized for 'chat-a-1'; feishu is allowlisted. The fake feishu
+  // send.js records each spawn so we can prove a doomed send is rejected BEFORE
+  // the child is spawned — the pre-gate behavior spawned it and let the failure
+  // crash deep inside the ReadStream 'error' path (the Elaine incident).
+
+  it('rejects a [MEDIA] path the broker cannot read (ENOENT) before spawning send.js', async () => {
+    const before = feishuSpawnCount();
+    const missing = path.join(tmpDir, 'no-such-attachment.png');
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${missing}` },
+    }, 'inst-a');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_unreadable/);
+    assert.match(r.error, /publish it under/); // actionable, self-correcting message
+    assert.equal(feishuSpawnCount(), before, 'send.js must NOT be spawned for an unreadable attachment');
+    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    assert.equal(row.status, 'failed', 'audit out-row must be marked failed');
+  });
+
+  it('does not leak the broker cwd for a relative [MEDIA] path (rev-security S3)', async () => {
+    // A relative path resolves against the broker's cwd; path.resolve() would
+    // prepend it, leaking the admin broker's cwd back to an isolated caller.
+    const rel = 'zzz-nonexistent-rel-dir/attachment.png';
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${rel}` },
+    }, 'inst-a');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_unreadable/);
+    assert.match(r.error, /publish it under/); // guidance text preserved
+    assert.ok(r.error.includes(rel), 'error should echo the path as the agent sent it');
+    assert.ok(!r.error.includes(process.cwd()), 'error must NOT contain the broker cwd');
+    assert.ok(!r.error.includes(path.resolve(rel)), 'error must NOT contain the cwd-resolved absolute path');
+    assert.equal(feishuSpawnCount(), before, 'send.js must NOT be spawned');
+  });
+
+  it('rejects a chmod-000 (EACCES) [MEDIA] file', async (t) => {
+    if (typeof process.getuid === 'function' && process.getuid() === 0) {
+      t.skip('running as root — DAC is bypassed, chmod-000 stays readable');
+      return;
+    }
+    const denied = path.join(tmpDir, 'secret-000.pdf');
+    fs.writeFileSync(denied, 'x');
+    fs.chmodSync(denied, 0o000);
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:file]${denied}` },
+    }, 'inst-a');
+    fs.chmodSync(denied, 0o644); // restore for cleanup regardless of assertions
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_unreadable/);
+    assert.equal(feishuSpawnCount(), before, 'send.js must NOT be spawned for an unreadable attachment');
+  });
+
+  it('regression: a readable /tmp attachment still spawns + delivers', async () => {
+    const readable = path.join(tmpDir, 'chart.png');
+    fs.writeFileSync(readable, 'imgbytes');
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${readable}` },
+    }, 'inst-a');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.data.sent, true);
+    assert.equal(feishuSpawnCount(), before + 1, 'readable attachment must reach the channel');
+  });
+
+  it('regression: a readable publish-dir-style attachment still delivers', async () => {
+    const pubDir = path.join(tmpDir, 'workspace', 'users', 'inst-a');
+    fs.mkdirSync(pubDir, { recursive: true });
+    const readable = path.join(pubDir, 'report.pdf');
+    fs.writeFileSync(readable, 'pdfbytes');
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:file]${readable}` },
+    }, 'inst-a');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(feishuSpawnCount(), before + 1);
+  });
+
+  it('non-media content is unaffected by the readability gate', async () => {
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: 'plain text, no attachment' },
+    }, 'inst-a');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(feishuSpawnCount(), before + 1);
   });
 });
 

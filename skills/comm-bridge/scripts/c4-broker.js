@@ -329,6 +329,37 @@ async function opSend(p, caller) {
     return { ok: false, error: `channel_script_missing:${channelScript}` };
   }
 
+  // REL-5: attachment readability gate. The spawned send.js child inherits the
+  // broker's uid/gid/supplementary groups, so a media path the broker itself
+  // cannot read fails DEEP inside the child (feishu's unguarded ReadStream
+  // 'error' crashes it; the incident's EACCES came from the God-daemon's stale
+  // supplementary groups, not a perms race) instead of being rejected up-front.
+  // accessSync from the broker predicts exactly what the child will see, so the
+  // gate is keyed on READABILITY, never a publish-dir path prefix — readable
+  // non-publish paths (e.g. /tmp/chart.png) stay allowed. Only the [MEDIA:] path
+  // is ever forwarded to the child (spawnSend passes `content`, not attachments),
+  // so that is the only path that can fail there and the only one we gate.
+  if (mediaPath) {
+    const resolved = path.resolve(mediaPath);
+    try {
+      fs.accessSync(resolved, fs.constants.R_OK);
+    } catch {
+      log(`ATTACHMENT UNREADABLE ${caller}: ${resolved}`);
+      markAuditFailed();
+      // Echo the path as the agent sent it. For a RELATIVE [MEDIA:] path,
+      // path.resolve() prepends the broker's cwd, which must not leak back to an
+      // isolated (possibly cross-tenant) caller (rev-security S3). accessSync
+      // above still uses the resolved path — it predicts the child's view — and
+      // the server-side log keeps the resolved path for ops (admin-only).
+      const shown = path.isAbsolute(mediaPath) ? resolved : mediaPath;
+      return {
+        ok: false,
+        error: `attachment_unreadable: broker cannot read ${shown}; publish it under ~/zylos/workspace/users/${caller}/ and resend`,
+        data: { conversation_id: conversationId },
+      };
+    }
+  }
+
   const code = await spawnSend(channelScript, endpoint, content);
   if (code === 0) return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
   markAuditFailed();

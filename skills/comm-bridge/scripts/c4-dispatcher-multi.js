@@ -40,6 +40,20 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
  */
 const MAX_SKIP_ATTEMPTS = 10;
 
+// Lifecycle events (wake/suspend/auto-start) fire from module-level functions
+// that don't receive the injected dispatcher `log`, so they use these local
+// timestamped wrappers — mirroring c4-dispatcher.js log(). In the incident the
+// reap lines were untimestamped, which degraded forensic timeline reconstruction.
+function ts() {
+  return new Date().toISOString().replace('T', ' ').substring(0, 19);
+}
+function tsLog(message) {
+  console.log(`[${ts()}] ${message}`);
+}
+function tsError(message) {
+  console.error(`[${ts()}] ${message}`);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Lifecycle functions
 // ─────────────────────────────────────────────────────────────────────────
@@ -59,7 +73,7 @@ export function writeWakeSignal(instanceId, zylosDir) {
     writeFileSync(path.join(dir, 'wake-signal'), new Date().toISOString());
   } catch (err) {
     // Best-effort — log but do not throw.
-    console.error(`[dispatcher-multi] Failed to write wake-signal for ${instanceId}: ${err.message}`);
+    tsError(`[dispatcher-multi] Failed to write wake-signal for ${instanceId}: ${err.message}`);
   }
 }
 
@@ -99,7 +113,7 @@ export function requestInstanceStart(instDef) {
 
   writeWakeSignal(instDef.id);
   autoStartedAt.set(instDef.id, Date.now());
-  console.log(`[dispatcher-multi] Requested start for instance '${instDef.id}' via wake signal`);
+  tsLog(`[dispatcher-multi] Requested start for instance '${instDef.id}' via wake signal`);
   return true;
 }
 
@@ -117,9 +131,9 @@ export function requestInstanceStop(instanceId) {
     writeFileSync(path.join(dir, 'suspend-signal'), new Date().toISOString());
     lastDeliveryAt.delete(instanceId);
     autoStartedAt.delete(instanceId);
-    console.log(`[dispatcher-multi] Requested stop for idle instance '${instanceId}' via suspend signal`);
+    tsLog(`[dispatcher-multi] Requested stop for idle instance '${instanceId}' via suspend signal`);
   } catch (err) {
-    console.error(`[dispatcher-multi] Failed to write suspend signal for '${instanceId}': ${err.message}`);
+    tsError(`[dispatcher-multi] Failed to write suspend signal for '${instanceId}': ${err.message}`);
   }
 }
 
@@ -127,8 +141,14 @@ export function requestInstanceStop(instanceId) {
  * Reap idle instances that opted into auto-suspend. Only instances with
  * `auto_suspend: true` are eligible (never the primary), and the idle window is
  * the instance's own `idle_timeout_min` (falling back to the 30-min default) —
- * NOT a single hardcoded timeout. Called once per dispatch cycle. ZY-LIFE-1: the
- * guardian now honors the resulting suspend-signal, so this actually suspends.
+ * NOT a single hardcoded timeout. Called once per dispatch cycle.
+ *
+ * SCOPE TODAY (REL-9): the suspend-signal this writes only gates the guardian's
+ * RELAUNCH of an instance whose session has already exited — it does NOT stop a
+ * running session, and the signal's short TTL means it lapses before it can
+ * meaningfully hold an instance down. So reap-based auto_suspend is effectively
+ * inert right now; making reap actually suspend live idle sessions is deferred
+ * to REL-9.
  */
 export function reapIdleInstances() {
   const now = Date.now();
@@ -282,7 +302,7 @@ export function multiSessionDispatch(item, helpers) {
   // 2. Suspended instance → wake + requeue.
   if (claudeState.state === 'suspended' && targetInstance && !bypass) {
     writeWakeSignal(targetInstance);
-    return { action: 'requeue', reason: `instance '${targetInstance}' is suspended — wake signal written` };
+    return { action: 'requeue', reason: `instance '${targetInstance}' is suspended — wake signal written`, reasonCategory: 'suspended' };
   }
 
   // 3. Offline / stopped → auto-start non-primary, skip primary.
@@ -291,14 +311,14 @@ export function multiSessionDispatch(item, helpers) {
     if (def && !def.primary) {
       // Signal the AM to start this instance, then skip (message retried on next poll)
       requestInstanceStart({ ...def, id: targetInstance });
-      return { action: 'skip', reason: `instance '${targetInstance}' offline, wake signal sent` };
+      return { action: 'skip', reason: `instance '${targetInstance}' offline, wake signal sent`, reasonCategory: 'offline' };
     }
-    return { action: 'skip', reason: `instance target offline (state=${claudeState.state})` };
+    return { action: 'skip', reason: `instance target offline (state=${claudeState.state})`, reasonCategory: 'offline' };
   }
 
   // 5. Unhealthy → skip.
   if (claudeState.health !== 'ok' && !bypass) {
-    return { action: 'skip', reason: `instance unhealthy (health=${claudeState.health})` };
+    return { action: 'skip', reason: `instance unhealthy (health=${claudeState.health})`, reasonCategory: 'unhealthy' };
   }
 
   // 6. Deliverable.
@@ -438,13 +458,22 @@ export async function processWithMultiSession(helpers) {
   // — including ack-waiting controls, which deliberately STAY 'running' until
   // the agent acks and must never be requeued by the finally.
   const heldItems = [];
+  const heldReasons = {};
   let inFlight = null;
+
+  // Additive result summary so the dispatcher heartbeat can report WHY nothing
+  // (or only some) shipped this tick. Existing callers read only .delivered /
+  // .state / .legacy — held / heldReasons are ignored by them.
+  const summarize = (result) => ({ ...result, held: heldItems.length, heldReasons: { ...heldReasons } });
+  const noteHeld = (category) => { heldReasons[category] = (heldReasons[category] || 0) + 1; };
 
   try {
     for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
       const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
       if (!item) {
-        return { delivered: false, state: 'idle' };
+        // No claimable item left — but items held earlier this cycle are still
+        // in `running` (released in finally), so surface their reasons.
+        return summarize({ delivered: false, state: 'idle' });
       }
       inFlight = item;
 
@@ -469,6 +498,7 @@ export async function processWithMultiSession(helpers) {
       // block releases it back to pending at cycle end — same requeue effect.)
       if (decision.action === 'requeue') {
         heldItems.push(item);
+        noteHeld(decision.reasonCategory);
         inFlight = null;
         log(`Held for requeue ${item.type} id=${item.id}: ${decision.reason}`);
         continue;
@@ -477,6 +507,7 @@ export async function processWithMultiSession(helpers) {
       // ── skip ── (hold in running state to prevent re-claim in this cycle)
       if (decision.action === 'skip') {
         heldItems.push(item);
+        noteHeld(decision.reasonCategory);
         inFlight = null;
         continue;
       }
@@ -489,6 +520,7 @@ export async function processWithMultiSession(helpers) {
       // Hold the item to prevent re-claim, then continue to try other items.
       if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
         heldItems.push(item);
+        noteHeld('require_idle');
         inFlight = null;
         continue;
       }
@@ -505,7 +537,7 @@ export async function processWithMultiSession(helpers) {
           ackControl(item.id);
           inFlight = null;
           log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}${requireIdleWaiting ? ' (require_idle waiting)' : ''}`);
-          return { delivered: true, state: claudeState.state };
+          return summarize({ delivered: true, state: claudeState.state });
         }
       }
 
@@ -530,12 +562,12 @@ export async function processWithMultiSession(helpers) {
             lastDeliveryAt.set(targetInstance, Date.now());
             autoStartedAt.delete(targetInstance);
           }
-          return { delivered: true, state: claudeState.state };
+          return summarize({ delivered: true, state: claudeState.state });
         } catch (err) {
           log(`Keystroke delivery error: ${err.message}`);
           await handleControlDeliveryFailure(item, `KEYSTROKE_ERROR: ${err.message}`);
           inFlight = null;
-          return { delivered: false, state: claudeState.state };
+          return summarize({ delivered: false, state: claudeState.state });
         }
       }
 
@@ -601,7 +633,7 @@ export async function processWithMultiSession(helpers) {
           autoStartedAt.delete(targetInstance);
         }
 
-        return { delivered: true, state: claudeState.state };
+        return summarize({ delivered: true, state: claudeState.state });
       }
 
       // Delivery failed.
@@ -615,11 +647,11 @@ export async function processWithMultiSession(helpers) {
       }
       inFlight = null; // failure handler owns the row now (requeued or failed)
 
-      return { delivered: false, state: claudeState.state };
+      return summarize({ delivered: false, state: claudeState.state });
     }
 
     // Exhausted skip attempts — all tried items were for offline/busy instances.
-    return { delivered: false, state: 'skip_exhausted' };
+    return summarize({ delivered: false, state: 'skip_exhausted' });
   } finally {
     // inFlight is non-null ONLY when a throw escaped mid-delivery, before the
     // item reached a terminal (or deliberately ack-held) state — release it so

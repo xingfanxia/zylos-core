@@ -126,7 +126,7 @@
  * Run with PM2: pm2 start activity-monitor.js --name activity-monitor
  */
 
-import { execSync, execFileSync, spawn } from 'child_process';
+import { execSync, execFileSync, spawn, spawnSync } from 'child_process';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
@@ -192,6 +192,8 @@ const {
   getMonitorDir: _getInstanceMonitorDir,
   isPrimary: _isInstancePrimary,
   isInstanceEnabled: _isInstanceEnabled,
+  getInstanceDef: _getInstanceDef,
+  getAllInstances: _getAllInstances,
 } = await import('../../multi-session/instance-config.js').catch(() => ({}));
 const INSTANCE_ID = _getInstanceId ? _getInstanceId() : null;
 const MONITOR_DIR = _getInstanceMonitorDir ? _getInstanceMonitorDir() : path.join(ZYLOS_DIR, 'activity-monitor');
@@ -207,6 +209,7 @@ const UPGRADE_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'upgrade-check-state.jso
 const USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
 const USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
 const USAGE_ALERT_STATE_FILE = path.join(MONITOR_DIR, 'usage-alert-state.json');
+const USAGE_FLEET_ALERT_STATE_FILE = path.join(MONITOR_DIR, 'usage-fleet-alert-state.json');
 
 // API activity snapshot — built by activity-monitor from Claude hook/session signals
 const API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
@@ -295,6 +298,21 @@ const USAGE_CRITICAL_THRESHOLD = readConfigInt('usage_critical_threshold', 95); 
 const USAGE_NOTIFY_COOLDOWN = readConfigInt('usage_notify_cooldown', 14400);  // seconds between same-tier notifications (4 hours)
 const USAGE_ACTIVE_HOURS_START = readConfigInt('usage_active_hours_start', 8); // check only during 8:00–23:00
 const USAGE_ACTIVE_HOURS_END = readConfigInt('usage_active_hours_end', 23);
+// Fleet near-full alert (system A / shared 5h+weekly meter). 5h thresholds are
+// LOWER than weekly because the 5h window fills fast.
+const USAGE_5H_WARN_THRESHOLD = readConfigInt('usage_5h_warn_threshold', 70);
+const USAGE_5H_HIGH_THRESHOLD = readConfigInt('usage_5h_high_threshold', 85);
+const USAGE_5H_CRITICAL_THRESHOLD = readConfigInt('usage_5h_critical_threshold', 95);
+const USAGE_FLEET_ALERT_INTERVAL = readConfigInt('usage_fleet_alert_interval', 120); // fast path, NOT idle-gated
+const USAGE_STATUSLINE_STALE_SEC = readConfigInt('usage_statusline_stale_sec', 900); // freshest reading older than this ⇒ "monitoring blind"
+const USAGE_ALERT_NOTIFY_USERS = readConfigBool('usage_alert_notify_users', true); // fan out to affected users (floor = high tier)
+const USAGE_USER_ALERT_MIN_INTERVAL = readConfigInt('usage_user_alert_min_interval', 1800); // independent floor between user fan-outs (churn guard)
+
+// Health escalation + self-recovery (REL-3) and guardian signal TTL (REL-6).
+const FLAP_CEILING_PER_HOUR = readConfigInt('flap_ceiling_per_hour', 6);          // kill-restart cycles/rolling hour before degraded
+const DEGRADED_PROBE_INTERVAL = readConfigInt('degraded_probe_interval', 1200);   // seconds between bounded degraded self-probes
+const RATE_LIMIT_PROBE_INTERVAL = readConfigInt('rate_limit_probe_interval', 900); // floor between rate-limit cooldown-expiry probes
+const SIGNAL_TTL_SEC = readConfigInt('signal_ttl_sec', 600);                      // suspend/wake signals older than this are orphans
 
 // Daily tasks config
 const DAILY_UPGRADE_HOUR = 5;        // 5:00 AM local time
@@ -382,6 +400,7 @@ function resolveCommBridgeScript(fileName) {
 
 const C4_CONTROL_PATH = resolveCommBridgeScript('c4-control.js');
 const C4_DB_PATH = resolveCommBridgeScript('c4-db.js');
+const C4_SEND_PATH = resolveCommBridgeScript('c4-send.js');
 
 function enqueueContextRotationHandoff({ ratio = 0, used = 0, ceiling = 0 } = {}) {
   const pct = Math.round(ratio * 100);
@@ -604,6 +623,72 @@ function runC4Control(args) {
     const stderr = err.stderr ? String(err.stderr).trim() : '';
     return { ok: false, output: stdout || stderr || err.message };
   }
+}
+
+// Direct claude-bypassing send: spawns c4-send.js with the message on stdin,
+// mirroring c4-receive's sendUnhealthyMessage. Reusable across delivery actions
+// (wave-2 health escalation reuses this for admin alerts). Only valid from a
+// non-isolated runner (admin/scheduler) — those use the legacy direct feishu
+// path and may send to any chat_id.
+// NOTE (REL-9 follow-up): this is a BLOCKING spawnSync — worst case it stalls the
+// AM main loop up to the 15s timeout per recipient if feishu send hangs. Tolerated
+// for this batch because fleet alerts are deduped-rare; REL-9 makes sends async.
+function runC4Send(channel, endpoint, message, deliveryAction = 'usage-alert') {
+  try {
+    const args = [C4_SEND_PATH, `--delivery-action=${deliveryAction}`, channel];
+    if (endpoint) args.push(endpoint);
+    const result = spawnSync('node', args, {
+      input: message, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000
+    });
+    if (result.status === 0) return { ok: true, output: (result.stdout || '').trim() };
+    return { ok: false, output: (result.stderr || result.stdout || `exit ${result.status}`).trim() };
+  } catch (err) {
+    return { ok: false, output: err.message };
+  }
+}
+
+// Admin chat id resolution (reusable seam — wave-2 admin alerts share this).
+function resolveAdminChatId() {
+  try {
+    const def = _getInstanceDef ? _getInstanceDef('admin') : null;
+    return def?.chat_ids?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Statusline path for an arbitrary instance (admin AM reads the shared tree to
+// find the freshest cross-instance reading). Honors state_dir via getMonitorDir.
+function resolveInstanceStatuslineFile(instanceId) {
+  if (_getInstanceMonitorDir) {
+    return path.join(_getInstanceMonitorDir(instanceId), 'statusline.json');
+  }
+  return STATUSLINE_FILE;
+}
+
+const ADMIN_CHAT_ID = resolveAdminChatId();
+
+// Degraded-transition admin alert (REL-3): direct feishu send that bypasses the
+// stuck instance entirely (its own queue can never forward while it flaps).
+function formatDegradedAdminAlert({ cycleCount, windowSec, ceiling, probeIntervalSec, reason }) {
+  const instance = INSTANCE_ID || 'primary';
+  return [
+    `🔴 实例已降级（degraded）：${instance}`,
+    `过去 ${Math.round(windowSec / 60)} 分钟内 kill-restart 循环 ${cycleCount} 次（上限 ${ceiling}/小时），已停止重启循环（触发原因：${reason}）。`,
+    `降级 = 有界自恢复：每 ${Math.round(probeIntervalSec / 60)} 分钟自动重启并探测一次，恢复后自动回到 ok；期间该实例的消息会被暂存，不会丢失。`,
+    '如需立即恢复：检查该实例的 claude 登录/额度状态；给它发一条消息即可触发立刻探测。',
+  ].join('\n');
+}
+
+function notifyDegradedAdmin(details) {
+  if (!ADMIN_CHAT_ID) {
+    log('Degraded admin alert skipped: no admin chat_id configured');
+    return;
+  }
+  const res = runC4Send('feishu', ADMIN_CHAT_ID, formatDegradedAdminAlert(details), 'health-alert');
+  log(res.ok
+    ? `Degraded admin alert sent (${details.cycleCount} cycles/${Math.round(details.windowSec / 60)}min)`
+    : `Degraded admin alert failed: ${res.output}`);
 }
 
 function readJsonFileSafe(filePath) {
@@ -888,6 +973,19 @@ function createUsageMonitor(activeAdapter) {
     notifyCooldownSec: USAGE_NOTIFY_COOLDOWN,
     activeHoursStart: USAGE_ACTIVE_HOURS_START,
     activeHoursEnd: USAGE_ACTIVE_HOURS_END,
+    // Fleet near-full alert wiring.
+    fiveHourWarnThreshold: USAGE_5H_WARN_THRESHOLD,
+    fiveHourHighThreshold: USAGE_5H_HIGH_THRESHOLD,
+    fiveHourCriticalThreshold: USAGE_5H_CRITICAL_THRESHOLD,
+    statuslineStaleSec: USAGE_STATUSLINE_STALE_SEC,
+    notifyUsers: USAGE_ALERT_NOTIFY_USERS,
+    userAlertMinIntervalSec: USAGE_USER_ALERT_MIN_INTERVAL,
+    isPrimary: () => (_isInstancePrimary ? _isInstancePrimary(INSTANCE_ID) : true),
+    getAllInstances: () => (_getAllInstances ? _getAllInstances() : []),
+    adminChatId: ADMIN_CHAT_ID,
+    fleetAlertStateFile: USAGE_FLEET_ALERT_STATE_FILE,
+    statuslineFileFor: resolveInstanceStatuslineFile,
+    c4Send: (channel, endpoint, message) => runC4Send(channel, endpoint, message, 'usage-alert'),
     getLocalHour,
     runC4Control,
     log,
@@ -903,6 +1001,7 @@ function createTaskScheduler(activeUsageMonitor) {
     healthCheckInterval: HEALTH_CHECK_INTERVAL,
     usageCheckInterval: USAGE_CHECK_INTERVAL,
     usageAlertInterval: USAGE_ALERT_INTERVAL,
+    usageFleetAlertInterval: USAGE_FLEET_ALERT_INTERVAL,
     readDailyUpgradeEnabled: () => readConfigBool('daily_upgrade_enabled', false),
     readHealthCheckEnabled: () => readConfigBool('health_check_enabled', true),
     loadDailyUpgradeState,
@@ -963,13 +1062,21 @@ function createHealthEngine(activeAdapter, initialStatus) {
     log,
     rateLimitDefaultCooldown: RATE_LIMIT_DEFAULT_COOLDOWN,
     userMessageRecoveryCooldown: USER_MESSAGE_RECOVERY_COOLDOWN,
+    flapCeilingPerHour: FLAP_CEILING_PER_HOUR,
+    degradedProbeInterval: DEGRADED_PROBE_INTERVAL,
+    rateLimitProbeInterval: RATE_LIMIT_PROBE_INTERVAL,
+    notifyDegraded: notifyDegradedAdmin,
   });
 }
 
-function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs) {
+function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, { monitorDir } = {}) {
   return createRuntimeGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, {
     apiActivityFile: API_ACTIVITY_FILE,
     hookStateFile: HOOK_STATE_FILE,
+    // REL-6: forwarding monitorDir enables the suspend/wake gate — this wrapper
+    // omitting it is exactly what left the gate dead in prod.
+    monitorDir: monitorDir ?? MONITOR_DIR,
+    signalTtlSec: SIGNAL_TTL_SEC,
     log,
   });
 }
