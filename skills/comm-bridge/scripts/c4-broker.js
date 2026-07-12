@@ -56,7 +56,7 @@ import {
 } from './c4-db-multi.js';
 import { initC4Session } from './c4-session-init.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
-import { sourceTierRoots, checkPathViolation, mediaPathFromContent } from './egress-policy.js';
+import { sourceTierRoots, checkPathViolation, mediaPathFromContent, makeUidResolver, stageOwnedMedia } from './egress-policy.js';
 import { getAllInstances, getMonitorDir, getInstanceDef } from '../../multi-session/instance-config.js';
 import * as taskOps from '../../scheduler/scripts/task-ops.js';
 import { getDb as getSchedulerDb, generateId as generateTaskId, now as taskNow } from '../../scheduler/scripts/database.js';
@@ -88,6 +88,23 @@ function cachedSourceTierRoots() {
   const roots = sourceTierRoots(WORKSPACE_DIR);
   _rootsCache = { at: nowMs, roots };
   return roots;
+}
+
+// REL-8: memoized caller os_user→uid resolver for attachment ownership checks
+// (only the CALLER's uid is ever resolved). Failures are logged loudly and treated
+// fail-closed by stageOwnedMedia.
+const resolveCallerUid = makeUidResolver(undefined, (m) => log(m));
+
+// REL-8: broker-private staging root for validated attachment bytes. 0700 and
+// under the broker's own DATA_DIR, so no tenant can write, traverse, or swap a
+// staged file. Created lazily on first media send.
+const ATTACH_STAGING_DIR = path.join(DATA_DIR, 'attach-staging');
+let _stagingReady = false;
+function ensureStagingDir() {
+  if (_stagingReady) return;
+  fs.mkdirSync(ATTACH_STAGING_DIR, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(ATTACH_STAGING_DIR, 0o700); } catch { /* best effort */ }
+  _stagingReady = true;
 }
 
 let isShuttingDown = false;
@@ -263,7 +280,7 @@ function endpointAuthorized(channel, endpoint, caller) {
 async function opSend(p, caller) {
   const channel = p.channel;
   const endpoint = p.endpoint ?? null;
-  const content = p.content;
+  let content = p.content;   // reassigned below when an isolated caller's [MEDIA:] path is rewritten to the broker staging copy (REL-8)
   // Audit tag (e.g. 'status-notice' from c4-receive's unhealthy auto-reply) —
   // must survive the broker hop or getUnansweredDeliveredForInstance counts the
   // auto-reply as a real answer. Coerced to a short string; it only ever lands
@@ -296,6 +313,17 @@ async function opSend(p, caller) {
   const roots = cachedSourceTierRoots();
   const mediaPath = mediaPathFromContent(content);
   const candidates = [...attachments.map(String), ...(mediaPath ? [mediaPath] : [])];
+  // Trust classification MUST fail CLOSED (REL-8 rev-security HIGH). `caller` is
+  // socket-bound at connect time; if its instances.json entry has since been
+  // removed/renamed (decommission/rename — the socket + os_user linger up to
+  // RESCAN_INTERVAL_MS or a SIGHUP), getInstanceDef returns undefined. Treating
+  // that as a trusted PRIMARY would skip stageOwnedMedia and re-enable c4.db
+  // egress. So: primary ONLY when positively proven (a def with no os_user);
+  // an unresolved def is an untrusted tenant and routes through owner-staging
+  // (whose caller_uid_unresolved path then denies). Preserves the exact os_user
+  // semantics for known instances; only changes the undefined-def case.
+  const callerDef = getInstanceDef(caller);
+  const callerIsolated = !callerDef || !!callerDef.os_user;
   for (const c of candidates) {
     const v = checkPathViolation(c, roots);
     if (v) {
@@ -329,38 +357,87 @@ async function opSend(p, caller) {
     return { ok: false, error: `channel_script_missing:${channelScript}` };
   }
 
-  // REL-5: attachment readability gate. The spawned send.js child inherits the
-  // broker's uid/gid/supplementary groups, so a media path the broker itself
-  // cannot read fails DEEP inside the child (feishu's unguarded ReadStream
-  // 'error' crashes it; the incident's EACCES came from the God-daemon's stale
-  // supplementary groups, not a perms race) instead of being rejected up-front.
-  // accessSync from the broker predicts exactly what the child will see, so the
-  // gate is keyed on READABILITY, never a publish-dir path prefix — readable
-  // non-publish paths (e.g. /tmp/chart.png) stay allowed. Only the [MEDIA:] path
-  // is ever forwarded to the child (spawnSend passes `content`, not attachments),
-  // so that is the only path that can fail there and the only one we gate.
+  // Attachment handling. The spawned send.js child inherits the broker's
+  // uid/gid/supplementary groups and re-reads the [MEDIA:] path by name at a
+  // LATER time than any check here, so a bare accessSync would be both (a)
+  // insufficient (readable ≠ allowed: c4.db is world-readable) and (b) racy
+  // (the child re-resolves a caller-mutable path). Two regimes:
+  let stagingSubdir = null;
   if (mediaPath) {
-    const resolved = path.resolve(mediaPath);
-    try {
-      fs.accessSync(resolved, fs.constants.R_OK);
-    } catch {
-      log(`ATTACHMENT UNREADABLE ${caller}: ${resolved}`);
-      markAuditFailed();
-      // Echo the path as the agent sent it. For a RELATIVE [MEDIA:] path,
-      // path.resolve() prepends the broker's cwd, which must not leak back to an
-      // isolated (possibly cross-tenant) caller (rev-security S3). accessSync
-      // above still uses the resolved path — it predicts the child's view — and
-      // the server-side log keeps the resolved path for ops (admin-only).
-      const shown = path.isAbsolute(mediaPath) ? resolved : mediaPath;
-      return {
-        ok: false,
-        error: `attachment_unreadable: broker cannot read ${shown}; publish it under ~/zylos/workspace/users/${caller}/ and resend`,
-        data: { conversation_id: conversationId },
-      };
+    if (callerIsolated) {
+      // REL-8: an isolated tenant may attach ONLY a file it owns. stageOwnedMedia
+      // fstat-validates ownership on the OPEN fd (symlink-swap-proof) and hands
+      // send.js the broker's own byte-copy, so peer/hub files (owned by another
+      // uid) are structurally unreachable and the child never re-resolves the
+      // original path. Fail-closed if the caller's uid can't be resolved.
+      // A synchronous fs error (ensureStagingDir mkdir, or an unforeseen throw)
+      // must NOT unwind opSend past markAuditFailed — otherwise the audit out-row
+      // stays 'delivered' for a never-sent message and mis-counts as an answer
+      // (rev crash-correctness MEDIUM). stageOwnedMedia itself already cleans its
+      // own subdir and returns {ok:false} on write failure; this catch covers the
+      // ensureStagingDir path and any residual throw.
+      let staged;
+      try {
+        ensureStagingDir();
+        const callerUid = resolveCallerUid(callerDef?.os_user);
+        staged = stageOwnedMedia(mediaPath, callerUid, ATTACH_STAGING_DIR);
+      } catch (err) {
+        markAuditFailed();
+        log(`ATTACHMENT STAGE ERROR ${caller}: ${err && err.message}`);
+        return { ok: false, error: 'attachment_rejected: broker could not stage the file', data: { conversation_id: conversationId } };
+      }
+      if (!staged.ok) {
+        markAuditFailed();
+        log(`ATTACHMENT REJECTED ${caller}: ${staged.error} (path ${mediaPath}` +
+          `${staged.owner != null ? `, owner uid ${staged.owner}` : ''}` +
+          `${staged.size != null ? `, size ${staged.size}` : ''})`);
+        // Generic, path/uid-free caller-facing reason (no cross-tenant layout or
+        // ownership oracle); server log above keeps the detail for ops.
+        const reason = staged.error === 'unreadable'
+          ? `attachment_unreadable: broker cannot read the file; publish it under ~/zylos/workspace/users/${caller}/ and resend`
+          : staged.error === 'not_owned_by_caller'
+            ? `egress_blocked: you can only attach files you own — publish it under ~/zylos/workspace/users/${caller}/ and resend`
+            : staged.error === 'too_large'
+              ? 'attachment_too_large: file exceeds the send size limit'
+              : staged.error === 'not_regular_file'
+                ? 'attachment_invalid: not a regular file'
+                : 'attachment_rejected: broker could not stage the file';
+        return { ok: false, error: reason, data: { conversation_id: conversationId } };
+      }
+      stagingSubdir = staged.stagingSubdir;
+      // Rewrite the [MEDIA:type] path to the broker-owned staging copy the child
+      // will read (preserves the type token; the [\s\S] class handles multi-line).
+      const m = content.match(/^(\[MEDIA:\w+\])[\s\S]+$/);
+      if (m) content = `${m[1]}${staged.stagingPath}`;
+    } else {
+      // Primary/trusted caller (admin, scheduler): keep the up-front readability
+      // gate so an unreadable path is rejected cleanly instead of crashing the
+      // child's unguarded ReadStream. No ownership scoping — trusted above tenants.
+      const resolved = path.resolve(mediaPath);
+      try {
+        fs.accessSync(resolved, fs.constants.R_OK);
+      } catch {
+        log(`ATTACHMENT UNREADABLE ${caller}: ${resolved}`);
+        markAuditFailed();
+        const shown = path.isAbsolute(mediaPath) ? resolved : mediaPath;
+        return {
+          ok: false,
+          error: `attachment_unreadable: broker cannot read ${shown}; publish it under ~/zylos/workspace/users/${caller}/ and resend`,
+          data: { conversation_id: conversationId },
+        };
+      }
     }
   }
 
-  const code = await spawnSend(channelScript, endpoint, content);
+  let code;
+  try {
+    code = await spawnSend(channelScript, endpoint, content);
+  } finally {
+    if (stagingSubdir) {
+      try { fs.rmSync(stagingSubdir, { recursive: true, force: true }); }
+      catch (e) { log(`WARN staging cleanup failed (${caller}): ${e.message}`); }
+    }
+  }
   if (code === 0) return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
   markAuditFailed();
   return { ok: false, error: `channel_send_failed:exit_${code}`, data: { conversation_id: conversationId } };

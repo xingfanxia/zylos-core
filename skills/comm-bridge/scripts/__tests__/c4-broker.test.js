@@ -22,15 +22,24 @@ process.env.C4_BROKER_DISABLE_MAIN = '1';
 delete process.env.ZYLOS_INSTANCE_ID;
 
 const stateDir = (id) => path.join(tmpDir, 'state', id);
-for (const id of ['inst-a', 'inst-b', 'admin']) fs.mkdirSync(stateDir(id), { recursive: true });
+for (const id of ['inst-a', 'inst-b', 'inst-self', 'admin']) fs.mkdirSync(stateDir(id), { recursive: true });
 fs.mkdirSync(path.join(tmpDir, 'workspace'), { recursive: true });
 fs.mkdirSync(path.join(tmpDir, 'activity-monitor'), { recursive: true });
+
+// `inst-self` is an ISOLATED tenant whose os_user is the REAL test-runner user, so
+// `id -u <user>` actually resolves and a file the test writes (owned by the runner)
+// is owned-by-caller — the only way to exercise the REL-8 stageOwnedMedia happy path
+// with real fs (we can't chown a fixture to a fake uid without root). `inst-a`
+// (os_user 'fake-a', unresolvable) covers the fail-closed path.
+const RUNNER_USER = os.userInfo().username;
+const RUNNER_UID = typeof process.getuid === 'function' ? process.getuid() : null;
 
 fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({
   version: 1,
   instances: {
     'inst-a': { os_user: 'fake-a', state_dir: stateDir('inst-a'), tmux_session: 'claude-inst-a', chat_ids: ['chat-a-1'] },
     'inst-b': { os_user: 'fake-b', state_dir: stateDir('inst-b'), tmux_session: 'claude-inst-b' },
+    'inst-self': { os_user: RUNNER_USER, state_dir: stateDir('inst-self'), tmux_session: 'claude-inst-self', chat_ids: ['chat-self'] },
     'admin':  { primary: true, state_dir: stateDir('admin'), tmux_session: 'claude-main', chat_ids: ['owner-chat'] },
   },
 }));
@@ -53,15 +62,23 @@ fakeChannel('shell', 0);
 // invocation to a log file so the attachment-readability tests (REL-5) can prove
 // whether the child send.js was spawned. It always exits 0 when it IS reached.
 const feishuSpawnLog = path.join(tmpDir, 'feishu-spawns.log');
+const feishuContentLog = path.join(tmpDir, 'feishu-content.log');
 (function fakeFeishuChannel() {
   const d = path.join(tmpDir, '.claude', 'skills', 'feishu', 'scripts');
   fs.mkdirSync(d, { recursive: true });
+  // args are [channelScript, endpoint, content] → process.argv[3] is the delivered
+  // content. Record it (overwrite) so a test can prove which path the child received.
   fs.writeFileSync(path.join(d, 'send.js'),
-    `const fs=require('fs');fs.appendFileSync(${JSON.stringify(feishuSpawnLog)}, 'x');process.exit(0);\n`);
+    `const fs=require('fs');fs.appendFileSync(${JSON.stringify(feishuSpawnLog)}, 'x');`
+    + `fs.writeFileSync(${JSON.stringify(feishuContentLog)}, process.argv[3] || '');process.exit(0);\n`);
 })();
 function feishuSpawnCount() {
   try { return fs.readFileSync(feishuSpawnLog, 'utf8').length; }
   catch { return 0; }
+}
+function lastFeishuContent() {
+  try { return fs.readFileSync(feishuContentLog, 'utf8'); }
+  catch { return ''; }
 }
 
 // ── Dynamic imports (now see the sandbox env) ───────────────────────
@@ -99,6 +116,165 @@ describe('egress-policy', () => {
     assert.equal(egress.mediaPathFromContent('[MEDIA:image]workspace/panpanmao-monorepo/x.png'),
       'workspace/panpanmao-monorepo/x.png');
     assert.equal(egress.mediaPathFromContent('hello world'), null);
+  });
+});
+
+// ── REL-8 owner-validated attachment staging (pure) ─────────────────
+describe('egress-policy stageOwnedMedia', () => {
+  const CALLER_UID = 1001;
+  // A fake fs whose fstat returns a configurable owner uid, capturing the staged
+  // write so we can assert the bytes/path handed to send.js.
+  function fakeFs({ uid = CALLER_UID, size = 4, isFile = true, openThrows = false,
+                    writeThrows = false, readChunks = null } = {}) {
+    const writes = [];
+    const dirs = [];
+    const removed = [];
+    // readChunks: optional list of byte counts returned by successive readSync
+    // calls (models a short-read filesystem); null → satisfy the whole request
+    // in one call, honoring the offset/length the copy loop passes.
+    let chunkIdx = 0;
+    return {
+      writes, dirs, removed,
+      impl: {
+        openSync: () => { if (openThrows) throw Object.assign(new Error('EACCES'), { code: 'EACCES' }); return 7; },
+        fstatSync: () => ({ uid, size, isFile: () => isFile }),
+        readSync: (_fd, buf, offset, length) => {
+          const n = readChunks ? (readChunks[chunkIdx++] ?? 0) : length;
+          buf.fill(0x41, offset, offset + n);   // fill only the returned span with 'A'
+          return n;
+        },
+        mkdirSync: (p) => dirs.push(p),
+        writeFileSync: (p, data, opts) => {
+          if (writeThrows) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+          writes.push({ p, len: data.length, mode: opts?.mode });
+        },
+        rmSync: (p) => removed.push(p),
+        closeSync: () => {},
+      },
+    };
+  }
+
+  it('stages a file the caller OWNS: reads bytes once, preserves basename, 0600', () => {
+    const f = fakeFs({ uid: CALLER_UID, size: 9 });
+    const r = egress.stageOwnedMedia('/home/user-a/report.pdf', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, true);
+    assert.equal(r.stagingSubdir, '/hub/.c4/attach-staging/RID');
+    assert.equal(r.stagingPath, '/hub/.c4/attach-staging/RID/report.pdf'); // display name preserved
+    assert.equal(r.bytes, 9);
+    assert.equal(f.writes[0].mode, 0o600);
+    assert.equal(f.writes[0].len, 9);
+  });
+
+  it('preserves CJK/Unicode basenames (recipient-visible display name) verbatim', () => {
+    // Regression (Elaine 2026-07-12): ASCII-only \w sanitization mangled
+    // 「外刊精读练习册-No08-威尼斯-高考版.pdf」 into 「-No08--.pdf」.
+    const f = fakeFs({ uid: CALLER_UID, size: 4 });
+    const r = egress.stageOwnedMedia('/home/user-a/外刊精读练习册-No08-威尼斯-高考版.pdf',
+      CALLER_UID, '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, true);
+    assert.equal(r.stagingPath, '/hub/.c4/attach-staging/RID/外刊精读练习册-No08-威尼斯-高考版.pdf');
+  });
+
+  it('still strips path-hostile chars and never stages as "." or ".."', () => {
+    const f = fakeFs({ uid: CALLER_UID, size: 4 });
+    // shell-hostile punctuation → '_' (basename already stripped dirs; belt-and-braces)
+    const hostile = egress.stageOwnedMedia('/home/user-a/a:b*c?.pdf', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(hostile.ok, true);
+    assert.equal(hostile.stagingPath, '/hub/.c4/attach-staging/RID/a_b_c_.pdf');
+    // '..' survives a pure char-class filter but must not escape the subdir
+    const dots = egress.stageOwnedMedia('/home/user-a/..', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID2' });
+    assert.equal(dots.ok, true);
+    assert.equal(dots.stagingPath, '/hub/.c4/attach-staging/RID2/attachment');
+  });
+
+  it('REJECTS a file owned by ANOTHER uid — the confused-deputy exfil (c4.db / peer home)', () => {
+    const f = fakeFs({ uid: 0 });               // hub/root-owned (e.g. world-readable c4.db)
+    const r = egress.stageOwnedMedia('/hub/comm-bridge/c4.db', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, false);
+    assert.equal(r.error, 'not_owned_by_caller');
+    assert.equal(r.owner, 0);
+    assert.equal(f.writes.length, 0);           // nothing staged → nothing to send
+  });
+
+  it('ownership is checked on the OPEN fd (fstat), so a post-check symlink swap cannot change the validated inode', () => {
+    // fstatSync reports the inode actually opened; a peer-owned target is caught
+    // regardless of what the path string looked like at any earlier moment.
+    const f = fakeFs({ uid: 2002 });            // peer tenant
+    const r = egress.stageOwnedMedia('/home/user-a/evil.png', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, false);
+    assert.equal(r.error, 'not_owned_by_caller');
+  });
+
+  it('fails CLOSED when the caller uid is unresolved (null / non-integer)', () => {
+    const f = fakeFs();
+    assert.equal(egress.stageOwnedMedia('/x', null, '/s', { fs: f.impl }).error, 'caller_uid_unresolved');
+    assert.equal(egress.stageOwnedMedia('/x', undefined, '/s', { fs: f.impl }).error, 'caller_uid_unresolved');
+    assert.equal(f.writes.length, 0);
+  });
+
+  it('maps unreadable, non-regular-file, and too-large to distinct rejections', () => {
+    const unreadable = egress.stageOwnedMedia('/x', CALLER_UID, '/s',
+      { fs: fakeFs({ openThrows: true }).impl });
+    assert.equal(unreadable.error, 'unreadable');
+
+    const notFile = egress.stageOwnedMedia('/x', CALLER_UID, '/s',
+      { fs: fakeFs({ isFile: false }).impl });
+    assert.equal(notFile.error, 'not_regular_file');
+
+    const tooBig = egress.stageOwnedMedia('/x', CALLER_UID, '/s',
+      { fs: fakeFs({ size: 999 }).impl, maxBytes: 100 });
+    assert.equal(tooBig.error, 'too_large');
+    assert.equal(tooBig.size, 999);
+  });
+
+  it('cleans up and fails CLOSED when the staging write throws (ENOSPC/EROFS) — no orphan subdir, no delivered row', () => {
+    const f = fakeFs({ uid: CALLER_UID, size: 12, writeThrows: true });
+    const r = egress.stageOwnedMedia('/home/user-a/big.bin', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, false);
+    assert.equal(r.error, 'stage_failed');            // caller maps → attachment_rejected + audit-failed
+    assert.equal(f.writes.length, 0);                 // nothing persisted
+    assert.deepEqual(f.removed, ['/hub/.c4/attach-staging/RID']); // subdir swept — no orphan left behind
+  });
+
+  it('assembles the whole file across a short-read filesystem (readSync returns partial chunks)', () => {
+    const f = fakeFs({ uid: CALLER_UID, size: 9, readChunks: [4, 5] });
+    const r = egress.stageOwnedMedia('/home/user-a/report.pdf', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, true);
+    assert.equal(r.bytes, 9);                          // 4 + 5 reassembled, not truncated at the first chunk
+    assert.equal(f.writes[0].len, 9);
+  });
+
+  it('stages a 0-byte file (empty but owned) without error', () => {
+    const f = fakeFs({ uid: CALLER_UID, size: 0 });
+    const r = egress.stageOwnedMedia('/home/user-a/empty.txt', CALLER_UID,
+      '/hub/.c4/attach-staging', { fs: f.impl, randomName: () => 'RID' });
+    assert.equal(r.ok, true);
+    assert.equal(r.bytes, 0);
+    assert.equal(f.writes[0].len, 0);                  // empty staged file still created
+  });
+
+  it('makeUidResolver caches successes only, retries after failure, and logs loudly', () => {
+    const logs = [];
+    let calls = 0;
+    const resolver = egress.makeUidResolver((_cmd, args) => {
+      calls++;
+      if (args[1] === 'zylos-real') return '4242\n';
+      throw new Error('id: no such user');
+    }, (m) => logs.push(m));
+    assert.equal(resolver('zylos-real'), 4242);
+    assert.equal(resolver('zylos-real'), 4242);  // cached success
+    assert.equal(calls, 1);
+    assert.equal(resolver('zylos-missing'), null);
+    assert.equal(resolver('zylos-missing'), null); // NOT cached → retried (self-heals)
+    assert.equal(calls, 3);
+    assert.ok(logs.some((m) => /uid resolve failed for zylos-missing/.test(m)));
   });
 });
 
@@ -222,20 +398,21 @@ describe('broker handleRequest', () => {
   });
 });
 
-// ── broker attachment readability gate (REL-5) ──────────────────────
-describe('broker attachment readability gate', () => {
-  // inst-a is authorized for 'chat-a-1'; feishu is allowlisted. The fake feishu
-  // send.js records each spawn so we can prove a doomed send is rejected BEFORE
-  // the child is spawned — the pre-gate behavior spawned it and let the failure
-  // crash deep inside the ReadStream 'error' path (the Elaine incident).
-
+// ── broker attachment gate — PRIMARY caller readability (REL-5) ──────
+// Primary/trusted callers (admin, scheduler — no os_user) keep the up-front
+// accessSync readability gate: an unreadable path is rejected cleanly instead of
+// crashing the child's unguarded feishu ReadStream (the Elaine incident). No
+// ownership scoping — a primary is trusted above the tenant boundary. `admin` is
+// primary and authorized for feishu 'owner-chat'. The fake feishu send.js records
+// each spawn so we can prove a doomed send is rejected BEFORE the child is spawned.
+describe('broker attachment gate — primary caller readability (REL-5)', () => {
   it('rejects a [MEDIA] path the broker cannot read (ENOENT) before spawning send.js', async () => {
     const before = feishuSpawnCount();
     const missing = path.join(tmpDir, 'no-such-attachment.png');
     const r = await broker.handleRequest({
       op: 'send',
-      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${missing}` },
-    }, 'inst-a');
+      params: { channel: 'feishu', endpoint: 'owner-chat', content: `[MEDIA:image]${missing}` },
+    }, 'admin');
     assert.equal(r.ok, false);
     assert.match(r.error, /attachment_unreadable/);
     assert.match(r.error, /publish it under/); // actionable, self-correcting message
@@ -246,13 +423,13 @@ describe('broker attachment readability gate', () => {
 
   it('does not leak the broker cwd for a relative [MEDIA] path (rev-security S3)', async () => {
     // A relative path resolves against the broker's cwd; path.resolve() would
-    // prepend it, leaking the admin broker's cwd back to an isolated caller.
+    // prepend it, leaking the admin broker's cwd back to the caller.
     const rel = 'zzz-nonexistent-rel-dir/attachment.png';
     const before = feishuSpawnCount();
     const r = await broker.handleRequest({
       op: 'send',
-      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${rel}` },
-    }, 'inst-a');
+      params: { channel: 'feishu', endpoint: 'owner-chat', content: `[MEDIA:image]${rel}` },
+    }, 'admin');
     assert.equal(r.ok, false);
     assert.match(r.error, /attachment_unreadable/);
     assert.match(r.error, /publish it under/); // guidance text preserved
@@ -273,47 +450,173 @@ describe('broker attachment readability gate', () => {
     const before = feishuSpawnCount();
     const r = await broker.handleRequest({
       op: 'send',
-      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:file]${denied}` },
-    }, 'inst-a');
+      params: { channel: 'feishu', endpoint: 'owner-chat', content: `[MEDIA:file]${denied}` },
+    }, 'admin');
     fs.chmodSync(denied, 0o644); // restore for cleanup regardless of assertions
     assert.equal(r.ok, false);
     assert.match(r.error, /attachment_unreadable/);
     assert.equal(feishuSpawnCount(), before, 'send.js must NOT be spawned for an unreadable attachment');
   });
 
-  it('regression: a readable /tmp attachment still spawns + delivers', async () => {
+  it('regression: a readable attachment from a trusted primary still spawns + delivers', async () => {
     const readable = path.join(tmpDir, 'chart.png');
     fs.writeFileSync(readable, 'imgbytes');
     const before = feishuSpawnCount();
     const r = await broker.handleRequest({
       op: 'send',
-      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${readable}` },
-    }, 'inst-a');
+      params: { channel: 'feishu', endpoint: 'owner-chat', content: `[MEDIA:image]${readable}` },
+    }, 'admin');
     assert.equal(r.ok, true, r.error);
     assert.equal(r.data.sent, true);
     assert.equal(feishuSpawnCount(), before + 1, 'readable attachment must reach the channel');
-  });
-
-  it('regression: a readable publish-dir-style attachment still delivers', async () => {
-    const pubDir = path.join(tmpDir, 'workspace', 'users', 'inst-a');
-    fs.mkdirSync(pubDir, { recursive: true });
-    const readable = path.join(pubDir, 'report.pdf');
-    fs.writeFileSync(readable, 'pdfbytes');
-    const before = feishuSpawnCount();
-    const r = await broker.handleRequest({
-      op: 'send',
-      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:file]${readable}` },
-    }, 'inst-a');
-    assert.equal(r.ok, true, r.error);
-    assert.equal(feishuSpawnCount(), before + 1);
   });
 
   it('non-media content is unaffected by the readability gate', async () => {
     const before = feishuSpawnCount();
     const r = await broker.handleRequest({
       op: 'send',
-      params: { channel: 'feishu', endpoint: 'chat-a-1', content: 'plain text, no attachment' },
+      params: { channel: 'feishu', endpoint: 'owner-chat', content: 'plain text, no attachment' },
+    }, 'admin');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(feishuSpawnCount(), before + 1);
+  });
+});
+
+// ── broker attachment staging — ISOLATED caller ownership (REL-8) ────
+// The REL-8 confused-deputy fix: an isolated tenant may attach ONLY a file IT
+// OWNS. The broker (hub user + supplementary groups + world-read) can otherwise
+// READ peer-tenant homes and hub/service files — most dangerously the
+// world-readable c4.db holding EVERY tenant's messages — and forward them to the
+// caller's own chat. stageOwnedMedia fstat-validates ownership on the OPEN fd and
+// hands send.js a broker-private byte-copy (default-deny + TOCTOU-safe).
+//   inst-self: os_user = the REAL runner user, so `id -u` resolves and a file the
+//              test writes is owned-by-caller → exercises the happy path.
+//   inst-a:    os_user 'fake-a' (unresolvable) → exercises fail-closed.
+describe('broker attachment staging — isolated caller ownership (REL-8)', () => {
+  it('stages + delivers a file the isolated caller OWNS, rewriting to the broker copy', async (t) => {
+    if (RUNNER_UID == null) { t.skip('no process.getuid — cannot exercise real uid ownership'); return; }
+    const owned = path.join(tmpDir, 'owned-attach.png');
+    fs.writeFileSync(owned, 'imgbytes'); // owned by the runner == inst-self's resolved uid
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-self', content: `[MEDIA:image]${owned}` },
+    }, 'inst-self');
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.data.sent, true);
+    assert.equal(feishuSpawnCount(), before + 1, 'an owned attachment must reach the channel');
+    // The child must receive the broker's staging COPY, never the caller-mutable
+    // original (the TOCTOU fix) — path rewritten under attach-staging, basename kept.
+    const delivered = lastFeishuContent();
+    assert.ok(delivered.startsWith('[MEDIA:image]'), `media prefix preserved: ${delivered}`);
+    assert.ok(delivered.includes('attach-staging'), `delivered path must be the staging copy: ${delivered}`);
+    assert.ok(delivered.includes('owned-attach.png'), 'original basename (display name) preserved');
+    assert.ok(!delivered.includes(owned), 'delivered path must NOT be the caller-mutable original');
+    // After delivery the broker sweeps its per-send staging subdir (the `finally`
+    // in opSend) so no tenant attachment bytes linger on disk (finding #6).
+    const stagedPath = delivered.slice('[MEDIA:image]'.length);
+    assert.ok(!fs.existsSync(path.dirname(stagedPath)), 'per-send staging subdir must be removed after delivery');
+  });
+
+  it('REL-8 HIGH-2: isolated caller CANNOT exfil a readable file it does NOT own (c4.db-style)', async (t) => {
+    if (RUNNER_UID == null) { t.skip('no process.getuid'); return; }
+    if (RUNNER_UID === 0) { t.skip('running as root — owns system files, cannot construct a cross-owner case'); return; }
+    // A world-readable file owned by ANOTHER uid stands in for c4.db / a peer home:
+    // readable by the broker, but not owned by the caller → must be blocked.
+    const candidates = ['/etc/hosts', '/etc/passwd', '/etc/hostname', '/usr/bin/env', '/bin/sh'];
+    let foreign = null;
+    for (const c of candidates) {
+      try { fs.accessSync(c, fs.constants.R_OK); if (fs.statSync(c).uid !== RUNNER_UID) { foreign = c; break; } }
+      catch { /* not readable / missing — try next */ }
+    }
+    if (!foreign) { t.skip('no readable foreign-owned file available on this host'); return; }
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-self', content: `[MEDIA:file]${foreign}` },
+    }, 'inst-self');
+    assert.equal(r.ok, false, `a non-owned file (${foreign}) must be rejected`);
+    assert.match(r.error, /egress_blocked/); // not_owned_by_caller → egress_blocked
+    assert.equal(feishuSpawnCount(), before, 'a readable but non-owned file must NOT reach the channel');
+    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    assert.equal(row.status, 'failed', 'audit out-row must be marked failed');
+  });
+
+  it('isolated caller: a directory [MEDIA] path → attachment_invalid, audit-failed, no spawn (finding #8)', async (t) => {
+    if (RUNNER_UID == null) { t.skip('no process.getuid'); return; }
+    // A directory is openable + owned by the runner, but not a regular file →
+    // stageOwnedMedia returns not_regular_file, which the broker maps to the
+    // distinct caller-facing attachment_invalid reason (not a generic reject).
+    const dir = path.join(tmpDir, 'a-directory-attachment');
+    fs.mkdirSync(dir, { recursive: true });
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-self', content: `[MEDIA:file]${dir}` },
+    }, 'inst-self');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_invalid/);        // not_regular_file → distinct reason
+    assert.equal(feishuSpawnCount(), before, 'a non-regular-file attachment must NOT be spawned');
+    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    assert.equal(row.status, 'failed', 'audit out-row must be marked failed for a rejected attachment');
+  });
+
+  it('isolated caller: unreadable path → attachment_unreadable, no spawn (Elaine-incident guard)', async (t) => {
+    if (RUNNER_UID == null) { t.skip('no process.getuid'); return; }
+    const missing = path.join(tmpDir, 'isolated-missing.png');
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-self', content: `[MEDIA:image]${missing}` },
+    }, 'inst-self');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_unreadable/);
+    assert.equal(feishuSpawnCount(), before, 'send.js must NOT be spawned for an unreadable attachment');
+  });
+
+  it('REL-8 fail-closed: an isolated caller whose uid cannot be resolved is DENIED (never fails open)', async () => {
+    // inst-a's os_user 'fake-a' does not exist → `id -u fake-a` fails → uid
+    // unresolved → default-DENY. A send whose owner cannot be proven is blocked,
+    // even though the file itself is perfectly readable.
+    const readable = path.join(tmpDir, 'unresolved-caller.png');
+    fs.writeFileSync(readable, 'imgbytes');
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-a-1', content: `[MEDIA:image]${readable}` },
     }, 'inst-a');
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_rejected/); // caller_uid_unresolved → generic reject
+    assert.equal(feishuSpawnCount(), before, 'an unprovable-owner send must NOT spawn');
+  });
+
+  it('REL-8 fail-CLOSED classification: a caller with NO instance def (removed mid-connection) is treated as ISOLATED, not trusted-primary', async () => {
+    // The scan/SIGHUP teardown race: an instance removed from instances.json still
+    // holds a live authenticated socket for up to RESCAN_INTERVAL_MS. getInstanceDef
+    // then returns undefined. The OLD classification (`!!getInstanceDef(caller)?.os_user`)
+    // read that as FALSE → "trusted primary" → the readable-file path → and a ghost
+    // instance could exfil ANY broker-readable file (c4.db, peer homes). The fix
+    // classifies an unknown/undefined def as ISOLATED, so it routes through
+    // stageOwnedMedia whose caller_uid_unresolved branch denies. This readable,
+    // broker-owned file WOULD have been spawned under the old code.
+    const readable = path.join(tmpDir, 'ghost-exfil.png');
+    fs.writeFileSync(readable, 'imgbytes');            // perfectly readable by the broker
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'owner-chat', content: `[MEDIA:image]${readable}` },
+    }, 'ghost-removed');                               // caller not in instances.json → def undefined
+    assert.equal(r.ok, false);
+    assert.match(r.error, /attachment_rejected/);      // isolated + unresolvable uid → default-deny
+    assert.equal(feishuSpawnCount(), before, 'an unknown-def caller must NOT be trusted as primary → no spawn');
+  });
+
+  it('isolated caller: non-media content is unaffected by staging', async () => {
+    const before = feishuSpawnCount();
+    const r = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'feishu', endpoint: 'chat-self', content: 'plain text from an isolated tenant' },
+    }, 'inst-self');
     assert.equal(r.ok, true, r.error);
     assert.equal(feishuSpawnCount(), before + 1);
   });
