@@ -17,6 +17,7 @@ import {
   getNextPending,
   claimConversation,
   requeueConversation,
+  resetOrphanedRunning,
   markDelivered,
   getPendingCount,
   getPendingControlCount,
@@ -58,6 +59,8 @@ import {
   API_ACTIVITY_FILE,
   STALE_STATUS_THRESHOLD,
   TMUX_MISSING_WARN_THRESHOLD,
+  HEARTBEAT_INTERVAL_MS,
+  WATCHDOG_MAX_TICK_MS,
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
@@ -69,9 +72,18 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+// Observability state (WS-A). lastHeartbeatMs=0 → the first tick emits a
+// heartbeat immediately (a positive "alive" signal at startup), then every
+// HEARTBEAT_INTERVAL_MS. lastTickCompletedAt drives the stuck-tick watchdog and
+// is refreshed at the end of BOTH the success and error branches of the loop.
+let lastHeartbeatMs = 0;
+let lastTickCompletedAt = Date.now();
 
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const NOTIFY_DELIVERED_TIMEOUT_MS = 5000;
+// How often the watchdog checks for a stuck tick. Well below WATCHDOG_MAX_TICK_MS
+// so detection latency is bounded; internal implementation detail, not a tuning knob.
+const WATCHDOG_CHECK_INTERVAL_MS = 30000;
 
 function log(message) {
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
@@ -82,9 +94,9 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now() } = {}) {
+export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now(), socketPath = AM_SOCKET_PATH } = {}) {
   return new Promise((resolve) => {
-    const socket = net.createConnection(AM_SOCKET_PATH);
+    const socket = net.createConnection(socketPath);
     let settled = false;
 
     function settle() {
@@ -114,6 +126,42 @@ export function notifyMessageDelivered({ conversationId, channel, deliveredAt = 
 
 function nowSeconds() {
   return Math.floor(Date.now() / 1000);
+}
+
+// ── Loop liveness decisions (WS-A) ─────────────────────────────────────────
+// Extracted as pure functions with an injected `now` so the heartbeat/watchdog
+// logic is unit-testable without driving the live dispatcher loop.
+
+/** True when at least `intervalMs` has elapsed since the last heartbeat. */
+export function shouldEmitHeartbeat(now, lastHeartbeat, intervalMs = HEARTBEAT_INTERVAL_MS) {
+  return now - lastHeartbeat >= intervalMs;
+}
+
+/**
+ * True only when a tick has been silent strictly LONGER than `maxTickMs`.
+ * Strict `>` keeps a healthy long require_idle delivery (120s deadline + backoffs)
+ * from being falsely killed; an alive-but-erroring loop still refreshes
+ * lastTickCompletedAt each iteration, so it reads as healthy too (review LOW-7).
+ */
+export function isWatchdogExpired(now, lastTick, maxTickMs = WATCHDOG_MAX_TICK_MS) {
+  return now - lastTick > maxTickMs;
+}
+
+/**
+ * Render the periodic liveness line. Emitted unconditionally each interval, so a
+ * gap in these lines means the loop is dead/hung — the exact signal missing
+ * during the 6h04m silence. held/heldReasons default for legacy single-session
+ * results that don't carry them.
+ */
+export function formatHeartbeatLine({ pendingConv, pendingControl, held = 0, heldReasons = {}, state }) {
+  const breakdown = Object.entries(heldReasons).map(([k, v]) => `${k}:${v}`).join(',');
+  return `dispatcher alive: ${pendingConv} pending-conv, ${pendingControl} pending-control, ` +
+    `held=${held}${breakdown ? ` {${breakdown}}` : ''}, state=${state}`;
+}
+
+/** Read-only accessor for the watchdog clock (module-private state), for tests. */
+export function getLastTickCompletedAt() {
+  return lastTickCompletedAt;
 }
 
 export function readJsonFileWithRetry(filePath, attempts = 3) {
@@ -440,6 +488,9 @@ async function submitAndVerify(session = TMUX_SESSION) {
 async function sendToTmux(message, options = {}) {
   const strictVerify = options.strictVerify === true;
   const session = options.session || TMUX_SESSION;
+  // Multi-session: the "is the agent actually dead" fallback below must consult
+  // the TARGET instance's status files, not the primary's defaults.
+  const statusFile = options.statusFile || AGENT_STATUS_FILE;
   const acceptShutdownAfterSubmit = options.acceptShutdownAfterSubmit === true;
   const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
@@ -479,8 +530,8 @@ async function sendToTmux(message, options = {}) {
   // For non-conversation controls, preserve prior permissive behavior when the
   // process is confirmed alive (only hard-fail if process is dead/offline).
   if (!verifyResult.verified) {
-    const procState = readProcState();
-    const agentState = getAgentState();
+    const procState = readProcState(statusFile);
+    const agentState = getAgentState(statusFile);
     if ((procState && procState.alive === false) ||
         agentState.state === 'offline' || agentState.state === 'stopped') {
       if (acceptShutdownAfterSubmit) {
@@ -505,6 +556,17 @@ export function isKeystrokeControl(item) {
 
 export function parseKeystrokeKey(content) {
   return (content || '').slice('[KEYSTROKE]'.length).trim();
+}
+
+/**
+ * Send a raw key to a tmux session (no buffer paste, no verify). Used for
+ * [KEYSTROKE] controls (auto-approve Enter, watchdog interrupts). Injected into
+ * the multi-session path so per-instance sessions get real keypresses too.
+ * @param {string} session - tmux session name
+ * @param {string} key - tmux send-keys key name (e.g. 'Enter', 'Escape')
+ */
+export function sendKeystroke(session, key) {
+  execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 });
 }
 
 export function isCodexExitLifecycleControl(item, activeRuntime = ACTIVE_RUNTIME) {
@@ -660,7 +722,21 @@ function maybeCleanupControlQueue() {
 }
 
 async function processNextMessage() {
-  // Multi-session dispatch hook
+  // Control maintenance sweeps run in BOTH modes. They used to sit below the
+  // multi-session hook (which returns early), so in multi-session deployments
+  // control timeouts never fired and control_queue retention never ran.
+  maybeCleanupControlQueue();
+  const timedOut = expireTimedOutControls();
+  if (timedOut > 0) {
+    log(`Control timeout sweep marked ${timedOut} record(s) as timeout`);
+  }
+
+  // Multi-session dispatch hook. Module-load failure (modules absent) falls
+  // through to single-session; a RUNTIME error inside multi-session dispatch
+  // must NOT — falling through would paste instance-targeted messages into the
+  // default primary pane (cross-instance mis-delivery). Legacy mode (no
+  // instances.json) is signalled via `legacy: true` and falls through cleanly.
+  let multi = null;
   try {
     const { processWithMultiSession } = await import('./c4-dispatcher-multi.js');
     const {
@@ -670,25 +746,41 @@ async function processNextMessage() {
       markRejected,
       markControlRejected
     } = await import('./c4-db-multi.js');
-    return await processWithMultiSession({
-      getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
-      releaseItem, isBypassState, shouldAutoAckHeartbeat,
-      handleConversationDeliveryFailure, handleControlDeliveryFailure,
-      waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
-      markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
-      getNextPendingForInstances, getPendingTargetInstancesNeedingWake,
+    multi = {
+      processWithMultiSession,
+      getNextPendingForInstances,
+      getPendingTargetInstancesNeedingWake,
       getNextPendingControlForInstances,
-      markRejected, markControlRejected,
-    });
+      markRejected,
+      markControlRejected,
+    };
   } catch (e) {
-    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session error: ${e.message}`);
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session module load error: ${e.message}`);
     // Fall through to single-session logic below
   }
 
-  maybeCleanupControlQueue();
-  const timedOut = expireTimedOutControls();
-  if (timedOut > 0) {
-    log(`Control timeout sweep marked ${timedOut} record(s) as timeout`);
+  if (multi) {
+    try {
+      const result = await multi.processWithMultiSession({
+        getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+        releaseItem, isBypassState, shouldAutoAckHeartbeat,
+        handleConversationDeliveryFailure, handleControlDeliveryFailure,
+        waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+        markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
+        sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
+        getNextPendingForInstances: multi.getNextPendingForInstances,
+        getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
+        getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
+        markRejected: multi.markRejected,
+        markControlRejected: multi.markControlRejected,
+        notifyMessageDelivered,
+      });
+      if (!result?.legacy) return result;
+      // legacy mode (no instances.json): fall through to single-session
+    } catch (e) {
+      log(`Multi-session dispatch error: ${e.message}`);
+      return { delivered: false, state: 'multi_error' };
+    }
   }
 
   const agentState = getAgentState();
@@ -806,28 +898,78 @@ async function processNextMessage() {
   return { delivered: false, state: agentState.state };
 }
 
+// Emit the periodic liveness line at most once per interval. Reads the last
+// tick's result for held/heldReasons/state; DB counts are cheap enough at ~1/min.
+// Defensive: a DB hiccup while counting must never crash the loop — lastHeartbeatMs
+// is advanced before the read so a persistent error can't spin the log every tick.
+function maybeEmitHeartbeat(result) {
+  const now = Date.now();
+  if (!shouldEmitHeartbeat(now, lastHeartbeatMs, HEARTBEAT_INTERVAL_MS)) return;
+  lastHeartbeatMs = now;
+  try {
+    log(formatHeartbeatLine({
+      pendingConv: getPendingCount(),
+      pendingControl: getPendingControlCount(),
+      held: result?.held ?? 0,
+      heldReasons: result?.heldReasons ?? {},
+      state: result?.state,
+    }));
+  } catch (err) {
+    log(`Heartbeat emit error: ${err.message}`);
+  }
+}
+
+/**
+ * One dispatcher iteration, extracted from the loop so the liveness invariant is
+ * unit-testable without driving the infinite loop. Refreshes the watchdog clock
+ * AND emits the heartbeat on BOTH the success and error paths — an alive-but-
+ * erroring loop must keep lastTickCompletedAt fresh so the watchdog does not
+ * falsely kill it, while a genuinely stuck tick (which never returns here) goes
+ * stale and trips it (review LOW-7). `processFn` and `now` are injectable for
+ * tests; dispatcherLoop calls it with the defaults.
+ *
+ * @returns {Promise<{ result: object, errored: boolean }>}
+ */
+export async function runDispatcherTick(processFn = processNextMessage, now = Date.now) {
+  try {
+    const result = await processFn();
+    lastTickCompletedAt = now();
+    maybeEmitHeartbeat(result);
+    return { result, errored: false };
+  } catch (err) {
+    log(`Dispatcher error: ${err.stack}`);
+    lastTickCompletedAt = now();
+    maybeEmitHeartbeat({ state: 'error' });
+    return { result: { delivered: false, state: 'error' }, errored: true };
+  }
+}
+
 async function dispatcherLoop() {
   while (!isShuttingDown) {
-    try {
-      const { delivered, state } = await processNextMessage();
+    const { result, errored } = await runDispatcherTick();
+    const { delivered, state } = result;
 
-      if (delivered) {
-        pollInterval = POLL_INTERVAL_BASE;
-        await sleep(POLL_INTERVAL_BASE);
-        continue;
-      }
-
-      if (state === 'idle') {
-        pollInterval = Math.min(POLL_INTERVAL_MAX, pollInterval + POLL_INTERVAL_BASE);
-      } else {
-        pollInterval = POLL_INTERVAL_BASE;
-      }
-
+    // On error keep the prior poll interval and back off by it — unchanged from
+    // the original catch-branch behavior (an erroring tick does not reset the
+    // adaptive interval).
+    if (errored) {
       await sleep(pollInterval);
-    } catch (err) {
-      log(`Dispatcher error: ${err.stack}`);
-      await sleep(pollInterval);
+      continue;
     }
+
+    if (delivered) {
+      pollInterval = POLL_INTERVAL_BASE;
+      await sleep(POLL_INTERVAL_BASE);
+      continue;
+    }
+
+    if (state === 'idle') {
+      pollInterval = Math.min(POLL_INTERVAL_MAX, pollInterval + POLL_INTERVAL_BASE);
+    } else {
+      pollInterval = POLL_INTERVAL_BASE;
+    }
+
+    await sleep(pollInterval);
   }
 }
 
@@ -887,6 +1029,19 @@ async function main() {
   log(`Tmux session: ${TMUX_SESSION}`);
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);
 
+  // Reclaim rows a previous dispatcher left in 'running' (killed mid-delivery).
+  // Safe here: the singleton lock is held, so no other dispatcher owns a claim.
+  // Without this, a message claimed right before a SIGKILL/pm2 kill_timeout is
+  // invisible to every pending query forever — silent loss.
+  try {
+    const orphaned = resetOrphanedRunning();
+    if (orphaned.conversations > 0 || orphaned.controls > 0) {
+      log(`Reclaimed orphaned in-flight rows from a prior dispatcher: ${orphaned.conversations} conversation(s), ${orphaned.controls} control(s)`);
+    }
+  } catch (err) {
+    log(`Warning: orphaned-running reclaim failed: ${err.message}`);
+  }
+
   const pendingControl = getPendingControlCount();
   const pendingConversation = getPendingCount();
   if (pendingControl > 0) {
@@ -895,6 +1050,20 @@ async function main() {
   if (pendingConversation > 0) {
     log(`Found ${pendingConversation} pending conversation message(s)`);
   }
+
+  // Stuck-tick watchdog (defense-in-depth). pm2 can't detect a hung-but-online
+  // event loop, so a self-timer force-exits when no tick has completed in
+  // WATCHDOG_MAX_TICK_MS; pm2 (autorestart) then restarts and resetOrphanedRunning
+  // reclaims in-flight rows. .unref() so this timer never blocks the clean-shutdown
+  // process.exit(0) below.
+  lastTickCompletedAt = Date.now();
+  const watchdog = setInterval(() => {
+    if (isWatchdogExpired(Date.now(), lastTickCompletedAt, WATCHDOG_MAX_TICK_MS)) {
+      log(`WATCHDOG: no tick completed in >${WATCHDOG_MAX_TICK_MS}ms (last tick ${new Date(lastTickCompletedAt).toISOString()}) — exiting for pm2 restart`);
+      process.exit(1);
+    }
+  }, WATCHDOG_CHECK_INTERVAL_MS);
+  watchdog.unref();
 
   await dispatcherLoop();
   close();

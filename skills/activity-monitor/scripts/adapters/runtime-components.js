@@ -38,17 +38,25 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   log,
   rateLimitDefaultCooldown,
   userMessageRecoveryCooldown,
+  flapCeilingPerHour,
+  degradedProbeInterval,
+  rateLimitProbeInterval,
+  notifyDegraded,
 }) {
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
     killTmuxSession: () => activeAdapter.stop(),
     checkAuth: () => activeAdapter.checkAuth ? activeAdapter.checkAuth() : { status: 'success', reason: 'no_checkAuth' },
+    notifyDegraded, // REL-3: out-of-band admin alert on the flap-ceiling transition
     log,
   }, {
     initialHealth: initialStatus.health,
     initialReason: initialStatus.unavailable_reason || '',
     rateLimitDefaultCooldown,
     userMessageRecoveryCooldown,
+    flapCeilingPerHour,
+    degradedProbeInterval,
+    rateLimitProbeInterval,
   });
 }
 
@@ -56,11 +64,13 @@ export function createGuardian(activeAdapter, activeToolPipeline, initialRuntime
   apiActivityFile,
   hookStateFile,
   monitorDir,
+  signalTtlSec,
   log,
 }) {
   return new Guardian(activeAdapter, {
     log,
     monitorDir, // ZY-LIFE-1: enables the auto-suspend gate
+    signalTtlSec, // REL-6: orphaned suspend/wake signals are ignored + deleted
     initialRuntimeLaunchAtMs,
     resetToolLifecycleState: () => {
       activeToolPipeline.reset({ clearFiles: true });

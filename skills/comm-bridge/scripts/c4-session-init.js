@@ -145,6 +145,42 @@ export async function emitC4Conversations(_payload = null, budget = null, { inst
       );
     }
 
+    // Delivered-but-unanswered user messages (lost to an interruption — restart,
+    // not-logged-in, frozen) get an explicit ACTION-REQUIRED flag so a fresh
+    // session actually replies instead of treating them as passive history.
+    // Built once here; appended to whichever delivery path returns below.
+    let unansweredSection = null;
+    if (instanceId && multi?.getUnansweredDeliveredForInstance) {
+      try {
+        const unanswered = multi.getUnansweredDeliveredForInstance(instanceId);
+        if (unanswered && unanswered.length > 0) {
+          const MAX = 5;
+          const lines = unanswered.slice(-MAX).map((m) => {
+            const chat = String(m.endpoint_id || '').split('|')[0];
+            // Strip any reply-routing suffix from the preview: this section is a
+            // pointer, not a second copy of the routing (the full message with
+            // its reply path is in the conversation sections above).
+            const preview = String(m.content || '')
+              .replace(/----\s*reply via:.*$/is, '')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 100);
+            return `- [${m.channel} ${chat}] "${preview}" (${m.timestamp})`;
+          });
+          const more = unanswered.length > MAX ? `\n(+${unanswered.length - MAX} more earlier)` : '';
+          unansweredSection = formatSection(
+            'ACTION REQUIRED — POSSIBLY UNANSWERED',
+            'These user message(s) were delivered but have NO reply yet — likely delivered during an '
+            + 'interruption (restart / not-logged-in / frozen) and never processed. Read the full text in '
+            + 'the conversation sections above and REPLY if still relevant, using the reply path shown '
+            + `with each message above:\n${lines.join('\n')}${more}`,
+          );
+        }
+      } catch (err) {
+        console.error(`[c4-session-init] WARN: unanswered-delivered check failed: ${err.message}`);
+      }
+    }
+
     const range = (instanceId && multi?.getUnsummarizedRangeForInstance)
       ? multi.getUnsummarizedRangeForInstance(instanceId)
       : getUnsummarizedRange();
@@ -184,6 +220,7 @@ export async function emitC4Conversations(_payload = null, budget = null, { inst
           `There are ${range.count} unsummarized conversations across all groups (conversation id ${range.begin_id} ~ ${range.end_id}). Please use zylos-memory skill to process them, keeping each chat's memory under memory/groups/<group_key>/.`,
         ));
       }
+      if (unansweredSection) sections.push(unansweredSection);
       return sections.join('\n\n');
     }
 
@@ -216,18 +253,20 @@ export async function emitC4Conversations(_payload = null, budget = null, { inst
 
     let kept = conversations;
     let body = assemble(kept);
-    if (!budget) return body;
-
-    // Reserve room for the [k/N] shard header the orchestrator prepends.
-    const packBudget = {
-      maxChars: Math.max(0, budget.maxChars - 200),
-      maxTokens: Math.max(0, budget.maxTokens - 60),
-    };
-    while (kept.length > 1 && !withinBudget(body, packBudget)) {
-      kept = kept.slice(1); // drop the oldest whole message
-      body = assemble(kept);
+    if (budget) {
+      // Reserve room for the [k/N] shard header the orchestrator prepends.
+      const packBudget = {
+        maxChars: Math.max(0, budget.maxChars - 200),
+        maxTokens: Math.max(0, budget.maxTokens - 60),
+      };
+      while (kept.length > 1 && !withinBudget(body, packBudget)) {
+        kept = kept.slice(1); // drop the oldest whole message
+        body = assemble(kept);
+      }
     }
-    return body;
+    // The unanswered flag rides outside packing: it is small, and dropping it
+    // to fit budget would defeat its whole purpose (never lose a waiting user).
+    return unansweredSection ? `${body}\n\n${unansweredSection}` : body;
   }, { closeDb });
 }
 
