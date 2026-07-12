@@ -11,8 +11,8 @@ export function createUsageMonitor(activeAdapter, options) {
   return new UsageMonitor(activeAdapter, options);
 }
 
-export function createProcSampler(activeAdapter, { log }) {
-  return new ProcSampler({ sessionName: activeAdapter.sessionName, log });
+export function createProcSampler(activeAdapter, { log, findRuntimePidUnderPane }) {
+  return new ProcSampler({ sessionName: activeAdapter.sessionName, log, findRuntimePidUnderPane });
 }
 
 export function createToolPipeline(activeAdapter, config, {
@@ -55,10 +55,12 @@ export function createHealthEngine(activeAdapter, initialStatus, {
 export function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, {
   apiActivityFile,
   hookStateFile,
+  monitorDir,
   log,
 }) {
   return new Guardian(activeAdapter, {
     log,
+    monitorDir, // ZY-LIFE-1: enables the auto-suspend gate
     initialRuntimeLaunchAtMs,
     resetToolLifecycleState: () => {
       activeToolPipeline.reset({ clearFiles: true });

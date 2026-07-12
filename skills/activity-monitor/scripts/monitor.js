@@ -176,7 +176,7 @@ const _runtimeIndexPath = (() => {
 })();
 const _runtimeDirPath = path.dirname(_runtimeIndexPath);
 const _sessionHandoffPath = path.join(_runtimeDirPath, 'session-handoff.js');
-const { getActiveAdapter } = await import(_runtimeIndexPath);
+const { getActiveAdapter, findRuntimePidUnderPane } = await import(_runtimeIndexPath);
 const { enqueueNewSession } = await import(_sessionHandoffPath);
 
 const __filename = fileURLToPath(import.meta.url);
@@ -184,7 +184,17 @@ const __dirname = path.dirname(__filename);
 
 // Core runtime config
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+// Multi-session (fork): each instance gets its own activity-monitor state dir.
+// getMonitorDir() honors ZYLOS_INSTANCE_ID + instances.json `state_dir` override,
+// falling back to ~/zylos/activity-monitor when no instance is set (single-session).
+const {
+  getInstanceId: _getInstanceId,
+  getMonitorDir: _getInstanceMonitorDir,
+  isPrimary: _isInstancePrimary,
+  isInstanceEnabled: _isInstanceEnabled,
+} = await import('../../multi-session/instance-config.js').catch(() => ({}));
+const INSTANCE_ID = _getInstanceId ? _getInstanceId() : null;
+const MONITOR_DIR = _getInstanceMonitorDir ? _getInstanceMonitorDir() : path.join(ZYLOS_DIR, 'activity-monitor');
 const STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
 const AM_SOCKET_FILE = path.join(MONITOR_DIR, 'am.sock');
 const MESSAGE_ROUTER_CACHE_FILE = path.join(MONITOR_DIR, 'message-router-probe-cache.json');
@@ -403,7 +413,10 @@ function atomicWriteJson(filePath, value) {
 }
 
 function writeStatusFile(statusObj) {
-  writeStatus({ statusFile: STATUS_FILE, statusObj, healthEngine: engine });
+  // Stamp every status write with the instance id (multi-session: dashboard + downstream
+  // consumers expect this field to disambiguate per-instance status files).
+  const enriched = INSTANCE_ID ? { ...statusObj, instance_id: INSTANCE_ID } : statusObj;
+  writeStatus({ statusFile: STATUS_FILE, statusObj: enriched, healthEngine: engine });
 }
 
 function buildNotRunningStatus({
@@ -636,27 +649,9 @@ function getTmuxPanePid(sessionName) {
 function getTmuxClaudePid(sessionName) {
   const panePid = getTmuxPanePid(sessionName);
   if (!panePid) return 0;
-
-  try {
-    const name = execSync(`ps -p ${panePid} -o comm= 2>/dev/null`, {
-      encoding: 'utf8',
-      timeout: 3000
-    }).trim();
-    if (name === 'claude') return panePid;
-  } catch {
-    // Ignore and fall through.
-  }
-
-  try {
-    const out = execSync(`pgrep -P ${panePid} -f "claude" | head -1`, {
-      encoding: 'utf8',
-      timeout: 3000
-    }).trim();
-    const childPid = Number.parseInt(out, 10);
-    return Number.isInteger(childPid) && childPid > 0 ? childPid : 0;
-  } catch {
-    return 0;
-  }
+  // Shared util: pane pid itself when it IS the runtime (non-os_user), else the
+  // runtime descendant (os_user nests it under sudo -> sudo -> node -> claude).
+  return findRuntimePidUnderPane(panePid, 'claude');
 }
 
 function writeWatchdogState() {
@@ -1024,7 +1019,7 @@ function init() {
     readConfigObject,
     createToolPipeline,
     readWatchdogState: () => readJsonFileSafe(TOOL_WATCHDOG_STATE_FILE),
-    createProcSampler: (activeAdapter) => createRuntimeProcSampler(activeAdapter, { log }),
+    createProcSampler: (activeAdapter) => createRuntimeProcSampler(activeAdapter, { log, findRuntimePidUnderPane }),
     loadInitialHealth,
     createHealthEngine,
     createGuardian,

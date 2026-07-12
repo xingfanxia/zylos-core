@@ -65,9 +65,56 @@ try {
   }
 } catch { /* ZYLOS_PACKAGE_ROOT stays empty — activity-monitor uses relative path fallback */ }
 
+/**
+ * Load instances.json and generate one PM2 activity-monitor app per enabled,
+ * non-on-demand instance. Falls back to empty array when instances.json is
+ * absent (single-session mode).
+ */
+function loadInstanceMonitors() {
+  const instancesFile = path.join(ZYLOS_DIR, 'instances.json');
+  try {
+    const config = JSON.parse(fs.readFileSync(instancesFile, 'utf8'));
+    const instances = config.instances || {};
+    const apps = [];
+
+    for (const [id, def] of Object.entries(instances)) {
+      // Skip disabled instances
+      if (def.enabled === false) continue;
+
+      const pm2Name = `activity-monitor-${id}`;
+      const monitorDir = (def.state_dir || '').replace(/^~/, HOME)
+        || path.join(ZYLOS_DIR, 'activity-monitor', id);
+
+      apps.push({
+        name: pm2Name,
+        script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
+        cwd: HOME,
+        env: {
+          PATH: ENHANCED_PATH,
+          NODE_ENV: 'production',
+          ZYLOS_DIR,
+          ZYLOS_INSTANCE_ID: id,
+          ZYLOS_TMUX_SESSION: def.tmux_session || `claude-${id}`,
+          CLAUDE_BYPASS_PERMISSIONS,
+          CODEX_BYPASS_PERMISSIONS,
+          ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+        },
+        autorestart: true,
+        max_restarts: 10,
+        min_uptime: '10s',
+      });
+    }
+
+    return apps;
+  } catch {
+    // instances.json missing or malformed — single-session mode
+    return [];
+  }
+}
+
 // Core service names — components must not collide with these
 const CORE_SERVICE_NAMES = new Set([
-  'scheduler', 'web-console', 'c4-dispatcher', 'activity-monitor', 'caddy',
+  'scheduler', 'web-console', 'c4-dispatcher', 'c4-broker', 'activity-monitor', 'caddy',
 ]);
 
 // Parse SKILL.md YAML frontmatter service block.
@@ -227,19 +274,75 @@ module.exports = {
       min_uptime: '10s'
     },
     {
-      name: 'activity-monitor',
-      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
-      cwd: HOME,
+      // ZY-ISO-2: mediates isolated agents' c4.db access + channel sends over
+      // per-instance unix sockets. Same env as c4-dispatcher so channel sends
+      // resolve the cred-bearing root .env via $HOME/zylos/.env.
+      name: 'c4-broker',
+      script: path.join(SKILLS_DIR, 'comm-bridge', 'scripts', 'c4-broker.js'),
+      cwd: path.join(SKILLS_DIR, 'comm-bridge', 'scripts'),
       env: {
         PATH: ENHANCED_PATH,
-        NODE_ENV: 'production',
-        CLAUDE_BYPASS_PERMISSIONS,
-        CODEX_BYPASS_PERMISSIONS,
-        ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+        NODE_ENV: 'production'
       },
       autorestart: true,
       max_restarts: 10,
       min_uptime: '10s'
+    },
+    // Activity monitors: per-instance when instances.json exists, single fallback otherwise
+    ...(() => {
+      const instanceMonitors = loadInstanceMonitors();
+      if (instanceMonitors.length > 0) return instanceMonitors;
+      // Fallback: single activity-monitor (single-session mode)
+      return [{
+        name: 'activity-monitor',
+        script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'activity-monitor.js'),
+        cwd: HOME,
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+        CLAUDE_BYPASS_PERMISSIONS,
+        CODEX_BYPASS_PERMISSIONS,
+        ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
+      },
+        autorestart: true,
+        max_restarts: 10,
+        min_uptime: '10s'
+      }];
+    })(),
+    // Token cache updater — runs ccusage hourly, writes per-instance data for dashboard
+    {
+      name: 'token-cache-updater',
+      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'update-token-cache.js'),
+      args: '--daemon',
+      cwd: HOME,
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+        TOKEN_CACHE_INTERVAL_MS: String(60 * 60 * 1000),
+        TOKEN_CACHE_RETRY_MS: String(10 * 60 * 1000),
+      },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
+    },
+    {
+      name: 'provider-usage-updater',
+      script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'update-provider-usage.js'),
+      args: '--daemon',
+      cwd: HOME,
+      env: {
+        PATH: ENHANCED_PATH,
+        NODE_ENV: 'production',
+        ZYLOS_DIR,
+        CODEXBAR_BIN: path.join(BIN_DIR, 'codexbar'),
+        PROVIDER_USAGE_INTERVAL_MS: String(5 * 60 * 1000),
+        PROVIDER_USAGE_RETRY_MS: String(60 * 1000),
+      },
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: '10s',
     },
     // Caddy web server (only if set up via `zylos init`)
     ...(fs.existsSync(path.join(BIN_DIR, 'caddy')) && fs.existsSync(path.join(HTTP_DIR, 'Caddyfile'))

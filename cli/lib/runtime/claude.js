@@ -34,11 +34,27 @@ import {
   getProcessName,
   hasChildProcess,
 } from './tmux-helpers.js';
-import { buildCleanEnv, buildCompatEnv, loadRuntimeEnvManifest, writeLaunchSpec } from './tmux-env.js';
+import {
+  buildCleanEnv,
+  buildCompatEnv,
+  ensureInstanceGhConfigDir,
+  loadRuntimeEnvManifest,
+  writeLaunchSpec,
+} from './tmux-env.js';
+
+// Multi-session: heartbeat pending state must be per-instance. With the shared
+// path, two instances' health engines overwrite each other's pending pointer,
+// each polls the other's control id, and both kill healthy sessions on the
+// resulting false timeouts (2026-07-09 scheduler/user-elaine heartbeat storm).
+// getMonitorDir() honors ZYLOS_INSTANCE_ID + instances.json state_dir and falls
+// back to the shared dir for single-session deployments.
+const { getMonitorDir: _getMonitorDir } =
+  await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'claude-main';
+// Multi-session: allow ZYLOS_TMUX_SESSION env var to override the default
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'claude-main';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 // When CLAUDE_BYPASS_PERMISSIONS=false, skip --dangerously-skip-permissions.
@@ -76,7 +92,7 @@ function _parseEnvValue(content, key) {
 export class ClaudeAdapter extends RuntimeAdapter {
   get displayName() { return 'Claude Code'; }
   get runtimeId() { return 'claude'; }
-  get sessionName()  { return 'claude-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -245,8 +261,38 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // 1. Build instruction file before launching
     await this.buildInstructionFile();
 
-    // 2. Pre-accept onboarding/trust dialogs (all auth methods)
-    _ensureOnboardingComplete(ZYLOS_DIR);
+    // 1b. Resolve per-instance working directory (token tracking isolation)
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    let osUser = null;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd, getInstanceDef } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+        // OS-level isolation (docs/design/agent-os-isolation.md): instances with
+        // an os_user run Claude as that dedicated unix user instead of the
+        // service user. Provisioned by scripts/ops/provision-agent-user.sh.
+        const candidate = getInstanceDef(instanceId)?.os_user || null;
+        if (candidate) {
+          if (/^[a-z_][a-z0-9_-]{0,31}$/.test(candidate)) {
+            osUser = candidate;
+          } else {
+            console.error(`[ClaudeAdapter] ignoring invalid os_user "${candidate}" for "${instanceId}"`);
+          }
+        }
+      } catch (err) {
+        console.error(`[ClaudeAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
+    // 2. Pre-accept onboarding/trust dialogs (all auth methods).
+    // os_user instances: provisioning owns /home/<os_user>/.claude.json — the
+    // service user cannot (and must not) write into the agent home.
+    if (!osUser) {
+      _ensureOnboardingComplete(ZYLOS_DIR);
+      if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
+    }
+    const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
     // 3. Detect auth method to avoid "Auth conflict" errors
     const useCredentialsFile = _hasCredentialsFile();
@@ -284,15 +330,33 @@ export class ClaudeAdapter extends RuntimeAdapter {
     const envStripFlags = hasNativeAuth
       ? ' -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY'
       : '';
+
+    // No --continue: CC's resume locks model to original session and double-injects
+    // context (zylos's c4-session-init hook already restores conversation history).
     const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'claude-exit.log');
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
+    // os_user instances: a leftover pane belongs to the agent user (or is a
+    // stale service-user shell) — neither can be reused for a privileged
+    // relaunch. Kill and rebuild through the clean new-session pipeline.
+    if (osUser && tmuxHasSession(SESSION)) {
+      tmuxKillSession(SESSION);
+    }
+
     if (tmuxHasSession(SESSION)) {
-      // Existing session — send command via sendMessage, no env rebuild
-      const cmd = `cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
+      // Existing session — send command via sendMessage, no env rebuild.
+      // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+        ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
+        ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
@@ -307,6 +371,12 @@ export class ClaudeAdapter extends RuntimeAdapter {
       // Strip vars that cause Claude to refuse startup ("already running" detection)
       for (const v of ENV_VARS_TO_STRIP) delete env[v];
 
+      // Multi-session: propagate instance identity into the launched Claude process
+      // so its hooks/skills write to the correct per-instance paths.
+      if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
+      if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
+      if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
+
       // Inject auth tokens
       if (hasNativeAuth) {
         delete env.ANTHROPIC_API_KEY;
@@ -315,6 +385,15 @@ export class ClaudeAdapter extends RuntimeAdapter {
         if (apiKeyValue) env.ANTHROPIC_API_KEY = apiKeyValue;
         if (oauthTokenValue) env.CLAUDE_CODE_OAUTH_TOKEN = oauthTokenValue;
         if (baseUrlValue) env.ANTHROPIC_BASE_URL = baseUrlValue;
+      }
+
+      // os_user instances: the agent process gets the agent's own HOME so its
+      // ~/zylos farm dir (per-instance .env + symlinks), credentials symlink,
+      // transcripts, and hook `~` expansion all resolve inside the agent home.
+      if (osUser) {
+        env.HOME = `/home/${osUser}`;
+        env.USER = osUser;
+        env.LOGNAME = osUser;
       }
 
       // Build launch spec
@@ -326,9 +405,24 @@ export class ClaudeAdapter extends RuntimeAdapter {
         command: CLAUDE_BIN,
         args,
         env,
-        cwd: ZYLOS_DIR,
+        cwd: instanceCwd,
         exitLogFile,
       });
+
+      // Spec is 0600 in /tmp (sticky): hand it to the agent user so the
+      // launcher (running as os_user) can read + unlink it.
+      if (osUser) {
+        try {
+          execFileSync('sudo', ['-n', 'chown', `${osUser}:${osUser}`, specPath], { timeout: 10_000 });
+        } catch (e) {
+          try { fs.unlinkSync(specPath); } catch { }
+          throw new Error(`Failed to chown launch spec to ${osUser}: ${e.message}`);
+        }
+      }
+
+      const launchCmd = osUser
+        ? `sudo -n -u ${osUser} -H -- "${process.execPath}" "${launcherPath}" "${specPath}"`
+        : `"${process.execPath}" "${launcherPath}" "${specPath}"`;
 
       // tmux args — only pass minimal env for launcher itself to start
       const tmuxArgs = [
@@ -336,7 +430,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         '-e', `PATH=${env.PATH}`,
         '-e', `HOME=${env.HOME}`,
         '-e', `TERM=${env.TERM || 'xterm-256color'}`,
-        '--', `"${process.execPath}" "${launcherPath}" "${specPath}"`,
+        '--', launchCmd,
       ];
 
       try {
@@ -358,7 +452,10 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @returns {object}
    */
   getHeartbeatDeps() {
-    const pendingFile = path.join(ZYLOS_DIR, 'activity-monitor', 'heartbeat-pending.json');
+    const monitorDir = _getMonitorDir
+      ? _getMonitorDir()
+      : path.join(ZYLOS_DIR, 'activity-monitor');
+    const pendingFile = path.join(monitorDir, 'heartbeat-pending.json');
     return createClaudeProbe({ pendingFile, tmuxSession: SESSION });
   }
 

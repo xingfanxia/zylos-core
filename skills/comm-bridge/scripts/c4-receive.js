@@ -28,7 +28,7 @@ const ROUTER_IPC_TIMEOUT_MS = 30000;
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] [--target-instance <id>] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Mark as not needing a reply target (use for system messages)');
@@ -51,7 +51,8 @@ function parseArgs(args) {
     priority: 3,
     noReply: false,
     requireIdle: false,
-    json: false
+    json: false,
+    targetInstance: null
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -77,6 +78,9 @@ function parseArgs(args) {
         break;
       case '--content':
         result.content = args[++i];
+        break;
+      case '--target-instance':
+        result.targetInstance = args[++i];
         break;
       default:
         if (args[i].startsWith('--')) {
@@ -310,7 +314,7 @@ async function main() {
     emitError(asJson, 'INVALID_ARGS', parsed.error);
   }
 
-  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json } = parsed;
+  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json, targetInstance: explicitTargetInstance } = parsed;
   let channel = rawChannel;
 
   if (!channel && noReply) {
@@ -346,9 +350,43 @@ async function main() {
     }
   }
 
+  // Health check via AM v3 message-router IPC (with file fallback).
+  // Replaces the old inline readHealthStatus() / recordPendingChannel pattern —
+  // those helpers were removed in v0.4.13; the AM router now owns recovery routing.
   const route = await queryRoute(channel, endpoint, noReply);
+  // Resolve target instance for multi-session routing (fork extension).
+  // Uses the raw endpoint: instance routing is orthogonal to replyability —
+  // a --no-reply message still routes to the endpoint's instance.
+  let targetInstance = explicitTargetInstance;
+  if (!targetInstance) {
+    try {
+      const { resolveInstance } = await import('./c4-instance-router.js');
+      targetInstance = resolveInstance(endpoint);
+    } catch { /* instance router not available */ }
+  }
+
+  // Clean-store model (#618): the DB keeps content exactly as received; reply
+  // routing is reconstructed at delivery (dispatcher getDeliveryContent) and
+  // agent-facing formatting (formatConversationsForAgent). endpoint_id doubles
+  // as the replyability signal — NULL when --no-reply.
   const replyEndpoint = noReply ? null : endpoint;
+  // let (not const): upstream's status-cooldown path appends to dbContent below.
   let dbContent = content;
+
+  // Check if unknown endpoint should be held for approval (fork extension).
+  // Held rows keep the raw endpoint: checkAndHoldForApproval returns false for
+  // no-reply messages, so a held row is always replyable.
+  try {
+    const { checkAndHoldForApproval, holdAndNotify } = await import('./c4-approve.js');
+    const held = await checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
+    if (held) {
+      const record = holdAndNotify(channel, endpoint, dbContent, priority, targetInstance);
+      emitSuccess(json, record.id);
+      close();
+      return;
+    }
+  } catch { /* approval module not available */ }
+
   const dbStatus = route.recovered ? 'pending' : 'delivered';
   let cooldown = null;
 
@@ -361,7 +399,7 @@ async function main() {
     if (cooldown.suppressed) {
       dbContent += `\n\n[C4] Status notification suppressed by cooldown while health=${statusNoticeType(route)} reason=${statusNoticeReason(route)}.`;
       try {
-        const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, 'suppressed');
+        const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, 'suppressed', targetInstance);
         emitSuccess(json, record.id, 'suppressed');
         return;
       } catch (err) {
@@ -373,7 +411,7 @@ async function main() {
   }
 
   try {
-    const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle);
+    const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, null, targetInstance);
     if (route.recovered || noReply) {
       emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered');
       return;

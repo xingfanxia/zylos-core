@@ -125,6 +125,17 @@ export function parsePathManifest(value, warnings, keyName) {
 }
 
 /**
+ * Give each Zylos instance its own GitHub CLI config directory.
+ * This prevents per-instance agents from inheriting the operator's ~/.config/gh.
+ */
+export function ensureInstanceGhConfigDir(instanceCwd) {
+  const ghConfigDir = path.join(instanceCwd, '.config', 'gh');
+  fs.mkdirSync(ghConfigDir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(ghConfigDir, 0o700); } catch { /* best effort */ }
+  return ghConfigDir;
+}
+
+/**
  * Parse a comma-separated manifest string into validated variable names.
  * Invalid names are skipped and recorded in warnings.
  */
@@ -154,10 +165,6 @@ function _buildPath(processEnv, platform, pathPrepend, pathAppend, execPath) {
     path.join(home, '.claude', 'bin'),
   ];
 
-  // Pin the node binary that's running core — guarantees tmux child processes
-  // use the same node even when the caller's PATH lacks nvm (e.g. PM2).
-  const execDir = execPath ? [path.dirname(execPath)] : [];
-
   const currentParts = (processEnv.PATH || '').split(':').filter(Boolean);
   const nvmParts = currentParts.filter(p => p.includes('.nvm'));
 
@@ -171,6 +178,17 @@ function _buildPath(processEnv, platform, pathPrepend, pathAppend, execPath) {
     '/usr/sbin', '/usr/bin',
     '/sbin', '/bin',
   ];
+
+  // Pin the node binary that's running core — guarantees tmux child processes
+  // use the same node even when the caller's PATH lacks nvm (e.g. PM2).
+  // When node IS a platform/system binary, skip the pin: hoisting a whole
+  // system dir here would shadow its later position and break the documented
+  // "PREPEND before platform/system base paths" contract (dedup keeps the
+  // first occurrence).
+  const execDir = execPath
+    ? [path.dirname(execPath)].filter(
+        d => !systemPaths.includes(d) && !platformPaths.includes(d))
+    : [];
 
   const allParts = [
     ...userDirs, ...execDir, ...nvmParts,

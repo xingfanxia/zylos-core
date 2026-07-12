@@ -56,7 +56,7 @@ export class ContextMonitorBase {
     const usage = await this.getUsage();
     if (!usage || !usage.ceiling) return null;
     const { used, ceiling } = usage;
-    return { used, ceiling, ratio: used / ceiling };
+    return { ...usage, used, ceiling, ratio: used / ceiling };
   }
 
   /**
@@ -69,11 +69,14 @@ export class ContextMonitorBase {
    * @param {object} callbacks
    * @param {Function} [callbacks.onExceed]           Fired when session-switch threshold exceeded
    * @param {Function} [callbacks.onEarlyThreshold]   Fired when early threshold reached (but below session-switch)
+   * @param {Function} [callbacks.onSample]           Fired on every check with the usage result (multi-session monitoring)
    * @returns {Promise<void>}
    */
-  async checkThreshold({ onExceed, onEarlyThreshold } = {}) {
+  async checkThreshold({ onExceed, onEarlyThreshold, onSample } = {}) {
     const result = await this.check();
     if (!result) return;
+
+    if (onSample) await onSample(result);
 
     const { used, ceiling, ratio } = result;
     const now = Date.now();
@@ -104,11 +107,12 @@ export class ContextMonitorBase {
    * @param {number}   [opts.intervalMs=30000]       Poll interval in ms
    * @param {Function} [opts.onExceed]               Callback fired when session-switch threshold exceeded
    * @param {Function} [opts.onEarlyThreshold]       Callback fired when early threshold reached
+   * @param {Function} [opts.onSample]               Callback fired on every check (multi-session monitoring)
    */
-  startPolling({ intervalMs = 30_000, onExceed, onEarlyThreshold } = {}) {
+  startPolling({ intervalMs = 30_000, onExceed, onEarlyThreshold, onSample } = {}) {
     if (this._intervalId) return;
     this._intervalId = setInterval(() => {
-      this.checkThreshold({ onExceed, onEarlyThreshold }).catch(() => {});
+      this.checkThreshold({ onExceed, onEarlyThreshold, onSample }).catch(() => {});
     }, intervalMs);
   }
 

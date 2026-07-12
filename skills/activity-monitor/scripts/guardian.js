@@ -1,4 +1,6 @@
 import { execSync as defaultExecSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
 export const BASE_RESTART_DELAY = 5;
 export const MAX_RESTART_DELAY = 60;
@@ -76,6 +78,7 @@ export class Guardian {
       execSyncImpl: defaultExecSync,
       nowMs: () => Date.now(),
       initialRuntimeLaunchAtMs: 0,
+      monitorDir: null, // ZY-LIFE-1: per-instance state dir for suspend/wake signals
       ...deps,
     };
     this.notRunningCount = 0;
@@ -104,6 +107,7 @@ export class Guardian {
     });
 
     if (!hasSession) {
+      if (this._shouldStaySuspended()) return this._suspendedResult('tmux session not found (instance suspended)');
       return this._handleNotRunning({
         state: 'offline',
         message: 'tmux session not found',
@@ -119,6 +123,7 @@ export class Guardian {
     }
 
     if (!agentRunning) {
+      if (this._shouldStaySuspended()) return this._suspendedResult(`${this.adapter.displayName} suspended`);
       return this._handleNotRunning({
         state: 'stopped',
         message: `${this.adapter.displayName} not running in tmux`,
@@ -144,6 +149,82 @@ export class Guardian {
       runtimeLaunchAtMs: this.runtimeLaunchAtMs,
       notRunningSeconds: 0,
       message: null,
+      skippedForStartupGrace: false,
+    };
+  }
+
+  // ── ZY-LIFE-1: auto-suspend gate ─────────────────────────────────────
+  // The dispatcher writes a `suspend-signal` when it reaps an idle instance and
+  // a `wake-signal` when a message arrives for an offline instance; the dashboard
+  // Suspend also drops a suspend-signal. This gate makes the guardian RESPECT
+  // suspension (skip relaunch) instead of restarting immediately — but a pending
+  // wake-signal always wins, so a suspended instance self-heals on the user's
+  // next message. Legacy behavior (always relaunch) is preserved when no
+  // monitorDir is wired.
+
+  _signalPath(name) {
+    return this.deps.monitorDir ? path.join(this.deps.monitorDir, name) : null;
+  }
+
+  /**
+   * @returns {boolean} true if the instance should remain suspended (skip relaunch)
+   */
+  _shouldStaySuspended() {
+    if (!this.deps.monitorDir) return false; // not wired → legacy always-relaunch
+
+    // Wake takes priority: consume the wake-signal, clear suspension, relaunch.
+    const wake = this._signalPath('wake-signal');
+    try {
+      if (wake && fs.existsSync(wake)) {
+        fs.unlinkSync(wake);
+        const sus = this._signalPath('suspend-signal');
+        try { if (sus && fs.existsSync(sus)) fs.unlinkSync(sus); } catch { /* ignore */ }
+        this._clearSuspendedStatus();
+        return false;
+      }
+    } catch { /* fall through to suspend checks */ }
+
+    // Suspended via the durable signal file (dispatcher reap / dashboard).
+    try {
+      const sus = this._signalPath('suspend-signal');
+      if (sus && fs.existsSync(sus)) return true;
+    } catch { /* ignore */ }
+
+    // Secondary: an explicit suspended state in agent-status.json.
+    try {
+      const sp = this._signalPath('agent-status.json');
+      if (sp && fs.existsSync(sp)) {
+        const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+        if (st && st.state === 'suspended') return true;
+      }
+    } catch { /* ignore */ }
+
+    return false;
+  }
+
+  _clearSuspendedStatus() {
+    const sp = this._signalPath('agent-status.json');
+    if (!sp) return;
+    try {
+      const st = JSON.parse(fs.readFileSync(sp, 'utf8'));
+      if (st && st.state === 'suspended') {
+        st.state = 'starting';
+        st.resumed_at = this.deps.nowMs();
+        fs.writeFileSync(sp, JSON.stringify(st));
+      }
+    } catch { /* best effort */ }
+  }
+
+  _suspendedResult(message) {
+    this.notRunningCount = 0;
+    this.startupGrace = 0;
+    this.stableRunningSince = 0;
+    return {
+      state: 'suspended',
+      attempted_restart: false,
+      runtimeLaunchAtMs: this.runtimeLaunchAtMs,
+      notRunningSeconds: 0,
+      message,
       skippedForStartupGrace: false,
     };
   }

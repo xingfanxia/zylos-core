@@ -727,9 +727,10 @@ describe('syncHooks SessionStart orchestrator convergence', () => {
 
     const result = syncHooks(installed, makeOrchestratorTemplate(), { log: noopLog });
 
-    // 8 shard/side-effect commands x 3 SessionStart matchers + 7 other-event
-    // hooks added; 4 retired per-step hooks x 3 matchers removed.
-    assert.deepEqual(result, { added: 31, updated: 0, removed: 12 });
+    // 33 = upstream's 31 (8 shard/side-effect commands x 3 SessionStart
+    // matchers + 7 other-event hooks) + the two fork PreToolUse guards
+    // (memory-guard, src-egress-guard) that desiredClaudeHooks() manages.
+    assert.deepEqual(result, { added: 33, updated: 0, removed: 12 });
     assertSessionStartUsesOrchestrator(installed);
   });
 

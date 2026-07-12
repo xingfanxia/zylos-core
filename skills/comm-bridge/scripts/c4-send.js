@@ -31,6 +31,7 @@ import { spawn } from 'child_process';
 import { insertConversation, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 function printUsage() {
   console.log('Usage: node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
@@ -71,9 +72,18 @@ async function main() {
   let message = null;
 
   if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
-    // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin
-    endpoint = cleanArgs[1];
-    message = (await readStdin()).trimEnd();
+    // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin.
+    // But a non-interactive stdin (cron, spawn) may simply be empty — in that case
+    // fall back to the documented 2-arg CLI form (channel + message, no endpoint /
+    // broadcast) instead of erroring, so the [endpoint_id]-optional contract works
+    // outside a TTY too.
+    const stdinData = (await readStdin()).trimEnd();
+    if (stdinData) {
+      endpoint = cleanArgs[1];
+      message = stdinData;
+    } else {
+      message = cleanArgs[1].replace(/\\n/g, '\n');
+    }
   } else if (cleanArgs.length === 1 && (stdinAvailable || hasStdinFlag)) {
     // 1 arg (channel only) with piped stdin: read from stdin
     message = (await readStdin()).trimEnd();
@@ -98,9 +108,26 @@ async function main() {
     process.exit(1);
   }
 
-  // Virtual 'void' channel (#689): record-only, never dispatched.
-  // No skill directory exists for it, so skip channel-path validation and
-  // the channel send script entirely.
+  // Determine broker routing up front — the void channel gate below needs it
+  // too. Isolated agents route sends + audit through the broker (which holds
+  // channel creds, enforces egress policy, and owns the DB). Admin/scheduler
+  // fall through to the legacy direct path. A missing broker socket for an
+  // isolated agent is a loud failure, never a silent legacy fallback.
+  let useBroker;
+  try {
+    useBroker = shouldUseBroker();
+  } catch (err) {
+    console.error(`[C4] ${err.message}`);
+    process.exit(1);
+  }
+
+  // Virtual 'void' channel (#689): record-only, never dispatched. It is
+  // agent-facing (new-session / session-handoff skills write handoff summaries
+  // here), so isolated agents MUST be able to use it — but NEVER via a direct
+  // DB write: post-isolation they have no DB access, so a direct
+  // insertConversation would EACCES-crash, and a NULL-scoped row would not be
+  // picked up by that instance's own instance-scoped session-init. Route it
+  // through the broker, which records the row scoped to the calling instance.
   if (channel === 'void') {
     if (!endpoint) {
       console.error('Error: Endpoint is required for the void channel (e.g. c4-send.js void session-handoff)');
@@ -114,11 +141,25 @@ async function main() {
       process.exit(1);
     }
 
+    if (useBroker) {
+      try {
+        await brokerCall('void', { endpoint, content: message });
+        console.log('[C4] Message recorded on void channel (broker, not dispatched)');
+        process.exit(0);
+      } catch (err) {
+        console.error(`[C4] Broker void record failed: ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    // Admin/scheduler direct path: scope the handoff to this identity's own
+    // instance (ZYLOS_INSTANCE_ID) so its next session-init reads it back; NULL
+    // for an unscoped admin is the global surface, which its global session-init
+    // reads. Unlike real channels (audit only), the DB write IS the delivery for
+    // void — fail loudly.
     try {
-      insertConversation('out', 'void', endpoint, message);
+      insertConversation('out', 'void', endpoint, message, null, 3, false, null, process.env.ZYLOS_INSTANCE_ID || null);
     } catch (err) {
-      // Unlike real channels (where the DB row is an audit trail), the DB
-      // write IS the delivery for void — fail loudly.
       console.error(`[C4] Failed to record void message: ${err.stack}`);
       process.exit(1);
     } finally {
@@ -141,6 +182,17 @@ async function main() {
       validateEndpoint(endpoint);
     } catch (err) {
       console.error(`[C4] Invalid endpoint: ${err.stack}`);
+      process.exit(1);
+    }
+  }
+
+  if (useBroker) {
+    try {
+      await brokerCall('send', { channel, endpoint, content: message });
+      console.log(`[C4] Message sent via ${channel} (broker)`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`[C4] Broker send failed: ${err.message}`);
       process.exit(1);
     }
   }
@@ -182,4 +234,7 @@ async function main() {
   });
 }
 
-main();
+main().catch((err) => {
+  console.error(`[C4] ${err?.message || err}`);
+  process.exit(1);
+});

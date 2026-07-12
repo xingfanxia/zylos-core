@@ -23,11 +23,11 @@ import { execSync } from 'child_process';
 const SAMPLE_INTERVAL = 10;   // seconds between samples
 const FROZEN_THRESHOLD = 60;  // seconds of zero delta → frozen
 
-const PROC_STATE_FILE = path.join(
-  process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
-  'activity-monitor',
-  'proc-state.json'
-);
+const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const PROC_STATE_FILE = INSTANCE_ID
+  ? path.join(ZYLOS_DIR, 'activity-monitor', INSTANCE_ID, 'proc-state.json')
+  : path.join(ZYLOS_DIR, 'activity-monitor', 'proc-state.json');
 
 export class ProcSampler {
   /**
@@ -37,11 +37,14 @@ export class ProcSampler {
    * @param {number}  [opts.sampleInterval]  seconds between samples (default 10)
    * @param {number}  [opts.frozenThreshold] seconds of zero-delta to declare frozen (default 60)
    */
-  constructor({ sessionName, log, sampleInterval, frozenThreshold } = {}) {
+  constructor({ sessionName, log, sampleInterval, frozenThreshold, findRuntimePidUnderPane } = {}) {
     this._sessionName = sessionName;
     this._log = log || (() => {});
     this._sampleInterval = sampleInterval || SAMPLE_INTERVAL;
     this._frozenThreshold = frozenThreshold || FROZEN_THRESHOLD;
+    // Shared runtime-pid resolver (handles the os_user nested-sudo tree). Injected
+    // by createProcSampler; falls back to a direct-child lookup if absent.
+    this._findRuntimePidUnderPane = typeof findRuntimePidUnderPane === 'function' ? findRuntimePidUnderPane : null;
 
     this._lastPid = null;
     this._lastCtxTotal = null;
@@ -169,19 +172,31 @@ export class ProcSampler {
    */
   _findRuntimePid() {
     try {
-      const panePid = execSync(
+      const paneOut = execSync(
         `tmux list-panes -t "${this._sessionName}" -F '#{pane_pid}' 2>/dev/null`,
         { encoding: 'utf8', stdio: 'pipe', timeout: 3000 }
       ).trim();
-      if (!panePid) return null;
+      if (!paneOut) return null;
+      const panePid = parseInt(paneOut, 10);
+      if (!Number.isFinite(panePid) || panePid <= 0) return null;
 
+      // Runtime name from the session prefix ('claude-user-pan' -> 'claude').
+      const pattern = String(this._sessionName || '').split('-')[0] || 'claude';
+
+      // Preferred: shared util resolves the runtime pid whether it's the pane
+      // itself or a descendant (os_user nests it under sudo -> sudo -> node).
+      if (this._findRuntimePidUnderPane) {
+        const pid = this._findRuntimePidUnderPane(panePid, pattern);
+        return pid > 0 ? pid : null;
+      }
+
+      // Fallback (util not injected): first direct child. Note this misses the
+      // os_user nested tree — kept only so a bare ProcSampler still functions.
       const childPid = execSync(
         `pgrep -P ${panePid}`,
         { encoding: 'utf8', stdio: 'pipe', timeout: 1000 }
       ).trim();
       if (!childPid) return null;
-
-      // pgrep may return multiple children; take the first
       const pid = parseInt(childPid.split('\n')[0], 10);
       return Number.isFinite(pid) && pid > 0 ? pid : null;
     } catch {

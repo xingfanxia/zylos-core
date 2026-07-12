@@ -25,9 +25,30 @@ export function getDb() {
 
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');  // Better concurrent access
+    // Two long-lived writers share this DB (scheduler daemon + c4-broker);
+    // without a busy_timeout a write collision fails immediately with
+    // SQLITE_BUSY instead of briefly queueing.
+    db.pragma('busy_timeout = 5000');
     initSchema();
   }
   return db;
+}
+
+/**
+ * Migrate existing tasks table to add new columns introduced after initial schema.
+ * Safe to call repeatedly — checks PRAGMA table_info before altering.
+ */
+function migrateSchema() {
+  try {
+    const columns = db.pragma('table_info(tasks)');
+    const columnNames = new Set(columns.map(c => c.name));
+
+    if (!columnNames.has('target_instance')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN target_instance TEXT DEFAULT NULL');
+    }
+  } catch {
+    // Table may not exist yet — initSchema will create it with the column
+  }
 }
 
 function initSchema() {
@@ -69,6 +90,9 @@ function initSchema() {
       retry_count INTEGER DEFAULT 0,
       max_retries INTEGER DEFAULT 3,
 
+      -- Multi-session targeting
+      target_instance TEXT DEFAULT NULL,     -- target instance ID for dispatch
+
       -- Metadata
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL,
@@ -107,6 +131,8 @@ function initSchema() {
     );
   `);
 
+  // Migrate existing tables to add new columns
+  migrateSchema();
 }
 
 // Clean up old history entries (older than HISTORY_RETENTION_DAYS)

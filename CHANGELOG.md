@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **⚠️ BEHAVIOR CHANGE — `zylos upgrade --all` exit code**: non-JSON mode now exits **1** when any component check fails, matching the `--json` contract (previously it printed warnings and exited 0). Shell scripts and CI that relied on exit 0 despite failed component checks must be updated (the standard `|| true` idiom opts out). Same failure scenario now yields the same exit code in both output modes; no `--no-fail` flag is provided by design. (#706)
 
+### Fork
+- 2026-07-12: fork history linearized to a 4-commit stack (platform / reliability / REL-8 egress guard / REL-9 + provider-sourced quota alert) and rebased onto upstream `81d1064` (#697-#716). The prior upstream-sync merge commit is gone — future syncs replay 4 linear commits. Shard session-start architecture merged instance-aware (emitters resolve per-instance state; broker `initC4Session(caller, {closeDb})` preserved); upstream budget test adapted to fork delivered≠processed semantics.
+- (2026-07-09) Rebased multi-session v2 + local activity-monitor/runtime patches onto upstream v0.5.3 (was v0.5.0). Adopted upstream's `smol-toml` codex-config rework, dropping the fork's superseded manual-TOML codex config. Multi-session, per-instance gh-config isolation, and the context hard-ceiling forced reset are preserved.
+
 ## [0.5.3] - 2026-06-17
 
 ### Added

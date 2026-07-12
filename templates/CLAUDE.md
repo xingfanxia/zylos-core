@@ -24,7 +24,9 @@ This file provides guidance to Claude Code when working in this directory.
 
 ## Environment Overview
 
-This is a Zylos-managed workspace for an autonomous AI agent. You have full control of this environment — sudo access, Docker, network, and all installed tools.
+This is a Zylos-managed workspace for an autonomous AI agent. By default you have full control of this environment — sudo access, Docker, network, and all installed tools.
+
+**OS-isolated instances** (deployments that set `os_user` in instances.json — see `docs/design/os-user-isolation.md`): you run as a dedicated unix user without sudo. Check with `whoami`. Permission-denied on protected paths (other instances' dirs, operator config, locked source repos) is BY DESIGN — do not retry or work around it; say so in your reply if a task genuinely needs an admin-only resource.
 
 Be resourceful: when a user makes a request, don't give up easily. If you can do it yourself, do it — save the user's effort. If you can't act immediately, suggest feasible approaches rather than saying it's not possible.
 
@@ -74,13 +76,15 @@ Persistent memory stored in `~/zylos/memory/` with an Inside Out-inspired archit
 
 | Tier | Path | Purpose | Loading |
 |------|------|---------|---------|
-| **Identity** | `memory/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
-| **State** | `memory/state.md` | Active work, pending tasks | Always (session start) |
-| **References** | `memory/references.md` | Pointers to config files, key paths | Always (session start) |
-| **User Profiles** | `memory/users/<id>/profile.md` | Per-user preferences | On demand |
-| **Reference** | `memory/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
-| **Sessions** | `memory/sessions/current.md` | Today's event log | On demand |
+| **Identity** | `memory/shared/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
+| **State** | `memory/instances/<id>/state.md` | Active work, pending tasks (per-instance) | Always (session start) |
+| **References** | `memory/shared/references.md` | Pointers to config files, key paths | Always (session start) |
+| **User Profiles** | `memory/shared/users/<id>/profile.md` | Per-user preferences | On demand |
+| **Reference** | `memory/shared/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
+| **Sessions** | `memory/instances/<id>/sessions/current.md` | Today's event log (per-instance) | On demand |
 | **Archive** | `memory/archive/` | Cold storage for old data | Rarely |
+
+Note: When `shared/` directory doesn't exist (single-session mode), all paths fall back to `memory/` directly.
 
 ### Multi-User
 
@@ -96,12 +100,42 @@ Route user-specific preferences to the correct profile file. Bot identity stays 
 
 ### Classification Rules for reference/ Files
 
-- **decisions.md:** Deliberate choices that close off alternatives
-- **projects.md:** Work efforts with defined scope and lifecycle
-- **preferences.md:** Standing instructions for how things should be done (shared across users)
-- **ideas.md:** Uncommitted plans, explorations, hypotheses
+- **decisions.md:** Deliberate choices that close off alternatives (shared/)
+- **projects.md:** Work efforts with defined scope and lifecycle (shared/)
+- **preferences.md:** Standing instructions for how things should be done (shared/)
+- **ideas.md:** Uncommitted plans, explorations, hypotheses (shared/)
+
+**Shared vs Instance-specific files:**
+- **Shared** (in `shared/`): identity.md, references.md, reference/*.md, users/ — common across all instances
+- **Instance-specific** (in `instances/<id>/`): state.md, sessions/ — unique per running instance
+- **Group** (in `groups/<group_key>/`): per-chat memory owned by the group instance ONLY (ZY-GRP-1) — other instances are denied this tier.
 
 When in doubt, write to sessions/current.md.
+
+### Single-Owner & Scoping Rules (ZY-MEM-1)
+
+- **One loop, one owner.** A per-user work loop lives in exactly ONE place: the
+  owning user instance's `instances/<id>/state.md`. The primary/admin instance's
+  state.md is a cross-instance COORDINATION tracker — it may REFERENCE another
+  instance's loops with a short pointer, but must not re-copy their full detail
+  (duplicated detail drifts and there's no single source of truth).
+- **Instance-scoped c4 view ≠ full history.** A user instance's `c4-fetch` /
+  session-init only sees conversations tagged `target_instance=<its id>`.
+  Messages that predate multi-session targeting won't appear even though they
+  happened — so cross-check `memory/users/<chat_id>/profile.md` before writing
+  "no conversations / dormant". An instance that is `enabled` in instances.json
+  IS approved, regardless of any stale "awaiting approval" note in a profile;
+  reconcile state.md/profile against instances.json rather than trusting a stale
+  claim.
+
+### Instance Approval Flow
+
+When a new user first connects (multi-session mode), the approval process is:
+1. New instance requests are recorded in `instances.json` with `status: "pending"`
+2. The primary instance owner reviews pending instances via `zylos instance list`
+3. Owner approves with `zylos instance approve <id>` which sets `status: "enabled"`
+4. Denied instances are removed with `zylos instance remove <id>`
+5. Only enabled instances can dispatch tasks and access shared memory
 
 ### On-Demand Memory Loading
 
@@ -115,6 +149,24 @@ Triggers:
 - Exploring ideas → check `reference/ideas.md` for existing proposals
 - Recalling recent events → read `sessions/current.md`
 - Searching for historical info → check `archive/`
+
+## Inter-Instance Communication
+
+When you need context from another instance, you can query it directly via C4:
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-query-instance.js \
+  --from <your-instance-id> --to <target-instance> \
+  --content "What was discussed about <topic>?"
+```
+
+The target instance will auto-start if offline and receive your question.
+Its reply will be delivered back to your instance via C4.
+
+Use this for:
+- Asking the group instance about recent discussions
+- Requesting the admin for system status
+- Cross-referencing what another user discussed (the target instance decides what to share)
 
 ## Communication
 

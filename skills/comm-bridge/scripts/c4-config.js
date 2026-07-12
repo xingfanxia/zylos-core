@@ -58,6 +58,13 @@ export const SKILLS_DIR = path.join(ZYLOS_DIR, '.claude', 'skills');
 // conversation count that triggers a sync). Imported by the activity-monitor
 // context-monitor / monitor scripts — do NOT re-declare it as a literal elsewhere.
 export const CHECKPOINT_THRESHOLD = 15;
+
+// Group instance (type:'group') session-init segmentation caps. Injected history
+// is split into one section per chat/group; each group shows its most recent
+// SESSION_INIT_GROUP_PER_GROUP messages, and at most SESSION_INIT_GROUP_MAX_GROUPS
+// (most-recently-active first) are shown — the rest are summarized as "N omitted".
+export const SESSION_INIT_GROUP_PER_GROUP = 10;
+export const SESSION_INIT_GROUP_MAX_GROUPS = 8;
 export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by session-init when above threshold
 
 export const STALE_STATUS_THRESHOLD = 5000; // ms

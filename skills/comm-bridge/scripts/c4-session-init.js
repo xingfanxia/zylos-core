@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 /**
  * C4 Communication Bridge - Session Init
- * Called by session start hook. Outputs context prompt for Claude Code as
- * uniform `=== LABEL ===` blocks (see session-format.js), shared with the
+ * Emits uniform `=== LABEL ===` blocks (see session-format.js), shared with the
  * memory injection step so the combined session-start context reads
  * consistently:
  * - Last checkpoint (summary if present, else a `(no summary …)` fallback so
@@ -10,19 +9,66 @@
  * - Unsummarized conversations (all if ≤ threshold, last N if > threshold)
  * - Memory Sync instruction (only if > threshold)
  *
+ * Two consumption paths:
+ * - Shard emitters (emitC4Checkpoint / emitC4Conversations) for the
+ *   session-start shard orchestrator — each section gets its own hook stdout
+ *   budget, with over-budget conversations packed at MESSAGE granularity.
+ * - initC4Session(instanceId, { closeDb }) — the legacy single-stdout path,
+ *   also called by the C4 broker with the authenticated caller so isolated
+ *   agents get their context without opening c4.db directly.
+ *
+ * Multi-session aware (fork): when an instance id is in play (argument or
+ * ZYLOS_INSTANCE_ID), checkpoint / range / conversation queries are scoped to
+ * that instance. If the instance-scoped query layer is unavailable,
+ * conversation injection is SKIPPED rather than falling back to unfiltered
+ * global queries — injecting nothing is strictly safer than bleeding other
+ * instances' conversations into this session.
+ *
  * Usage: node c4-session-init.js
  */
 
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
 import { withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
+import { getInstanceDef } from '../../multi-session/instance-config.js';
 import { fileURLToPath } from 'node:url';
 
-async function withC4Db(label, action) {
+const ENV_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+/** Whether an instance is the group instance (type:'group'); fails safe to false. */
+function isGroupInstanceId(instanceId) {
+  try {
+    return getInstanceDef(instanceId)?.type === 'group';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Instance-scoped query overrides (loaded lazily, graceful degradation).
+ * multiLoadFailed distinguishes "single-session mode" from "scoped layer
+ * broken" — the latter must never silently widen to global queries.
+ */
+async function loadInstanceQueries(instanceId) {
+  if (!instanceId) return { multi: null, multiLoadFailed: false };
+  try {
+    return { multi: await import('./c4-db-multi.js'), multiLoadFailed: false };
+  } catch (err) {
+    console.error(`[c4-session-init] WARN: c4-db-multi.js import failed: ${err.message}`);
+    return { multi: null, multiLoadFailed: true };
+  }
+}
+
+/**
+ * closeDb:false keeps the shared c4-db connection open — the broker reuses one
+ * handle across requests; standalone shard emitters close per call.
+ */
+async function withC4Db(label, action, { closeDb = true } = {}) {
   let close = () => {};
   try {
     const db = await import('./c4-db.js');
-    close = db.close;
+    if (closeDb) close = db.close;
     return await action(db);
   } catch (err) {
     const wrapped = new Error(`Error in ${label}: ${err.message}`);
@@ -35,12 +81,15 @@ async function withC4Db(label, action) {
 
 /**
  * Emit the last-checkpoint section, or '' when no checkpoint exists yet.
- * Standalone emitter for the session-start shard orchestrator; also composed
- * into initC4Session() for the legacy single-stdout path.
+ * Standalone emitter for the session-start shard orchestrator (payload-first
+ * signature); also composed into initC4Session() for the legacy path.
  */
-export async function emitC4Checkpoint() {
+export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTANCE_ID, closeDb = true } = {}) {
+  const { multi } = await loadInstanceQueries(instanceId);
   return withC4Db('c4 checkpoint init', ({ getLastCheckpoint }) => {
-    const checkpoint = getLastCheckpoint();
+    const checkpoint = (instanceId && multi?.getLastCheckpointForInstance)
+      ? multi.getLastCheckpointForInstance(instanceId)
+      : getLastCheckpoint();
 
     // Always surface the last checkpoint. Summary present → show it; summary
     // null → emit a fallback so the block never silently disappears.
@@ -52,7 +101,7 @@ export async function emitC4Checkpoint() {
       'LAST CHECKPOINT',
       `(no summary — checkpoint #${checkpoint.id}, ${checkpoint.timestamp})`,
     );
-  });
+  }, { closeDb });
 }
 
 /**
@@ -67,26 +116,84 @@ export async function emitC4Checkpoint() {
  * pointer. Dropped messages are not lost: Memory Sync reads c4.db directly,
  * so they are covered by the next checkpoint summary. Without a budget
  * (legacy single-stdout path) the output is byte-identical to before.
+ *
+ * Fork: instance-scoped queries when an instance id is in play; the group
+ * instance gets per-chat segmentation instead (bounded by the per-group /
+ * max-group caps, so message packing is not applied there).
  */
-export async function emitC4Conversations(_payload, budget = null) {
+export async function emitC4Conversations(_payload = null, budget = null, { instanceId = ENV_INSTANCE_ID, closeDb = true } = {}) {
+  const { multi, multiLoadFailed } = await loadInstanceQueries(instanceId);
   return withC4Db('c4 conversations init', async ({
     getUnsummarizedRange,
     getUnsummarizedConversations,
     formatConversationsForAgent,
   }) => {
-    const { CHECKPOINT_THRESHOLD, SESSION_INIT_RECENT_COUNT } = await import('./c4-config.js');
+    const {
+      CHECKPOINT_THRESHOLD,
+      SESSION_INIT_RECENT_COUNT,
+      SESSION_INIT_GROUP_PER_GROUP,
+      SESSION_INIT_GROUP_MAX_GROUPS,
+    } = await import('./c4-config.js');
 
-    const range = getUnsummarizedRange();
+    // Guard: in multi-session mode, never fall back to unfiltered global queries.
+    // Injecting nothing is strictly safer than injecting all instances' conversations.
+    if (instanceId && multiLoadFailed) {
+      console.error(`[c4-session-init] Instance ${instanceId}: instance-scoped queries unavailable, skipping conversation injection`);
+      return formatSection(
+        'RECENT CONVERSATIONS',
+        '(instance-scoped query unavailable — skipped to prevent cross-instance bleed)',
+      );
+    }
+
+    const range = (instanceId && multi?.getUnsummarizedRangeForInstance)
+      ? multi.getUnsummarizedRangeForInstance(instanceId)
+      : getUnsummarizedRange();
     if (range.count === 0) {
       return formatSection('RECENT CONVERSATIONS', 'No new conversations since last checkpoint.');
     }
 
     const needsSync = range.count > CHECKPOINT_THRESHOLD;
 
+    // Group instance: segment injected history by chat so one busy group can't
+    // crowd out others and cross-group context never blends. Each chat gets its
+    // own labeled section (most-recently-active first), capped per group.
+    if (instanceId && isGroupInstanceId(instanceId)
+      && multi?.getUnsummarizedConversationsForInstance && multi?.groupConversationsByGroup) {
+      const sections = [];
+      const allConvos = multi.getUnsummarizedConversationsForInstance(instanceId);
+      const { buckets, omittedGroups } = multi.groupConversationsByGroup(allConvos, {
+        perGroupLimit: SESSION_INIT_GROUP_PER_GROUP,
+        maxGroups: SESSION_INIT_GROUP_MAX_GROUPS,
+      });
+
+      for (const bucket of buckets) {
+        const label = bucket.count > bucket.conversations.length
+          ? `GROUP ${bucket.label} (showing ${bucket.conversations.length} of ${bucket.count})`
+          : `GROUP ${bucket.label}`;
+        sections.push(formatSection(label, formatConversationsForAgent(bucket.conversations)));
+      }
+      if (omittedGroups > 0) {
+        sections.push(formatSection(
+          'MORE GROUPS',
+          `${omittedGroups} less-recently-active group(s) omitted from this injection.`,
+        ));
+      }
+      if (needsSync) {
+        sections.push(formatSection(
+          'ACTION REQUIRED',
+          `There are ${range.count} unsummarized conversations across all groups (conversation id ${range.begin_id} ~ ${range.end_id}). Please use zylos-memory skill to process them, keeping each chat's memory under memory/groups/<group_key>/.`,
+        ));
+      }
+      return sections.join('\n\n');
+    }
+
     // Get conversations: all if under threshold, last N if over
+    const getConvos = (instanceId && multi?.getUnsummarizedConversationsForInstance)
+      ? (limit) => multi.getUnsummarizedConversationsForInstance(instanceId, limit != null ? { limit } : undefined)
+      : getUnsummarizedConversations;
     const conversations = needsSync
-      ? getUnsummarizedConversations(SESSION_INIT_RECENT_COUNT)
-      : getUnsummarizedConversations();
+      ? getConvos(SESSION_INIT_RECENT_COUNT)
+      : getConvos();
 
     const assemble = kept => {
       // Informational only — no file to read. Kept within the section so it
@@ -121,12 +228,25 @@ export async function emitC4Conversations(_payload, budget = null) {
       body = assemble(kept);
     }
     return body;
-  });
+  }, { closeDb });
 }
 
-export async function initC4Session() {
+/**
+ * Build the SessionStart context string for one instance (legacy single-stdout
+ * path, composed from the shard emitters).
+ *
+ * @param {string|null} [instanceId] - target instance; defaults to the env
+ *   (standalone hook use). The C4 broker passes the authenticated caller so it
+ *   can serve isolated agents that no longer open the DB directly.
+ * @param {{ closeDb?: boolean }} [opts] - closeDb:false keeps the shared c4-db
+ *   connection open (the broker reuses one handle across requests).
+ */
+export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: closeDbAfter = true } = {}) {
   try {
-    const sections = [await emitC4Checkpoint(), await emitC4Conversations()].filter(Boolean);
+    const sections = [
+      await emitC4Checkpoint(null, { instanceId, closeDb: false }),
+      await emitC4Conversations(null, null, { instanceId, closeDb: closeDbAfter }),
+    ].filter(Boolean);
     return `${sections.join('\n\n')}\n`;
   } catch (err) {
     if (err.cause) throw err;
@@ -140,7 +260,12 @@ function main() {
   const startMs = Date.now();
   (async () => {
     try {
-      process.stdout.write(await initC4Session());
+      // Isolated agents fetch their session context from the broker (they no
+      // longer open c4.db directly). Admin/scheduler compute it in-process.
+      const output = shouldUseBroker()
+        ? (await brokerCall('session-init')).context
+        : await initC4Session();
+      process.stdout.write(output);
     } catch (err) {
       console.error(err.cause?.stack || err.stack || err.message);
       process.exitCode = 1;

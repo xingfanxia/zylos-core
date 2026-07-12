@@ -114,6 +114,9 @@ export class HealthEngine {
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
 
+    // Cold-start grace period: skip heartbeat processing during warmup (fork)
+    this.warmupUntil = 0;
+
     // OK-path detection debounce counters, advanced by dispatcher delivery notifications.
     this.rateLimitConsecutiveHits = 0;
     this.stickyErrorConsecutiveHits = 0;
@@ -182,6 +185,18 @@ export class HealthEngine {
     if (nextHealth === 'ok' || nextHealth === 'rate_limited') {
       this._clearPostRestartProbeTimer();
     }
+  }
+
+  /**
+   * Signal that a cold start is in progress. Suppresses heartbeat processing
+   * for `seconds` to avoid false-positive failures during instance startup.
+   * Also resets health to 'ok' so the instance starts clean.
+   * @param {number} seconds - Grace period duration
+   */
+  notifyColdStart(seconds) {
+    this.warmupUntil = Math.floor(Date.now() / 1000) + seconds;
+    this.setHealth('ok', `cold_start_grace_${seconds}s`);
+    this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
 
   /**
@@ -272,6 +287,9 @@ export class HealthEngine {
   }
 
   runMaintenanceCycle(agentRunning, currentTime) {
+    // Fork: skip processing during cold-start grace period
+    if (currentTime < this.warmupUntil) return;
+
     // Track agentRunning transitions for process signal acceleration
     this._trackAgentRunning(agentRunning, currentTime);
 
