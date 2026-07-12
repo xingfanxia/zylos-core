@@ -230,20 +230,101 @@ export class UsageMonitor {
    * re-blasting real users. Read failures degrade LOUDLY, distinguishing EACCES
    * (frozen supplementary groups — actionable) from ENOENT (idle instance).
    */
+  // REL-9: the task scheduler calls this synchronously and does NOT await it, so
+  // the sync prologue below (primary gate + run-marker) runs before the first
+  // await inside _runFleetAlertInner — this preserves interval re-entry gating
+  // (getLastFleetAlertRunAt reads lastFleetAlertAt). The async body is
+  // fire-and-forget; the .catch guarantees a rejected send-promise can never
+  // surface as an unhandled rejection.
   runFleetAlert({ currentTime }) {
     if (!this.isPrimaryInstance()) return true;
     this.lastFleetAlertAt = currentTime;
+    return this._runFleetAlertInner({ currentTime }).catch((err) => {
+      this.options.log(`Usage fleet alert: unexpected error — ${err && err.message}`);
+      return true;
+    });
+  }
 
+  /**
+   * Preferred fleet-alert source: provider-usage.json, written every ~5min by
+   * the provider-usage-updater daemon (codexbar) — an ACTIVE query of the
+   * shared account's real quota, independent of whether any instance is
+   * rendering. Statusline files are passive render exhaust: stale whenever the
+   * fleet is idle OR an instance sits inside one long busy turn, which made
+   * the old statusline-only fleet alert go "blind" nightly (2026-07-12: 12
+   * flap alerts while the direct read was fresh all night). Source order is
+   * provider → statusline scan; "blind" now requires BOTH channels down.
+   * Returns { ok:true, reading } | { ok:false, reason } — never throws.
+   */
+  readProviderUsage(currentTime) {
+    const file = this.options.providerUsageFile
+      ?? (this.options.zylosDir ? path.join(this.options.zylosDir, 'activity-monitor', 'provider-usage.json') : null);
+    if (!file) return { ok: false, reason: 'unconfigured' };
+    let doc;
+    try {
+      doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (err) {
+      return { ok: false, reason: err?.code === 'ENOENT' ? 'missing' : `unreadable(${err?.code || 'EPARSE'})` };
+    }
+    const p = doc?.providers?.[this.runtimeId === 'codex' ? 'codex' : 'claude'];
+    if (!p || p.available !== true) {
+      return { ok: false, reason: p?.error ? `unavailable(${String(p.error).slice(0, 80)})` : 'unavailable' };
+    }
+    const fetchedAtSec = Math.floor(new Date(p.fetched_at || doc.updated_at || 0).getTime() / 1000);
+    if (!Number.isFinite(fetchedAtSec) || fetchedAtSec <= 0) return { ok: false, reason: 'no_timestamp' };
+    const ageSec = currentTime - fetchedAtSec;
+    // updater cadence is 5min (60s retry) — 15min = 3 missed cycles = poll is down.
+    const staleSec = this.options.providerUsageStaleSec ?? 900;
+    if (ageSec > staleSec) return { ok: false, reason: `stale(${Math.round(ageSec / 60)}m)` };
+    const fiveHour = p.primary?.used_percent;
+    if (typeof fiveHour !== 'number' || !Number.isFinite(fiveHour)) return { ok: false, reason: 'no_5h_percent' };
+    const weekly = p.secondary?.used_percent;
+    return {
+      ok: true,
+      reading: {
+        fiveHour,
+        // a provider payload without a weekly window tiers weekly as 0 (off) —
+        // 5h still tiers, and maxRankTier means a real weekly is never masked.
+        weekly: (typeof weekly === 'number' && Number.isFinite(weekly)) ? weekly : 0,
+        fiveHourResetsAt: p.primary?.resets_at ?? null,
+        fiveHourResets: p.primary?.reset_description || p.primary?.resets_at || null,
+        weeklyAllResets: p.secondary?.reset_description || p.secondary?.resets_at || null,
+        ageSec,
+      },
+    };
+  }
+
+  async _runFleetAlertInner({ currentTime }) {
     const fleetState = this.loadFleetAlertState();
     const staleSec = this.options.statuslineStaleSec;
     const nowIso = new Date(currentTime * 1000).toISOString();
 
-    const instances = this.options.getAllInstances ? this.options.getAllInstances() : [];
-    const scanList = instances.length ? instances : [{ id: null }];
-
     const readings = [];
     const loudErrors = {};          // id → error code (EACCES/EPARSE/EINVALID/…) — NOT ENOENT
     const reasonCounts = { stale: 0, eacces: 0, enoent: 0, unreadable: 0, invalid: 0 };
+
+    // Direct read first; the per-instance statusline scan below is now the
+    // FALLBACK channel, only walked when the provider read is unusable.
+    const provider = this.readProviderUsage(currentTime);
+    const sourceMode = provider.ok ? 'provider' : 'statusline';
+    if (provider.ok) {
+      readings.push({
+        id: 'provider-usage',
+        fiveHour: provider.reading.fiveHour,
+        weekly: provider.reading.weekly,
+        fiveHourResetsAt: provider.reading.fiveHourResetsAt,
+        fiveHourResets: provider.reading.fiveHourResets,
+        weeklyAllResets: provider.reading.weeklyAllResets,
+        mtimeSec: currentTime - provider.reading.ageSec,
+      });
+    } else if (provider.reason !== this._lastProviderReason) {
+      // in-memory change-dedup (2-min cycles would spam); a restart re-logs once.
+      this.options.log(`Usage fleet alert: provider usage unusable (${provider.reason}) — falling back to statusline scan`);
+    }
+    this._lastProviderReason = provider.ok ? null : provider.reason;
+
+    const instances = this.options.getAllInstances ? this.options.getAllInstances() : [];
+    const scanList = provider.ok ? [] : (instances.length ? instances : [{ id: null }]);
 
     for (const inst of scanList) {
       const id = inst.id;
@@ -304,13 +385,19 @@ export class UsageMonitor {
     const usableCount = readings.length;
     const sources = readings.map((r) => r.id);
 
-    // 0 usable readings → we cannot see the shared meter → blind (never a false all-clear).
+    // 0 usable readings → BOTH channels down (provider poll unusable AND every
+    // statusline stale/broken) → blind (never a false all-clear).
     if (usableCount === 0) {
-      return this.emitMonitoringBlind({ currentTime, fleetState, staleSec, usableCount, reasonCounts, loudErrors });
+      return await this.emitMonitoringBlind({
+        currentTime, fleetState, staleSec, usableCount, reasonCounts, loudErrors,
+        providerReason: provider.reason,
+      });
     }
 
-    // >=3 sources → median (robust to one forger); 1-2 → worst-case (max), admin-only.
-    const quorum = usableCount >= 3;
+    // Provider direct read is the single trusted source (hub-owned daemon) →
+    // quorum by definition. Statusline fallback keeps the forgery-resistant
+    // rule: >=3 sources → median; 1-2 → worst-case (max), admin-only.
+    const quorum = sourceMode === 'provider' || usableCount >= 3;
     const fiveHour = quorum
       ? median(readings.map((r) => r.fiveHour))
       : Math.max(...readings.map((r) => r.fiveHour));
@@ -337,7 +424,9 @@ export class UsageMonitor {
       hotWindow,
       usableCount,
       sources,
-      quorum
+      quorum,
+      sourceMode,
+      providerAgeMin: provider.ok ? Math.round(provider.reading.ageSec / 60) : null
     };
 
     // Any usable reading clears a prior "monitoring blind" episode.
@@ -360,7 +449,7 @@ export class UsageMonitor {
     const escalated = tierRank(tier) > tierRank(fleetState.lastAlertedTier || 'ok');
     const firstAlert = !fleetState.lastAlertedTier;
     if (!windowChanged && !escalated && !firstAlert) {
-      this.options.log(`Usage fleet alert: suppressing (tier=${tier}, window unchanged, sources=${usableCount})`);
+      this.options.log(`Usage fleet alert: suppressing (tier=${tier}, window unchanged, source=${sourceMode}, sources=${usableCount})`);
       this.writeFleetAlertState({ ...carry, lastObservedTier: tier });
       return true;
     }
@@ -376,10 +465,10 @@ export class UsageMonitor {
       this.options.log(`Usage fleet alert: user fan-out suppressed — ${why}`);
     }
 
-    const { userSends, adminSent } = this.deliverFleetAlert(tier, data, { doUserFanout });
+    const { userSends, adminSent } = await this.deliverFleetAlert(tier, data, { doUserFanout });
     this.options.log(
       `Usage fleet alert: delivered tier=${tier} (users=${userSends}, admin=${adminSent}, ` +
-      `sources=${usableCount}, 5h=${fiveHour}% weekly=${weeklyAll}%)`
+      `source=${sourceMode}, sources=${usableCount}, 5h=${fiveHour}% weekly=${weeklyAll}%)`
     );
     this.writeFleetAlertState({
       version: 1,
@@ -390,14 +479,23 @@ export class UsageMonitor {
       lastCheckedAt: nowIso,
       lastUserAlertedAt: doUserFanout ? currentTime : (fleetState.lastUserAlertedAt || 0),
       blindAlertedAt: null,
+      // the blind re-alert cooldown survives recovery + tier alerts by design
+      blindLastAlertAt: fleetState.blindLastAlertAt || 0,
       statErrors: loudErrors
     });
     return true;
   }
 
-  deliverFleetAlert(tier, data, { doUserFanout }) {
+  // REL-9: async, non-blocking fan-out. Every c4Send runs CONCURRENTLY (wall-clock
+  // = slowest single send, not the sum), and the AM event loop is never blocked
+  // while they're in flight. `Promise.resolve(...)` tolerates a c4Send that returns
+  // a plain value (sync test fakes) as well as a real Promise. Counts are tallied
+  // in the .then callbacks and only read after Promise.all settles, so the
+  // `delivered users=X admin=Y` log stays accurate.
+  async deliverFleetAlert(tier, data, { doUserFanout }) {
     let userSends = 0;
     let adminSent = 0;
+    const pending = [];
     if (doUserFanout) {
       const userText = formatUserNotification(data, tier);
       for (const inst of (this.options.getAllInstances ? this.options.getAllInstances() : [])) {
@@ -406,41 +504,71 @@ export class UsageMonitor {
         const chatIds = Array.isArray(inst.chat_ids) ? inst.chat_ids : [];
         for (const chatId of chatIds) {
           if (!chatId) continue;
-          const res = this.options.c4Send('feishu', chatId, userText);
-          if (res?.ok) userSends++;
-          else this.options.log(`Usage fleet alert: user send failed for ${chatId} (${res?.output})`);
+          pending.push(Promise.resolve().then(() => this.options.c4Send('feishu', chatId, userText)).then((res) => {
+            if (res?.ok) userSends++;
+            else this.options.log(`Usage fleet alert: user send failed for ${chatId} (${res?.output})`);
+          }));
         }
       }
     }
     // Admin always (caller guarantees tier >= warning here).
     if (this.options.adminChatId) {
-      const res = this.options.c4Send('feishu', this.options.adminChatId, formatAdminNotification(data, tier));
-      if (res?.ok) adminSent = 1;
-      else this.options.log(`Usage fleet alert: admin send failed (${res?.output})`);
+      pending.push(Promise.resolve()
+        .then(() => this.options.c4Send('feishu', this.options.adminChatId, formatAdminNotification(data, tier)))
+        .then((res) => {
+          if (res?.ok) adminSent = 1;
+          else this.options.log(`Usage fleet alert: admin send failed (${res?.output})`);
+        }));
     } else {
       this.options.log('Usage fleet alert: no adminChatId configured — admin alert skipped (check instances.json admin.chat_ids)');
     }
+    await Promise.all(pending);
     return { userSends, adminSent };
   }
 
-  emitMonitoringBlind({ currentTime, fleetState, staleSec, usableCount, reasonCounts, loudErrors }) {
+  async emitMonitoringBlind({ currentTime, fleetState, staleSec, usableCount, reasonCounts, loudErrors, providerReason = null }) {
     const nowIso = new Date(currentTime * 1000).toISOString();
-    // Exactly one blind alert per BLIND EPISODE (review F3): once blindAlertedAt
-    // is set it stays set until a fresh valid reading clears it — so an idle
-    // overnight fleet gets one alert, not one every staleSec.
+    // Two dedupe layers, because blindness FLAPS:
+    //   1. blindAlertedAt — one alert per contiguous blind EPISODE (review F3);
+    //      cleared by any usable reading, so an idle overnight fleet gets one
+    //      alert, not one every staleSec.
+    //   2. blindLastAlertAt — a persistent re-alert COOLDOWN that recovery does
+    //      NOT clear. Statusline files only update while an instance is actively
+    //      rendering turns, so a short scheduled turn freshens one file (clears
+    //      the episode) and 15min later it re-expires → new "episode" → new
+    //      alert. 2026-07-12: 12 identical blind alerts in 6h overnight, incl.
+    //      re-fires while a persona was ACTIVE mid-long-turn (statuslines don't
+    //      refresh inside one long turn). The cooldown caps the spam to one
+    //      alert per blindRealertCooldownSec regardless of flapping.
     if (fleetState.blindAlertedAt) {
       this.options.log('Usage fleet alert: monitoring blind — already alerted this episode');
       this.writeFleetAlertState({ ...fleetState, lastCheckedAt: nowIso, statErrors: loudErrors });
       return true;
     }
-    const text = formatBlindNotification({ staleSec, usableCount, reasonCounts });
+    const cooldownSec = this.options.blindRealertCooldownSec ?? 4 * 60 * 60;
+    const sinceLastSec = currentTime - (fleetState.blindLastAlertAt || 0);
+    if (sinceLastSec < cooldownSec) {
+      this.options.log(
+        `Usage fleet alert: monitoring blind — re-alert suppressed (cooldown, last alert ${Math.round(sinceLastSec / 60)}m ago)`
+      );
+      // Mark the episode so subsequent stale cycles take the cheap branch above.
+      this.writeFleetAlertState({ ...fleetState, blindAlertedAt: nowIso, lastCheckedAt: nowIso, statErrors: loudErrors });
+      return true;
+    }
+    const text = formatBlindNotification({ staleSec, usableCount, reasonCounts, providerReason });
     if (this.options.adminChatId) {
-      const res = this.options.c4Send('feishu', this.options.adminChatId, text);
+      const res = await Promise.resolve().then(() => this.options.c4Send('feishu', this.options.adminChatId, text));
       this.options.log(`Usage fleet alert: monitoring-blind admin alert (${res?.ok ? 'ok' : 'fail'})`);
     } else {
       this.options.log('Usage fleet alert: monitoring blind but no adminChatId configured (check instances.json admin.chat_ids)');
     }
-    this.writeFleetAlertState({ ...fleetState, blindAlertedAt: nowIso, lastCheckedAt: nowIso, statErrors: loudErrors });
+    this.writeFleetAlertState({
+      ...fleetState,
+      blindAlertedAt: nowIso,
+      blindLastAlertAt: currentTime,
+      lastCheckedAt: nowIso,
+      statErrors: loudErrors
+    });
     return true;
   }
 
@@ -630,11 +758,15 @@ function formatAdminNotification(data, tier) {
   const hot = data.hotWindow === 'weekly' ? '周额度(weekly)' : '5小时(5h)';
   const usableCount = data.usableCount ?? 0;
   const agg = data.quorum ? '中位数' : '最坏值';
+  const sourceLine = data.sourceMode === 'provider'
+    ? `读数来源: provider 直读（codexbar，${data.providerAgeMin ?? '?'} 分钟前查询）`
+    : `读数来源: ${usableCount} 个实例 statusline（${agg}，直读通道不可用）` +
+      (data.sources?.length ? `：${data.sources.join(', ')}` : '');
   const lines = [
     `${tierLabels[tier] || '额度提醒'}（${tier}，热点=${hot}）`,
     `5h: ${data.fiveHour ?? 'null'}%（${data.fiveHourResets || '未知'} 重置）`,
     `weekly: ${data.weeklyAll ?? 'null'}%（${data.weeklyAllResets || '未知'} 重置）`,
-    `读数来源: ${usableCount} 个实例（${agg}）` + (data.sources?.length ? `：${data.sources.join(', ')}` : '')
+    sourceLine
   ];
   if (!data.quorum) {
     lines.push('⚠️ 来源不足 3 个，未向用户群发（仅管理员）。');
@@ -643,10 +775,12 @@ function formatAdminNotification(data, tier) {
   return lines.join('\n');
 }
 
-// Admin-only "monitoring blind" text — emitted when NO usable cross-instance
-// reading exists (all stale / inaccessible / invalid), so a rate-limit ramp is
-// never masked by a false all-clear. Names the dominant cause so ops can act.
-function formatBlindNotification({ staleSec, usableCount, reasonCounts = {} }) {
+// Admin-only "monitoring blind" text — emitted only when BOTH channels are
+// down: the provider direct read (codexbar → provider-usage.json) is unusable
+// AND no usable statusline reading exists. That is an actionable ops signal
+// (poll daemon / auth / disk), unlike the old statusline-only blindness which
+// fired whenever the fleet was merely idle or mid-long-turn.
+function formatBlindNotification({ staleSec, usableCount, reasonCounts = {}, providerReason = null }) {
   const parts = [];
   if (reasonCounts.stale) parts.push(`${reasonCounts.stale} 过期`);
   if (reasonCounts.eacces) parts.push(`${reasonCounts.eacces} 权限拒绝(EACCES)`);
@@ -655,10 +789,11 @@ function formatBlindNotification({ staleSec, usableCount, reasonCounts = {} }) {
   if (reasonCounts.enoent) parts.push(`${reasonCounts.enoent} 未写入`);
   const breakdown = parts.length ? parts.join('、') : '无数据';
   return [
-    '🟡 额度监控失明（无可用 statusline 读数）',
-    `可用来源: ${usableCount ?? 0}（阈值 ${Math.round(staleSec / 60)} 分钟）。来源状态: ${breakdown}。`,
+    '🔴 额度监控失明（直读 + statusline 双通道均不可用）',
+    `provider 直读: ${providerReason || '不可用'} —— 检查 pm2 provider-usage-updater / codexbar / 账号 auth。`,
+    `statusline 兜底: 可用 ${usableCount ?? 0}（阈值 ${Math.round(staleSec / 60)} 分钟），状态: ${breakdown}。`,
     reasonCounts.eacces
       ? '存在 EACCES：admin 无法读取其它实例 statusline（冻结的补充组？给 statusline 文件加 ACL）。'
-      : '无法判断共享额度是否接近上限——请人工确认 fleet 是否处于 rate-limit/重启循环。'
+      : '无法判断共享额度是否接近上限——请先修复 provider-usage-updater（这是主通道）。'
   ].join('\n');
 }

@@ -126,7 +126,7 @@
  * Run with PM2: pm2 start activity-monitor.js --name activity-monitor
  */
 
-import { execSync, execFileSync, spawn, spawnSync } from 'child_process';
+import { execSync, execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
@@ -630,21 +630,57 @@ function runC4Control(args) {
 // (wave-2 health escalation reuses this for admin alerts). Only valid from a
 // non-isolated runner (admin/scheduler) — those use the legacy direct feishu
 // path and may send to any chat_id.
-// NOTE (REL-9 follow-up): this is a BLOCKING spawnSync — worst case it stalls the
-// AM main loop up to the 15s timeout per recipient if feishu send hangs. Tolerated
-// for this batch because fleet alerts are deduped-rare; REL-9 makes sends async.
-function runC4Send(channel, endpoint, message, deliveryAction = 'usage-alert') {
-  try {
-    const args = [C4_SEND_PATH, `--delivery-action=${deliveryAction}`, channel];
-    if (endpoint) args.push(endpoint);
-    const result = spawnSync('node', args, {
-      input: message, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 15000
+// REL-9: async (non-blocking) send. Spawns c4-send.js with the message on stdin
+// and resolves { ok, output } on close. Unlike the old spawnSync, this never
+// blocks the AM event loop — the 15s cap kills a hung child but other timers
+// (guardian probes, dispatcher heartbeat consumption) keep running meanwhile.
+// Never rejects: every failure path resolves { ok:false, output } so callers
+// that fire-and-forget can't produce an unhandled rejection.
+const C4_SEND_TIMEOUT_MS = 15000;
+const C4_SEND_MAX_OUTPUT = 256 * 1024; // cap child stdout/stderr accumulation (spawnSync had an implicit maxBuffer)
+function runC4Send(channel, endpoint, message, deliveryAction = 'usage-alert', { spawn: _spawn = spawn } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    let child;
+    try {
+      const args = [C4_SEND_PATH, `--delivery-action=${deliveryAction}`, channel];
+      if (endpoint) args.push(endpoint);
+      child = _spawn('node', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err) {
+      return done({ ok: false, output: err.message });
+    }
+    timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      done({ ok: false, output: `timeout after ${C4_SEND_TIMEOUT_MS}ms` });
+    }, C4_SEND_TIMEOUT_MS);
+    let stdout = '';
+    let stderr = '';
+    const cap = (buf, d) => (buf.length >= C4_SEND_MAX_OUTPUT ? buf : (buf + d).slice(0, C4_SEND_MAX_OUTPUT));
+    child.stdout.on('data', (d) => { stdout = cap(stdout, d); });
+    child.stderr.on('data', (d) => { stderr = cap(stderr, d); });
+    child.on('error', (err) => done({ ok: false, output: err.message }));
+    // A child that exits before reading stdin makes child.stdin emit an ASYNC
+    // EPIPE that the sync try/catch below cannot see; with no listener Node turns
+    // it into an uncaughtException that would kill the whole AM daemon (review C1).
+    child.stdin.on('error', (err) => done({ ok: false, output: `stdin: ${err.message}` }));
+    child.on('close', (code) => {
+      if (code === 0) done({ ok: true, output: stdout.trim() });
+      else done({ ok: false, output: (stderr || stdout || `exit ${code}`).trim() });
     });
-    if (result.status === 0) return { ok: true, output: (result.stdout || '').trim() };
-    return { ok: false, output: (result.stderr || result.stdout || `exit ${result.status}`).trim() };
-  } catch (err) {
-    return { ok: false, output: err.message };
-  }
+    try {
+      child.stdin.write(message);
+      child.stdin.end();
+    } catch (err) {
+      done({ ok: false, output: `stdin write failed: ${err.message}` });
+    }
+  });
 }
 
 // Admin chat id resolution (reusable seam — wave-2 admin alerts share this).
@@ -680,15 +716,24 @@ function formatDegradedAdminAlert({ cycleCount, windowSec, ceiling, probeInterva
   ].join('\n');
 }
 
-function notifyDegradedAdmin(details) {
-  if (!ADMIN_CHAT_ID) {
-    log('Degraded admin alert skipped: no admin chat_id configured');
-    return;
+// REL-9: async, wired as a FIRE-AND-FORGET callback (health-engine.js calls it
+// inside a *synchronous* try/catch that can't catch an async rejection). So it
+// must fully self-contain: the try/catch here covers not just runC4Send but also
+// formatDegradedAdminAlert (throws on bad details) and log (can throw on ENOSPC),
+// guaranteeing the returned promise never rejects → no unhandledRejection.
+async function notifyDegradedAdmin(details) {
+  try {
+    if (!ADMIN_CHAT_ID) {
+      log('Degraded admin alert skipped: no admin chat_id configured');
+      return;
+    }
+    const res = await runC4Send('feishu', ADMIN_CHAT_ID, formatDegradedAdminAlert(details), 'health-alert');
+    log(res.ok
+      ? `Degraded admin alert sent (${details.cycleCount} cycles/${Math.round(details.windowSec / 60)}min)`
+      : `Degraded admin alert failed: ${res.output}`);
+  } catch (err) {
+    try { log(`Degraded admin alert error: ${err && err.message}`); } catch { /* logging itself failed */ }
   }
-  const res = runC4Send('feishu', ADMIN_CHAT_ID, formatDegradedAdminAlert(details), 'health-alert');
-  log(res.ok
-    ? `Degraded admin alert sent (${details.cycleCount} cycles/${Math.round(details.windowSec / 60)}min)`
-    : `Degraded admin alert failed: ${res.output}`);
 }
 
 function readJsonFileSafe(filePath) {
@@ -1154,28 +1199,69 @@ function init() {
   } = orchestrator.start());
 }
 
-try {
-  init();
-} catch (err) {
-  // init() failure (e.g. unknown runtime in config.json) must not crash the PM2 process
-  // into a tight restart loop. Log and exit cleanly so PM2 backs off via its restart policy.
-  console.error(`[activity-monitor] Fatal: init() failed: ${err.message}`);
-  process.exit(1);
-}
-log(`=== Activity Monitor Started (v25 - RuntimeAdapter: ${adapter.displayName} | Guardian + Heartbeat v4 + ProcSampler + LiveAuth + DailyTasks + UpgradeCheck + UsageMonitor): ${new Date().toISOString()} tz=${timezone} ===`);
+// REL-9b seam: gate the daemon side-effects (init, process handlers, schedule
+// loop) so tests can `import` this module without launching the whole monitor.
+// Production (pm2 → activity-monitor.js → `import './monitor.js'`) leaves
+// MONITOR_DISABLE_MAIN unset, so the daemon runs; the test harness sets
+// MONITOR_DISABLE_MAIN=1 before importing so only the exported functions load.
+//
+// Do NOT gate on process.argv[1] / main-module detection. Under pm2 fork_mode
+// process.argv[1] is pm2's own ProcessContainerFork.js (NOT activity-monitor.js),
+// so ANY argv/entry-name check evaluates false in production and silently
+// disables the daemon — an alive-but-dead monitor (message-router listens, but
+// monitorLoop never runs and activity.log goes cold). Verified 2026-07-12: the
+// prior argv-based gate passed `node --test` (argv[1] = the test file) yet broke
+// every pm2-launched instance. The env opt-out is the only launch-mode-agnostic
+// signal, and it is exactly what the tests already set.
+export { runC4Send, notifyDegradedAdmin, formatDegradedAdminAlert };
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    engine?.destroy();
-    stopMessageRouterServer();
-    process.exit(0);
+const RUN_MAIN = process.env.MONITOR_DISABLE_MAIN !== '1';
+
+if (RUN_MAIN) {
+  try {
+    init();
+  } catch (err) {
+    // init() failure (e.g. unknown runtime in config.json) must not crash the PM2 process
+    // into a tight restart loop. Log and exit cleanly so PM2 backs off via its restart policy.
+    console.error(`[activity-monitor] Fatal: init() failed: ${err.message}`);
+    process.exit(1);
+  }
+  log(`=== Activity Monitor Started (v25 - RuntimeAdapter: ${adapter.displayName} | Guardian + Heartbeat v4 + ProcSampler + LiveAuth + DailyTasks + UpgradeCheck + UsageMonitor): ${new Date().toISOString()} tz=${timezone} ===`);
+
+  // REL-9 (review H1): this is a liveness SUPERVISOR — a single dropped async edge
+  // (the scheduler and health-engine fire-and-forget promise SENDS) must never take
+  // the whole monitor down. A rejected send promise is expected-and-benign, so
+  // log-and-survive; the targeted C1/M1 fixes prevent these from firing in the first
+  // place, this is the net for that specific class.
+  process.on('unhandledRejection', (reason) => {
+    try { log(`UNHANDLED REJECTION: ${reason && (reason.stack || reason.message || reason)}`); } catch { /* logging failed */ }
   });
-}
+  // REL-9 rev (async-crash MEDIUM): an uncaughtException is DIFFERENT — it means
+  // corrupt process state, not a dropped send edge (those resolve via their own
+  // listeners + unhandledRejection above). Swallowing it turns a crash+PM2-restart
+  // into an invisible alive-but-dead supervisor (PM2 never restarts a process that
+  // doesn't exit; the survived-log line doesn't even match log()'s pm2-visible prefix
+  // filter). Fail LOUD (console.error reaches `pm2 logs`) and exit(1) so PM2 restarts
+  // a clean daemon — same contract the init() catch above already chose.
+  process.on('uncaughtException', (err) => {
+    try { log(`UNCAUGHT EXCEPTION (exiting for clean restart): ${err && (err.stack || err.message)}`); } catch { /* logging failed */ }
+    try { console.error(`[activity-monitor] FATAL uncaughtException — exiting for PM2 restart: ${err && (err.stack || err.message)}`); } catch { /* stderr failed */ }
+    process.exit(1);
+  });
 
-// Use self-scheduling loop instead of setInterval to prevent concurrent
-// invocations: async monitorLoop + setInterval can overlap if isRunning()
-// takes >INTERVAL ms (e.g., under high system load), causing state variable races.
-(async function scheduleLoop() {
-  await monitorLoop().catch(err => log(`Monitor loop error: ${err.message}`));
-  setTimeout(scheduleLoop, INTERVAL);
-})();
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+      engine?.destroy();
+      stopMessageRouterServer();
+      process.exit(0);
+    });
+  }
+
+  // Use self-scheduling loop instead of setInterval to prevent concurrent
+  // invocations: async monitorLoop + setInterval can overlap if isRunning()
+  // takes >INTERVAL ms (e.g., under high system load), causing state variable races.
+  (async function scheduleLoop() {
+    await monitorLoop().catch(err => log(`Monitor loop error: ${err.message}`));
+    setTimeout(scheduleLoop, INTERVAL);
+  })();
+}
