@@ -36,21 +36,23 @@ const RATE_LIMIT_PATTERNS = [
 ];
 
 // Auth-failure text signatures. HealthEngine.onUserMessageDelivered verifies
-// every hit here with the adapter's live checkAuth() probe before flipping
-// health to auth_failed, so these can be inclusive without risking a false
-// flip from a user message that merely mentions "unauthorized" etc.
-// "not logged in" / "run /login" / token-expired are the credential-expiry
-// signatures Claude Code shows when a shared OAuth token goes stale
-// mid-session (the credential-farm outage). They were previously missing here
-// — present only in the codex probe — so a logged-out Claude session never
-// tripped auth detection and the dispatcher kept delivering into a dead pane.
+// every hit here with the adapter's live checkAuth() before flipping health to
+// auth_failed, so these can be inclusive without risking a false flip from a
+// user message that merely mentions "unauthorized" etc.
+//
+// DELIBERATELY EXCLUDED: "not logged in" / "run /login". On a long-lived
+// setup-token fleet those strings are printed PERMANENTLY as a cosmetic status
+// line (setup tokens are inference-scope, so Claude Code's TUI can't fetch the
+// account profile and shows "Not logged in · Run /login" even while the agent
+// is actively making authenticated API calls). Matching them made detectAuthFailure
+// fire on every persona on any heartbeat blip → false auth_failed. A GENUINE
+// logout is now caught by checkAuth's credential resolution (no token file →
+// failure), not by scraping this cosmetic pane text.
 const AUTH_FAILURE_PATTERNS = [
   /authentication_error/i,
   /auth(?:entication)? failed/i,
   /invalid api key/i,
   /unauthorized/i,
-  /not logged in/i,
-  /run\s+`?\/login/i,
   /(?:oauth|login|session|credential) token (?:has )?expired/i,
 ];
 

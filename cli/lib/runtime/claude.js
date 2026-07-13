@@ -87,6 +87,99 @@ function _parseEnvValue(content, key) {
   return m[1].trim().replace(/^(['"])(.*)\1$/, '$2');
 }
 
+/**
+ * Resolve whether a usable Claude credential is INSTALLED, by reading the same
+ * locations Claude Code reads — with NO subprocess and NO API round-trip.
+ *
+ * On this fleet auth is a long-lived, non-rotating setup-token (`sk-ant-oat01-…`,
+ * ~1yr expiry, no refresh token). Its validity is a STATIC property of the
+ * stored credential. The former auth signal — `claude -p ping --max-turns 1` —
+ * is flaky by construction: SessionStart hooks provoke tool use so a one-word
+ * ping hits "Reached max turns", quota pressure returns 429/overload, and MCP/
+ * hook hiccups produce unknown non-zero exits. NONE of those are auth failures,
+ * yet they drove the recurring false `auth_failed` wedges. Checking the
+ * credential directly removes that flake: a present, well-formed token IS auth.
+ *
+ * The SAME setup-token is installed in `settings.local.json` `env` (no expiry
+ * metadata) AND `~/.claude/.credentials.json` `claudeAiOauth` (with `expiresAt`).
+ * `.credentials.json` is therefore checked FIRST and its expiry is AUTHORITATIVE:
+ * if that token is expired we do NOT let the expiry-less env/settings copies of
+ * the same token mask it — we fall through to the live probe so a genuine token
+ * expiry surfaces as a clean `auth_failed`, not a masked `success`.
+ *
+ * Accepted tradeoff: a token that is present + unexpired but REVOKED server-side
+ * still resolves `success` here (no API round-trip). That is not silent — a dead
+ * token can't ACK heartbeats, so the session still surfaces via heartbeat-timeout
+ * → restart → degraded + admin alert. Detecting revocation directly requires the
+ * live API call whose flake this change exists to remove.
+ *
+ * @param {string} [homeDir]
+ * @returns {{ found: boolean, kind?: string }}
+ */
+function _resolveInstalledCredential(homeDir = os.homedir()) {
+  // A usable credential is any Anthropic token/key form: OAuth/setup tokens
+  // (`sk-ant-oat01-…`) and API keys (`sk-ant-api03-…`) all share the `sk-ant-`
+  // prefix and are ≥ ~100 chars. The length floor rejects placeholder/test
+  // strings ("oauth-test", "sk-ant-test") without a network call.
+  const usable = (v) =>
+    typeof v === 'string' && /^sk-ant-/.test(v.trim()) && v.trim().length >= 40;
+
+  // 0. Expiry-authoritative source: ~/.claude/.credentials.json `claudeAiOauth`
+  //    (the only source carrying `expiresAt`). Checked before the env/settings
+  //    copies so an EXPIRED token cannot be masked by its expiry-less mirror.
+  let credExpired = false;
+  try {
+    const creds = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', '.credentials.json'), 'utf8'));
+    const oauth = creds && creds.claudeAiOauth;
+    if (oauth && usable(oauth.accessToken)) {
+      const raw = oauth.expiresAt;
+      const exp = Number(raw);
+      if (raw === undefined || raw === null || exp === 0) {
+        // No expiry recorded → cannot expiry-check; accept the well-formed token.
+        return { found: true, kind: 'credentials.json' };
+      }
+      if (Number.isFinite(exp) && exp > 0) {
+        if (exp > Date.now()) return { found: true, kind: 'credentials.json' };
+        credExpired = true; // present but past-expiry → known-bad, block the mirror
+      } else {
+        // Malformed expiry (NaN / negative) on a well-formed token — don't trust
+        // it; let the live probe adjudicate rather than accept indefinitely.
+        credExpired = true;
+      }
+    }
+  } catch { /* absent / malformed JSON — no expiry verdict, continue */ }
+
+  if (credExpired) return { found: false };
+
+  // 1. Process env (shell / pm2 / applied settings `env`).
+  for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+    if (usable(process.env[k])) return { found: true, kind: `env:${k}` };
+  }
+
+  // 2. ZYLOS `.env` file.
+  try {
+    const envContent = fs.readFileSync(path.join(ZYLOS_DIR, '.env'), 'utf8');
+    for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+      if (usable(_parseEnvValue(envContent, k))) return { found: true, kind: `dotenv:${k}` };
+    }
+  } catch { /* no .env — fall through */ }
+
+  // 3. settings.local.json `env` (project ZYLOS dir, then user home) — the
+  //    fleet-wide long-lived setup-token (mirror of the creds-file token above,
+  //    but WITHOUT expiry metadata, hence checked after the expiry verdict).
+  for (const base of [path.join(ZYLOS_DIR, '.claude'), path.join(homeDir, '.claude')]) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(path.join(base, 'settings.local.json'), 'utf8'));
+      const env = (settings && settings.env) || {};
+      for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+        if (usable(env[k])) return { found: true, kind: `settings:${k}` };
+      }
+    } catch { /* absent / malformed — fall through */ }
+  }
+
+  return { found: false };
+}
+
 // ── ClaudeAdapter ─────────────────────────────────────────────────────────────
 
 export class ClaudeAdapter extends RuntimeAdapter {
@@ -107,18 +200,34 @@ export class ClaudeAdapter extends RuntimeAdapter {
   // ── Auth ──────────────────────────────────────────────────────────────────
 
   /**
-   * Live auth check via `claude -p ping --max-turns 1` (30s timeout).
-   * End-to-end validation through the same path Claude Code uses at runtime.
-   * Works with all credential types (API keys, setup tokens, OAuth tokens).
+   * Auth check. Primary signal is the INSTALLED credential (deterministic, no
+   * subprocess): a well-formed long-lived token/key present in any location
+   * Claude Code reads IS authentication → success. Only when NO credential is
+   * installed do we fall through to the live `claude -p ping --max-turns 1`
+   * probe for a definitive "genuinely logged out" answer.
+   *
+   * Rationale: the probe is a full agentic round-trip that flakes on
+   * SessionStart-hook "Reached max turns", quota 429/overload, and unknown
+   * non-zero exits — none of which are auth failures. Letting those drive
+   * health was the entire source of the recurring false `auth_failed` wedges.
    *
    * Return values:
-   *   { status: 'success' }   — authenticated
-   *   { status: 'failure' }   — explicit auth failure
+   *   { status: 'success' }   — authenticated (credential present, or probe OK)
+   *   { status: 'failure' }   — explicit auth failure (no credential / logged out)
    *   { status: 'uncertain' } — probe could not confirm either way
    *
    * @returns {Promise<{status: 'success'|'failure'|'uncertain', reason: string}>}
    */
   async checkAuth() {
+    // Fast path: a well-formed long-lived credential is installed → auth is
+    // valid. Deterministic, flake-proof, and the case that holds ~100% of the
+    // time on a setup-token fleet.
+    const cred = _resolveInstalledCredential();
+    if (cred.found) return { status: 'success', reason: `credential_present:${cred.kind}` };
+
+    // No credential found in any known location — genuinely unconfigured/logged
+    // out. Fall through to the live probe for a definitive signal (and so
+    // `zylos doctor` still surfaces a real not-logged-in state).
     // Build subprocess env: inherit current env, inject .env API keys (same as launch()).
     const injectedEnv = { ...process.env };
     let envApiKey = '';

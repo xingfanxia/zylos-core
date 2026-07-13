@@ -64,15 +64,22 @@ describe('AUTH_FAILURE_PATTERNS', () => {
     assert.ok(matchesAuth('401 Unauthorized'));
   });
 
-  it('matches the credential-expiry signatures that were previously missing', () => {
-    // The exact strings Claude Code shows when a shared OAuth token goes stale.
-    assert.ok(matchesAuth('Not logged in'));
-    assert.ok(matchesAuth('  Not logged in · Please run /login'));
-    assert.ok(matchesAuth('Please run /login to authenticate'));
-    assert.ok(matchesAuth('Run `/login` to continue'));
+  it('matches genuine token-expiry signatures', () => {
     assert.ok(matchesAuth('Your OAuth token has expired'));
     assert.ok(matchesAuth('login token expired'));
     assert.ok(matchesAuth('session token expired'));
+  });
+
+  it('does NOT match the cosmetic setup-token status line', () => {
+    // "Not logged in · Run /login" is printed permanently by Claude Code's TUI
+    // for an inference-scope setup token, even while the agent is fully
+    // authenticated and actively calling the API. Matching it made every
+    // persona false-trip auth_failed on any heartbeat blip. A genuine logout is
+    // caught by checkAuth's credential resolution, not by this pane text.
+    assert.ok(!matchesAuth('Not logged in'));
+    assert.ok(!matchesAuth('  Not logged in · Please run /login'));
+    assert.ok(!matchesAuth('Please run /login to authenticate'));
+    assert.ok(!matchesAuth('Run `/login` to continue'));
   });
 
   it('does not match unrelated conversational text', () => {
