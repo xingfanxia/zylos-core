@@ -159,7 +159,25 @@ export class ClaudeAdapter extends RuntimeAdapter {
       if (isTransient) {
         return { status: 'uncertain', reason: 'cli_probe_uncertain' };
       }
-      return { status: 'failure', reason: 'cli_probe_not_authenticated', output: output.slice(0, 500) };
+      // Explicit unauthenticated signals — the only outputs that prove auth is broken.
+      if (
+        output.includes('Not logged in') ||
+        output.includes('Please run /login') ||
+        output.includes('Invalid API key')
+      ) {
+        return { status: 'failure', reason: 'cli_probe_not_authenticated', output: output.slice(0, 500) };
+      }
+      // `claude -p ping --max-turns 1` exits non-zero with "Reached max turns" when the
+      // probe runs inside the full project context (SessionStart hooks provoke tool use,
+      // so a one-word "ping" needs >1 turn). Reaching a turn at all proves an
+      // authenticated API round-trip happened -> success, NOT an auth failure.
+      if (output.includes('Reached max turns')) {
+        return { status: 'success', reason: 'cli_probe_max_turns' };
+      }
+      // Unknown non-zero exit: could not confirm auth either way. Do NOT assert
+      // auth_failed (it gates message routing) — report uncertain so the live agent
+      // heals via heartbeat ACK and the next probe re-checks.
+      return { status: 'uncertain', reason: 'cli_probe_unknown_exit', output: output.slice(0, 500) };
     }
   }
 
