@@ -130,9 +130,15 @@ describe('egress-policy', () => {
       '/tmp/外刊精读-No03.pdf');
     // a trailing newline with no caption is not a caption
     assert.equal(egress.mediaPathFromContent('[MEDIA:file]/tmp/a.pdf\n'), '/tmp/a.pdf');
+    // caption BEFORE the directive (the /m case) — extract the path, not null
+    assert.equal(
+      egress.mediaPathFromContent('九上词汇封面来啦👇\n[MEDIA:image]/pub/cover.png'),
+      '/pub/cover.png');
+    // directive not at a line start is NOT a media message
+    assert.equal(egress.mediaPathFromContent('see this [MEDIA:image]/pub/x.png'), null);
   });
 
-  it('rewrites the media path to a staged copy, preserving token and caption', () => {
+  it('rewrites the media path to a staged copy, preserving token, position and caption', () => {
     assert.equal(
       egress.mediaContentWithStagedPath('[MEDIA:image]/pub/cover.png\n九上词汇封面👆', '/stage/uuid/cover.png'),
       '[MEDIA:image]/stage/uuid/cover.png\n九上词汇封面👆');
@@ -144,6 +150,10 @@ describe('egress-policy', () => {
     assert.equal(
       egress.mediaContentWithStagedPath('[MEDIA:image]/pub/x.png\nline1\nline2', '/stage/y.png'),
       '[MEDIA:image]/stage/y.png\nline1\nline2');
+    // caption BEFORE the directive — replaced in place, lead-in preserved
+    assert.equal(
+      egress.mediaContentWithStagedPath('封面来啦👇\n[MEDIA:image]/pub/cover.png', '/stage/c.png'),
+      '封面来啦👇\n[MEDIA:image]/stage/c.png');
     // non-media content is returned unchanged
     assert.equal(egress.mediaContentWithStagedPath('hello world', '/stage/z'), 'hello world');
   });

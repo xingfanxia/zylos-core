@@ -99,29 +99,30 @@ export function checkPathViolation(candidatePath, roots, homedir = os.homedir())
  * Extract the file path from a `[MEDIA:type]path` message prefix (the feishu
  * send.js media convention), or null when the content is plain text.
  *
- * The path is the remainder of the FIRST line only. The documented contract is
- * "prefix the message with [MEDIA:type]path", so a caption may follow on the
- * next line(s); it must NOT be swallowed into the path. The old `(.+)$/s`
- * (dotAll) captured the newline + caption, so the broker called
- * openSync("…/x.png\n<caption>") → ENOENT and rejected every captioned
- * attachment as `attachment_unreadable`. Matching up to the first newline is
- * correct because a filesystem path never spans lines.
+ * The path is the remainder of the line the directive sits on. The `/m` flag
+ * lets the `[MEDIA:type]` directive appear on ANY line (caption-before-media is
+ * as valid as caption-after); text on other lines is a caption, never part of
+ * the path. Matching to the first newline is correct because a filesystem path
+ * never spans lines. (The old dotAll `(.+)$/s` swallowed the newline + caption
+ * into the path → `openSync("…/x.png\n<caption>")` → ENOENT → every captioned
+ * attachment rejected `attachment_unreadable`.)
  *
  * @param {string} content
  * @returns {string | null}
  */
 export function mediaPathFromContent(content) {
   if (typeof content !== 'string') return null;
-  const m = content.match(/^\[MEDIA:\w+\]([^\n]+)/);
+  const m = content.match(/^\[MEDIA:\w+\]([^\n]+)/m);
   return m ? m[1].trim() : null;
 }
 
 /**
- * Rewrite a `[MEDIA:type]path\ncaption` message so the first-line path is
- * replaced by `stagedPath` while the `[MEDIA:type]` token and any caption
- * line(s) are preserved verbatim. Used after the broker stages an isolated
- * tenant's attachment into a broker-owned copy: send.js must still receive the
- * caption. Returns `content` unchanged when it is not a media message.
+ * Rewrite a message so the `[MEDIA:type]` directive's path is replaced by
+ * `stagedPath`, IN PLACE — the token, its line position, and every other line
+ * (caption before and/or after) are preserved verbatim. Used after the broker
+ * stages an isolated tenant's attachment into a broker-owned copy: send.js must
+ * still receive the surrounding caption in its original order. Returns `content`
+ * unchanged when it is not a media message.
  *
  * @param {string} content
  * @param {string} stagedPath
@@ -129,8 +130,7 @@ export function mediaPathFromContent(content) {
  */
 export function mediaContentWithStagedPath(content, stagedPath) {
   if (typeof content !== 'string') return content;
-  const m = content.match(/^(\[MEDIA:\w+\])[^\n]*(\n[\s\S]*)?$/);
-  return m ? `${m[1]}${stagedPath}${m[2] || ''}` : content;
+  return content.replace(/^(\[MEDIA:\w+\])[^\n]*/m, (_m, token) => `${token}${stagedPath}`);
 }
 
 // ── REL-8 owner-validated attachment staging ────────────────────────────────
