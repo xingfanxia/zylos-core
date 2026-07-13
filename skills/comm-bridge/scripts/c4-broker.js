@@ -56,7 +56,7 @@ import {
 } from './c4-db-multi.js';
 import { initC4Session } from './c4-session-init.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
-import { sourceTierRoots, checkPathViolation, mediaPathFromContent, makeUidResolver, stageOwnedMedia } from './egress-policy.js';
+import { sourceTierRoots, checkPathViolation, mediaPathFromContent, mediaContentWithStagedPath, makeUidResolver, stageOwnedMedia } from './egress-policy.js';
 import { getAllInstances, getMonitorDir, getInstanceDef } from '../../multi-session/instance-config.js';
 import * as taskOps from '../../scheduler/scripts/task-ops.js';
 import { getDb as getSchedulerDb, generateId as generateTaskId, now as taskNow } from '../../scheduler/scripts/database.js';
@@ -406,9 +406,9 @@ async function opSend(p, caller) {
       }
       stagingSubdir = staged.stagingSubdir;
       // Rewrite the [MEDIA:type] path to the broker-owned staging copy the child
-      // will read (preserves the type token; the [\s\S] class handles multi-line).
-      const m = content.match(/^(\[MEDIA:\w+\])[\s\S]+$/);
-      if (m) content = `${m[1]}${staged.stagingPath}`;
+      // will read, preserving the type token AND any caption line(s) after the
+      // path (the documented "[MEDIA:type]path\n<caption>" form).
+      content = mediaContentWithStagedPath(content, staged.stagingPath);
     } else {
       // Primary/trusted caller (admin, scheduler): keep the up-front readability
       // gate so an unreadable path is rejected cleanly instead of crashing the

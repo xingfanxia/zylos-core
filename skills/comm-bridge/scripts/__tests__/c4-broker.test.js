@@ -117,6 +117,36 @@ describe('egress-policy', () => {
       'workspace/panpanmao-monorepo/x.png');
     assert.equal(egress.mediaPathFromContent('hello world'), null);
   });
+
+  it('extracts only the first-line path when a caption follows (Elaine unreadable regression)', () => {
+    // The documented "[MEDIA:type]path\n<caption>" form. The old dotAll `(.+)$/s`
+    // swallowed "\n<caption>" into the path, so openSync got a non-existent
+    // "path\ncaption" and every captioned attachment was rejected unreadable.
+    assert.equal(
+      egress.mediaPathFromContent('[MEDIA:image]/home/x_computelabs_ai/zylos/workspace/users/user-elaine/9shang-vocab-cover.png\n九上词汇封面👆'),
+      '/home/x_computelabs_ai/zylos/workspace/users/user-elaine/9shang-vocab-cover.png');
+    assert.equal(
+      egress.mediaPathFromContent('[MEDIA:file]/tmp/外刊精读-No03.pdf\n跟读版(先用文件形式发)\n第二行说明'),
+      '/tmp/外刊精读-No03.pdf');
+    // a trailing newline with no caption is not a caption
+    assert.equal(egress.mediaPathFromContent('[MEDIA:file]/tmp/a.pdf\n'), '/tmp/a.pdf');
+  });
+
+  it('rewrites the media path to a staged copy, preserving token and caption', () => {
+    assert.equal(
+      egress.mediaContentWithStagedPath('[MEDIA:image]/pub/cover.png\n九上词汇封面👆', '/stage/uuid/cover.png'),
+      '[MEDIA:image]/stage/uuid/cover.png\n九上词汇封面👆');
+    // no caption — token + staged path only
+    assert.equal(
+      egress.mediaContentWithStagedPath('[MEDIA:file]/pub/doc.pdf', '/stage/uuid/doc.pdf'),
+      '[MEDIA:file]/stage/uuid/doc.pdf');
+    // multi-line caption preserved verbatim
+    assert.equal(
+      egress.mediaContentWithStagedPath('[MEDIA:image]/pub/x.png\nline1\nline2', '/stage/y.png'),
+      '[MEDIA:image]/stage/y.png\nline1\nline2');
+    // non-media content is returned unchanged
+    assert.equal(egress.mediaContentWithStagedPath('hello world', '/stage/z'), 'hello world');
+  });
 });
 
 // ── REL-8 owner-validated attachment staging (pure) ─────────────────

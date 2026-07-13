@@ -58,7 +58,10 @@ global broker, which runs as a different unix user and cannot read your private
 `~/zylos/workspace/users/<your-instance>/` (or another broker-readable shared
 path) — an unreadable path is rejected before send with
 `attachment_unreadable: broker cannot read <path>; publish it under ~/zylos/workspace/users/<instance>/ and resend`,
-and no message is delivered. Prefer absolute paths.
+and no message is delivered. Prefer absolute paths. The `[MEDIA:type]<path>`
+directive must be the FIRST line; put the file path on that line only. Any text
+on the following line(s) is treated as a caption and delivered as a follow-up
+text message after the file.
 
 
 ## Database
