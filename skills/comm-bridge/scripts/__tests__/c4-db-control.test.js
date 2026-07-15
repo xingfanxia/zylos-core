@@ -119,6 +119,17 @@ describe('insertControl', () => {
     assert.equal(mod.getControlById(replacement.id).status, 'pending');
   });
 
+  it('does not supersede equivalent controls belonging to different instances', () => {
+    const admin = mod.insertControl('Heartbeat check. [phase=recovery]', { targetInstance: 'admin' });
+    const scheduler = mod.insertControl('Heartbeat check. [phase=recovery]', { targetInstance: 'scheduler' });
+    const newerAdmin = mod.insertControl('Heartbeat check. [phase=recovery]', { targetInstance: 'admin' });
+
+    assert.equal(newerAdmin.superseded_count, 1);
+    assert.equal(mod.getControlById(admin.id).status, 'superseded');
+    assert.equal(mod.getControlById(scheduler.id).status, 'pending');
+    assert.equal(mod.getControlById(newerAdmin.id).status, 'pending');
+  });
+
   it('does not supersede running or final controls', () => {
     const running = mod.insertControl('same content');
     mod.claimControl(running.id);

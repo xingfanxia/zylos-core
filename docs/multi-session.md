@@ -52,6 +52,12 @@ Claude subscription windows and Codex's 5-hour and exact 10,080-minute weekly
 windows. Unknown usage permits one optimistic hop; a subsequent live rate-limit
 signal advances to the next tier.
 
+`auto_recover: false` keeps an explicitly selected profile active instead of
+returning to an earlier tier after the dwell window. When that selected profile
+is the final chain entry, `wrap_on_exhausted: true` lets a live health or usage
+failure wrap to the first usable earlier tier. This supports an API-primary
+deployment without removing subscription fallback profiles.
+
 A profile transition is deliberately engine-only. It may update
 `runtime_profile`, `runtime`, transition metadata, generated `CLAUDE.md` or
 `AGENTS.md`, and the engine process. It must preserve all of the following in
@@ -61,8 +67,8 @@ place:
 - the same memory directories and files, without a runtime-specific copy;
 - `.claude/skills`, exposed to Codex only through
   `.agents/skills -> .claude/skills`;
-- the same workspace `.env` and secret files, so either engine can use them
-  from the unchanged working directory;
+- the same persona-owned workspace `.env` and secret files, so either engine
+  can use them from the unchanged working directory;
 - the same C4 database, queue, task state, and chat routing;
 - the working directory and stable tmux identity.
 
@@ -71,6 +77,23 @@ Codex profile uses a protected `CODEX_HOME`; provider keys are read from that
 home's `auth.json` into a mode-0600 launch specification and never stored in
 `instances.json`, PM2 configuration, process argv, or logs. This isolation does
 not copy or replace the persona workspace `.env`.
+
+For an `os_user` persona, `instances/<id>/.env` resolves to the writable
+`/home/<os_user>/zylos/.env`, never the private root Zylos env. The launch spec
+contains only its path; after `sudo` drops to the persona, `tmux-launcher`
+reads that file and merges its variables into either Claude or Codex. Explicit
+runtime values win on conflicts, so a persona env cannot replace HOME,
+CODEX_HOME, model/profile identity, or provider injection. A regular/custom
+workspace `.env` is preserved by repeated `ensureInstanceCwd()` calls.
+Shared-user personas may retain the legacy root link or replace it with their
+own regular/custom workspace env; repeated setup preserves that choice too.
+
+Codex SessionStart hooks are installed only once at the shared Zylos root.
+Per-instance `.codex/config.toml` remains an engine overlay, but duplicate
+per-instance hook files are removed. Hook discovery runs from the actual
+instance cwd and automatically trusts only the shared Zylos-managed hook file.
+Heartbeat controls always include `target_instance`, and equivalent controls
+supersede only within that persona, preventing cross-persona health timeouts.
 
 ## Key Components
 

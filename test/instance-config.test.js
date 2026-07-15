@@ -19,6 +19,7 @@ const INSTANCES_FIXTURE = {
     'user-betty': {
       tmux_session: 'claude-betty',
       state_dir: '/tmp/zylos-test/state/betty',
+      os_user: 'zylos-betty',
       primary: false,
       enabled: true,
       default: false,
@@ -203,6 +204,22 @@ describe('instance-config — with instances.json', () => {
     expect(fs.readlinkSync(path.join(cwd, 'memory'))).toBe('../../memory');
     expect(fs.readlinkSync(path.join(cwd, '.claude'))).toBe('../../.claude');
     expect(fs.readlinkSync(path.join(cwd, '.agents'))).toBe('../../.agents');
+  });
+
+  it('uses the persona-owned farm env for an OS-isolated workspace', () => {
+    const cwd = mod.ensureInstanceCwd('user-betty');
+    expect(fs.readlinkSync(path.join(cwd, '.env'))).toBe('/home/zylos-betty/zylos/.env');
+  });
+
+  it('preserves a persona-created workspace env across repeated setup', () => {
+    const cwd = mod.ensureInstanceCwd('admin');
+    fs.unlinkSync(path.join(cwd, '.env'));
+    fs.writeFileSync(path.join(cwd, '.env'), 'PERSONA_SERVICE_TOKEN=owned\n');
+
+    mod.ensureInstanceCwd('admin');
+
+    expect(fs.lstatSync(path.join(cwd, '.env')).isFile()).toBe(true);
+    expect(fs.readFileSync(path.join(cwd, '.env'), 'utf8')).toBe('PERSONA_SERVICE_TOKEN=owned\n');
   });
 
   // ── Cache TTL ─────────────────────────────────────────────────

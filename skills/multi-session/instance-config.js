@@ -246,8 +246,10 @@ export function getDefaultInstance() {
  * Ensure the per-instance working directory exists with correct symlinks.
  *
  * Creates `~/zylos/instances/<instanceId>/` and sets up symlinks to shared
- * resources (.claude, CLAUDE.md, AGENTS.md, .env, memory) so the runtime launches from an
- * isolated cwd while sharing auth, skills, config, and memory.
+ * resources (.claude, CLAUDE.md, AGENTS.md, memory) so the runtime launches from
+ * an isolated cwd while sharing skills, config, and memory. `.env` is
+ * persona-owned: OS-isolated workspaces link to their writable farm env, while
+ * shared-user workspaces may keep or replace the legacy root link.
  *
  * Safe to call repeatedly — only creates missing dirs/links, updates stale ones.
  *
@@ -259,6 +261,7 @@ export function ensureInstanceCwd(instanceId) {
 
   const instanceDir = path.join(ZYLOS_DIR, 'instances', instanceId);
   fs.mkdirSync(instanceDir, { recursive: true });
+  const instanceDef = getInstanceDef(instanceId);
 
   const symlinks = [
     ['.claude', '../../.claude'],
@@ -268,7 +271,6 @@ export function ensureInstanceCwd(instanceId) {
     ['.agents', '../../.agents'],
     ['CLAUDE.md', '../../CLAUDE.md'],
     ['AGENTS.md', '../../AGENTS.md'],
-    ['.env', '../../.env'],
     ['memory', '../../memory'],
   ];
 
@@ -287,9 +289,38 @@ export function ensureInstanceCwd(instanceId) {
     } catch { /* best effort */ }
   }
 
+  // `.env` belongs to the persona, not to a runtime profile. Dedicated OS-user
+  // personas use their writable farm env; shared-user personas keep the legacy
+  // root link until they replace it with a regular workspace file. Never
+  // overwrite a persona-created file or custom symlink on a later launch.
+  const envPath = path.join(instanceDir, '.env');
+  const validOsUser = /^[a-z_][a-z0-9_-]{0,31}$/.test(instanceDef?.os_user || '')
+    ? instanceDef.os_user
+    : null;
+  const desiredEnvTarget = validOsUser
+    ? `/home/${validOsUser}/zylos/.env`
+    : '../../.env';
+  let shouldCreateEnvLink = false;
+  try {
+    const stat = fs.lstatSync(envPath);
+    if (stat.isSymbolicLink()) {
+      const current = fs.readlinkSync(envPath);
+      const managed = current === '../../.env'
+        || /^\/home\/zylos-[a-z0-9_-]+\/zylos\/\.env$/.test(current);
+      if (managed && current !== desiredEnvTarget) {
+        fs.unlinkSync(envPath);
+        shouldCreateEnvLink = true;
+      }
+    }
+  } catch {
+    shouldCreateEnvLink = true;
+  }
+  if (shouldCreateEnvLink) {
+    try { fs.symlinkSync(desiredEnvTarget, envPath); } catch { /* best effort */ }
+  }
+
   // Generate per-instance identity anchor (ZYLOS.md)
   const zylosMdPath = path.join(instanceDir, 'ZYLOS.md');
-  const instanceDef = getInstanceDef(instanceId);
   const displayName = instanceDef?.display_name || instanceId;
   const description = instanceDef?.description || '';
   const instanceType = instanceDef?.type || 'dedicated';

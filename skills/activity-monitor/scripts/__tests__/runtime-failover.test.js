@@ -96,6 +96,37 @@ describe('runtime failover selection', () => {
     });
   });
 
+  it('keeps a manually selected API profile active when auto recovery is disabled', () => {
+    const result = chooseRuntimeProfile({
+      currentProfile: 'codex-azure',
+      chain: Object.keys(profiles),
+      profiles,
+      providerUsage: usage({ claude: 20, codex: 30 }),
+      changedAtMs: 1_000,
+      nowMs: 10_000,
+      minDwellMs: 1_000,
+      autoRecover: false,
+    });
+
+    assert.deepEqual(result, { profile: 'codex-azure', reason: 'no_change' });
+  });
+
+  it('wraps an unhealthy active API profile to an available subscription tier', () => {
+    const result = chooseRuntimeProfile({
+      currentProfile: 'codex-azure',
+      chain: Object.keys(profiles),
+      profiles,
+      providerUsage: usage({ claude: 99, codex: 30 }),
+      currentHealth: 'rate_limited',
+      wrapOnExhausted: true,
+    });
+
+    assert.deepEqual(result, {
+      profile: 'codex-subscription',
+      reason: 'health_rate_limited_wrap:codex-azure',
+    });
+  });
+
   it('plans only opted-in instances and preserves stable tmux identities', () => {
     const document = {
       runtime_profiles: profiles,

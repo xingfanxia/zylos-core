@@ -20,7 +20,7 @@ read every other instance's files, the shared `.env`, the operator's `~/.claude`
 "user-pan": { "os_user": "zylos-pan", ... }
 ```
 
-When set, `cli/lib/runtime/claude.js`:
+When set, both runtime adapters and the shared launcher:
 
 1. builds the launch env with `HOME=/home/<os_user>`, `USER`/`LOGNAME=<os_user>`
 2. chowns the launch spec to the agent user (launcher must read + unlink it)
@@ -32,6 +32,10 @@ When set, `cli/lib/runtime/claude.js`:
    `.claude.json` + `.claude/settings.json`)
 5. kills any leftover tmux session instead of reusing it (a privileged pane
    can't be reused safely)
+6. keeps `instances/<id>/.env` linked to the persona's real farm env and lets
+   `tmux-launcher` read it only after dropping to that OS user; Claude and Codex
+   therefore receive the same persona-managed variables, while runtime-forced
+   identity/profile values take precedence
 
 `os_user` values are validated against `/^[a-z_][a-z0-9_-]{0,31}$/`.
 
@@ -55,7 +59,9 @@ service user with a warning.
 
 The farm dir is the key trick: every skill that resolves `$HOME/zylos/.env`
 (channel send scripts, imagegen, etc.) transparently gets the per-instance env
-with zero code changes, while all shared paths keep resolving through symlinks.
+with zero code changes. The instance cwd `.env` resolves to this same file, so
+the persona may add or update its own service credentials and both runtimes see
+them without a copy. The root Zylos `.env` stays unreadable to isolated users.
 
 ## Shared-write surfaces
 

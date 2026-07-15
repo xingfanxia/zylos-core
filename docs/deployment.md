@@ -48,17 +48,20 @@ tmux list-sessions -F '#{session_name}' | grep '^codex-user-' | xargs -I{} tmux 
 
 Runtime failover is an engine replacement, not a persona migration. Before and
 after a failover canary, verify that `ZYLOS.md`, memory paths/inodes,
-`.claude/skills`, `.env`, C4 databases, chat routing, instance cwd, and explicit
+`.claude/skills`, the workspace `.env`, C4 databases, chat routing, instance cwd, and explicit
 tmux names are unchanged. Every instance working directory must expose the
-shared files through `.claude`, `.agents`, `.env`, and `memory` links; the root
+shared files through `.claude`, `.agents`, and `memory` links; an OS-isolated
+instance's `.env` must resolve to its writable `/home/<os_user>/zylos/.env`, not
+the root env. The root
 `.agents/skills` link must resolve to the root `.claude/skills` tree.
 
 Only profile/provider credentials use separate homes. Keep subscription and API
 credentials in protected `CODEX_HOME` directories. Profile JSON may contain a
 provider environment variable **name**, never its value. The launcher reads the
 key from that profile's `auth.json` into its mode-0600 launch spec, so it does
-not appear in PM2 state, shell arguments, or logs. Workspace `.env` remains the
-same file and is available to either engine from the unchanged cwd.
+not appear in PM2 state, shell arguments, or logs. The launcher reads the
+persona `.env` only after dropping to the persona user and makes that same file
+available to either engine; runtime-controlled values win on conflicts.
 
 For multi-session deployments, `runtime-failover` atomically changes only the
 instance's runtime/profile metadata, kills its stable tmux pane, and restarts

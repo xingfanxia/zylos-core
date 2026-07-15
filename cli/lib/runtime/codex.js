@@ -45,10 +45,12 @@ import {
   buildCompatEnv,
   ensureInstanceGhConfigDir,
   loadRuntimeEnvManifest,
+  readMergedDotenvVars,
+  resolvePersonaDotenvPath,
   writeLaunchSpec,
 } from './tmux-env.js';
 import { classifyCodexLoginStatus } from '../auth-parsers.js';
-import { ensureCodexHooksTrusted } from '../codex-hooks.js';
+import { ensureCodexHooksTrusted, uninstallCoreCodexHook } from '../codex-hooks.js';
 
 // Multi-session: heartbeat pending state must be per-instance (see claude.js —
 // shared-path pending files let instances overwrite each other's pointer and
@@ -286,7 +288,13 @@ export class CodexAdapter extends RuntimeAdapter {
     if (writeCodexConfig) {
       try { writeCodexConfig(ZYLOS_DIR); } catch { /* best effort */ }
       if (instanceCwd !== ZYLOS_DIR) {
-        try { writeCodexConfig(instanceCwd); } catch { /* best effort */ }
+        try {
+          // The shared root hook already resolves through the instance's
+          // .claude symlink. A second generated hook in the instance cwd is
+          // both redundant and independently reviewed by Codex.
+          writeCodexConfig(instanceCwd, { installCoreHook: false });
+          uninstallCoreCodexHook({ zylosDir: instanceCwd });
+        } catch { /* best effort */ }
       }
     }
     const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
@@ -371,7 +379,8 @@ export class CodexAdapter extends RuntimeAdapter {
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
-      const dotenvVars = _readDotenvVars();
+      const dotenvVars = readMergedDotenvVars([path.join(ZYLOS_DIR, '.env')]);
+      const personaEnvFile = resolvePersonaDotenvPath(ZYLOS_DIR, instanceCwd);
       const useCleanEnv = dotenvVars.ZYLOS_CLEAN_ENV !== 'false';
       const manifest = useCleanEnv ? loadRuntimeEnvManifest(ZYLOS_DIR) : undefined;
 
@@ -418,6 +427,7 @@ export class CodexAdapter extends RuntimeAdapter {
         args,
         env,
         cwd: instanceCwd,
+        personaEnvFile,
         exitLogFile,
       });
 
@@ -500,20 +510,3 @@ export class CodexAdapter extends RuntimeAdapter {
 
 
 // ── Private helpers ────────────────────────────────────────────────────────
-
-function _readDotenvVars() {
-  const vars = {};
-  try {
-    const content = fs.readFileSync(path.join(ZYLOS_DIR, '.env'), 'utf8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx < 1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
-      vars[key] = val;
-    }
-  } catch { /* .env absent */ }
-  return vars;
-}

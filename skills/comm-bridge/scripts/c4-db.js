@@ -493,10 +493,12 @@ export function insertControl(content, options = {}) {
       WHERE id != ?
         AND status = 'pending'
         AND raw_content = ?
+        AND target_instance IS ?
     `).run(
       current,
       id,
-      content
+      content,
+      targetInstance
     );
 
     const row = database.prepare(`

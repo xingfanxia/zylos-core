@@ -81,17 +81,31 @@ mock.module('node:child_process', {
     }),
     spawnSync: mock.fn((file, args, opts) => {
       const canonicalZylosDir = fs.realpathSync(fakeZylosDir);
-      const key = `${path.join(canonicalZylosDir, '.codex', 'hooks.json')}:session_start:0:0`;
+      const hooksPath = path.join(canonicalZylosDir, '.codex', 'hooks.json');
+      const hooks = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+      const stateLines = [];
+      for (const [event, groups] of Object.entries(hooks.hooks || {})) {
+        const eventName = event.replace(/[A-Z]/g, (m, i) => `${i ? '_' : ''}${m.toLowerCase()}`);
+        groups.forEach((group, groupIndex) => {
+          group.hooks.forEach((hook, hookIndex) => {
+            if (!hook.command) return;
+            const key = `${hooksPath}:${eventName}:${groupIndex}:${hookIndex}`;
+            stateLines.push(
+              `[hooks.state."${key}"]`,
+              'enabled = true',
+              'trusted_hash = "sha256:test"',
+              '',
+            );
+          });
+        });
+      }
       const configPath = path.join(opts?.env?.CODEX_HOME || path.join(fakeHome, '.codex'), 'config.toml');
       fs.mkdirSync(path.dirname(configPath), { recursive: true });
       fs.writeFileSync(configPath, [
         '[features]',
         'hooks = true',
         '',
-        `[hooks.state."${key}"]`,
-        'enabled = true',
-        'trusted_hash = "sha256:test"',
-        '',
+        ...stateLines,
       ].join('\n'));
       return {
         status: 0,
@@ -414,6 +428,11 @@ describe('Codex launch — new session', () => {
     assert.equal(env.GH_PROMPT_DISABLED, '1');
     assert.equal(env.ZYLOS_INSTANCE_ID, 'yanzi');
     assert.ok(fs.existsSync(env.GH_CONFIG_DIR), 'per-instance gh config dir should be created');
+    assert.equal(
+      fs.existsSync(path.join(fakeZylosDir, 'instances', 'yanzi', '.codex', 'hooks.json')),
+      false,
+      'instance overlays must use the shared root hook instead of creating a duplicate',
+    );
   });
 
   it('launches an os_user instance with its isolated Codex profile and forced model settings', async () => {

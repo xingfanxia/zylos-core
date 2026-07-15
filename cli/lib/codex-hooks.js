@@ -302,11 +302,13 @@ export function readHooksState(globalConfigPath) {
   return isSection(state) ? state : {};
 }
 
-export function extractTrustSnapshot(hooksState = {}, hooksPath = '') {
+export function extractTrustSnapshot(hooksState = {}, hooksPath = '', allowedKeys = null) {
   const prefix = hooksPath ? `${hooksPath}:` : '';
+  const allowed = allowedKeys ? new Set(allowedKeys) : null;
   const out = {};
   for (const [key, value] of Object.entries(hooksState || {})) {
     if (prefix && !key.startsWith(prefix)) continue;
+    if (allowed && !allowed.has(key)) continue;
     if (!value || typeof value !== 'object') continue;
     out[key] = {
       enabled: value.enabled === true,
@@ -314,6 +316,22 @@ export function extractTrustSnapshot(hooksState = {}, hooksPath = '') {
     };
   }
   return stable(out);
+}
+
+function configuredHookKeys(hooksPath) {
+  const config = readCodexHooksConfig(hooksPath);
+  const keys = [];
+  for (const [event, groups] of Object.entries(config.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    groups.forEach((group, groupIndex) => {
+      if (!Array.isArray(group?.hooks)) return;
+      group.hooks.forEach((hook, hookIndex) => {
+        if (!hook?.command) return;
+        keys.push(`${hooksPath}:${eventKey(event)}:${groupIndex}:${hookIndex}`);
+      });
+    });
+  }
+  return keys.sort();
 }
 
 function readTrustMarker(markerPath) {
@@ -384,7 +402,14 @@ export function isCodexTrustValid({
   if (marker.hooksHash !== sha256(hooksContent)) return { valid: false, reason: 'hooks_json_changed' };
   if (marker.codexVersion !== codexVersion) return { valid: false, reason: 'codex_version_changed' };
 
-  const currentSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath);
+  const expectedKeys = configuredHookKeys(hooksPath);
+  const currentSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath, expectedKeys);
+  if (expectedKeys.length === 0 || Object.keys(currentSnapshot).length !== expectedKeys.length) {
+    return { valid: false, reason: 'trust_snapshot_incomplete' };
+  }
+  if (Object.values(currentSnapshot).some(value => !value.enabled || !value.trusted_hash)) {
+    return { valid: false, reason: 'trust_snapshot_untrusted' };
+  }
   if (stableJson(currentSnapshot) !== stableJson(marker.trustSnapshot || {})) {
     return { valid: false, reason: 'trust_snapshot_changed' };
   }
@@ -398,6 +423,7 @@ export function hookKeyFor({ zylosDir, event, groupIndex, hookIndex }) {
 
 export function trustCodexHooksWithAppServer({
   zylosDir,
+  projectDir = zylosDir,
   homeDir = os.homedir(),
   codexHome = null,
   runAsUser = null,
@@ -409,6 +435,8 @@ export function trustCodexHooksWithAppServer({
 const { spawn } = require('node:child_process');
 
 const cwd = process.env.ZYLOS_CODEX_TRUST_CWD;
+const trustedHooksPath = process.env.ZYLOS_CODEX_TRUST_HOOKS_PATH;
+const trustedKeyPrefix = trustedHooksPath + ':';
 const codexBin = process.env.ZYLOS_CODEX_BIN || 'codex';
 const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
   cwd,
@@ -479,7 +507,12 @@ app.stdout.on('data', chunk => {
       const state = {};
       for (const entry of msg.result?.data || []) {
         for (const hook of entry.hooks || []) {
-          if (hook.isManaged || !hook.key || !hook.currentHash) continue;
+          if (
+            hook.isManaged
+            || !hook.key
+            || !hook.currentHash
+            || !hook.key.startsWith(trustedKeyPrefix)
+          ) continue;
           state[hook.key] = { enabled: true, trusted_hash: hook.currentHash };
         }
       }
@@ -517,12 +550,14 @@ send('initialize', {
 });
 `;
 
-  const trustCwd = canonicalExistingPath(zylosDir);
+  const trustCwd = canonicalExistingPath(projectDir);
+  const trustedHooksPath = codexHooksPath(zylosDir);
   const helperEnv = {
     ...process.env,
     HOME: homeDir,
     ...(codexHome ? { CODEX_HOME: codexHome } : {}),
     ZYLOS_CODEX_TRUST_CWD: trustCwd,
+    ZYLOS_CODEX_TRUST_HOOKS_PATH: trustedHooksPath,
     ZYLOS_CODEX_BIN: codexBin,
   };
   const executable = runAsUser ? 'sudo' : process.execPath;
@@ -532,6 +567,7 @@ send('initialize', {
       `HOME=${homeDir}`,
       ...(codexHome ? [`CODEX_HOME=${codexHome}`] : []),
       `ZYLOS_CODEX_TRUST_CWD=${trustCwd}`,
+      `ZYLOS_CODEX_TRUST_HOOKS_PATH=${trustedHooksPath}`,
       `ZYLOS_CODEX_BIN=${codexBin}`,
       process.execPath, '-e', helper,
     ]
@@ -587,6 +623,7 @@ export function ensureCodexHooksTrusted({
   ensureTrustedProjectsAtPath(codexGlobalConfigPath(homeDir, codexHome), [zylosDir, projectDir]);
   const trust = trustCodexHooksWithAppServer({
     zylosDir,
+    projectDir,
     homeDir,
     codexHome,
     runAsUser,
@@ -602,9 +639,14 @@ export function ensureCodexHooksTrusted({
   // Restore operator:<persona> before the monitor reads hooks.state below.
   restoreSharedProfileConfigAccess({ globalConfig, runAsUser, execFileSyncImpl });
   const hooksContent = fs.readFileSync(hooksPath, 'utf8');
-  const trustSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath);
-  if (Object.keys(trustSnapshot).length === 0) {
-    throw new Error('Codex hook trust failed (empty_trust_snapshot). Native SessionStart bootstrap may not run.');
+  const expectedKeys = configuredHookKeys(hooksPath);
+  const trustSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath, expectedKeys);
+  if (
+    expectedKeys.length === 0
+    || Object.keys(trustSnapshot).length !== expectedKeys.length
+    || Object.values(trustSnapshot).some(value => !value.enabled || !value.trusted_hash)
+  ) {
+    throw new Error('Codex hook trust failed (incomplete_trust_snapshot). Native SessionStart bootstrap may not run.');
   }
   writeTrustMarker(codexTrustMarkerPath(zylosDir, codexHome), {
     hooksHash: sha256(hooksContent),

@@ -39,6 +39,8 @@ import {
   buildCompatEnv,
   ensureInstanceGhConfigDir,
   loadRuntimeEnvManifest,
+  readMergedDotenvVars,
+  resolvePersonaDotenvPath,
   writeLaunchSpec,
 } from './tmux-env.js';
 
@@ -490,7 +492,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
-      const dotenvVars = _readDotenvVars();
+      const dotenvVars = readMergedDotenvVars([path.join(ZYLOS_DIR, '.env')]);
+      const personaEnvFile = resolvePersonaDotenvPath(ZYLOS_DIR, instanceCwd);
       const useCleanEnv = dotenvVars.ZYLOS_CLEAN_ENV !== 'false';
       const manifest = useCleanEnv ? loadRuntimeEnvManifest(ZYLOS_DIR) : undefined;
 
@@ -537,6 +540,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         args,
         env,
         cwd: instanceCwd,
+        personaEnvFile,
         exitLogFile,
       });
 
@@ -604,23 +608,6 @@ export class ClaudeAdapter extends RuntimeAdapter {
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────
-
-function _readDotenvVars() {
-  const vars = {};
-  try {
-    const content = fs.readFileSync(path.join(ZYLOS_DIR, '.env'), 'utf8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx < 1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
-      vars[key] = val;
-    }
-  } catch { /* .env absent */ }
-  return vars;
-}
 
 function _hasCredentialsFile() {
   try {

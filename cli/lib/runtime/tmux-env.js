@@ -17,6 +17,55 @@ const EMPTY_MANIFEST = Object.freeze({
 });
 
 /**
+ * Read one or more dotenv files without mutating process.env. Later files win,
+ * which lets a persona-owned env override shared runtime defaults. Duplicate
+ * paths/symlinks are read once. Missing or unreadable files are ignored.
+ */
+export function readMergedDotenvVars(filePaths = []) {
+  const vars = {};
+  const seen = new Set();
+  for (const filePath of filePaths) {
+    if (!filePath) continue;
+    let identity = path.resolve(filePath);
+    try { identity = fs.realpathSync(identity); } catch { /* handled by read below */ }
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+
+    let content;
+    try { content = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx < 1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (!VALID_NAME.test(key)) continue;
+      vars[key] = trimmed.slice(eqIdx + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
+    }
+  }
+  return vars;
+}
+
+/**
+ * Return the persona workspace env only when it is a different file from the
+ * shared root env. The launcher runs as the persona and reads this file after
+ * dropping privileges, so the operator process never needs access to it.
+ */
+export function resolvePersonaDotenvPath(zylosDir, instanceCwd) {
+  if (!instanceCwd || path.resolve(instanceCwd) === path.resolve(zylosDir)) return null;
+  const sharedPath = path.join(zylosDir, '.env');
+  const personaPath = path.join(instanceCwd, '.env');
+  try {
+    const personaReal = fs.realpathSync(personaPath);
+    let sharedReal = null;
+    try { sharedReal = fs.realpathSync(sharedPath); } catch { /* root env may be absent */ }
+    return personaReal === sharedReal ? null : personaPath;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parse runtime-env.manifest content into structured directives.
  * Line-based format: env NAME, inherit NAME, path_prepend PATH, path_append PATH.
  */

@@ -57,6 +57,8 @@ export function chooseRuntimeProfile({
   changedAtMs = 0,
   nowMs = Date.now(),
   minDwellMs = 300_000,
+  autoRecover = true,
+  wrapOnExhausted = false,
 } = {}) {
   const currentIndex = chain.indexOf(currentProfile);
   if (currentIndex < 0) return { profile: chain[0] || currentProfile, reason: 'profile_not_in_chain' };
@@ -80,10 +82,30 @@ export function chooseRuntimeProfile({
         };
       }
     }
+
+    // An operator may deliberately make the final API profile active while
+    // retaining the subscription tiers as health fallbacks. In that mode a
+    // failing last-tier engine must be able to wrap to an earlier usable tier;
+    // normal usage-driven progression still follows the declared chain first.
+    if (wrapOnExhausted) {
+      for (let i = 0; i < currentIndex; i++) {
+        const candidateId = chain[i];
+        const candidate = profiles[candidateId] || {};
+        const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
+        if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
+          return {
+            profile: candidateId,
+            reason: healthLimited
+              ? `health_rate_limited_wrap:${currentProfile}`
+              : `usage_exhausted_wrap:${current.usage_provider}`,
+          };
+        }
+      }
+    }
     return { profile: currentProfile, reason: 'fallback_chain_exhausted' };
   }
 
-  if (currentIndex > 0 && nowMs - changedAtMs >= minDwellMs) {
+  if (autoRecover && currentIndex > 0 && nowMs - changedAtMs >= minDwellMs) {
     for (let i = 0; i < currentIndex; i++) {
       const candidateId = chain[i];
       const candidate = profiles[candidateId] || {};
@@ -129,6 +151,8 @@ export function planRuntimeFailover({
       minDwellMs: Math.max(0, Number(policy.min_dwell_sec) || 0) * 1000,
       changedAtMs,
       nowMs,
+      autoRecover: policy.auto_recover !== false,
+      wrapOnExhausted: policy.wrap_on_exhausted === true,
     });
     if (decision.profile === currentProfile) continue;
 
@@ -179,6 +203,8 @@ export function planSingleSessionRuntimeFailover({
     minDwellMs: Math.max(0, Number(policy.min_dwell_sec) || 0) * 1000,
     changedAtMs: Date.parse(next.runtime_profile_changed_at || '') || 0,
     nowMs,
+    autoRecover: policy.auto_recover !== false,
+    wrapOnExhausted: policy.wrap_on_exhausted === true,
   });
   if (decision.profile === currentProfile) return { document: next, changes };
 
