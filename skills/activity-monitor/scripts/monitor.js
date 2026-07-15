@@ -1002,8 +1002,15 @@ function executeUpgradeCheck() {
 }
 
 function createUsageMonitor(activeAdapter) {
+  const runtimeProfile = activeAdapter.config?.runtimeProfile || null;
   return createRuntimeUsageMonitor(activeAdapter, {
     zylosDir: ZYLOS_DIR,
+    instanceId: INSTANCE_ID,
+    // Named profiles explicitly declare which subscription quota they use.
+    // `null` means an API-backed profile (for example Azure) and disables
+    // subscription reminders instead of misreporting Codex subscription usage.
+    ...(runtimeProfile?.id ? { usageProvider: runtimeProfile.usageProvider } : {}),
+    codexHome: runtimeProfile?.codexHome,
     statuslineFile: STATUSLINE_FILE,
     usageStateFile: USAGE_STATE_FILE,
     usageCodexStateFile: USAGE_CODEX_STATE_FILE,

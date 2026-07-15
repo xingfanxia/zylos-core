@@ -112,9 +112,19 @@ function loadInstanceMonitors() {
   }
 }
 
+function runtimeFailoverEnabled() {
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, 'instances.json'), 'utf8'));
+    return config.runtime_failover?.enabled === true;
+  } catch {
+    return false;
+  }
+}
+
 // Core service names — components must not collide with these
 const CORE_SERVICE_NAMES = new Set([
-  'scheduler', 'web-console', 'c4-dispatcher', 'c4-broker', 'activity-monitor', 'caddy',
+  'scheduler', 'web-console', 'c4-dispatcher', 'c4-broker', 'activity-monitor',
+  'runtime-failover', 'caddy',
 ]);
 
 // Parse SKILL.md YAML frontmatter service block.
@@ -337,13 +347,31 @@ module.exports = {
         NODE_ENV: 'production',
         ZYLOS_DIR,
         CODEXBAR_BIN: path.join(BIN_DIR, 'codexbar'),
-        PROVIDER_USAGE_INTERVAL_MS: String(5 * 60 * 1000),
+        CODEX_SUBSCRIPTION_HOME: path.join(HOME, '.codex-subscription'),
+        PROVIDER_USAGE_INTERVAL_MS: String(runtimeFailoverEnabled() ? 30 * 1000 : 5 * 60 * 1000),
         PROVIDER_USAGE_RETRY_MS: String(60 * 1000),
       },
       autorestart: true,
       max_restarts: 10,
       min_uptime: '10s',
     },
+    ...(runtimeFailoverEnabled()
+      ? [{
+          name: 'runtime-failover',
+          script: path.join(SKILLS_DIR, 'activity-monitor', 'scripts', 'runtime-failover.js'),
+          args: '--daemon',
+          cwd: HOME,
+          env: {
+            PATH: ENHANCED_PATH,
+            NODE_ENV: 'production',
+            ZYLOS_DIR,
+            RUNTIME_FAILOVER_POLL_MS: String(10 * 1000),
+          },
+          autorestart: true,
+          max_restarts: 10,
+          min_uptime: '10s',
+        }]
+      : []),
     // Caddy web server (only if set up via `zylos init`)
     ...(fs.existsSync(path.join(BIN_DIR, 'caddy')) && fs.existsSync(path.join(HTTP_DIR, 'Caddyfile'))
       ? [{

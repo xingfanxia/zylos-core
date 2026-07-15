@@ -2,7 +2,10 @@
 
 Multi-session v2 runs multiple runtime instances in parallel, each handling a
 different set of users/channels. Claude Code and Codex can coexist in one
-deployment, with runtime chosen per instance in `instances.json`.
+deployment, with the active runtime profile chosen per instance in
+`instances.json`. Upstream/public single-session deployments can use the same
+profile model through `.zylos/runtime-profiles.json` without being converted to
+multi-session.
 
 ## Instance Types
 
@@ -23,7 +26,51 @@ deployment, with runtime chosen per instance in `instances.json`.
 
 **Important:** The AM's `CONV_DIR` must resolve to CC's actual project directory. CC derives project dirs from `realpath(instanceCwd)` with `/` and `_` replaced by `-`. The AM uses `instanceConfig.getInstanceCwd()` + `fs.realpathSync()` to match this. If idle detection shows `source=tmux_activity` instead of `source=conv_file` in `agent-status.json`, the CONV_DIR resolution is broken.
 
-**Session naming convention:** tmux sessions use `<runtime>-<id>` (e.g., `codex-main`, `codex-user-pan` for Codex runtime; `claude-main` for Claude runtime). The `getSessionName()` fallback in `instance-config.js` reads the instance or global runtime to derive the correct prefix. Explicit `tmux_session` in `instances.json` always takes precedence.
+**Stable session identity:** an explicit `tmux_session` in `instances.json`
+belongs to the persona, not the engine. Runtime failover kills and recreates the
+engine pane under that same tmux name. The `<runtime>-<id>` convention is only a
+fallback for definitions that do not provide a stable name.
+
+## Runtime Profiles and Automatic Failover
+
+`runtime_profiles` separates an engine choice from persona state. A profile may
+select `claude` or `codex`, a model and reasoning effort, a private Codex home,
+and the **name** of a provider environment variable. Credential values are
+forbidden in the profile document.
+
+The `runtime-failover` daemon evaluates the configured chain. The production
+chain is typically:
+
+```
+claude-subscription -> codex-subscription -> codex-azure
+```
+
+It advances when the current provider reaches `switch_threshold` or reports a
+live `rate_limited` health state. It can return to an earlier recovered profile
+below `recover_threshold` after `min_dwell_sec`. Provider usage uses the live
+Claude subscription windows and Codex's 5-hour and exact 10,080-minute weekly
+windows. Unknown usage permits one optimistic hop; a subsequent live rate-limit
+signal advances to the next tier.
+
+A profile transition is deliberately engine-only. It may update
+`runtime_profile`, `runtime`, transition metadata, generated `CLAUDE.md` or
+`AGENTS.md`, and the engine process. It must preserve all of the following in
+place:
+
+- `ZYLOS.md` and persona identity;
+- the same memory directories and files, without a runtime-specific copy;
+- `.claude/skills`, exposed to Codex only through
+  `.agents/skills -> .claude/skills`;
+- the same workspace `.env` and secret files, so either engine can use them
+  from the unchanged working directory;
+- the same C4 database, queue, task state, and chat routing;
+- the working directory and stable tmux identity.
+
+Provider credentials are the sole intentional runtime-private state. Each
+Codex profile uses a protected `CODEX_HOME`; provider keys are read from that
+home's `auth.json` into a mode-0600 launch specification and never stored in
+`instances.json`, PM2 configuration, process argv, or logs. This isolation does
+not copy or replace the persona workspace `.env`.
 
 ## Key Components
 
@@ -147,6 +194,7 @@ Each instance runs its runtime from its own directory:
 ```
 ~/zylos/instances/<id>/
   ├── .claude → ../../.claude       (shared skills)
+  ├── .agents → ../../.agents       (Codex view of the same skills)
   ├── CLAUDE.md → ../../CLAUDE.md   (shared instructions)
   ├── AGENTS.md → ../../AGENTS.md   (Codex instructions)
   ├── .env → ../../.env             (shared config)
@@ -156,12 +204,12 @@ Each instance runs its runtime from its own directory:
 Claude derives its project dir from `cwd`, so each instance writes JSONL
 transcripts to a unique dir in `~/.claude/projects/`.
 
-Codex stores runtime state globally under `~/.codex/`, not inside each
-instance folder. Zylos reconstructs per-instance ownership by reading the
-rollout/session metadata and grouping sessions by `session_meta.cwd`.
-
-Operationally, this means Codex separation is enforced logically by Zylos
-rather than by separate per-instance `~/.codex` roots.
+Codex stores engine state under the active profile's protected `CODEX_HOME`
+(for example `~/.codex-subscription` or `~/.codex-azure`), not inside the
+instance folder. Zylos reconstructs persona attribution by reading rollout
+metadata and grouping sessions by `session_meta.cwd`. Credential/provider state
+is profile-private; identity, memory, skills, workspace secrets, messaging, and
+tasks remain shared persona state.
 
 Directories are created automatically:
 - For built-in instances (admin, scheduler, group): by `ensureInstanceCwd()` on first launch
@@ -171,15 +219,22 @@ Directories are created automatically:
 
 ### Data Flow
 1. Claude writes JSONL session transcripts to `~/.claude/projects/<project-dir>/`.
-2. Codex writes session history to shared `~/.codex/sessions/.../rollout-*.jsonl`.
+2. Codex writes session history under each configured profile's
+   `CODEX_HOME/sessions/.../rollout-*.jsonl`.
 3. `update-token-cache.js` runs from PM2 and merges:
    - Claude history from `ccusage daily --json --instances --breakdown`
-   - Codex history from `@ccusage/codex session --json`
+   - Codex history from the pinned `ccusage@20.0.17 codex session --json`
 4. Zylos maps:
    - Claude project names → instance IDs
    - Codex rollout `session_meta.cwd` → instance IDs
 5. The merged cache is written to `~/zylos/activity-monitor/token-cache.json`
 6. Dashboard reads the cache and renders per-runtime plus per-instance views
+
+API-backed profiles report input, output, cached, and total token counts. Their
+cost is a LiteLLM-pricing equivalent API estimate (`cost_basis` is
+`litellm_equivalent_api_estimate`), not a provider invoice. Subscription
+profiles retain the tool's subscription-equivalent attribution and are not
+presented as billed API spend.
 
 ### Dashboard Token Features
 - Stacked bar chart with per-instance color coding
@@ -233,8 +288,9 @@ The ecosystem config (`templates/pm2/ecosystem.config.cjs`) manages:
 | web-console | Dashboard + API server |
 | c4-dispatcher | Message dispatch loop |
 | activity-monitor-\<id\> | One per enabled instance (generated dynamically) |
-| token-cache-updater | Daemon: merges Claude `ccusage` and Codex `@ccusage/codex` history |
+| token-cache-updater | Daemon: merges Claude `ccusage` and pinned `ccusage codex` history |
 | provider-usage-updater | Daemon: refreshes top runtime usage cards |
+| runtime-failover | Daemon: switches opted-in personas across the configured profile chain |
 | caddy | Reverse proxy (if configured) |
 | zylos-telegram | Telegram bot connector |
 | zylos-feishu | Feishu bot connector |

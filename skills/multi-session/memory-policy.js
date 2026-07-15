@@ -184,13 +184,22 @@ export function validateMemoryWrite(filePath, {
     return null;
   }
 
+  // realpathSync canonicalizes platform aliases such as macOS /var ->
+  // /private/var. Compare canonical roots to canonical targets; mixing one
+  // canonical path with one lexical path falsely labels every valid write as
+  // an escape (and is especially dangerous because it hides the intended
+  // per-persona policy behind the wrong error).
+  const resolvedMemoryDir = resolveThroughExistingAncestor(path.resolve(memoryDir), {
+    existsSync,
+    realpathSync,
+  });
   const resolvedPath = resolveThroughExistingAncestor(absPath, { existsSync, realpathSync });
-  if (!isInside(memoryDir, resolvedPath)) {
+  if (!isInside(resolvedMemoryDir, resolvedPath)) {
     return `Memory write path escapes the memory directory: ${filePath}`;
   }
 
   return validateResolvedMemoryPath(resolvedPath, {
-    memoryDir,
+    memoryDir: resolvedMemoryDir,
     instanceId,
     instancesFilePath,
     readFileSync,

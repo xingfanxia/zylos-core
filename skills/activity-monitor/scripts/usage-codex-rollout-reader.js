@@ -4,9 +4,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 
 const HOME = os.homedir();
-const CODEX_DIR = path.join(HOME, '.codex');
-const SQLITE_FILE = path.join(CODEX_DIR, 'state_5.sqlite');
-const SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
+const DEFAULT_CODEX_DIR = process.env.CODEX_HOME || path.join(HOME, '.codex');
 const TAIL_BYTES = 65_536;
 const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
@@ -107,7 +105,9 @@ function sqlEscape(value) {
 export function getActiveRolloutPath({
   instanceId = INSTANCE_ID,
   execFileSyncImpl = execFileSync,
-  sessionsDir = SESSIONS_DIR,
+  codexHome = DEFAULT_CODEX_DIR,
+  sqliteFile = path.join(codexHome, 'state_5.sqlite'),
+  sessionsDir = path.join(codexHome, 'sessions'),
 } = {}) {
   try {
     const sql = [
@@ -117,7 +117,7 @@ export function getActiveRolloutPath({
       'ORDER BY updated_at DESC',
       'LIMIT 1;'
     ].filter(Boolean).join(' ');
-    const out = execFileSyncImpl('sqlite3', [SQLITE_FILE, sql], {
+    const out = execFileSyncImpl('sqlite3', [sqliteFile, sql], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -157,6 +157,27 @@ export function getActiveRolloutPath({
   }
 }
 
+/**
+ * Codex rate-limit payloads do not guarantee that `primary` means 5h and
+ * `secondary` means weekly. Some subscriptions expose only one 10080-minute
+ * window as `primary`. Classify by the declared duration first and retain the
+ * legacy positional fallback only when older events omit window_minutes.
+ */
+export function classifyCodexRateLimitWindows(rateLimits) {
+  const primary = rateLimits?.primary ?? null;
+  const secondary = rateLimits?.secondary ?? null;
+  const tertiary = rateLimits?.tertiary ?? null;
+  const windows = [primary, secondary, tertiary].filter(Boolean);
+  const minutes = (window) => Number(window?.window_minutes ?? window?.windowMinutes);
+
+  const fiveHour = windows.find((window) => minutes(window) === 300)
+    ?? (Number.isFinite(minutes(primary)) ? null : primary);
+  const weekly = windows.find((window) => minutes(window) === 10080)
+    ?? (Number.isFinite(minutes(secondary)) ? null : secondary);
+
+  return { fiveHour, weekly };
+}
+
 export function parseCodexUsageFromRolloutLines(lines) {
   if (!Array.isArray(lines) || !lines.length) return null;
 
@@ -169,20 +190,21 @@ export function parseCodexUsageFromRolloutLines(lines) {
       if (event.type !== 'event_msg' || event.payload?.type !== 'token_count') continue;
 
       const rateLimits = event.payload?.rate_limits;
-      const primary = rateLimits?.primary;
-      const secondary = rateLimits?.secondary;
-      if (!primary && !secondary) continue;
+      const { fiveHour, weekly } = classifyCodexRateLimitWindows(rateLimits);
+      if (!fiveHour && !weekly) continue;
 
-      const fiveHourPercent = primary?.used_percent ?? null;
-      const weeklyAllPercent = secondary?.used_percent ?? null;
+      const fiveHourPercent = fiveHour?.used_percent ?? null;
+      const weeklyAllPercent = weekly?.used_percent ?? null;
 
       return {
         sessionPercent: fiveHourPercent,
-        sessionResets: formatResetTime(primary?.resets_at ?? null),
+        sessionResets: formatResetTime(fiveHour?.resets_at ?? null),
         fiveHourPercent,
-        fiveHourResets: formatResetTime(primary?.resets_at ?? null),
+        fiveHourResets: formatResetTime(fiveHour?.resets_at ?? null),
+        fiveHourResetsAt: fiveHour?.resets_at ?? null,
         weeklyAllPercent,
-        weeklyAllResets: formatResetTime(secondary?.resets_at ?? null),
+        weeklyAllResets: formatResetTime(weekly?.resets_at ?? null),
+        weeklyAllResetsAt: weekly?.resets_at ?? null,
         statusShape: 'rollout'
       };
     } catch {
@@ -195,11 +217,38 @@ export function parseCodexUsageFromRolloutLines(lines) {
 
 export function readCodexUsageFromActiveRollout(opts = {}) {
   const rolloutPath = getActiveRolloutPath(opts);
-  if (!rolloutPath) return null;
-
-  try {
-    return parseCodexUsageFromRolloutLines(readTailLines(rolloutPath));
-  } catch {
-    return null;
+  if (rolloutPath) {
+    try {
+      const active = parseCodexUsageFromRolloutLines(readTailLines(rolloutPath));
+      if (active) return active;
+    } catch { /* try recent rollouts below */ }
   }
+
+  // A trust helper/app-server thread can be the newest SQLite row even though
+  // it never emits token_count rate limits. Fall back to the newest usable
+  // rollout instead of reporting the subscription monitor unavailable.
+  const codexHome = opts.codexHome || DEFAULT_CODEX_DIR;
+  const sessionsDir = opts.sessionsDir || path.join(codexHome, 'sessions');
+  const candidates = [];
+  const walk = (dir) => {
+    try {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        else if (entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
+          if (!opts.instanceId || rolloutMatchesInstance(full, opts.instanceId)) candidates.push(full);
+        }
+      }
+    } catch { /* unreadable profile home */ }
+  };
+  walk(sessionsDir);
+  candidates.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+  for (const candidate of candidates.slice(0, 200)) {
+    if (candidate === rolloutPath) continue;
+    try {
+      const usage = parseCodexUsageFromRolloutLines(readTailLines(candidate));
+      if (usage) return usage;
+    } catch { /* continue */ }
+  }
+  return null;
 }

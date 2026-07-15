@@ -287,7 +287,7 @@ Other frameworks charge per API token. Community reports show monthly bills of $
 
 ### Powered by Best-in-Class AI Runtimes
 
-Zylos supports Claude Code (Anthropic) and Codex (OpenAI) as first-class runtimes. You can still do a global switch with `zylos runtime codex`, but current multi-session deployments can also mix runtimes per instance: for example `admin` on Claude while selected user or worker instances run Codex. Memory, skills, and channels stay shared at the Zylos layer, while runtime sessions, usage cards, and token history remain instance-aware. When AI providers ship new capabilities, your agent benefits automatically. And because both runtimes can program, your AI writes new skills, integrates services, and evolves with your needs.
+Zylos supports Claude Code (Anthropic) and Codex (OpenAI) as first-class runtimes. You can still do a global switch with `zylos runtime codex`, while runtime profiles also support per-persona selection and subscription-to-API failover. The engine may change, but the persona keeps the same identity, memory, skills, workspace `.env`, messages, tasks, working directory, and stable tmux identity. Codex sees the Claude skill tree through `.agents/skills -> .claude/skills`; only runtime credentials, generated overlays, and the engine process are profile-specific. Usage cards include live subscription windows, while API profiles report tokens and a LiteLLM equivalent cost estimate. When AI providers ship new capabilities, your agent benefits automatically. And because both runtimes can program, your AI writes new skills, integrates services, and evolves with your needs.
 
 ---
 

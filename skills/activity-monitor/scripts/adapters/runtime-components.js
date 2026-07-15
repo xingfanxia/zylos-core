@@ -139,14 +139,22 @@ export function startContextMonitor(activeAdapter, {
   return monitor;
 }
 
-export function scheduleStaleRuntimeCleanup(activeAdapter, { log }) {
+export function scheduleStaleRuntimeCleanup(activeAdapter, {
+  log,
+  setTimeoutImpl = setTimeout,
+  execFileSyncImpl = execFileSync,
+}) {
   // Runs on every startup (not just runtime switches). If the other session is
   // absent, the kill fails silently. The delay gives a running agent time to
   // finish its current response before being terminated.
   const otherSession = activeAdapter.runtimeId === 'codex' ? 'claude-main' : 'codex-main';
-  setTimeout(() => {
+  // Runtime failover deliberately preserves the persona's stable tmux name
+  // (often `claude-main`) across providers. Never mistake that active stable
+  // identity for a stale session and kill it ten seconds after every restart.
+  if (otherSession === activeAdapter.sessionName) return;
+  setTimeoutImpl(() => {
     try {
-      execSync(`tmux kill-session -t "${otherSession}" 2>/dev/null`, { stdio: 'pipe', timeout: 3000 });
+      execFileSyncImpl('tmux', ['kill-session', '-t', otherSession], { stdio: 'pipe', timeout: 3000 });
       log(`Startup cleanup: killed stale ${otherSession} session from previous runtime`);
     } catch { /* session didn't exist, normal startup no-op */ }
   }, 10_000);

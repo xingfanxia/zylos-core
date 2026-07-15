@@ -14,6 +14,10 @@ This fork (xingfanxia/zylos-core) deploys directly from the repo — no `npm ins
 | `~/zylos/instances.json` | Instance definitions (runtime config) |
 | `~/.local/bin/zylos` | CLI binary symlink → `~/zylos-core/cli/zylos.js` |
 
+For upstream/public single-session installs, runtime profile state may instead
+live in `~/zylos/.zylos/runtime-profiles.json`. Do not add `instances.json` just
+to enable failover; that would change the deployment topology.
+
 ## Deploy Steps
 
 ```bash
@@ -39,6 +43,45 @@ pm2 delete all && pm2 start ~/zylos/pm2/ecosystem.config.cjs && pm2 save
 for s in codex-main codex-scheduler codex-group; do tmux kill-session -t "$s" 2>/dev/null; done
 tmux list-sessions -F '#{session_name}' | grep '^codex-user-' | xargs -I{} tmux kill-session -t {}
 ```
+
+## Runtime Failover Deployment Contract
+
+Runtime failover is an engine replacement, not a persona migration. Before and
+after a failover canary, verify that `ZYLOS.md`, memory paths/inodes,
+`.claude/skills`, `.env`, C4 databases, chat routing, instance cwd, and explicit
+tmux names are unchanged. Every instance working directory must expose the
+shared files through `.claude`, `.agents`, `.env`, and `memory` links; the root
+`.agents/skills` link must resolve to the root `.claude/skills` tree.
+
+Only profile/provider credentials use separate homes. Keep subscription and API
+credentials in protected `CODEX_HOME` directories. Profile JSON may contain a
+provider environment variable **name**, never its value. The launcher reads the
+key from that profile's `auth.json` into its mode-0600 launch spec, so it does
+not appear in PM2 state, shell arguments, or logs. Workspace `.env` remains the
+same file and is available to either engine from the unchanged cwd.
+
+For multi-session deployments, `runtime-failover` atomically changes only the
+instance's runtime/profile metadata, kills its stable tmux pane, and restarts
+that instance's activity monitor. For upstream single-session deployments it
+does the same through `.zylos/runtime-profiles.json`, the existing
+`.zylos/config.json`, the existing stable tmux name, and the existing
+`activity-monitor`; it must not create `instances.json` or duplicate persona
+state.
+
+After deployment, verify both transitions with a bounded canary:
+
+1. switch one persona from subscription to the API profile and allow the
+   monitor to recreate its engine;
+2. confirm model/reasoning/provider and credential environment **names** only;
+3. confirm the identity, memory, skills, `.env`, C4/routing, cwd, and tmux
+   invariants above;
+4. confirm API token totals and the LiteLLM equivalent estimate are attributed
+   to that persona/profile;
+5. fail back to the subscription profile and repeat the invariant check.
+
+Claude profiles use `CLAUDE_EFFORT`; current fleet policy is `high` with
+ultracode disabled. Codex model and reasoning are profile fields and therefore
+can differ by host without changing the persona.
 
 Step 5 is only needed when `cli/lib/runtime/claude.js` (the RuntimeAdapter) changes. For skills-only changes, steps 1-4 are sufficient since PM2 restart reloads the AM which imports skills.
 

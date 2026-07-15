@@ -4,11 +4,39 @@ import { describe, it } from 'node:test';
 process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 
 const {
+  fetchCodexNativeUsage,
   fetchClaudeNativeUsage,
   normalizeProviderPayload,
   normalizeNativeClaudeUsage,
   runProviderUsageOnce,
 } = await import('../update-provider-usage.js');
+
+describe('fetchCodexNativeUsage', () => {
+  it('publishes a weekly-only Codex subscription window from the selected profile rollout', () => {
+    const result = fetchCodexNativeUsage({
+      codexHome: '/home/persona/.codex-subscription',
+      now: '2026-07-14T23:08:31.672Z',
+      readImpl: ({ codexHome, instanceId }) => {
+        assert.equal(codexHome, '/home/persona/.codex-subscription');
+        assert.equal(instanceId, null);
+        return {
+          fiveHourPercent: null,
+          fiveHourResetsAt: null,
+          weeklyAllPercent: 8,
+          weeklyAllResetsAt: 1784666236,
+          weeklyAllResets: '21 Jul, 21:57',
+        };
+      },
+    });
+
+    assert.equal(result.available, true);
+    assert.equal(result.source, 'zylos-native-rollout');
+    assert.equal(result.primary, null);
+    assert.equal(result.secondary.used_percent, 8);
+    assert.equal(result.secondary.left_percent, 92);
+    assert.equal(result.secondary.window_minutes, 10080);
+  });
+});
 
 describe('normalizeProviderPayload', () => {
   it('normalizes successful Claude/CodexBar CLI usage output', () => {

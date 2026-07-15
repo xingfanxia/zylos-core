@@ -262,6 +262,10 @@ export function ensureInstanceCwd(instanceId) {
 
   const symlinks = [
     ['.claude', '../../.claude'],
+    // Codex discovers the exact same skill tree through the runtime-neutral
+    // workspace path. The root .agents/skills link itself targets
+    // .claude/skills; no skill is copied or forked per engine.
+    ['.agents', '../../.agents'],
     ['CLAUDE.md', '../../CLAUDE.md'],
     ['AGENTS.md', '../../AGENTS.md'],
     ['.env', '../../.env'],

@@ -12,11 +12,13 @@ import {
   codexTrustMarkerPath,
   ensureCodexHooksTrusted,
   ensureHooksFeatureInToml,
+  ensureTrustedProjectsAtPath,
   extractTrustSnapshot,
   hookKeyFor,
   installCoreCodexHook,
   isCodexTrustValid,
   readHooksState,
+  trustCodexHooksWithAppServer,
   uninstallCoreCodexHook,
 } from '../codex-hooks.js';
 
@@ -44,11 +46,18 @@ function writeTrustedState({ homeDir, zylosDir, hash = 'sha256:core' }) {
     '[features]',
     'hooks = true',
     '',
+    `[projects."${zylosDir}"]`,
+    'trust_level = "trusted"',
+    '',
     `[hooks.state."${key}"]`,
     'enabled = true',
     `trusted_hash = "${hash}"`,
     '',
   ].join('\n'));
+  // macOS resolves /var/... temp paths to /private/var/.... Production trusts
+  // both the declared symlink/path and its canonical target, so the fixture
+  // must model the same dual trust entries.
+  ensureTrustedProjectsAtPath(globalConfigPath, [zylosDir]);
   return key;
 }
 
@@ -162,6 +171,31 @@ describe('Codex core hook installer', () => {
 });
 
 describe('Codex hook trust backstop', () => {
+  it('runs app-server trust as the isolated persona user', () => {
+    const { homeDir, zylosDir } = makeEnv();
+    const codexHome = path.join(homeDir, '.codex-subscription');
+    let invocation;
+
+    const result = trustCodexHooksWithAppServer({
+      zylosDir,
+      homeDir,
+      codexHome,
+      runAsUser: 'zylos-pan',
+      spawnSyncImpl: (file, args, opts) => {
+        invocation = { file, args, opts };
+        return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 8 }) + '\n', stderr: '' };
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(invocation.file, 'sudo');
+    assert.deepEqual(invocation.args.slice(0, 7), [
+      '-n', '-u', 'zylos-pan', '-H', '--', '/usr/bin/env', `HOME=${homeDir}`,
+    ]);
+    assert.ok(invocation.args.includes(`CODEX_HOME=${codexHome}`));
+    assert.ok(invocation.args.includes(process.execPath));
+  });
+
   it('re-trusts all hooks, writes marker, then skips app-server in steady state', () => {
     const { homeDir, zylosDir } = makeEnv();
     installCoreCodexHook({ zylosDir });
@@ -235,11 +269,15 @@ describe('Codex hook trust backstop', () => {
         '[features]',
         'hooks = true',
         '',
+        `[projects."${zylosDir}"]`,
+        'trust_level = "trusted"',
+        '',
         `[hooks.state."${key}"]`,
         'enabled = true',
         'trusted_hash = "sha256:core"',
         '',
       ].join('\n'));
+      ensureTrustedProjectsAtPath(globalConfigPath, [zylosDir]);
       return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 1 }) + '\n', stderr: '' };
     };
     const execFileSyncImpl = () => 'codex-cli 0.142.2\n';
@@ -259,11 +297,15 @@ describe('Codex hook trust backstop', () => {
         '[features]',
         'hooks = true',
         '',
+        `[projects."${zylosDir}"]`,
+        'trust_level = "trusted"',
+        '',
         `[hooks.state."${key}"]`,
         'enabled = true',
         'trusted_hash = "sha256:core"',
         '',
       ].join('\n'));
+      ensureTrustedProjectsAtPath(globalConfigPath, [zylosDir]);
       return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 1 }) + '\n', stderr: '' };
     };
 

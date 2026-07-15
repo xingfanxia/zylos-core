@@ -2,7 +2,10 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { shouldStartUsageCheck } from './usage-check-engine.js';
-import { readCodexUsageFromActiveRollout } from './usage-codex-rollout-reader.js';
+import {
+  classifyCodexRateLimitWindows,
+  readCodexUsageFromActiveRollout,
+} from './usage-codex-rollout-reader.js';
 import {
   readClaudeUsageFromMonitorFiles,
   readCodexUsageFromMonitorFile,
@@ -21,19 +24,25 @@ export class UsageMonitor {
     return this.adapter.runtimeId;
   }
 
+  get usageProvider() {
+    return Object.prototype.hasOwnProperty.call(this.options, 'usageProvider')
+      ? this.options.usageProvider
+      : this.runtimeId;
+  }
+
   initializeLastCheckAt(nowEpoch) {
     const usageState = this.loadUsageState();
-    if (this.runtimeId === 'codex') return 0;
+    if (this.usageProvider === 'codex') return 0;
     if (usageState?.lastCheckEpoch) return usageState.lastCheckEpoch;
     return nowEpoch;
   }
 
   isMonitorEnabled() {
-    return this.options.monitorEnabled;
+    return Boolean(this.usageProvider) && this.options.monitorEnabled;
   }
 
   isAlertEnabled() {
-    return this.options.alertEnabled;
+    return Boolean(this.usageProvider) && this.options.alertEnabled;
   }
 
   getLastMonitorRunAt() {
@@ -46,19 +55,19 @@ export class UsageMonitor {
   }
 
   canRunTask({ claudeState, idleSeconds, currentTime, apiActivity, activeHoursOnly = false }) {
-    if (this.runtimeId !== 'claude' && this.runtimeId !== 'codex') return false;
+    if (this.usageProvider !== 'claude' && this.usageProvider !== 'codex') return false;
 
     const promptUpdatedAt = apiActivity?.updated_at
       ? Math.floor(apiActivity.updated_at / 1000) : 0;
     return shouldStartUsageCheck({
-      runtimeId: this.runtimeId,
+      runtimeId: this.usageProvider,
       allowedRuntimeIds: ['claude', 'codex'],
       claudeState,
       idleSeconds,
       currentTime,
       lastUsageCheckAt: 0,
       checkInterval: { seconds: this.options.checkIntervalSec, idleGate: this.options.idleGateSec },
-      inPrompt: this.runtimeId === 'claude' ? Boolean(apiActivity?.in_prompt) : false,
+      inPrompt: this.usageProvider === 'claude' ? Boolean(apiActivity?.in_prompt) : false,
       promptUpdatedAt,
       localHour: this.options.getLocalHour(),
       activeHoursStart: activeHoursOnly ? this.options.activeHoursStart : 0,
@@ -71,42 +80,36 @@ export class UsageMonitor {
   }
 
   runMonitor({ currentTime }) {
+    if (!this.usageProvider) return true;
     let snapshot = null;
     let source = null;
-    if (this.runtimeId === 'claude') {
+    if (this.usageProvider === 'claude') {
       snapshot = readClaudeUsageFromMonitorFiles({
         statuslineFile: this.options.statuslineFile,
         usageStateFile: this.options.usageStateFile
       });
       source = snapshot?.statusShape || 'none';
     } else {
-      snapshot = readCodexUsageFromMonitorFile({
-        usageStateFile: this.options.usageCodexStateFile
+      // The active rollout is the live subscription source. usage-codex.json is
+      // this monitor's own persisted output, so preferring it would keep a
+      // stale value forever after a profile/account switch.
+      snapshot = readCodexUsageFromActiveRollout({
+        codexHome: this.options.codexHome,
+        instanceId: this.options.instanceId,
       });
-      source = snapshot?.statusShape || 'usage-codex-missing';
+      source = snapshot?.statusShape || 'rollout-missing';
 
       if (!snapshot) {
-        const rolloutStatus = readCodexUsageFromActiveRollout();
-        if (rolloutStatus) {
-          snapshot = {
-            sessionPercent: rolloutStatus.sessionPercent,
-            sessionResets: rolloutStatus.sessionResets,
-            weeklyAllPercent: rolloutStatus.weeklyAllPercent,
-            weeklyAllResets: rolloutStatus.weeklyAllResets,
-            weeklySonnetPercent: null,
-            weeklySonnetResets: null,
-            fiveHourPercent: rolloutStatus.fiveHourPercent,
-            fiveHourResets: rolloutStatus.fiveHourResets,
-            statusShape: 'rollout_fallback'
-          };
-          source = snapshot.statusShape;
-          this.options.log('Usage monitor (codex): usage-codex.json unavailable, falling back to rollout reader');
-        }
+        snapshot = readCodexUsageFromMonitorFile({
+          usageStateFile: this.options.usageCodexStateFile
+        });
+        source = snapshot?.statusShape || 'usage-codex-missing';
+        if (snapshot) this.options.log('Usage monitor (codex): live rollout unavailable, using persisted snapshot');
       }
     }
 
     if (!snapshot) {
-      this.options.log(`Usage monitor (${this.runtimeId}): no local usage snapshot available`);
+      this.options.log(`Usage monitor (${this.usageProvider}): no local usage snapshot available`);
       this.lastUsageCheckAt = currentTime;
       return true;
     }
@@ -144,7 +147,7 @@ export class UsageMonitor {
     };
 
     this.options.log(
-      `Usage monitor (${this.runtimeId}): source=${source} session=${usage.session ?? 'null'}% ` +
+      `Usage monitor (${this.usageProvider}): source=${source} session=${usage.session ?? 'null'}% ` +
       `5h=${usage.fiveHour ?? 'null'}% weekly=${usage.weeklyAll ?? 'null'}% ` +
       `tier=${tier} (weekly=${weeklyTier},5h=${fiveHourTier})`
     );
@@ -155,6 +158,7 @@ export class UsageMonitor {
   }
 
   runAlert({ currentTime }) {
+    if (!this.usageProvider) return true;
     const checkedAt = new Date(currentTime * 1000).toISOString();
     const alertState = this.loadUsageAlertState();
     const writeCheckedState = (patch = {}) => {
@@ -162,21 +166,21 @@ export class UsageMonitor {
         version: 1,
         ...alertState,
         lastCheckedAt: checkedAt,
-        sourceRuntime: this.runtimeId,
+        sourceRuntime: this.usageProvider,
         ...patch
       });
     };
 
     const state = this.loadUsageState();
     if (!state) {
-      this.options.log(`Usage alert (${this.runtimeId}): no usage state available`);
+      this.options.log(`Usage alert (${this.usageProvider}): no usage state available`);
       writeCheckedState();
       return true;
     }
 
     const weekly = state.weeklyAll?.percent;
     if (weekly === null || weekly === undefined) {
-      this.options.log(`Usage alert (${this.runtimeId}): no weekly usage metric available`);
+      this.options.log(`Usage alert (${this.usageProvider}): no weekly usage metric available`);
       writeCheckedState();
       return true;
     }
@@ -194,7 +198,7 @@ export class UsageMonitor {
     const cooldownExpired = (currentTime - prevNotifiedAt) >= this.options.notifyCooldownSec;
 
     if (!tierEscalated && !cooldownExpired) {
-      this.options.log(`Usage alert (${this.runtimeId}): suppressing notification (cooldown active, tier=${tier})`);
+      this.options.log(`Usage alert (${this.usageProvider}): suppressing notification (cooldown active, tier=${tier})`);
       writeCheckedState({ lastObservedTier: tier });
       return true;
     }
@@ -205,8 +209,8 @@ export class UsageMonitor {
       weeklySonnet: state.weeklySonnet?.percent,
       weeklyAllResets: state.weeklyAll?.resets
     };
-    this.options.log(`Usage alert (${this.runtimeId}): notifying owner for tier=${tier}`);
-    this.sendNotification(formatUsageNotification(usage, tier));
+    this.options.log(`Usage alert (${this.usageProvider}): notifying owner for tier=${tier}`);
+    this.sendNotification(formatUsageNotification(usage, tier, this.usageProvider));
     writeCheckedState({
       lastObservedTier: tier,
       lastNotifiedTier: tier,
@@ -237,7 +241,7 @@ export class UsageMonitor {
   // fire-and-forget; the .catch guarantees a rejected send-promise can never
   // surface as an unhandled rejection.
   runFleetAlert({ currentTime }) {
-    if (!this.isPrimaryInstance()) return true;
+    if (!this.usageProvider || !this.isPrimaryInstance()) return true;
     this.lastFleetAlertAt = currentTime;
     return this._runFleetAlertInner({ currentTime }).catch((err) => {
       this.options.log(`Usage fleet alert: unexpected error — ${err && err.message}`);
@@ -266,7 +270,7 @@ export class UsageMonitor {
     } catch (err) {
       return { ok: false, reason: err?.code === 'ENOENT' ? 'missing' : `unreadable(${err?.code || 'EPARSE'})` };
     }
-    const p = doc?.providers?.[this.runtimeId === 'codex' ? 'codex' : 'claude'];
+    const p = doc?.providers?.[this.usageProvider];
     if (!p || p.available !== true) {
       return { ok: false, reason: p?.error ? `unavailable(${String(p.error).slice(0, 80)})` : 'unavailable' };
     }
@@ -276,19 +280,23 @@ export class UsageMonitor {
     // updater cadence is 5min (60s retry) — 15min = 3 missed cycles = poll is down.
     const staleSec = this.options.providerUsageStaleSec ?? 900;
     if (ageSec > staleSec) return { ok: false, reason: `stale(${Math.round(ageSec / 60)}m)` };
-    const fiveHour = p.primary?.used_percent;
-    if (typeof fiveHour !== 'number' || !Number.isFinite(fiveHour)) return { ok: false, reason: 'no_5h_percent' };
-    const weekly = p.secondary?.used_percent;
+    const { fiveHour: fiveHourWindow, weekly: weeklyWindow } = classifyCodexRateLimitWindows(p);
+    const fiveHour = fiveHourWindow?.used_percent;
+    const weekly = weeklyWindow?.used_percent;
+    if (![fiveHour, weekly].some(value => typeof value === 'number' && Number.isFinite(value))) {
+      return { ok: false, reason: 'no_known_usage_window' };
+    }
     return {
       ok: true,
       reading: {
-        fiveHour,
+        fiveHour: (typeof fiveHour === 'number' && Number.isFinite(fiveHour)) ? fiveHour : 0,
         // a provider payload without a weekly window tiers weekly as 0 (off) —
         // 5h still tiers, and maxRankTier means a real weekly is never masked.
         weekly: (typeof weekly === 'number' && Number.isFinite(weekly)) ? weekly : 0,
-        fiveHourResetsAt: p.primary?.resets_at ?? null,
-        fiveHourResets: p.primary?.reset_description || p.primary?.resets_at || null,
-        weeklyAllResets: p.secondary?.reset_description || p.secondary?.resets_at || null,
+        fiveHourResetsAt: fiveHourWindow?.resets_at ?? null,
+        fiveHourResets: fiveHourWindow?.reset_description || fiveHourWindow?.resets_at || null,
+        weeklyAllResetsAt: weeklyWindow?.resets_at ?? null,
+        weeklyAllResets: weeklyWindow?.reset_description || weeklyWindow?.resets_at || null,
         ageSec,
       },
     };
@@ -314,6 +322,7 @@ export class UsageMonitor {
         weekly: provider.reading.weekly,
         fiveHourResetsAt: provider.reading.fiveHourResetsAt,
         fiveHourResets: provider.reading.fiveHourResets,
+        weeklyAllResetsAt: provider.reading.weeklyAllResetsAt,
         weeklyAllResets: provider.reading.weeklyAllResets,
         mtimeSec: currentTime - provider.reading.ageSec,
       });
@@ -365,6 +374,7 @@ export class UsageMonitor {
         weekly: reading.weeklyAllPercent,
         fiveHourResetsAt: reading.fiveHourResetsAt ?? null,
         fiveHourResets: reading.fiveHourResets ?? null,
+        weeklyAllResetsAt: reading.weeklyAllResetsAt ?? null,
         weeklyAllResets: reading.weeklyAllResets ?? null,
         mtimeSec
       });
@@ -407,12 +417,13 @@ export class UsageMonitor {
 
     // Window identity + display come from the freshest usable reading.
     const freshest = readings.reduce((a, b) => (b.mtimeSec >= a.mtimeSec ? b : a));
-    const fiveHourResetsKey = String(freshest.fiveHourResetsAt ?? freshest.fiveHourResets ?? 'unknown');
-
     const weeklyTier = this.getUsageTier(weeklyAll ?? 0);
     const fiveHourTier = this.getFiveHourTier(fiveHour ?? 0);
     const tier = maxRankTier(weeklyTier, fiveHourTier);
     const hotWindow = tierRank(fiveHourTier) >= tierRank(weeklyTier) ? '5h' : 'weekly';
+    const alertWindowKey = String(hotWindow === 'weekly'
+      ? (freshest.weeklyAllResetsAt ?? freshest.weeklyAllResets ?? 'weekly:unknown')
+      : (freshest.fiveHourResetsAt ?? freshest.fiveHourResets ?? '5h:unknown'));
 
     const data = {
       fiveHour,
@@ -426,6 +437,7 @@ export class UsageMonitor {
       sources,
       quorum,
       sourceMode,
+      usageProvider: this.usageProvider,
       providerAgeMin: provider.ok ? Math.round(provider.reading.ageSec / 60) : null
     };
 
@@ -445,7 +457,8 @@ export class UsageMonitor {
     // Dedupe on the 5h window (keyed on the RAW resets_at epoch — review F6):
     // fire once per threshold crossing per window, re-arm when the window resets,
     // re-fire on tier-rank escalation.
-    const windowChanged = fleetState.lastAlertedFiveHourResetsKey !== fiveHourResetsKey;
+    const previousWindowKey = fleetState.lastAlertedWindowKey ?? fleetState.lastAlertedFiveHourResetsKey;
+    const windowChanged = previousWindowKey !== alertWindowKey;
     const escalated = tierRank(tier) > tierRank(fleetState.lastAlertedTier || 'ok');
     const firstAlert = !fleetState.lastAlertedTier;
     if (!windowChanged && !escalated && !firstAlert) {
@@ -473,7 +486,9 @@ export class UsageMonitor {
     this.writeFleetAlertState({
       version: 1,
       lastAlertedTier: tier,
-      lastAlertedFiveHourResetsKey: fiveHourResetsKey,
+      lastAlertedWindowKey: alertWindowKey,
+      // Backward-compatible state field for existing deployments/tests.
+      lastAlertedFiveHourResetsKey: alertWindowKey,
       lastAlertedAt: nowIso,
       lastObservedTier: tier,
       lastCheckedAt: nowIso,
@@ -608,7 +623,7 @@ export class UsageMonitor {
   }
 
   getUsageStateFile() {
-    if (this.runtimeId === 'codex') return this.options.usageCodexStateFile;
+    if (this.usageProvider === 'codex') return this.options.usageCodexStateFile;
     return this.options.usageStateFile;
   }
 
@@ -683,7 +698,19 @@ export class UsageMonitor {
   }
 }
 
-function formatUsageNotification(usage, tier) {
+function providerLabel(provider) {
+  return provider === 'codex' ? 'Codex subscription' : 'Claude subscription';
+}
+
+function remainingPercent(used) {
+  return Math.max(0, 100 - (Number(used) || 0));
+}
+
+function remainingLabel(used) {
+  return used == null ? 'unknown' : `${remainingPercent(used)}%`;
+}
+
+function formatUsageNotification(usage, tier, provider = 'claude') {
   const weekly = usage.weeklyAll ?? 0;
   const session = usage.session ?? 0;
   const resets = usage.weeklyAllResets || 'unknown';
@@ -697,8 +724,9 @@ function formatUsageNotification(usage, tier) {
   const lines = [
     tierLabels[tier] || 'Usage Alert',
     '',
-    `Weekly (all models): ${weekly}% used`,
-    `Session: ${session}% used`
+    `Provider: ${providerLabel(provider)}`,
+    `Weekly (all models): ${weekly}% used / ${remainingLabel(weekly)} remaining`,
+    `Session: ${session}% used / ${remainingLabel(session)} remaining`
   ];
 
   if (usage.weeklySonnet !== undefined && usage.weeklySonnet !== null) {
@@ -746,7 +774,8 @@ function formatUserNotification(data, tier) {
     ? { pct: data.weeklyAll ?? 0, reset: data.weeklyAllResets, label: '本周' }
     : { pct: data.fiveHour ?? 0, reset: data.fiveHourResets, label: '5小时窗口' };
   const reset = hot.reset || '稍后';
-  return `⚠️ 系统提示：AI 助手共享额度已用 ${hot.pct}%（${hot.label}，${reset} 重置）。` +
+  return `⚠️ 系统提示：${providerLabel(data.usageProvider)} 共享额度已用 ${hot.pct}%、剩余 ${remainingPercent(hot.pct)}%` +
+    `（${hot.label}，${reset} 重置）。` +
     `期间回复可能变慢或暂停，重置后自动恢复，无需重复发送。`;
 }
 
@@ -763,9 +792,9 @@ function formatAdminNotification(data, tier) {
     : `读数来源: ${usableCount} 个实例 statusline（${agg}，直读通道不可用）` +
       (data.sources?.length ? `：${data.sources.join(', ')}` : '');
   const lines = [
-    `${tierLabels[tier] || '额度提醒'}（${tier}，热点=${hot}）`,
-    `5h: ${data.fiveHour ?? 'null'}%（${data.fiveHourResets || '未知'} 重置）`,
-    `weekly: ${data.weeklyAll ?? 'null'}%（${data.weeklyAllResets || '未知'} 重置）`,
+    `${tierLabels[tier] || '额度提醒'}（${providerLabel(data.usageProvider)}，${tier}，热点=${hot}）`,
+    `5h: ${data.fiveHour ?? 'null'}% 已用 / ${remainingLabel(data.fiveHour)} 剩余（${data.fiveHourResets || '未知'} 重置）`,
+    `weekly: ${data.weeklyAll ?? 'null'}% 已用 / ${remainingLabel(data.weeklyAll)} 剩余（${data.weeklyAllResets || '未知'} 重置）`,
     sourceLine
   ];
   if (!data.quorum) {

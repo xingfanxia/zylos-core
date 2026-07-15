@@ -10,6 +10,7 @@ const originalDisableMain = process.env.UPDATE_TOKEN_CACHE_DISABLE_MAIN;
 process.env.UPDATE_TOKEN_CACHE_DISABLE_MAIN = '1';
 
 const {
+  buildCodexProfileHomes,
   buildTokenCacheResult,
   classifyModelRuntime,
   mergeCodexSessionsIntoResult,
@@ -114,19 +115,132 @@ describe('mergeCodexSessionsIntoResult', () => {
         sessionFile: 'rollout-admin',
         lastActivity: '2026-04-01T10:00:00.000Z',
         inputTokens: 100,
-        cachedInputTokens: 25,
+        cacheReadTokens: 25,
+        cacheCreationTokens: 5,
         outputTokens: 10,
         costUSD: 1.23,
       },
     ], {
       codexSessionsDir: codexDir,
+      runtimeProfileId: 'codex-azure',
     });
 
     assert.equal(result.instances.admin.totals.input_tokens, 100);
     assert.equal(result.instances.admin.totals.cache_read, 25);
+    assert.equal(result.instances.admin.totals.cache_write, 5);
     assert.equal(result.instances.admin.totals.output_tokens, 10);
-    assert.equal(result.instances.admin.runtimes.codex.totals.total_tokens, 135);
-    assert.equal(result.runtimes.codex.totals.total_tokens, 135);
+    assert.equal(result.instances.admin.runtimes.codex.totals.total_tokens, 140);
+    assert.equal(result.runtimes.codex.totals.total_tokens, 140);
+    assert.equal(result.instances.admin.profiles['codex-azure'].totals.total_tokens, 140);
+    assert.equal(result.instances.admin.profiles['codex-azure'].totals.cost_usd, 1.23);
+    assert.equal(result.instances.admin.profiles['codex-azure'].cost_basis, 'litellm_equivalent_api_estimate');
+  });
+
+  it('attributes sessions whose session_meta line is larger than 16 KiB', () => {
+    const codexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-large-meta-test-'));
+    tmpDirs.push(codexDir);
+    const sessionsDir = path.join(codexDir, '2026', '04', '01');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, 'rollout-large.jsonl'),
+      `${JSON.stringify({
+        type: 'session_meta',
+        payload: { instructions: 'x'.repeat(32_768), cwd: '/home/xingfanxia/zylos/instances/admin' },
+      })}\n`,
+      'utf8'
+    );
+
+    const result = buildTokenCacheResult({ projects: {} });
+    mergeCodexSessionsIntoResult(result, [{
+      directory: '2026/04/01',
+      sessionFile: 'rollout-large',
+      lastActivity: '2026-04-01T10:00:00.000Z',
+      inputTokens: 100,
+      outputTokens: 10,
+      costUSD: 1,
+    }], {
+      codexSessionsDir: codexDir,
+      runtimeProfileId: 'codex-azure',
+    });
+
+    assert.equal(result.instances.admin.profiles['codex-azure'].totals.total_tokens, 110);
+  });
+
+  it('attributes an upstream single-session rollout to its unchanged workspace persona', () => {
+    const codexDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-single-test-'));
+    tmpDirs.push(codexDir);
+    const sessionsDir = path.join(codexDir, '2026', '04', '01');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionsDir, 'rollout-bohe.jsonl'),
+      `${JSON.stringify({ type: 'session_meta', payload: { cwd: '/home/xingfanxia/zylos' } })}\n`,
+      'utf8',
+    );
+
+    const result = buildTokenCacheResult({ projects: {} });
+    mergeCodexSessionsIntoResult(result, [{
+      directory: '2026/04/01',
+      sessionFile: 'rollout-bohe',
+      lastActivity: '2026-04-01T10:00:00.000Z',
+      inputTokens: 200,
+      outputTokens: 20,
+      costUSD: 2,
+    }], {
+      codexSessionsDir: codexDir,
+      knownInstanceIds: new Set(['bohe']),
+      runtimeProfileId: 'codex-azure',
+      defaultInstanceId: 'bohe',
+      defaultInstanceCwd: '/home/xingfanxia/zylos',
+    });
+
+    assert.equal(result.instances.bohe.profiles['codex-azure'].totals.total_tokens, 220);
+    assert.equal(result.instances.bohe.profiles['codex-azure'].totals.cost_usd, 2);
+  });
+});
+
+describe('buildCodexProfileHomes', () => {
+  it('resolves subscription and Azure Codex homes for each isolated OS user', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-profile-homes-test-'));
+    tmpDirs.push(dir);
+    fs.writeFileSync(path.join(dir, 'instances.json'), JSON.stringify({
+      runtime_profiles: {
+        'claude-subscription': { runtime: 'claude' },
+        'codex-subscription': { runtime: 'codex', codex_home: '~/.codex-subscription' },
+        'codex-azure': { runtime: 'codex', codex_home: '~/.codex-azure' },
+      },
+      instances: {
+        admin: { enabled: true },
+        pan: { enabled: true, os_user: 'zylos-pan' },
+      },
+    }));
+
+    const homes = buildCodexProfileHomes(dir);
+    assert.ok(homes.some(x => x.profile_id === 'codex-azure' && x.codex_home === path.join(os.homedir(), '.codex-azure')));
+    assert.ok(homes.some(x => x.profile_id === 'codex-subscription'
+      && x.codex_home === '/home/zylos-pan/.codex-subscription'
+      && x.os_user === 'zylos-pan'));
+    assert.equal(homes.length, 4);
+  });
+
+  it('resolves Codex homes for upstream single-session Zylos', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-single-profile-homes-test-'));
+    tmpDirs.push(dir);
+    fs.mkdirSync(path.join(dir, '.zylos'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.zylos', 'runtime-profiles.json'), JSON.stringify({
+      persona_id: 'bohe',
+      workspace: dir,
+      runtime_profiles: {
+        'claude-subscription': { runtime: 'claude' },
+        'codex-subscription': { runtime: 'codex', codex_home: '~/.codex-subscription' },
+        'codex-azure': { runtime: 'codex', codex_home: '~/.codex-azure' },
+      },
+    }));
+
+    const homes = buildCodexProfileHomes(dir);
+    assert.equal(homes.length, 2);
+    assert.ok(homes.every(x => x.instance_id === 'bohe' && x.instance_cwd === dir));
+    assert.ok(homes.some(x => x.profile_id === 'codex-azure'
+      && x.codex_home === path.join(os.homedir(), '.codex-azure')));
   });
 });
 
@@ -268,5 +382,74 @@ describe('runUpdateOnce', () => {
 
     assert.equal(result.runtimes.codex.totals.total_tokens, 0);
     assert.equal(result.instances['probe-codex'], undefined);
+  });
+
+  it('continues Azure profile accounting when Claude transcript reads fail', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-token-cache-degrade-test-'));
+    tmpDirs.push(tmpDir);
+    const cacheFile = path.join(tmpDir, 'token-cache.json');
+    fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({ instances: { admin: {} } }));
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-azure-home-'));
+    tmpDirs.push(codexHome);
+    const sessionsDir = path.join(codexHome, 'sessions', '2026', '04', '01');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionsDir, 'rollout-admin.jsonl'), `${JSON.stringify({
+      type: 'session_meta', payload: { cwd: '/home/xingfanxia/zylos/instances/admin' },
+    })}\n`);
+
+    const result = runUpdateOnce({
+      cacheFile,
+      zylosDir: tmpDir,
+      codexProfileHomes: [{ profile_id: 'codex-azure', codex_home: codexHome }],
+      now: new Date('2026-04-01T12:00:00.000Z'),
+      execFileSyncImpl: (cmd) => {
+        if (String(cmd).endsWith('ccusage')) {
+          const err = new Error('EACCES');
+          err.stderr = Buffer.from('EACCES transcript');
+          throw err;
+        }
+        return JSON.stringify({ sessions: [{
+          directory: '2026/04/01', sessionFile: 'rollout-admin',
+          lastActivity: '2026-04-01T09:00:00Z', inputTokens: 100,
+          cacheReadTokens: 25, outputTokens: 10, costUSD: 1.23,
+        }] });
+      },
+      log: () => {},
+    });
+
+    assert.match(result.warnings[0], /claude:.*EACCES/);
+    assert.equal(result.instances.admin.profiles['codex-azure'].totals.total_tokens, 135);
+    assert.equal(result.instances.admin.profiles['codex-azure'].totals.cost_usd, 1.23);
+  });
+
+  it('runs ccusage as the isolated profile OS user', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-token-cache-os-user-test-'));
+    tmpDirs.push(tmpDir);
+    fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({ instances: { pan: {} } }));
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-os-user-home-'));
+    tmpDirs.push(codexHome);
+    let sudoArgs;
+
+    runUpdateOnce({
+      cacheFile: path.join(tmpDir, 'token-cache.json'),
+      zylosDir: tmpDir,
+      codexProfileHomes: [{
+        profile_id: 'codex-azure', codex_home: codexHome, os_user: 'zylos-pan',
+      }],
+      execFileSyncImpl: (cmd, args) => {
+        if (String(cmd).endsWith('ccusage')) return JSON.stringify({ projects: {} });
+        if (cmd === 'sudo') {
+          sudoArgs = args;
+          return JSON.stringify({ sessions: [] });
+        }
+        throw new Error(`unexpected command ${cmd}`);
+      },
+      log: () => {},
+    });
+
+    assert.deepEqual(sudoArgs.slice(0, 7), [
+      '-n', '-u', 'zylos-pan', '-H', '--', '/usr/bin/env', `CODEX_HOME=${codexHome}`,
+    ]);
+    assert.ok(sudoArgs.includes('ccusage@20.0.17'));
   });
 });

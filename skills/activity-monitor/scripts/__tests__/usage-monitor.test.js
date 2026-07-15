@@ -30,6 +30,9 @@ function makeMonitor(overrides = {}) {
       usageStateFile: path.join(dir, 'usage.json'),
       usageCodexStateFile: path.join(dir, 'usage-codex.json'),
       usageAlertStateFile: path.join(dir, 'usage-alert-state.json'),
+      ...(Object.prototype.hasOwnProperty.call(overrides, 'usageProvider')
+        ? { usageProvider: overrides.usageProvider }
+        : {}),
       monitorEnabled: true,
       alertEnabled: true,
       checkIntervalSec: 3600,
@@ -126,6 +129,20 @@ describe('UsageMonitor', () => {
 
     const codex = makeMonitor({ runtimeId: 'codex' });
     assert.equal(codex.monitor.initializeLastCheckAt(5000), 0);
+  });
+
+  it('disables subscription monitoring for an API-backed Codex profile', async () => {
+    const { monitor, calls } = makeMonitor({ runtimeId: 'codex', usageProvider: null });
+    assert.equal(monitor.isMonitorEnabled(), false);
+    assert.equal(monitor.isAlertEnabled(), false);
+    assert.equal(monitor.canRunTask({
+      claudeState: 'idle', idleSeconds: 100, currentTime: 1000, apiActivity: {},
+    }), false);
+    assert.equal(monitor.runMonitor({ currentTime: 1000 }), true);
+    assert.equal(monitor.runAlert({ currentTime: 1000 }), true);
+    assert.equal(await monitor.runFleetAlert({ currentTime: 1000 }), true);
+    assert.deepEqual(calls.control, []);
+    assert.deepEqual(calls.send, []);
   });
 
   it('refreshes local usage state without sending an alert', () => {

@@ -384,6 +384,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
    */
   async launch(opts = {}) {
     const bypassPermissions = opts.bypassPermissions ?? DEFAULT_BYPASS;
+    const profile = this.config.runtimeProfile || {};
+    const reasoningEffort = profile.reasoningEffort || null;
 
     // 1. Build instruction file before launching
     await this.buildInstructionFile();
@@ -479,6 +481,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       const envExports = [
         process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
         process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+        reasoningEffort ? `export CLAUDE_EFFORT='${reasoningEffort}'` : '',
         ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
         ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
       ].filter(Boolean).join('; ');
@@ -503,6 +506,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
       if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
       if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
+      if (reasoningEffort) env.CLAUDE_EFFORT = reasoningEffort;
 
       // Inject auth tokens
       if (hasNativeAuth) {

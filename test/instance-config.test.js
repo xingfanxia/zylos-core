@@ -196,6 +196,15 @@ describe('instance-config — with instances.json', () => {
     expect(sched.tmux_session).toBe('claude-admin');
   });
 
+  it('ensureInstanceCwd exposes the same env, memory and Claude skill tree to both runtimes', () => {
+    const cwd = mod.ensureInstanceCwd('admin');
+    expect(cwd).toBe(path.join(tmpDir, 'instances', 'admin'));
+    expect(fs.readlinkSync(path.join(cwd, '.env'))).toBe('../../.env');
+    expect(fs.readlinkSync(path.join(cwd, 'memory'))).toBe('../../memory');
+    expect(fs.readlinkSync(path.join(cwd, '.claude'))).toBe('../../.claude');
+    expect(fs.readlinkSync(path.join(cwd, '.agents'))).toBe('../../.agents');
+  });
+
   // ── Cache TTL ─────────────────────────────────────────────────
 
   it('cache TTL — modifying instances.json is picked up after TTL', async () => {

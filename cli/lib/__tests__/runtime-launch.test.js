@@ -19,6 +19,7 @@ const savedEnv = {
   CODEX_BYPASS_PERMISSIONS: process.env.CODEX_BYPASS_PERMISSIONS,
   ZYLOS_INSTANCE_ID: process.env.ZYLOS_INSTANCE_ID,
   ZYLOS_TMUX_SESSION: process.env.ZYLOS_TMUX_SESSION,
+  CODEX_HOME: process.env.CODEX_HOME,
 };
 
 process.env.HOME = fakeHome;
@@ -79,9 +80,9 @@ mock.module('node:child_process', {
       return '';
     }),
     spawnSync: mock.fn((file, args, opts) => {
-      const zylosDir = opts?.env?.ZYLOS_CODEX_TRUST_CWD || fakeZylosDir;
-      const key = `${path.join(zylosDir, '.codex', 'hooks.json')}:session_start:0:0`;
-      const configPath = path.join(fakeHome, '.codex', 'config.toml');
+      const canonicalZylosDir = fs.realpathSync(fakeZylosDir);
+      const key = `${path.join(canonicalZylosDir, '.codex', 'hooks.json')}:session_start:0:0`;
+      const configPath = path.join(opts?.env?.CODEX_HOME || path.join(fakeHome, '.codex'), 'config.toml');
       fs.mkdirSync(path.dirname(configPath), { recursive: true });
       fs.writeFileSync(configPath, [
         '[features]',
@@ -127,6 +128,8 @@ beforeEach(() => {
   tmuxSessionExists = false;
   delete process.env.ZYLOS_INSTANCE_ID;
   delete process.env.ZYLOS_TMUX_SESSION;
+  delete process.env.CODEX_HOME;
+  try { fs.unlinkSync(path.join(fakeZylosDir, 'instances.json')); } catch {}
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -252,6 +255,15 @@ describe('Claude launch — new session', () => {
     assert.equal(env.ZYLOS_INSTANCE_ID, 'user-pan');
     assert.ok(fs.existsSync(env.GH_CONFIG_DIR), 'per-instance gh config dir should be created');
   });
+
+  it('forces the Claude profile reasoning effort into the launch environment', async () => {
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = { id: 'claude-subscription', reasoningEffort: 'high' };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.equal(readSpecEnv().CLAUDE_EFFORT, 'high');
+  });
 });
 
 describe('Claude launch — existing session', () => {
@@ -288,6 +300,18 @@ describe('Claude launch — existing session', () => {
 
     assert.ok(sent.includes("export GH_CONFIG_DIR='"));
     assert.ok(sent.includes(path.join(fakeZylosDir, 'instances', 'user-limh', '.config', 'gh')));
+  });
+
+  it('exports the Claude profile reasoning effort before reusing a session', async () => {
+    tmuxSessionExists = true;
+    let sent = '';
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = { id: 'claude-subscription', reasoningEffort: 'high' };
+    adapter.sendMessage = async (text) => { sent = text; };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.ok(sent.includes("export CLAUDE_EFFORT='high'"));
   });
 });
 
@@ -369,6 +393,16 @@ describe('Codex launch — new session', () => {
     assert.ok(!JSON.stringify(spec).includes('session-start-inject.js'));
   });
 
+  it('honors CODEX_HOME for an upstream single-session runtime profile', async () => {
+    const codexHome = path.join(fakeHome, '.codex-subscription');
+    fs.mkdirSync(codexHome, { recursive: true });
+    process.env.CODEX_HOME = codexHome;
+
+    await makeAdapter(CodexAdapter).launch({ bypassPermissions: false });
+
+    assert.equal(readSpecEnv().CODEX_HOME, codexHome);
+  });
+
   it('sets per-instance GH_CONFIG_DIR when launched for an instance', async () => {
     tmuxSessionExists = false;
     process.env.ZYLOS_INSTANCE_ID = 'yanzi';
@@ -380,6 +414,66 @@ describe('Codex launch — new session', () => {
     assert.equal(env.GH_PROMPT_DISABLED, '1');
     assert.equal(env.ZYLOS_INSTANCE_ID, 'yanzi');
     assert.ok(fs.existsSync(env.GH_CONFIG_DIR), 'per-instance gh config dir should be created');
+  });
+
+  it('launches an os_user instance with its isolated Codex profile and forced model settings', async () => {
+    tmuxSessionExists = false;
+    process.env.ZYLOS_INSTANCE_ID = 'user-pan';
+    const agentHome = path.join(tmpRoot, 'zylos-pan');
+    const codexHome = path.join(agentHome, '.codex-azure');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'apikey',
+      OPENAI_API_KEY: 'azure-secret-not-on-command-line',
+    }));
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), [
+      'openai_base_url = "https://azure.example.com/openai/v1"',
+      '[features]',
+      'hooks = true',
+    ].join('\n'));
+    fs.writeFileSync(path.join(fakeZylosDir, 'instances.json'), JSON.stringify({
+      instances: { 'user-pan': { os_user: 'zylos-pan' } },
+    }));
+
+    const adapter = makeAdapter(CodexAdapter);
+    adapter.config.runtimeProfile = {
+      id: 'codex-azure',
+      runtime: 'codex',
+      runtimeHome: agentHome,
+      codexHome,
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'medium',
+      providerEnvKey: 'AZURE_FOUNDRY_KEY',
+    };
+    await adapter.launch({ bypassPermissions: false });
+
+    const spec = readLaunchSpec();
+    assert.ok(spec, 'spec should be written');
+    assert.equal(spec.env.HOME, agentHome);
+    assert.equal(spec.env.USER, 'zylos-pan');
+    assert.equal(spec.env.CODEX_HOME, codexHome);
+    assert.equal(spec.env.AZURE_FOUNDRY_KEY, 'azure-secret-not-on-command-line');
+    assert.deepEqual(spec.args, [
+      '-m', 'gpt-5.6-sol',
+      '-c', 'model_reasoning_effort="medium"',
+      'hello',
+    ]);
+
+    const tmux = findTmuxNewSession();
+    const command = tmux.args[tmux.args.length - 1];
+    assert.match(command, /sudo -n -u zylos-pan -H --/);
+    assert.equal(command.includes('azure-secret-not-on-command-line'), false);
+    assert.equal(tmux.args.join(' ').includes('AZURE_FOUNDRY_KEY'), false);
+
+    const configPath = path.join(codexHome, 'config.toml');
+    assert.ok(calls.execFileSync.some(call =>
+      call.file === 'sudo'
+      && call.args.join('\0') === ['-n', 'chgrp', 'zylos-pan', configPath].join('\0')
+    ), 'hook trust rewrites must restore the persona-private config group');
+    assert.ok(calls.execFileSync.some(call =>
+      call.file === 'sudo'
+      && call.args.join('\0') === ['-n', 'chmod', '0660', configPath].join('\0')
+    ), 'hook trust rewrites must restore group read/write mode');
   });
 });
 

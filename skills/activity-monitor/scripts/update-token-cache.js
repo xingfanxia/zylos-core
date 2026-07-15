@@ -35,7 +35,70 @@ const KNOWN_RUNTIMES = ['claude', 'codex', 'other'];
 const CODEX_DIR = path.join(os.homedir(), '.codex');
 const CODEX_SESSIONS_DIR = path.join(CODEX_DIR, 'sessions');
 const CODEX_USAGE_BIN = process.env.CCUSAGE_CODEX_BIN || 'npx';
-const CODEX_USAGE_PACKAGE = process.env.CCUSAGE_CODEX_PACKAGE || '@ccusage/codex@latest';
+// @ccusage/codex was retired in v19 and now exits after printing a migration
+// notice. Use the unified, pinned ccusage CLI so Codex token/cost cache refresh
+// remains reproducible across hosts.
+const CODEX_USAGE_PACKAGE = process.env.CCUSAGE_CODEX_PACKAGE || 'ccusage@20.0.17';
+
+export function buildCodexProfileHomes(zylosDir = ZYLOS_DIR) {
+  const fallback = [{ profile_id: null, codex_home: CODEX_DIR }];
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
+    const profiles = config.runtime_profiles || {};
+    const result = [];
+    const seen = new Set();
+    for (const instance of Object.values(config.instances || {})) {
+      if (instance?.enabled === false) continue;
+      const runtimeHome = instance?.os_user ? `/home/${instance.os_user}` : os.homedir();
+      for (const [profileId, profile] of Object.entries(profiles)) {
+        if (profile?.runtime !== 'codex' || typeof profile.codex_home !== 'string') continue;
+        const codexHome = profile.codex_home.startsWith('~/')
+          ? path.resolve(runtimeHome, profile.codex_home.slice(2))
+          : path.resolve(profile.codex_home);
+        const key = `${profileId}\0${codexHome}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push({
+          profile_id: profileId,
+          codex_home: codexHome,
+          os_user: instance?.os_user || null,
+        });
+      }
+    }
+    return result.length ? result : fallback;
+  } catch {
+    // Upstream/public Zylos is single-session and intentionally has no
+    // instances.json. Its sidecar describes only engine profiles; all profile
+    // rollouts still belong to the one persona/workspace.
+    try {
+      const config = JSON.parse(fs.readFileSync(
+        path.join(zylosDir, '.zylos', 'runtime-profiles.json'),
+        'utf8',
+      ));
+      const instanceId = config.persona_id || 'single';
+      const instanceCwd = path.resolve(
+        String(config.workspace || zylosDir).replace(/^~/, os.homedir()),
+      );
+      const result = [];
+      for (const [profileId, profile] of Object.entries(config.runtime_profiles || {})) {
+        if (profile?.runtime !== 'codex' || typeof profile.codex_home !== 'string') continue;
+        const codexHome = profile.codex_home.startsWith('~/')
+          ? path.resolve(os.homedir(), profile.codex_home.slice(2))
+          : path.resolve(profile.codex_home);
+        result.push({
+          profile_id: profileId,
+          codex_home: codexHome,
+          os_user: null,
+          instance_id: instanceId,
+          instance_cwd: instanceCwd,
+        });
+      }
+      return result.length ? result : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+}
 
 // ccusage pinned per-skill: v19+ dropped `--instances` and the `projects`
 // output shape this parser consumes (a global v20 upgrade silently broke the
@@ -71,7 +134,15 @@ function loadKnownInstanceIds(zylosDir = ZYLOS_DIR) {
     const config = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
     return new Set(Object.keys(config?.instances || {}));
   } catch {
-    return null;
+    try {
+      const config = JSON.parse(fs.readFileSync(
+        path.join(zylosDir, '.zylos', 'runtime-profiles.json'),
+        'utf8',
+      ));
+      return new Set([config.persona_id || 'single']);
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -233,6 +304,21 @@ function ensureInstanceBucket(result, instanceId) {
   return result.instances[instanceId];
 }
 
+function ensureProfileBucket(target, profileId) {
+  if (!profileId) return null;
+  if (!target.profiles) target.profiles = {};
+  if (!target.profiles[profileId]) {
+    target.profiles[profileId] = {
+      daily: [],
+      totals: computeTotals([]),
+      cost_basis: profileId === 'codex-azure'
+        ? 'litellm_equivalent_api_estimate'
+        : 'subscription_equivalent',
+    };
+  }
+  return target.profiles[profileId];
+}
+
 function finalizeTokenCacheResult(result) {
   result.daily.sort((a, b) => a.date.localeCompare(b.date));
   result.totals = computeTotals(result.daily);
@@ -251,6 +337,10 @@ function finalizeTokenCacheResult(result) {
       const bucket = ensureRuntimeBucket(instanceData, runtime);
       bucket.daily.sort((a, b) => a.date.localeCompare(b.date));
       bucket.totals = computeTotals(bucket.daily);
+    }
+    for (const profileData of Object.values(instanceData.profiles || {})) {
+      profileData.daily.sort((a, b) => a.date.localeCompare(b.date));
+      profileData.totals = computeTotals(profileData.daily);
     }
     result.instances[instanceId] = instanceData;
   }
@@ -284,15 +374,31 @@ function sessionFilePath(session, codexSessionsDir = CODEX_SESSIONS_DIR) {
 function readRolloutHead(filePath) {
   const stat = fs.statSync(filePath);
   if (!stat.size) return '';
-  const readBytes = Math.min(16_384, stat.size);
-  const buf = Buffer.alloc(readBytes);
+  // Modern Codex session_meta records can exceed 16 KiB because they embed
+  // the full instruction payload. Read through the first complete JSONL line
+  // (bounded to keep token accounting safe on very large rollouts) so cwd
+  // attribution does not silently drop every session.
+  const maxBytes = Math.min(1_048_576, stat.size);
+  const chunkSize = 65_536;
   const fd = fs.openSync(filePath, 'r');
   try {
-    fs.readSync(fd, buf, 0, readBytes, 0);
+    const chunks = [];
+    let offset = 0;
+    while (offset < maxBytes) {
+      const readBytes = Math.min(chunkSize, maxBytes - offset);
+      const buf = Buffer.alloc(readBytes);
+      const bytesRead = fs.readSync(fd, buf, 0, readBytes, offset);
+      if (!bytesRead) break;
+      const chunk = buf.subarray(0, bytesRead);
+      const newline = chunk.indexOf(0x0a);
+      chunks.push(newline >= 0 ? chunk.subarray(0, newline + 1) : chunk);
+      offset += bytesRead;
+      if (newline >= 0) break;
+    }
+    return Buffer.concat(chunks).toString('utf8');
   } finally {
     fs.closeSync(fd);
   }
-  return buf.toString('utf8');
 }
 
 function instanceIdFromCwd(cwd = '') {
@@ -300,7 +406,10 @@ function instanceIdFromCwd(cwd = '') {
   return match?.[1] || null;
 }
 
-function readInstanceIdFromRollout(filePath) {
+function readInstanceIdFromRollout(filePath, {
+  defaultInstanceId = null,
+  defaultInstanceCwd = null,
+} = {}) {
   try {
     const head = readRolloutHead(filePath).split('\n');
     for (const line of head) {
@@ -309,7 +418,16 @@ function readInstanceIdFromRollout(filePath) {
       try {
         const event = JSON.parse(trimmed);
         if (event.type === 'session_meta' && event.payload?.cwd) {
-          return instanceIdFromCwd(event.payload.cwd);
+          const instanceId = instanceIdFromCwd(event.payload.cwd);
+          if (instanceId) return instanceId;
+          if (
+            defaultInstanceId
+            && defaultInstanceCwd
+            && path.resolve(event.payload.cwd) === path.resolve(defaultInstanceCwd)
+          ) {
+            return defaultInstanceId;
+          }
+          return null;
         }
       } catch {
         // ignore malformed line
@@ -324,16 +442,19 @@ function readInstanceIdFromRollout(filePath) {
 function normalizeCodexSessionEntry(session) {
   const date = sessionDate(session);
   if (!date) return null;
+  const cacheWrite = session.cacheCreationTokens || 0;
+  const cacheRead = session.cacheReadTokens || session.cachedInputTokens || 0;
   return {
     date,
     input_tokens: session.inputTokens || 0,
     output_tokens: session.outputTokens || 0,
-    cache_write: 0,
-    cache_read: session.cachedInputTokens || 0,
+    cache_write: cacheWrite,
+    cache_read: cacheRead,
     total_tokens:
       (session.inputTokens || 0) +
       (session.outputTokens || 0) +
-      (session.cachedInputTokens || 0),
+      cacheWrite +
+      cacheRead,
     cost_usd: session.costUSD || 0,
   };
 }
@@ -341,6 +462,9 @@ function normalizeCodexSessionEntry(session) {
 export function mergeCodexSessionsIntoResult(result, sessions, {
   codexSessionsDir = CODEX_SESSIONS_DIR,
   knownInstanceIds = null,
+  runtimeProfileId = null,
+  defaultInstanceId = null,
+  defaultInstanceCwd = null,
 } = {}) {
   if (!result || !Array.isArray(sessions) || sessions.length === 0) return result;
 
@@ -349,18 +473,23 @@ export function mergeCodexSessionsIntoResult(result, sessions, {
     if (!entry) continue;
 
     const rolloutPath = sessionFilePath(session, codexSessionsDir);
-    const instanceId = rolloutPath ? readInstanceIdFromRollout(rolloutPath) : null;
+    const instanceId = rolloutPath ? readInstanceIdFromRollout(rolloutPath, {
+      defaultInstanceId,
+      defaultInstanceCwd,
+    }) : null;
     if (!instanceId) continue;
     if (knownInstanceIds && !knownInstanceIds.has(instanceId)) continue;
 
     const instanceBucket = ensureInstanceBucket(result, instanceId);
     const runtimeBucket = ensureRuntimeBucket(instanceBucket, 'codex');
     const aggregateRuntimeBucket = ensureRuntimeBucket(result, 'codex');
+    const profileBucket = ensureProfileBucket(instanceBucket, runtimeProfileId);
 
     mergeEntryIntoDailyArray(result.daily, entry);
     mergeEntryIntoDailyArray(aggregateRuntimeBucket.daily, entry);
     mergeEntryIntoDailyArray(instanceBucket.daily, entry);
     mergeEntryIntoDailyArray(runtimeBucket.daily, entry);
+    if (profileBucket) mergeEntryIntoDailyArray(profileBucket.daily, entry);
   }
 
   return finalizeTokenCacheResult(result);
@@ -496,6 +625,8 @@ function fetchClaudeTokenCacheData({
 function fetchCodexSessionData({
   execFileSyncImpl = execFileSync,
   now = new Date(),
+  codexHome = CODEX_DIR,
+  osUser = null,
 } = {}) {
   const sinceDate = new Date(now);
   sinceDate.setDate(sinceDate.getDate() - DAYS_BACK);
@@ -504,9 +635,10 @@ function fetchCodexSessionData({
 
   let raw;
   try {
-    raw = execFileSyncImpl(CODEX_USAGE_BIN, [
+    const ccusageArgs = [
       '-y',
       CODEX_USAGE_PACKAGE,
+      'codex',
       'session',
       '--json',
       '--since',
@@ -514,21 +646,27 @@ function fetchCodexSessionData({
       '--until',
       until,
       '--offline',
-    ], {
+    ];
+    const command = osUser ? 'sudo' : CODEX_USAGE_BIN;
+    const args = osUser
+      ? ['-n', '-u', osUser, '-H', '--', '/usr/bin/env', `CODEX_HOME=${codexHome}`, CODEX_USAGE_BIN, ...ccusageArgs]
+      : ccusageArgs;
+    raw = execFileSyncImpl(command, args, {
       encoding: 'utf8',
       timeout: 120_000,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, CODEX_HOME: codexHome },
     });
   } catch (err) {
     const detail = err.stderr ? String(err.stderr).trim() : err.message;
-    throw new Error(`@ccusage/codex failed: ${detail}`);
+    throw new Error(`ccusage codex failed: ${detail}`);
   }
 
   let data;
   try {
     data = JSON.parse(raw);
   } catch (err) {
-    throw new Error(`Failed to parse @ccusage/codex output: ${err.message}`);
+    throw new Error(`Failed to parse ccusage codex output: ${err.message}`);
   }
 
   return Array.isArray(data?.sessions) ? data.sessions : [];
@@ -539,16 +677,41 @@ export function fetchTokenCacheData({
   now = new Date(),
   codexSessionsDir = CODEX_SESSIONS_DIR,
   zylosDir = ZYLOS_DIR,
+  codexProfileHomes = null,
 } = {}) {
-  const result = fetchClaudeTokenCacheData({ execFileSyncImpl, now });
+  let result;
   try {
-    const codexSessions = fetchCodexSessionData({ execFileSyncImpl, now });
-    mergeCodexSessionsIntoResult(result, codexSessions, {
-      codexSessionsDir,
-      knownInstanceIds: loadKnownInstanceIds(zylosDir),
-    });
+    result = fetchClaudeTokenCacheData({ execFileSyncImpl, now });
   } catch (err) {
-    result.warnings = [...(result.warnings || []), err.message];
+    // Claude transcript ACL drift must not suppress independent Codex/Azure
+    // token and equivalent-cost reporting.
+    result = buildTokenCacheResult({ projects: {} }, now);
+    result.warnings = [`claude: ${err.message}`];
+  }
+  const profiles = codexProfileHomes || buildCodexProfileHomes(zylosDir);
+  for (const profile of profiles) {
+    try {
+      const codexSessions = fetchCodexSessionData({
+        execFileSyncImpl,
+        now,
+        codexHome: profile.codex_home,
+        osUser: profile.os_user || null,
+      });
+      mergeCodexSessionsIntoResult(result, codexSessions, {
+        codexSessionsDir: profile.codex_home === CODEX_DIR && codexSessionsDir !== CODEX_SESSIONS_DIR
+          ? codexSessionsDir
+          : path.join(profile.codex_home, 'sessions'),
+        knownInstanceIds: loadKnownInstanceIds(zylosDir),
+        runtimeProfileId: profile.profile_id,
+        defaultInstanceId: profile.instance_id || null,
+        defaultInstanceCwd: profile.instance_cwd || null,
+      });
+    } catch (err) {
+      result.warnings = [
+        ...(result.warnings || []),
+        `${profile.profile_id || 'codex-default'}: ${err.message}`,
+      ];
+    }
   }
   return result;
 }
@@ -565,10 +728,17 @@ export function runUpdateOnce({
   cacheFile = CACHE_FILE,
   codexSessionsDir = CODEX_SESSIONS_DIR,
   zylosDir = ZYLOS_DIR,
+  codexProfileHomes = null,
   now = new Date(),
   log = console.log,
 } = {}) {
-  const result = fetchTokenCacheData({ execFileSyncImpl, now, codexSessionsDir, zylosDir });
+  const result = fetchTokenCacheData({
+    execFileSyncImpl,
+    now,
+    codexSessionsDir,
+    zylosDir,
+    codexProfileHomes,
+  });
   writeTokenCache(result, cacheFile);
 
   const instanceCount = Object.keys(result.instances).length;
