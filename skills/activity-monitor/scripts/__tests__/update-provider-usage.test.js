@@ -93,7 +93,62 @@ describe('normalizeNativeClaudeUsage', () => {
   });
 });
 
+describe('normalizeNativeClaudeUsage reset epochs', () => {
+  it('converts raw reset epochs to ISO resets_at so stale windows can expire', () => {
+    // Without resets_at the failover daemon can never zero a frozen window:
+    // monitor files stop updating the moment the Claude session is replaced
+    // by Codex, so a 100% weekly reading would block recovery forever.
+    const normalized = normalizeNativeClaudeUsage({
+      session: 0,
+      sessionResets: '23:50 on Jul 14',
+      sessionResetsAt: 1784073000,
+      weeklyAll: 100,
+      weeklyAllResets: '02:00 on Jul 18',
+      weeklyAllResetsAt: 1784340000,
+    }, '2026-07-16T15:00:00.000Z');
+
+    assert.equal(normalized.primary.resets_at, new Date(1784073000 * 1000).toISOString());
+    assert.equal(normalized.secondary.resets_at, new Date(1784340000 * 1000).toISOString());
+  });
+
+  it('keeps resets_at null when no epoch is known', () => {
+    const normalized = normalizeNativeClaudeUsage({
+      session: 1,
+      weeklyAll: 99,
+    }, '2026-07-16T15:00:00.000Z');
+    assert.equal(normalized.primary.resets_at, null);
+    assert.equal(normalized.secondary.resets_at, null);
+  });
+});
+
 describe('fetchClaudeNativeUsage', () => {
+  it('publishes the five-hour rate-limit window as primary with reset epochs (statusline Format B)', () => {
+    // Format B statuslines report sessionPercent from context_window (not a
+    // rate limit); the genuine 5h window arrives in fiveHourPercent. The
+    // provider payload must carry the rate-limit window plus its reset epoch.
+    const result = fetchClaudeNativeUsage({
+      now: '2026-07-16T15:00:00.000Z',
+      readImpl: () => ({
+        sessionPercent: null,
+        sessionResets: null,
+        weeklyAllPercent: 100,
+        weeklyAllResets: '02:00 on Jul 18',
+        weeklyAllResetsAt: 1784340000,
+        weeklySonnetPercent: null,
+        fiveHourPercent: 0,
+        fiveHourResets: '23:50 on Jul 14',
+        fiveHourResetsAt: 1784073000,
+        statusShape: 'statusline_rate_limits',
+      }),
+    });
+
+    assert.equal(result.available, true);
+    assert.equal(result.primary.used_percent, 0);
+    assert.equal(result.primary.resets_at, new Date(1784073000 * 1000).toISOString());
+    assert.equal(result.secondary.used_percent, 100);
+    assert.equal(result.secondary.resets_at, new Date(1784340000 * 1000).toISOString());
+  });
+
   it('returns native Claude provider data from monitor files', () => {
     // v0.4.13 reshaped the API: fetchClaudeNativeUsage now takes a readImpl that
     // returns { sessionPercent, weeklyAllPercent, weeklySonnetPercent, ... } (the

@@ -64,6 +64,16 @@ export function normalizeProviderPayload(provider, payload, fetchedAt = new Date
   };
 }
 
+// Reset epochs are the only signal that lets a consumer expire a stale
+// window: monitor files stop refreshing once the persona switches runtime,
+// so a frozen used_percent must self-zero when its published reset passes
+// (runtime-failover.js windowUsedPercent). Same conversion as the codex
+// window() helper below.
+function nativeResetIso(epochSeconds) {
+  if (epochSeconds == null || !Number.isFinite(Number(epochSeconds))) return null;
+  return new Date(Number(epochSeconds) * 1000).toISOString();
+}
+
 export function normalizeNativeClaudeUsage(usage, fetchedAt = new Date().toISOString()) {
   return {
     provider: 'claude',
@@ -77,21 +87,21 @@ export function normalizeNativeClaudeUsage(usage, fetchedAt = new Date().toISOSt
       used_percent: usage.session,
       left_percent: Math.max(0, 100 - usage.session),
       window_minutes: 300,
-      resets_at: null,
+      resets_at: nativeResetIso(usage.sessionResetsAt),
       reset_description: usage.sessionResets || null,
     },
     secondary: usage?.weeklyAll == null ? null : {
       used_percent: usage.weeklyAll,
       left_percent: Math.max(0, 100 - usage.weeklyAll),
       window_minutes: 10080,
-      resets_at: null,
+      resets_at: nativeResetIso(usage.weeklyAllResetsAt),
       reset_description: usage.weeklyAllResets || null,
     },
     tertiary: usage?.weeklySonnet == null ? null : {
       used_percent: usage.weeklySonnet,
       left_percent: Math.max(0, 100 - usage.weeklySonnet),
       window_minutes: 10080,
-      resets_at: null,
+      resets_at: nativeResetIso(usage.weeklySonnetResetsAt),
       reset_description: usage.weeklySonnetResets || null,
     },
   };
@@ -159,11 +169,18 @@ export function fetchClaudeNativeUsage({
     };
   }
 
+  // Newer statuslines (Format B) report sessionPercent from context_window —
+  // not a rate limit — and carry the genuine 5h window in fiveHourPercent.
+  // Prefer the rate-limit window so the published primary never mistakes
+  // context fill for provider usage; older shapes keep their session window.
+  const hasFiveHour = usage.fiveHourPercent != null;
   return normalizeNativeClaudeUsage({
-    session: usage.sessionPercent,
-    sessionResets: usage.sessionResets,
+    session: hasFiveHour ? usage.fiveHourPercent : usage.sessionPercent,
+    sessionResets: hasFiveHour ? usage.fiveHourResets : usage.sessionResets,
+    sessionResetsAt: hasFiveHour ? usage.fiveHourResetsAt : usage.sessionResetsAt,
     weeklyAll: usage.weeklyAllPercent,
     weeklyAllResets: usage.weeklyAllResets,
+    weeklyAllResetsAt: usage.weeklyAllResetsAt,
     weeklySonnet: usage.weeklySonnetPercent,
     weeklySonnetResets: usage.weeklySonnetResets,
   }, now);

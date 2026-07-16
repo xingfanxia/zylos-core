@@ -96,6 +96,43 @@ describe('runtime failover selection', () => {
     });
   });
 
+  it('recovers off a frozen exhausted window once its reset time passes', () => {
+    // Monitor files stop refreshing the moment the persona runs Codex, so the
+    // Claude reading can stay frozen at 100%. The published reset epoch is the
+    // only signal that the weekly window has actually rolled over.
+    const frozenClaude = {
+      providers: {
+        claude: {
+          available: true,
+          secondary: { used_percent: 100, resets_at: '2026-07-18T02:00:00.000Z' },
+        },
+        codex: {
+          available: true,
+          secondary: { used_percent: 24, resets_at: '2026-07-23T04:15:56.000Z' },
+        },
+      },
+    };
+    const base = {
+      currentProfile: 'codex-subscription',
+      chain: Object.keys(profiles),
+      profiles,
+      providerUsage: frozenClaude,
+      switchThreshold: 98,
+      recoverThreshold: 80,
+      changedAtMs: Date.parse('2026-07-14T23:56:37.904Z'),
+      minDwellMs: 300_000,
+    };
+
+    const beforeReset = chooseRuntimeProfile({ ...base, nowMs: Date.parse('2026-07-16T15:00:00Z') });
+    assert.deepEqual(beforeReset, { profile: 'codex-subscription', reason: 'no_change' });
+
+    const afterReset = chooseRuntimeProfile({ ...base, nowMs: Date.parse('2026-07-18T02:00:01Z') });
+    assert.deepEqual(afterReset, {
+      profile: 'claude-subscription',
+      reason: 'preferred_provider_recovered:claude',
+    });
+  });
+
   it('keeps a manually selected API profile active when auto recovery is disabled', () => {
     const result = chooseRuntimeProfile({
       currentProfile: 'codex-azure',

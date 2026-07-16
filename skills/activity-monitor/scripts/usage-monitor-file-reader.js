@@ -59,6 +59,7 @@ function normalizePersistedUsage(snapshot, statusShape = 'persisted_usage') {
   return {
     sessionPercent: sessionPercent ?? null,
     sessionResets: snapshot.session?.resets ?? null,
+    sessionResetsAt: snapshot.session?.resets_at ?? null,
     weeklyAllPercent: weeklyAllPercent ?? null,
     weeklyAllResets: snapshot.weeklyAll?.resets ?? null,
     weeklyAllResetsAt: snapshot.weeklyAll?.resets_at ?? null,
@@ -99,6 +100,7 @@ function normalizeClaudeStatusline(status) {
       return {
         sessionPercent,
         sessionResets: formatResetTime(primary?.resets_at ?? null),
+        sessionResetsAt: primary?.resets_at ?? null,
         weeklyAllPercent,
         weeklyAllResets: formatResetTime(secondary?.resets_at ?? null),
         weeklyAllResetsAt: secondary?.resets_at ?? null,
@@ -121,6 +123,7 @@ function normalizeClaudeStatusline(status) {
       return {
         sessionPercent: status.context_window?.used_percentage ?? null,
         sessionResets: null,
+        sessionResetsAt: null,
         weeklyAllPercent: weeklyAllPercentB,
         weeklyAllResets: formatResetTime(sevenDay?.resets_at ?? null),
         weeklyAllResetsAt: sevenDay?.resets_at ?? null,
