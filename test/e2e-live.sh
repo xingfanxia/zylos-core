@@ -133,8 +133,11 @@ if [ -f "$QUERY" ]; then
   T6_CH=$(db_query "SELECT channel FROM conversations WHERE content LIKE '%E2E-6 query ${TS}%' ORDER BY id DESC LIMIT 1;")
   T6_EP=$(db_query "SELECT endpoint_id FROM conversations WHERE content LIKE '%E2E-6 query ${TS}%' ORDER BY id DESC LIMIT 1;")
   T6_TI=$(db_query "SELECT target_instance FROM conversations WHERE content LIKE '%E2E-6 query ${TS}%' ORDER BY id DESC LIMIT 1;")
-  if [ "$T6_CH" = "internal" ] && [ "$T6_EP" = "instance-test-e2e" ] && [ "$T6_TI" = "admin" ]; then
-    record_pass "Internal channel, endpoint=instance-test-e2e, target=admin"
+  # c4-query-instance sends a fire-and-forget (--no-reply) message. Under the
+  # clean-store contract, endpoint_id is NULL for non-replyable rows while the
+  # explicit target_instance still owns delivery.
+  if [ "$T6_CH" = "internal" ] && [ -z "$T6_EP" ] && [ "$T6_TI" = "admin" ]; then
+    record_pass "Internal channel, no reply endpoint, target=admin"
   else
     record_fail "Got channel='${T6_CH}' endpoint='${T6_EP}' target='${T6_TI}'"
   fi
