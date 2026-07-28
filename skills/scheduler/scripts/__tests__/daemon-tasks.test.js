@@ -121,9 +121,16 @@ describe('updateNextRunTime', () => {
         const utcRow = db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get('task-utc');
         const shRow = db.prepare('SELECT next_run_at FROM tasks WHERE id = ?').get('task-sh');
 
-        // Shanghai 9am is 8 hours earlier in UTC than UTC 9am
-        assert.ok(shRow.next_run_at < utcRow.next_run_at,
-          `Shanghai 9am (${shRow.next_run_at}) should be before UTC 9am (${utcRow.next_run_at})`);
+        // Deterministic (not time-of-day dependent): the cron fires at 9am in each
+        // task's timezone, so the next run lands at 09:00 UTC for the UTC task and
+        // 01:00 UTC for the Asia/Shanghai (UTC+8) task. Asserting the ORDER of the
+        // two timestamps is flaky — whichever 9am is "next" rolls to tomorrow once
+        // the current UTC hour passes it, flipping the comparison.
+        assert.equal(new Date(utcRow.next_run_at * 1000).getUTCHours(), 9,
+          `UTC 9am cron should schedule at 09:00 UTC (got ${new Date(utcRow.next_run_at * 1000).toISOString()})`);
+        assert.equal(new Date(shRow.next_run_at * 1000).getUTCHours(), 1,
+          `Asia/Shanghai 9am cron should schedule at 01:00 UTC (got ${new Date(shRow.next_run_at * 1000).toISOString()})`);
+        assert.notEqual(shRow.next_run_at, utcRow.next_run_at, 'timezone must affect the schedule');
       });
     } finally {
       if (originalTz === undefined) { delete process.env.TZ; } else { process.env.TZ = originalTz; }

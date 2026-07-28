@@ -118,6 +118,13 @@ function authMiddleware(req, res, next) {
 
 // Middleware
 app.use(express.json());
+// Fork: redirect root to dashboard before static middleware so the legacy
+// public/index.html does not shadow the redirect. Upstream registers this
+// after express.static (around line 445), which leaves the redirect as
+// dead code; we need it to actually run.
+app.get('/', (req, res) => {
+  res.redirect('/dashboard/');
+});
 app.use(express.static(path.join(SKILL_ROOT, 'public')));
 app.use('/api', authMiddleware);
 
@@ -723,10 +730,23 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Serve index.html for root
+// Redirect root to dashboard
 app.get('/', (req, res) => {
-  res.sendFile(path.join(SKILL_ROOT, 'public', 'index.html'));
+  res.redirect('/dashboard/');
 });
+
+// Multi-session dashboard (optional module)
+await (async () => {
+  try {
+    const { registerDashboardRoutes } = await import('./dashboard-routes.js');
+    registerDashboardRoutes(app, { zylosDir: ZYLOS_DIR, skillRoot: SKILL_ROOT, skillsDir: SKILLS_DIR });
+    console.log(`Dashboard available at http://${process.env.WEB_CONSOLE_BIND || '127.0.0.1'}:${PORT}/dashboard/`);
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') {
+      console.error('Dashboard registration failed:', e.message);
+    }
+  }
+})();
 
 // Start server (bind to localhost only for security)
 const BIND_HOST = process.env.WEB_CONSOLE_BIND || '127.0.0.1';

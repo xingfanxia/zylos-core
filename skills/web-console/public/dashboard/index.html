@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Zylos Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/style.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-mono/style.min.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="dashboard">
+    <header>
+      <div class="header-left">
+        <h1>Zylos</h1>
+        <div class="subtitle" id="system-subtitle">Loading...</div>
+      </div>
+      <div class="header-right">
+        <div class="refresh-indicator">
+          <span class="refresh-dot"></span>
+          <span>Live</span>
+        </div>
+        <a href="/" class="nav-link">Console</a>
+      </div>
+    </header>
+
+    <!-- Tab bar -->
+    <nav class="tab-bar" id="tab-bar">
+      <button class="tab active" data-tab="overview">Overview</button>
+      <button class="tab" data-tab="instances">Instances</button>
+      <button class="tab" data-tab="usage">Usage</button>
+      <button class="tab" data-tab="schedule">Schedule</button>
+      <button class="tab" data-tab="processes">Processes</button>
+    </nav>
+
+    <!-- Pending approvals banner -->
+    <div class="approval-banner" id="pending-section" style="display:none">
+      <span class="approval-dot"></span>
+      <span><span id="pending-count">0</span> pending approval(s)</span>
+      <div id="pending-users"></div>
+    </div>
+
+    <!-- Tab panels -->
+    <div class="tab-panel active" id="panel-overview">
+      <div class="stat-cards" id="system-stats">
+        <div class="skeleton" style="height:72px"></div>
+        <div class="skeleton" style="height:72px"></div>
+        <div class="skeleton" style="height:72px"></div>
+      </div>
+      <div class="section-block">
+        <div class="section-title">Instance status</div>
+        <div id="overview-instances">
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-instances">
+      <div class="instances-grid" id="instances-grid">
+        <div class="skeleton" style="height:160px"></div>
+        <div class="skeleton" style="height:160px"></div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-usage">
+      <div class="usage-controls">
+        <div class="usage-filter-groups">
+          <div class="token-tabs" id="token-tabs">
+            <button class="token-tab active" data-days="7">7d</button>
+            <button class="token-tab" data-days="14">14d</button>
+            <button class="token-tab" data-days="30">30d</button>
+          </div>
+          <div class="token-tabs" id="token-runtime-tabs">
+            <button class="token-tab active" data-runtime="all">All</button>
+            <button class="token-tab" data-runtime="claude">Claude</button>
+            <button class="token-tab" data-runtime="codex">Codex</button>
+          </div>
+        </div>
+        <label class="system-toggle">
+          <input type="checkbox" id="include-system"> Include system usage
+        </label>
+      </div>
+      <div class="section-block">
+        <div class="section-title">Runtime Usage</div>
+        <div id="usage-windows">
+          <div class="skeleton" style="height:140px"></div>
+        </div>
+      </div>
+      <div id="token-chart">
+        <div class="skeleton" style="height:200px"></div>
+      </div>
+      <div class="section-block">
+        <div class="section-title">Daily Usage (90 days)</div>
+        <div id="token-calendar"></div>
+        <div id="calendar-breakdown" style="margin-top:20px"></div>
+      </div>
+      <div class="section-block">
+        <div class="section-title">Aggregate Usage Trend</div>
+        <div id="token-trend-total">
+          <div class="skeleton" style="height:240px"></div>
+        </div>
+      </div>
+      <div class="section-block">
+        <div class="section-title">Per-Instance Usage Trend</div>
+        <div id="token-trend-instances">
+          <div class="skeleton" style="height:280px"></div>
+        </div>
+      </div>
+      <div id="token-pie" style="margin-top:24px"></div>
+      <div id="token-table" style="margin-top:24px"></div>
+    </div>
+
+    <div class="tab-panel" id="panel-schedule">
+      <div id="schedule-calendar"></div>
+      <div class="section-block" style="margin-top:24px">
+        <div class="section-title">All tasks</div>
+        <div id="schedule-table">
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+          <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="panel-processes">
+      <div id="pm2-table">
+        <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+        <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+        <div class="skeleton" style="height:20px;margin-bottom:8px"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

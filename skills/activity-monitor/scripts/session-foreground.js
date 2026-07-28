@@ -7,7 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { getClaudePid } from './claude-pid.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+// Multi-session: write to the per-instance state dir — monitor.js reads
+// foreground-session.json from getMonitorDir(), so a shared-dir write here
+// leaves every instance's monitor reading a file nothing writes.
+let MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+try {
+  const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+  MONITOR_DIR = getMonitorDir(process.env.ZYLOS_INSTANCE_ID || undefined);
+} catch { /* single-session fallback */ }
 const FOREGROUND_SESSION_FILE = path.join(MONITOR_DIR, 'foreground-session.json');
 
 function atomicWriteJson(filePath, value) {

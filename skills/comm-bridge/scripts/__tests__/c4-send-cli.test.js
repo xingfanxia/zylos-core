@@ -193,4 +193,38 @@ describe('c4-send failed channel', () => {
       assert.ok(stdout.includes('Failed to send'));
     });
   });
+
+  it('marks the audit out-row failed when the channel send fails', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      const skillDir = path.join(tmpDir, '.claude', 'skills', 'bad-channel', 'scripts');
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, 'send.js'), 'process.exit(1);');
+
+      cli(['bad-channel', 'Hello'], env);
+
+      // The user never received this — the audit row must not read 'delivered'
+      // (a phantom delivered out-row masks unanswered-inbound re-surfacing).
+      const rows = dbRecent(env);
+      const out = rows.find((r) => r.direction === 'out' && r.channel === 'bad-channel');
+      assert.ok(out, 'audit out-row exists');
+      assert.equal(out.status, 'failed');
+    });
+  });
+});
+
+describe('c4-send --delivery-action tag', () => {
+  it('records the delivery_action on the audit out-row', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      setupMockChannel(tmpDir, 'tag-chan');
+
+      const { status } = cli(['--delivery-action=status-notice', 'tag-chan', 'ep1', 'please resend'], env);
+      assert.equal(status, 0);
+
+      const rows = dbRecent(env);
+      const out = rows.find((r) => r.direction === 'out' && r.channel === 'tag-chan');
+      assert.ok(out, 'audit out-row exists');
+      assert.equal(out.delivery_action, 'status-notice');
+      assert.equal(out.status, 'delivered');
+    });
+  });
 });

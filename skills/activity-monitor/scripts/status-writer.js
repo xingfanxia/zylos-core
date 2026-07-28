@@ -25,7 +25,9 @@ export function readInitialStatus({ statusFile }) {
 }
 
 export function publicHealth(health) {
-  if (health === 'ok' || health === 'rate_limited' || health === 'auth_failed') {
+  // The dispatcher holds delivery on any health !== 'ok'; 'degraded' passes
+  // through verbatim so held-reason logs and the dashboard show the real state.
+  if (health === 'ok' || health === 'rate_limited' || health === 'auth_failed' || health === 'degraded') {
     return health;
   }
   return 'unavailable';

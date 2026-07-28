@@ -176,7 +176,7 @@ const _runtimeIndexPath = (() => {
 })();
 const _runtimeDirPath = path.dirname(_runtimeIndexPath);
 const _sessionHandoffPath = path.join(_runtimeDirPath, 'session-handoff.js');
-const { getActiveAdapter } = await import(_runtimeIndexPath);
+const { getActiveAdapter, findRuntimePidUnderPane } = await import(_runtimeIndexPath);
 const { enqueueNewSession } = await import(_sessionHandoffPath);
 
 const __filename = fileURLToPath(import.meta.url);
@@ -184,7 +184,19 @@ const __dirname = path.dirname(__filename);
 
 // Core runtime config
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+// Multi-session (fork): each instance gets its own activity-monitor state dir.
+// getMonitorDir() honors ZYLOS_INSTANCE_ID + instances.json `state_dir` override,
+// falling back to ~/zylos/activity-monitor when no instance is set (single-session).
+const {
+  getInstanceId: _getInstanceId,
+  getMonitorDir: _getInstanceMonitorDir,
+  isPrimary: _isInstancePrimary,
+  isInstanceEnabled: _isInstanceEnabled,
+  getInstanceDef: _getInstanceDef,
+  getAllInstances: _getAllInstances,
+} = await import('../../multi-session/instance-config.js').catch(() => ({}));
+const INSTANCE_ID = _getInstanceId ? _getInstanceId() : null;
+const MONITOR_DIR = _getInstanceMonitorDir ? _getInstanceMonitorDir() : path.join(ZYLOS_DIR, 'activity-monitor');
 const STATUS_FILE = path.join(MONITOR_DIR, 'agent-status.json');
 const AM_SOCKET_FILE = path.join(MONITOR_DIR, 'am.sock');
 const MESSAGE_ROUTER_CACHE_FILE = path.join(MONITOR_DIR, 'message-router-probe-cache.json');
@@ -197,6 +209,7 @@ const UPGRADE_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'upgrade-check-state.jso
 const USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
 const USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
 const USAGE_ALERT_STATE_FILE = path.join(MONITOR_DIR, 'usage-alert-state.json');
+const USAGE_FLEET_ALERT_STATE_FILE = path.join(MONITOR_DIR, 'usage-fleet-alert-state.json');
 
 // API activity snapshot — built by activity-monitor from Claude hook/session signals
 const API_ACTIVITY_FILE = path.join(MONITOR_DIR, 'api-activity.json');
@@ -285,6 +298,21 @@ const USAGE_CRITICAL_THRESHOLD = readConfigInt('usage_critical_threshold', 95); 
 const USAGE_NOTIFY_COOLDOWN = readConfigInt('usage_notify_cooldown', 14400);  // seconds between same-tier notifications (4 hours)
 const USAGE_ACTIVE_HOURS_START = readConfigInt('usage_active_hours_start', 8); // check only during 8:00–23:00
 const USAGE_ACTIVE_HOURS_END = readConfigInt('usage_active_hours_end', 23);
+// Fleet near-full alert (system A / shared 5h+weekly meter). 5h thresholds are
+// LOWER than weekly because the 5h window fills fast.
+const USAGE_5H_WARN_THRESHOLD = readConfigInt('usage_5h_warn_threshold', 70);
+const USAGE_5H_HIGH_THRESHOLD = readConfigInt('usage_5h_high_threshold', 85);
+const USAGE_5H_CRITICAL_THRESHOLD = readConfigInt('usage_5h_critical_threshold', 95);
+const USAGE_FLEET_ALERT_INTERVAL = readConfigInt('usage_fleet_alert_interval', 120); // fast path, NOT idle-gated
+const USAGE_STATUSLINE_STALE_SEC = readConfigInt('usage_statusline_stale_sec', 900); // freshest reading older than this ⇒ "monitoring blind"
+const USAGE_ALERT_NOTIFY_USERS = readConfigBool('usage_alert_notify_users', true); // fan out to affected users (floor = high tier)
+const USAGE_USER_ALERT_MIN_INTERVAL = readConfigInt('usage_user_alert_min_interval', 1800); // independent floor between user fan-outs (churn guard)
+
+// Health escalation + self-recovery (REL-3) and guardian signal TTL (REL-6).
+const FLAP_CEILING_PER_HOUR = readConfigInt('flap_ceiling_per_hour', 6);          // kill-restart cycles/rolling hour before degraded
+const DEGRADED_PROBE_INTERVAL = readConfigInt('degraded_probe_interval', 1200);   // seconds between bounded degraded self-probes
+const RATE_LIMIT_PROBE_INTERVAL = readConfigInt('rate_limit_probe_interval', 900); // floor between rate-limit cooldown-expiry probes
+const SIGNAL_TTL_SEC = readConfigInt('signal_ttl_sec', 600);                      // suspend/wake signals older than this are orphans
 
 // Daily tasks config
 const DAILY_UPGRADE_HOUR = 5;        // 5:00 AM local time
@@ -372,6 +400,7 @@ function resolveCommBridgeScript(fileName) {
 
 const C4_CONTROL_PATH = resolveCommBridgeScript('c4-control.js');
 const C4_DB_PATH = resolveCommBridgeScript('c4-db.js');
+const C4_SEND_PATH = resolveCommBridgeScript('c4-send.js');
 
 function enqueueContextRotationHandoff({ ratio = 0, used = 0, ceiling = 0 } = {}) {
   const pct = Math.round(ratio * 100);
@@ -403,7 +432,10 @@ function atomicWriteJson(filePath, value) {
 }
 
 function writeStatusFile(statusObj) {
-  writeStatus({ statusFile: STATUS_FILE, statusObj, healthEngine: engine });
+  // Stamp every status write with the instance id (multi-session: dashboard + downstream
+  // consumers expect this field to disambiguate per-instance status files).
+  const enriched = INSTANCE_ID ? { ...statusObj, instance_id: INSTANCE_ID } : statusObj;
+  writeStatus({ statusFile: STATUS_FILE, statusObj: enriched, healthEngine: engine });
 }
 
 function buildNotRunningStatus({
@@ -613,6 +645,117 @@ function saveContextMonitorState(state) {
   }
 }
 
+// Direct claude-bypassing send: spawns c4-send.js with the message on stdin,
+// mirroring c4-receive's sendUnhealthyMessage. Reusable across delivery actions
+// (wave-2 health escalation reuses this for admin alerts). Only valid from a
+// non-isolated runner (admin/scheduler) — those use the legacy direct feishu
+// path and may send to any chat_id.
+// REL-9: async (non-blocking) send. Spawns c4-send.js with the message on stdin
+// and resolves { ok, output } on close. Unlike the old spawnSync, this never
+// blocks the AM event loop — the 15s cap kills a hung child but other timers
+// (guardian probes, dispatcher heartbeat consumption) keep running meanwhile.
+// Never rejects: every failure path resolves { ok:false, output } so callers
+// that fire-and-forget can't produce an unhandled rejection.
+const C4_SEND_TIMEOUT_MS = 15000;
+const C4_SEND_MAX_OUTPUT = 256 * 1024; // cap child stdout/stderr accumulation (spawnSync had an implicit maxBuffer)
+function runC4Send(channel, endpoint, message, deliveryAction = 'usage-alert', { spawn: _spawn = spawn } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const done = (r) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(r);
+    };
+    let child;
+    try {
+      const args = [C4_SEND_PATH, `--delivery-action=${deliveryAction}`, channel];
+      if (endpoint) args.push(endpoint);
+      child = _spawn('node', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (err) {
+      return done({ ok: false, output: err.message });
+    }
+    timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      done({ ok: false, output: `timeout after ${C4_SEND_TIMEOUT_MS}ms` });
+    }, C4_SEND_TIMEOUT_MS);
+    let stdout = '';
+    let stderr = '';
+    const cap = (buf, d) => (buf.length >= C4_SEND_MAX_OUTPUT ? buf : (buf + d).slice(0, C4_SEND_MAX_OUTPUT));
+    child.stdout.on('data', (d) => { stdout = cap(stdout, d); });
+    child.stderr.on('data', (d) => { stderr = cap(stderr, d); });
+    child.on('error', (err) => done({ ok: false, output: err.message }));
+    // A child that exits before reading stdin makes child.stdin emit an ASYNC
+    // EPIPE that the sync try/catch below cannot see; with no listener Node turns
+    // it into an uncaughtException that would kill the whole AM daemon (review C1).
+    child.stdin.on('error', (err) => done({ ok: false, output: `stdin: ${err.message}` }));
+    child.on('close', (code) => {
+      if (code === 0) done({ ok: true, output: stdout.trim() });
+      else done({ ok: false, output: (stderr || stdout || `exit ${code}`).trim() });
+    });
+    try {
+      child.stdin.write(message);
+      child.stdin.end();
+    } catch (err) {
+      done({ ok: false, output: `stdin write failed: ${err.message}` });
+    }
+  });
+}
+
+// Admin chat id resolution (reusable seam — wave-2 admin alerts share this).
+function resolveAdminChatId() {
+  try {
+    const def = _getInstanceDef ? _getInstanceDef('admin') : null;
+    return def?.chat_ids?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Statusline path for an arbitrary instance (admin AM reads the shared tree to
+// find the freshest cross-instance reading). Honors state_dir via getMonitorDir.
+function resolveInstanceStatuslineFile(instanceId) {
+  if (_getInstanceMonitorDir) {
+    return path.join(_getInstanceMonitorDir(instanceId), 'statusline.json');
+  }
+  return STATUSLINE_FILE;
+}
+
+const ADMIN_CHAT_ID = resolveAdminChatId();
+
+// Degraded-transition admin alert (REL-3): direct feishu send that bypasses the
+// stuck instance entirely (its own queue can never forward while it flaps).
+function formatDegradedAdminAlert({ cycleCount, windowSec, ceiling, probeIntervalSec, reason }) {
+  const instance = INSTANCE_ID || 'primary';
+  return [
+    `🔴 实例已降级（degraded）：${instance}`,
+    `过去 ${Math.round(windowSec / 60)} 分钟内 kill-restart 循环 ${cycleCount} 次（上限 ${ceiling}/小时），已停止重启循环（触发原因：${reason}）。`,
+    `降级 = 有界自恢复：每 ${Math.round(probeIntervalSec / 60)} 分钟自动重启并探测一次，恢复后自动回到 ok；期间该实例的消息会被暂存，不会丢失。`,
+    '如需立即恢复：检查该实例的 claude 登录/额度状态；给它发一条消息即可触发立刻探测。',
+  ].join('\n');
+}
+
+// REL-9: async, wired as a FIRE-AND-FORGET callback (health-engine.js calls it
+// inside a *synchronous* try/catch that can't catch an async rejection). So it
+// must fully self-contain: the try/catch here covers not just runC4Send but also
+// formatDegradedAdminAlert (throws on bad details) and log (can throw on ENOSPC),
+// guaranteeing the returned promise never rejects → no unhandledRejection.
+async function notifyDegradedAdmin(details) {
+  try {
+    if (!ADMIN_CHAT_ID) {
+      log('Degraded admin alert skipped: no admin chat_id configured');
+      return;
+    }
+    const res = await runC4Send('feishu', ADMIN_CHAT_ID, formatDegradedAdminAlert(details), 'health-alert');
+    log(res.ok
+      ? `Degraded admin alert sent (${details.cycleCount} cycles/${Math.round(details.windowSec / 60)}min)`
+      : `Degraded admin alert failed: ${res.output}`);
+  } catch (err) {
+    try { log(`Degraded admin alert error: ${err && err.message}`); } catch { /* logging itself failed */ }
+  }
+}
+
 function readJsonFileSafe(filePath) {
   try {
     if (!fs.existsSync(filePath)) return null;
@@ -656,27 +799,9 @@ function getTmuxPanePid(sessionName) {
 function getTmuxClaudePid(sessionName) {
   const panePid = getTmuxPanePid(sessionName);
   if (!panePid) return 0;
-
-  try {
-    const name = execSync(`ps -p ${panePid} -o comm= 2>/dev/null`, {
-      encoding: 'utf8',
-      timeout: 3000
-    }).trim();
-    if (name === 'claude') return panePid;
-  } catch {
-    // Ignore and fall through.
-  }
-
-  try {
-    const out = execSync(`pgrep -P ${panePid} -f "claude" | head -1`, {
-      encoding: 'utf8',
-      timeout: 3000
-    }).trim();
-    const childPid = Number.parseInt(out, 10);
-    return Number.isInteger(childPid) && childPid > 0 ? childPid : 0;
-  } catch {
-    return 0;
-  }
+  // Shared util: pane pid itself when it IS the runtime (non-os_user), else the
+  // runtime descendant (os_user nests it under sudo -> sudo -> node -> claude).
+  return findRuntimePidUnderPane(panePid, 'claude');
 }
 
 function writeWatchdogState() {
@@ -897,8 +1022,15 @@ function executeUpgradeCheck() {
 }
 
 function createUsageMonitor(activeAdapter) {
+  const runtimeProfile = activeAdapter.config?.runtimeProfile || null;
   return createRuntimeUsageMonitor(activeAdapter, {
     zylosDir: ZYLOS_DIR,
+    instanceId: INSTANCE_ID,
+    // Named profiles explicitly declare which subscription quota they use.
+    // `null` means an API-backed profile (for example Azure) and disables
+    // subscription reminders instead of misreporting Codex subscription usage.
+    ...(runtimeProfile?.id ? { usageProvider: runtimeProfile.usageProvider } : {}),
+    codexHome: runtimeProfile?.codexHome,
     statuslineFile: STATUSLINE_FILE,
     usageStateFile: USAGE_STATE_FILE,
     usageCodexStateFile: USAGE_CODEX_STATE_FILE,
@@ -913,6 +1045,19 @@ function createUsageMonitor(activeAdapter) {
     notifyCooldownSec: USAGE_NOTIFY_COOLDOWN,
     activeHoursStart: USAGE_ACTIVE_HOURS_START,
     activeHoursEnd: USAGE_ACTIVE_HOURS_END,
+    // Fleet near-full alert wiring.
+    fiveHourWarnThreshold: USAGE_5H_WARN_THRESHOLD,
+    fiveHourHighThreshold: USAGE_5H_HIGH_THRESHOLD,
+    fiveHourCriticalThreshold: USAGE_5H_CRITICAL_THRESHOLD,
+    statuslineStaleSec: USAGE_STATUSLINE_STALE_SEC,
+    notifyUsers: USAGE_ALERT_NOTIFY_USERS,
+    userAlertMinIntervalSec: USAGE_USER_ALERT_MIN_INTERVAL,
+    isPrimary: () => (_isInstancePrimary ? _isInstancePrimary(INSTANCE_ID) : true),
+    getAllInstances: () => (_getAllInstances ? _getAllInstances() : []),
+    adminChatId: ADMIN_CHAT_ID,
+    fleetAlertStateFile: USAGE_FLEET_ALERT_STATE_FILE,
+    statuslineFileFor: resolveInstanceStatuslineFile,
+    c4Send: (channel, endpoint, message) => runC4Send(channel, endpoint, message, 'usage-alert'),
     getLocalHour,
     runC4Control,
     log,
@@ -928,6 +1073,7 @@ function createTaskScheduler(activeUsageMonitor) {
     healthCheckInterval: HEALTH_CHECK_INTERVAL,
     usageCheckInterval: USAGE_CHECK_INTERVAL,
     usageAlertInterval: USAGE_ALERT_INTERVAL,
+    usageFleetAlertInterval: USAGE_FLEET_ALERT_INTERVAL,
     readDailyUpgradeEnabled: () => readConfigBool('daily_upgrade_enabled', false),
     readHealthCheckEnabled: () => readConfigBool('health_check_enabled', true),
     loadDailyUpgradeState,
@@ -987,13 +1133,21 @@ function createHealthEngine(activeAdapter, initialStatus) {
     log,
     rateLimitDefaultCooldown: RATE_LIMIT_DEFAULT_COOLDOWN,
     userMessageRecoveryCooldown: USER_MESSAGE_RECOVERY_COOLDOWN,
+    flapCeilingPerHour: FLAP_CEILING_PER_HOUR,
+    degradedProbeInterval: DEGRADED_PROBE_INTERVAL,
+    rateLimitProbeInterval: RATE_LIMIT_PROBE_INTERVAL,
+    notifyDegraded: notifyDegradedAdmin,
   });
 }
 
-function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs) {
+function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, { monitorDir } = {}) {
   return createRuntimeGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, {
     apiActivityFile: API_ACTIVITY_FILE,
     hookStateFile: HOOK_STATE_FILE,
+    // REL-6: forwarding monitorDir enables the suspend/wake gate — this wrapper
+    // omitting it is exactly what left the gate dead in prod.
+    monitorDir: monitorDir ?? MONITOR_DIR,
+    signalTtlSec: SIGNAL_TTL_SEC,
     log,
   });
 }
@@ -1043,7 +1197,7 @@ function init() {
     readConfigObject,
     createToolPipeline,
     readWatchdogState: () => readJsonFileSafe(TOOL_WATCHDOG_STATE_FILE),
-    createProcSampler: (activeAdapter) => createRuntimeProcSampler(activeAdapter, { log }),
+    createProcSampler: (activeAdapter) => createRuntimeProcSampler(activeAdapter, { log, findRuntimePidUnderPane }),
     loadInitialHealth,
     createHealthEngine,
     createGuardian,
@@ -1071,28 +1225,69 @@ function init() {
   } = orchestrator.start());
 }
 
-try {
-  init();
-} catch (err) {
-  // init() failure (e.g. unknown runtime in config.json) must not crash the PM2 process
-  // into a tight restart loop. Log and exit cleanly so PM2 backs off via its restart policy.
-  console.error(`[activity-monitor] Fatal: init() failed: ${err.message}`);
-  process.exit(1);
-}
-log(`=== Activity Monitor Started (v25 - RuntimeAdapter: ${adapter.displayName} | Guardian + Heartbeat v4 + ProcSampler + LiveAuth + DailyTasks + UpgradeCheck + UsageMonitor): ${new Date().toISOString()} tz=${timezone} ===`);
+// REL-9b seam: gate the daemon side-effects (init, process handlers, schedule
+// loop) so tests can `import` this module without launching the whole monitor.
+// Production (pm2 → activity-monitor.js → `import './monitor.js'`) leaves
+// MONITOR_DISABLE_MAIN unset, so the daemon runs; the test harness sets
+// MONITOR_DISABLE_MAIN=1 before importing so only the exported functions load.
+//
+// Do NOT gate on process.argv[1] / main-module detection. Under pm2 fork_mode
+// process.argv[1] is pm2's own ProcessContainerFork.js (NOT activity-monitor.js),
+// so ANY argv/entry-name check evaluates false in production and silently
+// disables the daemon — an alive-but-dead monitor (message-router listens, but
+// monitorLoop never runs and activity.log goes cold). Verified 2026-07-12: the
+// prior argv-based gate passed `node --test` (argv[1] = the test file) yet broke
+// every pm2-launched instance. The env opt-out is the only launch-mode-agnostic
+// signal, and it is exactly what the tests already set.
+export { runC4Send, notifyDegradedAdmin, formatDegradedAdminAlert };
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.once(signal, () => {
-    engine?.destroy();
-    stopMessageRouterServer();
-    process.exit(0);
+const RUN_MAIN = process.env.MONITOR_DISABLE_MAIN !== '1';
+
+if (RUN_MAIN) {
+  try {
+    init();
+  } catch (err) {
+    // init() failure (e.g. unknown runtime in config.json) must not crash the PM2 process
+    // into a tight restart loop. Log and exit cleanly so PM2 backs off via its restart policy.
+    console.error(`[activity-monitor] Fatal: init() failed: ${err.message}`);
+    process.exit(1);
+  }
+  log(`=== Activity Monitor Started (v25 - RuntimeAdapter: ${adapter.displayName} | Guardian + Heartbeat v4 + ProcSampler + LiveAuth + DailyTasks + UpgradeCheck + UsageMonitor): ${new Date().toISOString()} tz=${timezone} ===`);
+
+  // REL-9 (review H1): this is a liveness SUPERVISOR — a single dropped async edge
+  // (the scheduler and health-engine fire-and-forget promise SENDS) must never take
+  // the whole monitor down. A rejected send promise is expected-and-benign, so
+  // log-and-survive; the targeted C1/M1 fixes prevent these from firing in the first
+  // place, this is the net for that specific class.
+  process.on('unhandledRejection', (reason) => {
+    try { log(`UNHANDLED REJECTION: ${reason && (reason.stack || reason.message || reason)}`); } catch { /* logging failed */ }
   });
-}
+  // REL-9 rev (async-crash MEDIUM): an uncaughtException is DIFFERENT — it means
+  // corrupt process state, not a dropped send edge (those resolve via their own
+  // listeners + unhandledRejection above). Swallowing it turns a crash+PM2-restart
+  // into an invisible alive-but-dead supervisor (PM2 never restarts a process that
+  // doesn't exit; the survived-log line doesn't even match log()'s pm2-visible prefix
+  // filter). Fail LOUD (console.error reaches `pm2 logs`) and exit(1) so PM2 restarts
+  // a clean daemon — same contract the init() catch above already chose.
+  process.on('uncaughtException', (err) => {
+    try { log(`UNCAUGHT EXCEPTION (exiting for clean restart): ${err && (err.stack || err.message)}`); } catch { /* logging failed */ }
+    try { console.error(`[activity-monitor] FATAL uncaughtException — exiting for PM2 restart: ${err && (err.stack || err.message)}`); } catch { /* stderr failed */ }
+    process.exit(1);
+  });
 
-// Use self-scheduling loop instead of setInterval to prevent concurrent
-// invocations: async monitorLoop + setInterval can overlap if isRunning()
-// takes >INTERVAL ms (e.g., under high system load), causing state variable races.
-(async function scheduleLoop() {
-  await monitorLoop().catch(err => log(`Monitor loop error: ${err.message}`));
-  setTimeout(scheduleLoop, INTERVAL);
-})();
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+      engine?.destroy();
+      stopMessageRouterServer();
+      process.exit(0);
+    });
+  }
+
+  // Use self-scheduling loop instead of setInterval to prevent concurrent
+  // invocations: async monitorLoop + setInterval can overlap if isRunning()
+  // takes >INTERVAL ms (e.g., under high system load), causing state variable races.
+  (async function scheduleLoop() {
+    await monitorLoop().catch(err => log(`Monitor loop error: ${err.message}`));
+    setTimeout(scheduleLoop, INTERVAL);
+  })();
+}

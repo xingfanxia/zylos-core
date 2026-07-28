@@ -58,19 +58,25 @@ function eventKey(event) {
 }
 
 export function codexHooksPath(zylosDir) {
-  return path.join(path.resolve(zylosDir), '.codex', 'hooks.json');
+  return path.join(canonicalExistingPath(zylosDir), '.codex', 'hooks.json');
 }
 
-export function codexTrustMarkerPath(zylosDir) {
-  return path.join(path.resolve(zylosDir), '.codex', 'hooks.trust.json');
+export function codexTrustMarkerPath(zylosDir, codexHome = null) {
+  const suffix = codexHome ? `.${sha256(path.resolve(codexHome)).slice(0, 12)}` : '';
+  return path.join(path.resolve(zylosDir), '.codex', `hooks.trust${suffix}.json`);
+}
+
+function canonicalExistingPath(input) {
+  const resolved = path.resolve(input);
+  try { return fs.realpathSync(resolved); } catch { return resolved; }
 }
 
 export function codexProjectConfigPath(projectDir) {
   return path.join(path.resolve(projectDir), '.codex', 'config.toml');
 }
 
-export function codexGlobalConfigPath(homeDir = os.homedir()) {
-  return path.join(homeDir, '.codex', 'config.toml');
+export function codexGlobalConfigPath(homeDir = os.homedir(), codexHome = null) {
+  return path.join(codexHome || path.join(homeDir, '.codex'), 'config.toml');
 }
 
 export function coreSessionStartCommand(zylosDir) {
@@ -226,10 +232,10 @@ export function ensureHooksFeatureAtPath(filePath) {
   return { path: filePath, changed: false };
 }
 
-export function ensureHooksFeature({ projectDir, homeDir = os.homedir() }) {
+export function ensureHooksFeature({ projectDir, homeDir = os.homedir(), codexHome = null }) {
   const paths = [
     codexProjectConfigPath(projectDir),
-    codexGlobalConfigPath(homeDir),
+    codexGlobalConfigPath(homeDir, codexHome),
   ];
   const results = paths.map(ensureHooksFeatureAtPath);
   return {
@@ -250,6 +256,40 @@ export function hooksFeatureEnabledAtPath(filePath) {
   return obj?.features?.hooks === true;
 }
 
+export function ensureTrustedProjectsAtPath(filePath, projectDirs = []) {
+  let existing = '';
+  try { existing = fs.readFileSync(filePath, 'utf8'); } catch { /* new file */ }
+  const obj = parseToml(existing);
+  obj.projects = isSection(obj.projects) ? obj.projects : {};
+  for (const projectDir of projectDirs) {
+    for (const abs of projectTrustPaths(projectDir)) {
+      const current = isSection(obj.projects[abs]) ? obj.projects[abs] : {};
+      obj.projects[abs] = { ...current, trust_level: 'trusted' };
+    }
+  }
+  const next = stringifyToml(obj);
+  if (next === existing) return { path: filePath, changed: false };
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, next, 'utf8');
+  return { path: filePath, changed: true };
+}
+
+export function projectTrustedAtPath(filePath, projectDir) {
+  let content = '';
+  try { content = fs.readFileSync(filePath, 'utf8'); } catch { return false; }
+  const obj = parseToml(content);
+  return projectTrustPaths(projectDir).every(
+    projectPath => obj?.projects?.[projectPath]?.trust_level === 'trusted'
+  );
+}
+
+function projectTrustPaths(projectDir) {
+  const resolved = path.resolve(projectDir);
+  let real = resolved;
+  try { real = fs.realpathSync(resolved); } catch { /* keep resolved */ }
+  return [...new Set([resolved, real])];
+}
+
 export function readHooksState(globalConfigPath) {
   let content = '';
   try {
@@ -262,11 +302,13 @@ export function readHooksState(globalConfigPath) {
   return isSection(state) ? state : {};
 }
 
-export function extractTrustSnapshot(hooksState = {}, hooksPath = '') {
+export function extractTrustSnapshot(hooksState = {}, hooksPath = '', allowedKeys = null) {
   const prefix = hooksPath ? `${hooksPath}:` : '';
+  const allowed = allowedKeys ? new Set(allowedKeys) : null;
   const out = {};
   for (const [key, value] of Object.entries(hooksState || {})) {
     if (prefix && !key.startsWith(prefix)) continue;
+    if (allowed && !allowed.has(key)) continue;
     if (!value || typeof value !== 'object') continue;
     out[key] = {
       enabled: value.enabled === true,
@@ -274,6 +316,22 @@ export function extractTrustSnapshot(hooksState = {}, hooksPath = '') {
     };
   }
   return stable(out);
+}
+
+function configuredHookKeys(hooksPath) {
+  const config = readCodexHooksConfig(hooksPath);
+  const keys = [];
+  for (const [event, groups] of Object.entries(config.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    groups.forEach((group, groupIndex) => {
+      if (!Array.isArray(group?.hooks)) return;
+      group.hooks.forEach((hook, hookIndex) => {
+        if (!hook?.command) return;
+        keys.push(`${hooksPath}:${eventKey(event)}:${groupIndex}:${hookIndex}`);
+      });
+    });
+  }
+  return keys.sort();
 }
 
 function readTrustMarker(markerPath) {
@@ -289,6 +347,24 @@ function writeTrustMarker(markerPath, marker) {
   fs.writeFileSync(markerPath, JSON.stringify(stable(marker), null, 2) + '\n', { mode: 0o600 });
 }
 
+function restoreSharedProfileConfigAccess({ globalConfig, runAsUser, execFileSyncImpl }) {
+  if (!runAsUser) return;
+  const operatorUser = os.userInfo().username;
+  const execImpl = execFileSyncImpl || execFileSync;
+  try {
+    execImpl('sudo', ['-n', 'chown', `${operatorUser}:${runAsUser}`, globalConfig], {
+      timeout: 10_000,
+      stdio: 'ignore',
+    });
+    execImpl('sudo', ['-n', 'chmod', '0660', globalConfig], {
+      timeout: 10_000,
+      stdio: 'ignore',
+    });
+  } catch (error) {
+    throw new Error(`Codex hook trust failed (profile_access_restore). ${error.message}`);
+  }
+}
+
 export function getCodexVersion({ codexBin = process.env.CODEX_BIN || 'codex', execFileSyncImpl } = {}) {
   const execImpl = execFileSyncImpl || execFileSync;
   return String(execImpl(codexBin, ['--version'], {
@@ -302,11 +378,12 @@ export function isCodexTrustValid({
   zylosDir,
   projectDir = zylosDir,
   homeDir = os.homedir(),
+  codexHome = null,
   codexVersion,
 } = {}) {
   const hooksPath = codexHooksPath(zylosDir);
-  const markerPath = codexTrustMarkerPath(zylosDir);
-  const globalConfig = codexGlobalConfigPath(homeDir);
+  const markerPath = codexTrustMarkerPath(zylosDir, codexHome);
+  const globalConfig = codexGlobalConfigPath(homeDir, codexHome);
   const projectConfig = codexProjectConfigPath(projectDir);
   let hooksContent = '';
   try {
@@ -317,13 +394,22 @@ export function isCodexTrustValid({
 
   if (!hooksFeatureEnabledAtPath(projectConfig)) return { valid: false, reason: 'project_hooks_feature_off' };
   if (!hooksFeatureEnabledAtPath(globalConfig)) return { valid: false, reason: 'global_hooks_feature_off' };
+  if (!projectTrustedAtPath(globalConfig, zylosDir)) return { valid: false, reason: 'zylos_project_untrusted' };
+  if (!projectTrustedAtPath(globalConfig, projectDir)) return { valid: false, reason: 'instance_project_untrusted' };
 
   const marker = readTrustMarker(markerPath);
   if (!marker) return { valid: false, reason: 'missing_marker' };
   if (marker.hooksHash !== sha256(hooksContent)) return { valid: false, reason: 'hooks_json_changed' };
   if (marker.codexVersion !== codexVersion) return { valid: false, reason: 'codex_version_changed' };
 
-  const currentSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath);
+  const expectedKeys = configuredHookKeys(hooksPath);
+  const currentSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath, expectedKeys);
+  if (expectedKeys.length === 0 || Object.keys(currentSnapshot).length !== expectedKeys.length) {
+    return { valid: false, reason: 'trust_snapshot_incomplete' };
+  }
+  if (Object.values(currentSnapshot).some(value => !value.enabled || !value.trusted_hash)) {
+    return { valid: false, reason: 'trust_snapshot_untrusted' };
+  }
   if (stableJson(currentSnapshot) !== stableJson(marker.trustSnapshot || {})) {
     return { valid: false, reason: 'trust_snapshot_changed' };
   }
@@ -337,6 +423,10 @@ export function hookKeyFor({ zylosDir, event, groupIndex, hookIndex }) {
 
 export function trustCodexHooksWithAppServer({
   zylosDir,
+  projectDir = zylosDir,
+  homeDir = os.homedir(),
+  codexHome = null,
+  runAsUser = null,
   codexBin = process.env.CODEX_BIN || 'codex',
   spawnSyncImpl = spawnSync,
   timeoutMs = DEFAULT_TRUST_TIMEOUT_MS,
@@ -345,6 +435,8 @@ export function trustCodexHooksWithAppServer({
 const { spawn } = require('node:child_process');
 
 const cwd = process.env.ZYLOS_CODEX_TRUST_CWD;
+const trustedHooksPath = process.env.ZYLOS_CODEX_TRUST_HOOKS_PATH;
+const trustedKeyPrefix = trustedHooksPath + ':';
 const codexBin = process.env.ZYLOS_CODEX_BIN || 'codex';
 const app = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
   cwd,
@@ -417,7 +509,11 @@ app.stdout.on('data', chunk => {
       const state = {};
       for (const entry of msg.result?.data || []) {
         for (const hook of entry.hooks || []) {
-          if (hook.isManaged || !hook.key) continue;
+          if (
+            hook.isManaged
+            || !hook.key
+            || !hook.key.startsWith(trustedKeyPrefix)
+          ) continue;
           candidateCount++;
           if (!hook.currentHash) {
             missingHashCount++;
@@ -466,13 +562,31 @@ send('initialize', {
 });
 `;
 
-  const result = spawnSyncImpl(process.execPath, ['-e', helper], {
-    cwd: zylosDir,
-    env: {
-      ...process.env,
-      ZYLOS_CODEX_TRUST_CWD: zylosDir,
-      ZYLOS_CODEX_BIN: codexBin,
-    },
+  const trustCwd = canonicalExistingPath(projectDir);
+  const trustedHooksPath = codexHooksPath(zylosDir);
+  const helperEnv = {
+    ...process.env,
+    HOME: homeDir,
+    ...(codexHome ? { CODEX_HOME: codexHome } : {}),
+    ZYLOS_CODEX_TRUST_CWD: trustCwd,
+    ZYLOS_CODEX_TRUST_HOOKS_PATH: trustedHooksPath,
+    ZYLOS_CODEX_BIN: codexBin,
+  };
+  const executable = runAsUser ? 'sudo' : process.execPath;
+  const helperArgs = runAsUser
+    ? [
+      '-n', '-u', runAsUser, '-H', '--', '/usr/bin/env',
+      `HOME=${homeDir}`,
+      ...(codexHome ? [`CODEX_HOME=${codexHome}`] : []),
+      `ZYLOS_CODEX_TRUST_CWD=${trustCwd}`,
+      `ZYLOS_CODEX_TRUST_HOOKS_PATH=${trustedHooksPath}`,
+      `ZYLOS_CODEX_BIN=${codexBin}`,
+      process.execPath, '-e', helper,
+    ]
+    : ['-e', helper];
+  const result = spawnSyncImpl(executable, helperArgs, {
+    cwd: trustCwd,
+    env: helperEnv,
     encoding: 'utf8',
     timeout: timeoutMs,
   });
@@ -500,18 +614,34 @@ export function ensureCodexHooksTrusted({
   zylosDir,
   projectDir = zylosDir,
   homeDir = os.homedir(),
+  codexHome = null,
+  runAsUser = null,
   codexBin = process.env.CODEX_BIN || 'codex',
   execFileSyncImpl,
   spawnSyncImpl = spawnSync,
 } = {}) {
   installCoreCodexHook({ zylosDir });
 
+  const globalConfig = codexGlobalConfigPath(homeDir, codexHome);
+  // Recover profiles left persona-only by an interrupted/older app-server
+  // trust attempt before any validity/config read occurs.
+  restoreSharedProfileConfigAccess({ globalConfig, runAsUser, execFileSyncImpl });
+
   const codexVersion = getCodexVersion({ codexBin, execFileSyncImpl });
-  const validity = isCodexTrustValid({ zylosDir, projectDir, homeDir, codexVersion });
+  const validity = isCodexTrustValid({ zylosDir, projectDir, homeDir, codexHome, codexVersion });
   if (validity.valid) return { trusted: false, skipped: true, reason: validity.reason };
 
-  ensureHooksFeature({ projectDir, homeDir });
-  const trust = trustCodexHooksWithAppServer({ zylosDir, codexBin, spawnSyncImpl });
+  ensureHooksFeature({ projectDir, homeDir, codexHome });
+  ensureTrustedProjectsAtPath(codexGlobalConfigPath(homeDir, codexHome), [zylosDir, projectDir]);
+  const trust = trustCodexHooksWithAppServer({
+    zylosDir,
+    projectDir,
+    homeDir,
+    codexHome,
+    runAsUser,
+    codexBin,
+    spawnSyncImpl,
+  });
   if (!trust.ok) {
     throw new Error(`Codex hook trust failed (${trust.reason || 'unknown'}). Native SessionStart bootstrap may not run.`);
   }
@@ -524,13 +654,20 @@ export function ensureCodexHooksTrusted({
   }
 
   const hooksPath = codexHooksPath(zylosDir);
-  const globalConfig = codexGlobalConfigPath(homeDir);
+  // app-server atomically replaces config.toml as the persona user (0600).
+  // Restore operator:<persona> before the monitor reads hooks.state below.
+  restoreSharedProfileConfigAccess({ globalConfig, runAsUser, execFileSyncImpl });
   const hooksContent = fs.readFileSync(hooksPath, 'utf8');
-  const trustSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath);
-  if (Object.keys(trustSnapshot).length === 0) {
-    throw new Error('Codex hook trust failed (empty_trust_snapshot). Native SessionStart bootstrap may not run.');
+  const expectedKeys = configuredHookKeys(hooksPath);
+  const trustSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath, expectedKeys);
+  if (
+    expectedKeys.length === 0
+    || Object.keys(trustSnapshot).length !== expectedKeys.length
+    || Object.values(trustSnapshot).some(value => !value.enabled || !value.trusted_hash)
+  ) {
+    throw new Error('Codex hook trust failed (incomplete_trust_snapshot). Native SessionStart bootstrap may not run.');
   }
-  writeTrustMarker(codexTrustMarkerPath(zylosDir), {
+  writeTrustMarker(codexTrustMarkerPath(zylosDir, codexHome), {
     hooksHash: sha256(hooksContent),
     codexVersion,
     trustSnapshot,
