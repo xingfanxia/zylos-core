@@ -242,16 +242,43 @@ export function isMultiSession() {
 export function updateInstancesConfig(mutator) {
   return withFileLock(INSTANCES_FILE + '.lock', () => {
     let input = null;
+    let previousMetadata = null;
+    try {
+      previousMetadata = fs.statSync(INSTANCES_FILE);
+    } catch (err) {
+      if (err?.code !== 'ENOENT') throw err;
+    }
     try {
       input = JSON.parse(fs.readFileSync(INSTANCES_FILE, 'utf8'));
-    } catch {
+    } catch (err) {
+      if (previousMetadata && !(err instanceof SyntaxError)) throw err;
       input = null; // missing/corrupt → legacy mode, mutator decides
     }
     const updated = mutator(input);
     if (!updated) return; // mutator declined the update
-    const tmpPath = INSTANCES_FILE + '.tmp';
-    fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2) + '\n');
-    fs.renameSync(tmpPath, INSTANCES_FILE);
+    const tmpPath = `${INSTANCES_FILE}.tmp.${process.pid}`;
+    const previousMode = previousMetadata ? previousMetadata.mode & 0o777 : null;
+    try {
+      fs.writeFileSync(tmpPath, JSON.stringify(updated, null, 2) + '\n', {
+        // chmod below defeats the writer's umask; this mode limits exposure if
+        // the process dies between write and metadata restoration.
+        mode: previousMode ?? 0o600,
+      });
+      if (previousMetadata) {
+        fs.chownSync(tmpPath, previousMetadata.uid, previousMetadata.gid);
+        fs.chmodSync(tmpPath, previousMode);
+        const tmpMetadata = fs.statSync(tmpPath);
+        if (tmpMetadata.uid !== previousMetadata.uid
+            || tmpMetadata.gid !== previousMetadata.gid
+            || (tmpMetadata.mode & 0o777) !== previousMode) {
+          throw new Error('temporary instances.json metadata does not match the original');
+        }
+      }
+      fs.renameSync(tmpPath, INSTANCES_FILE);
+    } catch (err) {
+      try { fs.unlinkSync(tmpPath); } catch { /* absent or already renamed */ }
+      throw err;
+    }
     config = updated; // update in-memory
     lastMtime = fs.statSync(INSTANCES_FILE).mtimeMs; // use actual filesystem mtime
   });
@@ -371,4 +398,3 @@ function getGroupInstance() {
   const instances = getAllInstances();
   return instances.find(inst => inst.type === 'group') || null;
 }
-
