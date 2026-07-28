@@ -7,6 +7,12 @@ have broad control of this environment (shell, network, installed tools), but
 capabilities vary per machine — verify before assuming (e.g. sudo may require
 a password; check what is actually installed).
 
+**OS-isolated instances** set `os_user` in `instances.json` and run as a
+dedicated Unix user without sudo. Check with `whoami`. Permission errors on
+other instances, operator configuration, or protected source are intentional;
+do not retry or work around them. Tell the owner when a task genuinely requires
+an admin-only resource.
+
 ## Behavioral Rules
 
 **These rules are mandatory and override any default behavior.**
@@ -146,14 +152,17 @@ Persistent memory lives in `~/zylos/memory/`.
 
 | Tier | Path | Purpose | Loading |
 |------|------|---------|---------|
-| **Identity** | `memory/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
+| **Identity** | `memory/shared/identity.md` | Bot soul: personality, principles, digital assets | Always (session start) |
 | **Custom** | `custom-hooks/session-start/*.md` | Operator-placed standing directives (machine-local); not agent-managed | Always (session start) |
-| **State** | `memory/state.md` | Active work, pending tasks | Always (session start) |
-| **References** | `memory/references.md` | Pointers to config files, key paths | Always (session start) |
-| **User Profiles** | `memory/users/<id>/profile.md` | Per-user preferences | On demand |
-| **Reference** | `memory/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
-| **Sessions** | `memory/sessions/current.md` | Today's event log | On demand |
+| **State** | `memory/instances/<id>/state.md` | Active work, pending tasks for this instance | Always (session start) |
+| **References** | `memory/shared/references.md` | Pointers to config files, key paths | Always (session start) |
+| **User Profiles** | `memory/shared/users/<id>/profile.md` | Per-user preferences | On demand |
+| **Reference** | `memory/shared/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
+| **Sessions** | `memory/instances/<id>/sessions/current.md` | This instance's event log | On demand |
 | **Archive** | `memory/archive/` | Cold storage | Rarely |
+
+Single-session installations without `memory/shared/` use the legacy paths
+directly under `memory/`.
 
 ### Custom Standing Directives (`custom-hooks/session-start/`)
 
@@ -171,6 +180,31 @@ readme `.md` files inside.
 
 The bot serves a team. Route user-specific preferences to
 `memory/users/<id>/profile.md`. Bot identity stays in `identity.md`.
+
+In multi-session mode, shared identity/reference/user files live under
+`memory/shared/`; per-instance state and sessions live under
+`memory/instances/<id>/`; group-chat memory lives under
+`memory/groups/<group_key>/` and is owned by the group instance.
+
+### Single-Owner & Scoping Rules
+
+- One work loop has one owner. Detailed per-user work belongs only in the
+  owning instance's state; admin state may point to it but must not duplicate
+  the detail.
+- An instance-scoped C4 view only contains rows targeted to that instance.
+  Older, untargeted history may still exist, so do not infer “no history” from
+  an empty scoped result.
+- `instances.json` is authoritative for whether an instance is enabled; stale
+  memory notes do not override it.
+- Non-primary instances may write only their own instance memory and the
+  relevant user profile. Never write another instance's directory or shared
+  memory unless the startup policy explicitly grants it.
+
+### Instance Approval
+
+New multi-session users remain pending until the primary owner approves them
+with `zylos instance approve <id>`. Only enabled instances may dispatch work
+or access shared memory.
 
 ### Memory Update Practices
 
@@ -215,6 +249,13 @@ a user → their profile; making a decision → `decisions.md`; starting/resumin
 work → `projects.md`; following a convention → `preferences.md`; exploring
 ideas → `ideas.md`; recalling recent events → `sessions/current.md`;
 historical info → `archive/`.
+
+## Inter-Instance Communication
+
+To request context from another instance, use
+`c4-query-instance.js --from <current> --to <target> --content <question>`.
+The target decides what it can share; do not bypass that boundary by reading
+its private files directly.
 
 ## Data Directories
 

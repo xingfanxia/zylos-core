@@ -11,8 +11,8 @@ export function createUsageMonitor(activeAdapter, options) {
   return new UsageMonitor(activeAdapter, options);
 }
 
-export function createProcSampler(activeAdapter, { log }) {
-  return new ProcSampler({ sessionName: activeAdapter.sessionName, log });
+export function createProcSampler(activeAdapter, { log, findRuntimePidUnderPane }) {
+  return new ProcSampler({ sessionName: activeAdapter.sessionName, log, findRuntimePidUnderPane });
 }
 
 export function createToolPipeline(activeAdapter, config, {
@@ -38,27 +38,39 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   log,
   rateLimitDefaultCooldown,
   userMessageRecoveryCooldown,
+  flapCeilingPerHour,
+  degradedProbeInterval,
+  rateLimitProbeInterval,
+  notifyDegraded,
 }) {
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
     killTmuxSession: () => activeAdapter.stop(),
     checkAuth: () => activeAdapter.checkAuth ? activeAdapter.checkAuth() : { status: 'success', reason: 'no_checkAuth' },
+    notifyDegraded, // REL-3: out-of-band admin alert on the flap-ceiling transition
     log,
   }, {
     initialHealth: initialStatus.health,
     initialReason: initialStatus.unavailable_reason || '',
     rateLimitDefaultCooldown,
     userMessageRecoveryCooldown,
+    flapCeilingPerHour,
+    degradedProbeInterval,
+    rateLimitProbeInterval,
   });
 }
 
 export function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, {
   apiActivityFile,
   hookStateFile,
+  monitorDir,
+  signalTtlSec,
   log,
 }) {
   return new Guardian(activeAdapter, {
     log,
+    monitorDir, // ZY-LIFE-1: enables the auto-suspend gate
+    signalTtlSec, // REL-6: orphaned suspend/wake signals are ignored + deleted
     initialRuntimeLaunchAtMs,
     resetToolLifecycleState: () => {
       activeToolPipeline.reset({ clearFiles: true });
@@ -127,14 +139,22 @@ export function startContextMonitor(activeAdapter, {
   return monitor;
 }
 
-export function scheduleStaleRuntimeCleanup(activeAdapter, { log }) {
+export function scheduleStaleRuntimeCleanup(activeAdapter, {
+  log,
+  setTimeoutImpl = setTimeout,
+  execFileSyncImpl = execFileSync,
+}) {
   // Runs on every startup (not just runtime switches). If the other session is
   // absent, the kill fails silently. The delay gives a running agent time to
   // finish its current response before being terminated.
   const otherSession = activeAdapter.runtimeId === 'codex' ? 'claude-main' : 'codex-main';
-  setTimeout(() => {
+  // Runtime failover deliberately preserves the persona's stable tmux name
+  // (often `claude-main`) across providers. Never mistake that active stable
+  // identity for a stale session and kill it ten seconds after every restart.
+  if (otherSession === activeAdapter.sessionName) return;
+  setTimeoutImpl(() => {
     try {
-      execSync(`tmux kill-session -t "${otherSession}" 2>/dev/null`, { stdio: 'pipe', timeout: 3000 });
+      execFileSyncImpl('tmux', ['kill-session', '-t', otherSession], { stdio: 'pipe', timeout: 3000 });
       log(`Startup cleanup: killed stale ${otherSession} session from previous runtime`);
     } catch { /* session didn't exist, normal startup no-op */ }
   }, 10_000);

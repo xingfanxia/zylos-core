@@ -51,6 +51,14 @@ const commands = {
   help: showHelp,
 };
 
+// Fork extensions (optional)
+let instanceCommandAvailable = false;
+try {
+  const { instanceCommand } = await import('./commands/instance.js');
+  commands.instance = instanceCommand;
+  instanceCommandAvailable = true;
+} catch { /* instance management not available */ }
+
 async function main() {
   const args = process.argv.slice(2);
   const command = args[0] || 'help';
@@ -126,7 +134,15 @@ Component Management:
   search [keyword]    Search available components
 
 Other:
-  help                Show this help
+  help                Show this help${instanceCommandAvailable ? `
+
+Instance Management:
+  instance list       List all instances
+  instance add <id>   Add a new instance
+  instance remove <id> Remove an instance
+  instance start <id> Start an instance
+  instance stop <id>  Stop an instance
+  instance status     Show instance statuses` : ''}
 
 Examples:
   zylos shell

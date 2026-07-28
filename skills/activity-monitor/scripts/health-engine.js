@@ -1,6 +1,21 @@
 /**
  * HealthEngine - Runtime functional liveness state machine.
  *
+ * v5 changes (REL-3 — flap escalation ceiling + self-driven recovery):
+ *   - Kill-restart CYCLES are counted in a rolling hour window
+ *     (restartCycleTimestamps); the window resets ONLY on a functional
+ *     heartbeat ACK — never on onProcessRestarted, whose per-cycle counter
+ *     reset kept the 2026-07-09 incident loop at "attempt 1" for 11h42m.
+ *   - Above `flap_ceiling_per_hour` cycles → DEGRADED: a bounded-relaunch
+ *     state (not terminal). triggerRecovery short-circuits, the guardian
+ *     skips relaunch EXCEPT one probe per `degraded_probe_interval`
+ *     (relaunch → recovery heartbeat → ACK exits to ok; failure kills the
+ *     session and waits for the next window). deps.notifyDegraded fires an
+ *     out-of-band admin alert exactly once per !degraded→degraded transition.
+ *   - rate_limited cooldown expiry now fires a throttled recovery probe
+ *     (`rate_limit_probe_interval` floor) so a zero-traffic instance
+ *     recovers on its own instead of parking rate_limited forever.
+ *
  * v4 changes (#256 — behavioral rate limit detection):
  *   - Rate limit detection moved from proactive tmux scan to heartbeat failure
  *   - deps.detectRateLimit callback: called on heartbeat failure before triggering
@@ -19,7 +34,8 @@
  *
  * v2 changes (#177 — exponential backoff + process signal acceleration):
  *   - Exponential backoff: min(3600, 60 × 5^(n-1)) → 1m, 5m, 25m, 60m cap
- *   - Infinite retries in unavailable/recovering state (no maxRestartFailures limit)
+ *   - No maxRestartFailures limit in unavailable/recovering — but v5's flap
+ *     ceiling bounds kill-restart cycles per rolling hour (→ degraded)
  *   - Legacy DOWN state remains readable for transitional persisted status.
  *   - Process signal acceleration: when agentRunning transitions false→true,
  *     wait a grace period then immediately verify via heartbeat (skip backoff)
@@ -31,6 +47,9 @@
 const USER_MESSAGE_CHECK_DELAY_MS = 5000;
 const CONSECUTIVE_HITS_THRESHOLD = 2;
 const STICKY_ERROR_MIN_INTERVAL_MS = 30000;
+// Rolling window for the flap-escalation ceiling. Cycles are counted per hour;
+// only the ceiling itself is configurable (flap_ceiling_per_hour).
+const FLAP_WINDOW_SEC = 3600;
 
 function isUnavailableRecoveryState(health) {
   return health === 'unavailable' || health === 'recovering';
@@ -57,6 +76,7 @@ export class HealthEngine {
    * @param {() => {detected: boolean, pattern?: string}} [deps.detectAuthFailure]
    * @param {() => {detected: boolean, pattern?: string}} [deps.detectApiError]
    * @param {() => Promise<{status: 'success'|'failure'|'uncertain', reason?: string}>|{status: 'success'|'failure'|'uncertain', reason?: string}} [deps.checkAuth]
+   * @param {(details: {cycleCount: number, windowSec: number, ceiling: number, probeIntervalSec: number, reason: string}) => void} [deps.notifyDegraded] - Out-of-band admin alert, fired exactly once per !degraded→degraded transition
    * @param {(ms: number) => Promise<void>} [deps.sleep]
    * @param {object} [options]
    * @param {number} [options.heartbeatInterval=1800]
@@ -65,6 +85,9 @@ export class HealthEngine {
    * @param {number} [options.signalGracePeriod=30] - Seconds to wait after agentRunning transitions before probing
    * @param {number} [options.rateLimitDefaultCooldown=3600] - Default cooldown when reset time can't be parsed
    * @param {number} [options.userMessageRecoveryCooldown=60] - Min seconds between user-message-triggered recoveries
+   * @param {number} [options.flapCeilingPerHour=6] - Kill-restart cycles per rolling hour before entering degraded
+   * @param {number} [options.degradedProbeInterval=1200] - Seconds between bounded self-probes while degraded
+   * @param {number} [options.rateLimitProbeInterval=900] - Min seconds between rate-limit cooldown-expiry probes
    * @param {string} [options.initialHealth='ok']
    * @param {boolean} [options.heartbeatEnabled=true]
    * @param {number} [options.maintenanceIntervalMs=1000]
@@ -80,6 +103,9 @@ export class HealthEngine {
     this.signalGracePeriod = options.signalGracePeriod ?? 30;
     this.rateLimitDefaultCooldown = options.rateLimitDefaultCooldown ?? 3600; // 1 hour
     this.userMessageRecoveryCooldown = options.userMessageRecoveryCooldown ?? 60; // 1 min
+    this.flapCeilingPerHour = options.flapCeilingPerHour ?? 6;
+    this.degradedProbeInterval = options.degradedProbeInterval ?? 1200; // 20 min
+    this.rateLimitProbeInterval = options.rateLimitProbeInterval ?? 900; // 15 min
     this.heartbeatEnabled = options.heartbeatEnabled ?? true;
     this.userMessageCheckDelayMs = options.userMessageCheckDelayMs ?? USER_MESSAGE_CHECK_DELAY_MS;
     this.maintenanceIntervalMs = options.maintenanceIntervalMs ?? 1000;
@@ -113,6 +139,23 @@ export class HealthEngine {
 
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
+
+    // Flap escalation: kill-restart cycle timestamps (epoch sec) in the rolling
+    // hour window. Incremented in triggerRecovery; reset ONLY by a functional
+    // heartbeat ACK (onHeartbeatSuccess) — never by onProcessRestarted, whose
+    // per-cycle reset was the 11h42m "attempt 1" incident bug.
+    this.restartCycleTimestamps = [];
+    // Last time a degraded probe window was consumed (guardian relaunch). 0 ⇒ due.
+    this.lastDegradedProbeAt = 0;
+    // In-flight rate-limit cooldown-expiry probe (re-entrancy guard across the
+    // maintenance interval, the cooldownTimer callback, and am.sock callbacks).
+    this._expiryProbeInFlight = false;
+
+    // In-flight async verify of a text-triggered auth_failed entry (tests await it)
+    this._authVerifyPromise = null;
+
+    // Cold-start grace period: skip heartbeat processing during warmup (fork)
+    this.warmupUntil = 0;
 
     // OK-path detection debounce counters, advanced by dispatcher delivery notifications.
     this.rateLimitConsecutiveHits = 0;
@@ -185,6 +228,18 @@ export class HealthEngine {
   }
 
   /**
+   * Signal that a cold start is in progress. Suppresses heartbeat processing
+   * for `seconds` to avoid false-positive failures during instance startup.
+   * Also resets health to 'ok' so the instance starts clean.
+   * @param {number} seconds - Grace period duration
+   */
+  notifyColdStart(seconds) {
+    this.warmupUntil = Math.floor(Date.now() / 1000) + seconds;
+    this.setHealth('ok', `cold_start_grace_${seconds}s`);
+    this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
+  }
+
+  /**
    * Calculate exponential backoff delay for the current failure count.
    * Formula: min(3600, 60 × 5^(n-1)) where n = restartFailureCount
    * Sequence: 60s, 300s, 1500s, 3600s, 3600s, ...
@@ -248,6 +303,15 @@ export class HealthEngine {
       return true;
     }
 
+    if (this.healthState === 'degraded') {
+      // Mirror the rate_limited path: user contact opens the degraded probe
+      // window immediately (guardian relaunches next tick) and the router
+      // fires a recovery probe.
+      this.deps.log('User message received while degraded — self-probe now due');
+      this.lastDegradedProbeAt = 0;
+      return true;
+    }
+
     if (this.healthState === 'rate_limited') {
       this.deps.log('User message triggered rate-limit recovery attempt');
       this.cooldownUntil = 0;
@@ -272,6 +336,9 @@ export class HealthEngine {
   }
 
   runMaintenanceCycle(agentRunning, currentTime) {
+    // Fork: skip processing during cold-start grace period
+    if (currentTime < this.warmupUntil) return;
+
     // Track agentRunning transitions for process signal acceleration
     this._trackAgentRunning(agentRunning, currentTime);
 
@@ -322,14 +389,41 @@ export class HealthEngine {
     }
 
     // Rate-limited recovery: when cooldown expires, stop waiting but do not
-    // restart the runtime. Rate limit is an upstream condition; recovery is
-    // verified by the next user-message/recovery probe.
+    // restart the runtime. Rate limit is an upstream condition; expiry fires
+    // a throttled recovery probe so an instance with zero user traffic still
+    // verifies recovery on its own (the parked-forever incident gap).
     if (this.healthState === 'rate_limited') {
       if (this.cooldownUntil > 0 && currentTime < this.cooldownUntil) {
         return;
       }
       if (this.cooldownUntil > 0) {
         this._expireRateLimitCooldown();
+      }
+      // Cooldown expired: probe on the rate_limit_probe_interval floor while
+      // the agent is running (a still-limited probe re-extends the cooldown
+      // via the detectRateLimit re-check in onHeartbeatFailure).
+      if (agentRunning) {
+        this._maybeRunRateLimitExpiryProbe(currentTime);
+      }
+      return;
+    }
+
+    // Degraded is a bounded-relaunch state. The probe driver depends on how
+    // degraded was entered (pending heartbeat results are processed above, so
+    // an ACK exits degraded either way):
+    //  - session still ALIVE (the ceiling trips BEFORE a kill — the dominant
+    //    login-screen-park entry): probe it directly here once per
+    //    degraded_probe_interval. An ACK exits degraded with zero SessionStart
+    //    burn; an ack-deadline failure kills once (onHeartbeatFailure's
+    //    degraded branch) and converges to
+    //  - session DEAD: the guardian's probe-window relaunch → post-restart probe.
+    if (this.healthState === 'degraded') {
+      if (agentRunning && this.isDegradedProbeDue(currentTime)) {
+        this.lastDegradedProbeAt = currentTime; // consume this probe window
+        const ok = this.enqueueHeartbeat('recovery');
+        this.deps.log(ok
+          ? `Degraded self-probe: session alive, probing directly (next window in ${this.degradedProbeInterval}s)`
+          : 'Degraded self-probe enqueue failed; retrying next window');
       }
       return;
     }
@@ -401,6 +495,9 @@ export class HealthEngine {
     this.signalDetectedAt = 0;
     this.cooldownUntil = 0;
     this.rateLimitResetTime = '';
+    // Functional ACK is the ONLY reset for the flap-cycle window.
+    this.restartCycleTimestamps = [];
+    this.lastDegradedProbeAt = 0;
     this._clearRateLimitCooldownTimer();
     this._clearPostRestartProbeTimer();
     this.lastUserMessageRecoveryAt = 0;
@@ -423,7 +520,34 @@ export class HealthEngine {
       return;
     }
 
-    const now = Math.floor(Date.now() / 1000);
+    // auth_failed is an upstream credential condition, same class as
+    // rate_limited: killing and restarting the session cannot fix it and just
+    // thrashes the pane. Recovery paths out of auth_failed: heartbeat ACK once
+    // credentials are restored (heartbeats bypass the health gate), the
+    // user-message-triggered probe (notifyUserMessage → runRecoveryProbe), the
+    // post-restart probe, and _verifyAuthFailedEntry's false-positive escape
+    // (live checkAuth OK → hang → restart) on each failed heartbeat.
+    if (this.healthState === 'auth_failed') {
+      this.deps.log(`Heartbeat recovery skipped in AUTH_FAILED state (${reason})`);
+      return;
+    }
+
+    // Degraded short-circuits the kill loop entirely; recovery happens only
+    // through the bounded probe window (see isDegradedProbeDue) or an ACK.
+    if (this.healthState === 'degraded') {
+      this.deps.log(`Heartbeat recovery skipped in DEGRADED state (${reason})`);
+      return;
+    }
+
+    const now = Math.floor(this.now() / 1000);
+
+    // Flap escalation ceiling: count kill-restart CYCLES in a rolling hour.
+    this.restartCycleTimestamps.push(now);
+    this._pruneRestartCycles(now);
+    if (this.restartCycleTimestamps.length > this.flapCeilingPerHour) {
+      this._enterDegraded(now, reason);
+      return;
+    }
 
     if (this.healthState === 'ok') {
       this.setHealth('unavailable', reason);
@@ -458,6 +582,50 @@ export class HealthEngine {
         this.enterRateLimited(rateLimit.cooldownUntil, rateLimit.resetTime);
         return;
       }
+    }
+
+    // Same dual-signal for auth failures: a heartbeat timing out because the
+    // session sits on a login screen used to be misclassified as 'unavailable'
+    // and entered an endless kill+restart loop (each restart lands on the same
+    // login screen). Behavioral signal = this heartbeat failure; text signal =
+    // auth-failure pane text. Enter auth_failed instead of killing.
+    // Pane text alone can false-positive (a genuinely HUNG agent whose pane
+    // echoes "not logged in" from tool output would otherwise be parked in
+    // auth_failed forever, since a hung agent never ACKs), so the flip is
+    // verified asynchronously with the adapter's live checkAuth() — a
+    // confirmed-good credential means this was a hang: resume kill+restart.
+    // (Intentionally NOT checked in rate_limited: the rate-limit branch above
+    // takes precedence there.)
+    if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState)) && this.deps.detectAuthFailure) {
+      const authFailure = this.deps.detectAuthFailure();
+      if (authFailure.detected) {
+        this.restartFailureCount = 0;
+        this.recoveringStartedAt = 0;
+        this.signalDetectedAt = 0;
+        this.setHealth('auth_failed', `${phase}_${status}:${authFailure.pattern || 'auth_text'}`);
+        this._authVerifyPromise = this._verifyAuthFailedEntry(`${phase}_${status}`);
+        return;
+      }
+    }
+
+    // Already auth_failed and another heartbeat failed: re-verify. This is the
+    // bounded escape for a hung-agent false positive whose first verify came
+    // back 'uncertain' (network flake) — every subsequent failed heartbeat
+    // re-runs the live probe until it resolves to broken creds (stay) or good
+    // creds (hang → restart).
+    if (this.healthState === 'auth_failed') {
+      this._authVerifyPromise = this._verifyAuthFailedEntry(`${phase}_${status}`);
+      return;
+    }
+
+    // Degraded self-probe failed its ack deadline: kill the (non-ACKing)
+    // session so it doesn't burn quota, stay degraded, and wait for the next
+    // probe window. Kill directly — triggerRecovery is short-circuited here
+    // and must not count this as a new flap cycle.
+    if (this.healthState === 'degraded') {
+      this.deps.log(`Degraded self-probe failed (${phase}_${status}); killing session until next probe window`);
+      this.deps.killTmuxSession();
+      return;
     }
 
     if (this.healthState === 'rate_limited') {
@@ -569,7 +737,7 @@ export class HealthEngine {
       return { recovered: true };
     }
 
-    this.lastRecoveryAt = Math.floor(Date.now() / 1000);
+    this.lastRecoveryAt = Math.floor(this.now() / 1000);
 
     if (this.healthState === 'auth_failed') {
       const authResult = await this._checkAuth();
@@ -618,14 +786,69 @@ export class HealthEngine {
     return { recovered: false, reason: this.healthReason || this.healthState, timedOut: true };
   }
 
-  onProcessRestarted(currentTime = Math.floor(Date.now() / 1000)) {
-    this.restartFailureCount = 0;
-    this.lastRecoveryAt = 0;
-    this.deps.log('Process restarted, recovery backoff reset');
+  onProcessRestarted(currentTime = Math.floor(this.now() / 1000)) {
+    // Counter/backoff reset is gated on flap context: during a flap the
+    // guardian restarts the runtime EVERY cycle, and resetting here is what
+    // kept the incident loop at "attempt 1" for 11h42m. Counters reset only
+    // on a functional heartbeat ACK (onHeartbeatSuccess); a restart with no
+    // recent kill cycles is a genuine fresh start and keeps the old behavior.
+    this._pruneRestartCycles(currentTime);
+    if (this.restartCycleTimestamps.length === 0) {
+      this.restartFailureCount = 0;
+      this.lastRecoveryAt = 0;
+      this.deps.log('Process restarted, recovery backoff reset');
+    } else {
+      this.deps.log(`Process restarted mid-flap (${this.restartCycleTimestamps.length} cycles in window); keeping recovery backoff`);
+    }
 
+    if (this.healthState === 'degraded') {
+      // The guardian relaunch consumed this degraded probe window.
+      this.lastDegradedProbeAt = currentTime;
+    }
+
+    // Recovery acceleration must survive the split: the post-restart probe
+    // always fires on a restart in non-ok health.
     if (this.healthState !== 'ok') {
       this.signalDetectedAt = currentTime;
       this._schedulePostRestartProbe();
+    }
+  }
+
+  /**
+   * True when the guardian may run one bounded degraded-relaunch probe.
+   * Read live by the orchestrator each tick and passed into guardian.tick().
+   */
+  isDegradedProbeDue(currentTime = Math.floor(this.now() / 1000)) {
+    if (this.healthState !== 'degraded') return false;
+    return (currentTime - this.lastDegradedProbeAt) >= this.degradedProbeInterval;
+  }
+
+  _pruneRestartCycles(nowSec) {
+    const cutoff = nowSec - FLAP_WINDOW_SEC;
+    this.restartCycleTimestamps = this.restartCycleTimestamps.filter(ts => ts >= cutoff);
+  }
+
+  _enterDegraded(nowSec, reason) {
+    const cycleCount = this.restartCycleTimestamps.length;
+    this.lastDegradedProbeAt = nowSec; // first self-probe waits one full interval
+    this.signalDetectedAt = 0;
+    this._clearPostRestartProbeTimer(); // bound burn: probes only via the probe window
+    this.setHealth('degraded', `flap_ceiling_${cycleCount}cyc_1h (${reason})`);
+    this.deps.log(`Flap ceiling: ${cycleCount} kill-restart cycles in the last hour (ceiling ${this.flapCeilingPerHour}); entering degraded, self-probe every ${this.degradedProbeInterval}s`);
+    // Alert fires exactly here — the only !degraded→degraded transition point
+    // (triggerRecovery short-circuits while degraded, so no re-entry).
+    if (typeof this.deps.notifyDegraded === 'function') {
+      try {
+        this.deps.notifyDegraded({
+          cycleCount,
+          windowSec: FLAP_WINDOW_SEC,
+          ceiling: this.flapCeilingPerHour,
+          probeIntervalSec: this.degradedProbeInterval,
+          reason,
+        });
+      } catch (err) {
+        this.deps.log(`Degraded admin alert failed: ${err?.message || err}`);
+      }
     }
   }
 
@@ -668,6 +891,29 @@ export class HealthEngine {
     }
   }
 
+  /**
+   * Verify a text-triggered auth_failed entry with the adapter's live checkAuth
+   * probe. Pane text alone can false-positive on a genuinely HUNG agent whose
+   * pane merely echoes auth-ish output ("gh auth status", curled API bodies) —
+   * and a hung agent never ACKs, so without this it would be parked in
+   * auth_failed forever. checkAuth 'success' = credentials are fine, the
+   * heartbeat failure was a real hang → resume normal kill+restart recovery.
+   * 'failure' confirms auth_failed. 'uncertain' stays put — every subsequent
+   * failed heartbeat re-runs this verify, and a live agent heals via ACK.
+   */
+  async _verifyAuthFailedEntry(reason) {
+    const result = await this._checkAuth();
+    if (this.healthState !== 'auth_failed') return; // recovered (ACK) or moved on meanwhile
+    if (result?.status === 'success') {
+      this.deps.log(`auth_failed was a text false positive (live checkAuth OK) — treating as hung session (${reason})`);
+      this.setHealth('unavailable', `${reason}:auth_text_false_positive`);
+      // Mirror triggerRecovery's from-ok bookkeeping: start the continuous-
+      // failure clock (it only sets this when transitioning from 'ok').
+      this.recoveringStartedAt = Math.floor(this.now() / 1000);
+      this.triggerRecovery(`${reason}:hung_with_auth_text`);
+    }
+  }
+
   _scheduleRateLimitCooldown() {
     this._clearRateLimitCooldownTimer();
     if (this.healthState !== 'rate_limited' || this.cooldownUntil <= 0) return;
@@ -691,9 +937,30 @@ export class HealthEngine {
 
   _expireRateLimitCooldown() {
     if (this.healthState !== 'rate_limited') return;
-    this.deps.log('Rate limit cooldown expired; waiting for next recovery trigger');
+    this.deps.log('Rate limit cooldown expired; probing to verify recovery');
     this.cooldownUntil = 0;
     this._clearRateLimitCooldownTimer();
+    // The probe itself fires from the maintenance cycle (≤1s later) so it is
+    // gated on agentRunning — heartbeats to a dead session only time out.
+  }
+
+  /**
+   * Self-driven rate-limit recovery: one throttled recovery probe after the
+   * cooldown expires, floored by rate_limit_probe_interval via lastRecoveryAt.
+   * A still-limited probe re-extends the cooldown through the existing
+   * detectRateLimit re-check in onHeartbeatFailure — no re-implementation here.
+   */
+  _maybeRunRateLimitExpiryProbe(currentTime) {
+    if (this._expiryProbeInFlight) return;
+    if (this.lastRecoveryAt > 0 && (currentTime - this.lastRecoveryAt) < this.rateLimitProbeInterval) return;
+    if (this.deps.readHeartbeatPending()) return; // a heartbeat is already in flight
+
+    this._expiryProbeInFlight = true;
+    this.runRecoveryProbe({ phase: 'recovery' })
+      .catch(err => this.deps.log(`Rate-limit expiry probe failed: ${err?.message || err}`))
+      .finally(() => {
+        this._expiryProbeInFlight = false;
+      });
   }
 
   _schedulePostRestartProbe() {

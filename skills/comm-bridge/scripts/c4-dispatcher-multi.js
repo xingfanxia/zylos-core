@@ -1,0 +1,662 @@
+/**
+ * C4 Dispatcher — Multi-session extension.
+ *
+ * Extracted routing, lifecycle, and orchestration logic for multi-session mode.
+ * This module has ZERO imports from c4-dispatcher.js.  All dispatcher internals
+ * are received via the `helpers` object (dependency injection), so the upstream
+ * dispatcher can evolve independently.
+ *
+ * Imports:
+ *  - instance-config.js for instance resolution (getAllInstances, getInstanceDef, etc.)
+ *  - c4-config.js for legacy constants (TMUX_SESSION, AGENT_STATUS_FILE) as fallbacks
+ *
+ * ESM-only, Node 20+.
+ */
+
+import { writeFileSync, mkdirSync, existsSync } from 'fs';
+import path from 'path';
+import os from 'os';
+
+import {
+  getAllInstances,
+  getInstanceDef,
+  getMonitorDir,
+  getSessionName,
+  resolveStatusFile as icResolveStatusFile,
+} from '../../multi-session/instance-config.js';
+
+import {
+  TMUX_SESSION,
+  AGENT_STATUS_FILE,
+} from './c4-config.js';
+
+// ── Constants ──────────────────────────────────────────────────────────
+
+const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+
+/**
+ * Maximum items to attempt per processWithMultiSession call before giving up.
+ * Prevents unbounded looping when every claimed item is for an offline instance.
+ */
+const MAX_SKIP_ATTEMPTS = 10;
+
+// Lifecycle events (wake/suspend/auto-start) fire from module-level functions
+// that don't receive the injected dispatcher `log`, so they use these local
+// timestamped wrappers — mirroring c4-dispatcher.js log(). In the incident the
+// reap lines were untimestamped, which degraded forensic timeline reconstruction.
+function ts() {
+  return new Date().toISOString().replace('T', ' ').substring(0, 19);
+}
+function tsLog(message) {
+  console.log(`[${ts()}] ${message}`);
+}
+function tsError(message) {
+  console.error(`[${ts()}] ${message}`);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Lifecycle functions
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Write a wake-signal file so the Activity Monitor knows to restart a
+ * suspended instance's Claude Code process.
+ *
+ * @param {string} instanceId - Target instance to wake.
+ * @param {string} [zylosDir] - Override for ZYLOS_DIR (testing).
+ */
+export function writeWakeSignal(instanceId, zylosDir) {
+  try {
+    const monDir = getMonitorDir(instanceId);
+    const dir = monDir || path.join(zylosDir || ZYLOS_DIR, 'activity-monitor', instanceId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'wake-signal'), new Date().toISOString());
+  } catch (err) {
+    // Best-effort — log but do not throw.
+    tsError(`[dispatcher-multi] Failed to write wake-signal for ${instanceId}: ${err.message}`);
+  }
+}
+
+// ── Auto-start / auto-stop for instance sessions ──────────────────────
+
+/** Tracks last delivery time per instance for idle reaping. */
+const lastDeliveryAt = new Map();
+
+/** Tracks auto-start timestamps to prevent requeue loops during CC boot. */
+const autoStartedAt = new Map();
+
+/** Grace period after auto-start before retrying delivery (CC needs time to boot). */
+const AUTO_START_GRACE_MS = 60 * 1000;
+
+/** Fallback idle timeout (minutes) when an instance has no idle_timeout_min. */
+const DEFAULT_IDLE_TIMEOUT_MIN = 30;
+
+/**
+ * Signal the Activity Monitor to start an instance session.
+ *
+ * The dispatcher does NOT launch CC directly — the AM's RuntimeAdapter
+ * handles auth, env vars, cwd, bypass permissions, instruction files, etc.
+ * We just write a wake-signal file that the AM picks up on its next tick.
+ *
+ * @param {object} instDef - Instance definition from instances.json.
+ * @param {string} instDef.id
+ * @returns {boolean} true if signal was written (AM should pick it up within 1-2s)
+ */
+export function requestInstanceStart(instDef) {
+  if (!instDef?.id) return false;
+
+  // Check if we already requested a start recently (grace period)
+  const startedTs = autoStartedAt.get(instDef.id);
+  if (startedTs && (Date.now() - startedTs) < AUTO_START_GRACE_MS) {
+    return false; // already requested, waiting for boot
+  }
+
+  writeWakeSignal(instDef.id);
+  autoStartedAt.set(instDef.id, Date.now());
+  tsLog(`[dispatcher-multi] Requested start for instance '${instDef.id}' via wake signal`);
+  return true;
+}
+
+/**
+ * Write a suspend signal for an idle non-primary instance.
+ * The AM picks this up and gracefully stops CC + kills the tmux session.
+ *
+ * @param {string} instanceId
+ */
+export function requestInstanceStop(instanceId) {
+  try {
+    const monDir = getMonitorDir(instanceId);
+    const dir = monDir || path.join(ZYLOS_DIR, 'activity-monitor', instanceId);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'suspend-signal'), new Date().toISOString());
+    lastDeliveryAt.delete(instanceId);
+    autoStartedAt.delete(instanceId);
+    tsLog(`[dispatcher-multi] Requested stop for idle instance '${instanceId}' via suspend signal`);
+  } catch (err) {
+    tsError(`[dispatcher-multi] Failed to write suspend signal for '${instanceId}': ${err.message}`);
+  }
+}
+
+/**
+ * Reap idle instances that opted into auto-suspend. Only instances with
+ * `auto_suspend: true` are eligible (never the primary), and the idle window is
+ * the instance's own `idle_timeout_min` (falling back to the 30-min default) —
+ * NOT a single hardcoded timeout. Called once per dispatch cycle.
+ *
+ * SCOPE TODAY (REL-9): the suspend-signal this writes only gates the guardian's
+ * RELAUNCH of an instance whose session has already exited — it does NOT stop a
+ * running session, and the signal's short TTL means it lapses before it can
+ * meaningfully hold an instance down. So reap-based auto_suspend is effectively
+ * inert right now; making reap actually suspend live idle sessions is deferred
+ * to REL-9.
+ */
+export function reapIdleInstances() {
+  const now = Date.now();
+  for (const [instanceId, lastTs] of lastDeliveryAt) {
+    const def = getInstanceDef(instanceId);
+    if (!def || def.primary) continue;           // never reap primary
+    if (def.auto_suspend !== true) continue;      // only opted-in instances
+    if (!def.tmux_session) continue;
+
+    const idleMs = (Number(def.idle_timeout_min) > 0 ? Number(def.idle_timeout_min) : DEFAULT_IDLE_TIMEOUT_MIN) * 60_000;
+    if (now - lastTs < idleMs) continue;
+
+    requestInstanceStop(instanceId);
+  }
+}
+
+/**
+ * Scan all configured instances, read each one's status file, and return
+ * the IDs of instances whose state is neither offline nor stopped.
+ *
+ * Returns `null` when no instances.json exists (single-session / legacy mode),
+ * signalling the caller to fall back to legacy behaviour.
+ *
+ * @param {(statusFile: string) => { state: string }} getClaudeStateFn
+ *   A function that reads an agent-status file and returns `{ state, ... }`.
+ *   Injected to avoid importing from c4-dispatcher.js.
+ * @returns {string[] | null}
+ */
+export function getOnlineInstanceIds(getClaudeStateFn) {
+  const all = getAllInstances();
+  if (all.length === 0) return null; // legacy mode
+
+  const online = [];
+  for (const inst of all) {
+    const statusFile = icResolveStatusFile(inst.id);
+    if (!statusFile) continue;
+    const st = getClaudeStateFn(statusFile);
+    if (st.state !== 'offline' && st.state !== 'stopped') {
+      online.push(inst.id);
+    }
+  }
+  return online;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Resolution helpers
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Map an instance ID to its tmux session name.
+ * Returns the legacy `TMUX_SESSION` when `targetInstance` is null / undefined
+ * or when the instance has no configured session.
+ *
+ * @param {string | null | undefined} targetInstance
+ * @returns {string}
+ */
+export function resolveSessionName(targetInstance) {
+  if (!targetInstance) return TMUX_SESSION;
+  const resolved = getSessionName(targetInstance);
+  return resolved || TMUX_SESSION;
+}
+
+/**
+ * Map an instance ID to its agent-status.json path.
+ * Returns the legacy `AGENT_STATUS_FILE` when `targetInstance` is null /
+ * undefined or when the instance has no configured status file.
+ *
+ * @param {string | null | undefined} targetInstance
+ * @returns {string}
+ */
+export function resolveStatusFile(targetInstance) {
+  if (!targetInstance) return AGENT_STATUS_FILE;
+  const resolved = icResolveStatusFile(targetInstance);
+  return resolved || AGENT_STATUS_FILE;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Core routing — per-item dispatch decision
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {Object} DispatchDeliver
+ * @property {'deliver'} action
+ * @property {string} session    - tmux session name
+ * @property {string} statusFile - agent-status.json path
+ * @property {object} claudeState - result of getClaudeState(statusFile)
+ */
+
+/**
+ * @typedef {Object} DispatchSkip
+ * @property {'skip'} action
+ * @property {string} reason
+ */
+
+/**
+ * @typedef {Object} DispatchReject
+ * @property {'reject'} action
+ * @property {string} reason
+ */
+
+/**
+ * @typedef {Object} DispatchRequeue
+ * @property {'requeue'} action
+ * @property {string} reason
+ */
+
+/** @typedef {DispatchDeliver | DispatchSkip | DispatchReject | DispatchRequeue} DispatchResult */
+
+/**
+ * Decide what to do with a single claimed queue item in multi-session mode.
+ *
+ * @param {object} item - Queue row (conversation or control), must include
+ *   `target_instance`, `type`, `bypass_state`, `require_idle`, `content`.
+ * @param {object} helpers
+ * @param {(statusFile: string) => object} helpers.getClaudeState
+ * @param {(statusFile: string) => boolean} helpers.isStatusFresh
+ * @param {(item: object) => boolean} helpers.isBypassState
+ * @returns {DispatchResult}
+ */
+export function multiSessionDispatch(item, helpers) {
+  const { getClaudeState, isBypassState } = helpers;
+  let targetInstance = item.target_instance || null;
+  if (!targetInstance) {
+    // No target → route to primary/default. Controls: heartbeats from the
+    // adapter. Conversations: legacy pre-multi-session rows, which
+    // getNextPendingForInstances deliberately still surfaces — rejecting them
+    // here (as this used to) silently dropped exactly the rows that query
+    // promises to deliver. Primary matches single-session semantics: legacy
+    // rows were always delivered to the one (primary) session.
+    const all = getAllInstances();
+    const primary = all.find(i => i.primary === true) ?? all[0];
+    if (primary) targetInstance = primary.id;
+    if (!targetInstance) {
+      return { action: 'reject', reason: 'no target_instance and no primary instance configured' };
+    }
+  }
+  const bypass = isBypassState(item);
+
+  // 1. Disabled instance → reject (drop permanently).
+  if (targetInstance) {
+    const def = getInstanceDef(targetInstance);
+    if (def && def.enabled === false) {
+      return { action: 'reject', reason: `instance '${targetInstance}' is disabled` };
+    }
+  }
+
+  const session = resolveSessionName(targetInstance);
+  const statusFile = resolveStatusFile(targetInstance);
+  const claudeState = getClaudeState(statusFile);
+
+  // 2. Suspended instance → wake + requeue.
+  if (claudeState.state === 'suspended' && targetInstance && !bypass) {
+    writeWakeSignal(targetInstance);
+    return { action: 'requeue', reason: `instance '${targetInstance}' is suspended — wake signal written`, reasonCategory: 'suspended' };
+  }
+
+  // 3. Offline / stopped → auto-start non-primary, skip primary.
+  if ((claudeState.state === 'offline' || claudeState.state === 'stopped') && !bypass) {
+    const def = targetInstance ? getInstanceDef(targetInstance) : null;
+    if (def && !def.primary) {
+      // Signal the AM to start this instance, then skip (message retried on next poll)
+      requestInstanceStart({ ...def, id: targetInstance });
+      return { action: 'skip', reason: `instance '${targetInstance}' offline, wake signal sent`, reasonCategory: 'offline' };
+    }
+    return { action: 'skip', reason: `instance target offline (state=${claudeState.state})`, reasonCategory: 'offline' };
+  }
+
+  // 5. Unhealthy → skip.
+  if (claudeState.health !== 'ok' && !bypass) {
+    return { action: 'skip', reason: `instance unhealthy (health=${claudeState.health})`, reasonCategory: 'unhealthy' };
+  }
+
+  // 6. Deliverable.
+  return { action: 'deliver', session, statusFile, claudeState };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Orchestrator — replaces processNextMessage in multi-session mode
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * @typedef {Object} ProcessResult
+ * @property {boolean} delivered - Whether a message was successfully delivered.
+ * @property {string}  state    - Last observed agent state string.
+ */
+
+/**
+ * Multi-session dispatch loop.  Claims items one at a time, runs
+ * `multiSessionDispatch` for routing, and performs the full delivery pipeline
+ * (heartbeat auto-ack shortcut, sendToTmux, mark delivered, idle settlement,
+ * failure handling).
+ *
+ * Designed to be called from the upstream dispatcher's `processNextMessage()`
+ * as a drop-in replacement when multi-session mode is active.
+ *
+ * @param {object} helpers — every dispatcher function needed, injected to
+ *   avoid importing from c4-dispatcher.js:
+ * @param {(statusFile: string) => object} helpers.getClaudeState
+ * @param {(statusFile: string) => boolean} helpers.isStatusFresh
+ * @param {(message: string, options?: object) => Promise<string>} helpers.sendToTmux
+ * @param {() => Promise<{ verified: boolean, state: string }>} helpers.submitAndVerify
+ * @param {(onlineIds?: string[] | null) => object | null} helpers.claimNextItem
+ * @param {(item: object, reason?: string) => void} helpers.releaseItem
+ * @param {(item: object) => boolean} helpers.isBypassState
+ * @param {(opts: object) => boolean} helpers.shouldAutoAckHeartbeat
+ * @param {(msg: object, statusFile?: string) => Promise<void>} helpers.handleConversationDeliveryFailure
+ * @param {(control: object, reason: string) => Promise<void>} helpers.handleControlDeliveryFailure
+ * @param {(msgId: number, statusFile?: string) => Promise<void>} helpers.waitForRequireIdleSettlement
+ * @param {(id: number) => void} helpers.markDelivered
+ * @param {(id: number) => void} helpers.ackControl
+ * @param {() => object | null} helpers.readProcState
+ * @param {() => boolean} helpers.isAgentConfirmedActive
+ * @param {(message: string) => void} helpers.log
+ * @param {(ms: number) => Promise<void>} helpers.sleep
+ * @param {() => number} helpers.nowSeconds
+ * @param {(item: object) => string} helpers.getDeliveryContent
+ * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingForInstances
+ * @param {(instanceIds: string[]) => object[]} helpers.getPendingTargetInstancesNeedingWake
+ * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingControlForInstances
+ * @param {(id: number) => void} helpers.markRejected
+ * @param {(id: number) => void} helpers.markControlRejected
+ * @returns {Promise<ProcessResult>}
+ */
+export async function processWithMultiSession(helpers) {
+  const {
+    getAgentState,
+    isStatusFresh,
+    sendToTmux,
+    claimNextItem,
+    releaseItem,
+    isBypassState,
+    shouldAutoAckHeartbeat,
+    handleConversationDeliveryFailure,
+    handleControlDeliveryFailure,
+    waitForRequireIdleSettlement,
+    markDelivered,
+    ackControl,
+    readProcState,
+    isAgentConfirmedActive,
+    log,
+    sleep,
+    nowSeconds,
+    getDeliveryContent,
+    markRejected,
+    markControlRejected,
+    getNextPendingForInstances,
+    getPendingTargetInstancesNeedingWake,
+    getNextPendingControlForInstances,
+    notifyMessageDelivered,
+    sendKeystroke,
+    isKeystrokeControl,
+    parseKeystrokeKey,
+  } = helpers;
+
+  // Reap idle non-primary instances before processing.
+  reapIdleInstances();
+
+
+  // Compute online instance IDs.  Returns null in legacy mode — callers
+  // should NOT invoke this function in legacy mode, but we handle it gracefully.
+  const onlineIds = getOnlineInstanceIds(getAgentState);
+
+  if (onlineIds === null) {
+    // Legacy mode (no instances.json): the caller must fall back to the
+    // single-session processNextMessage. `legacy: true` is the explicit signal
+    // — the caller must not treat this as a normal "nothing delivered" result.
+    return { delivered: false, state: 'unknown', legacy: true };
+  }
+
+  // Wake offline targets with pending inbound conversations before claiming
+  // online-deliverable work. This avoids a deadlock where offline instances
+  // never receive a wake signal because pending rows are filtered out of the
+  // normal claim query until the instance is already online.
+  const wakeCandidates = getPendingTargetInstancesNeedingWake
+    ? getPendingTargetInstancesNeedingWake(onlineIds)
+    : [];
+
+  for (const candidate of wakeCandidates) {
+    const targetInstance = candidate?.target_instance;
+    if (!targetInstance) continue;
+
+    const def = getInstanceDef(targetInstance);
+    if (!def) {
+      markRejected(candidate.oldest_id);
+      log(`Rejected conversation id=${candidate.oldest_id}: unknown instance '${targetInstance}'`);
+      continue;
+    }
+
+    if (def.enabled === false) {
+      markRejected(candidate.oldest_id);
+      log(`Rejected conversation id=${candidate.oldest_id}: instance '${targetInstance}' is disabled`);
+      continue;
+    }
+
+    requestInstanceStart({ ...def, id: targetInstance });
+  }
+
+  // Skip-loop: try up to MAX_SKIP_ATTEMPTS items.
+  // Track items held in 'running' state so we can release them at the end.
+  // Items must stay 'running' during the loop to prevent re-claiming the same item.
+  // try/finally guarantees release on EVERY exit path — a throw mid-loop must
+  // never strand claimed items in 'running' (they'd be invisible to all
+  // pending queries and silently lost). `inFlight` covers the item currently
+  // being delivered (never in heldItems): if markDelivered/ackControl/
+  // handle*DeliveryFailure throws (e.g. SQLITE_BUSY), the finally releases it.
+  // Every normal path clears inFlight once the item reaches its resolved state
+  // — including ack-waiting controls, which deliberately STAY 'running' until
+  // the agent acks and must never be requeued by the finally.
+  const heldItems = [];
+  const heldReasons = {};
+  let inFlight = null;
+
+  // Additive result summary so the dispatcher heartbeat can report WHY nothing
+  // (or only some) shipped this tick. Existing callers read only .delivered /
+  // .state / .legacy — held / heldReasons are ignored by them.
+  const summarize = (result) => ({ ...result, held: heldItems.length, heldReasons: { ...heldReasons } });
+  const noteHeld = (category) => { heldReasons[category] = (heldReasons[category] || 0) + 1; };
+
+  try {
+    for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
+      const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
+      if (!item) {
+        // No claimable item left — but items held earlier this cycle are still
+        // in `running` (released in finally), so surface their reasons.
+        return summarize({ delivered: false, state: 'idle' });
+      }
+      inFlight = item;
+
+      const decision = multiSessionDispatch(item, { getClaudeState: getAgentState, isStatusFresh, isBypassState });
+
+      // ── reject ──
+      if (decision.action === 'reject') {
+        if (item.type === 'control') {
+          markControlRejected(item.id);
+        } else {
+          markRejected(item.id);
+        }
+        log(`Rejected ${item.type} id=${item.id}: ${decision.reason}`);
+        inFlight = null;
+        continue;
+      }
+
+      // ── requeue ── (hold like a skip: an immediate release would let the
+      // very next claimNextItem re-claim the same row, spinning the whole
+      // MAX_SKIP_ATTEMPTS budget on one suspended instance's message and
+      // starving delivery to every healthy instance this cycle. The finally
+      // block releases it back to pending at cycle end — same requeue effect.)
+      if (decision.action === 'requeue') {
+        heldItems.push(item);
+        noteHeld(decision.reasonCategory);
+        inFlight = null;
+        log(`Held for requeue ${item.type} id=${item.id}: ${decision.reason}`);
+        continue;
+      }
+
+      // ── skip ── (hold in running state to prevent re-claim in this cycle)
+      if (decision.action === 'skip') {
+        heldItems.push(item);
+        noteHeld(decision.reasonCategory);
+        inFlight = null;
+        continue;
+      }
+
+      // ── deliver ──
+      const { session, statusFile, claudeState } = decision;
+      const bypass = isBypassState(item);
+
+      // require_idle gate (must be idle with sufficient duration).
+      // Hold the item to prevent re-claim, then continue to try other items.
+      if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
+        heldItems.push(item);
+        noteHeld('require_idle');
+        inFlight = null;
+        continue;
+      }
+
+      // Heartbeat auto-ack shortcut.
+      if (bypass) {
+        const procState = readProcState();
+        const confirmed = isAgentConfirmedActive();
+        // Starvation guard: if a require_idle control is already held in this
+        // cycle (skipped above), widen the auto-ack gate so heartbeats don't
+        // bump the idle counter and starve the waiting /clear.
+        const requireIdleWaiting = heldItems.some((h) => h.require_idle === 1);
+        if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
+          ackControl(item.id);
+          inFlight = null;
+          log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}${requireIdleWaiting ? ' (require_idle waiting)' : ''}`);
+          return summarize({ delivered: true, state: claudeState.state });
+        }
+      }
+
+      const targetInstance = item.target_instance || null;
+
+      // Keystroke controls send a raw key to the per-instance session — never
+      // a buffer paste. Without this branch (it existed only in the
+      // single-session path), [KEYSTROKE] controls were pasted into the pane
+      // as literal chat text, so auto-approve Enter / watchdog keys never
+      // functioned in multi-session mode.
+      if (isKeystrokeControl && sendKeystroke && isKeystrokeControl(item)) {
+        const key = parseKeystrokeKey(item.content || '');
+        log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority}${targetInstance ? ` -> ${targetInstance}` : ''})`);
+        try {
+          sendKeystroke(session, key);
+          ackControl(item.id);
+          inFlight = null;
+          log(`Keystroke delivered: key=${key} (control id=${item.id})`);
+          // A keystroke is a real delivery to this instance — refresh the
+          // idle-reap clock and clear boot grace, same as the paste path.
+          if (targetInstance) {
+            lastDeliveryAt.set(targetInstance, Date.now());
+            autoStartedAt.delete(targetInstance);
+          }
+          return summarize({ delivered: true, state: claudeState.state });
+        } catch (err) {
+          log(`Keystroke delivery error: ${err.message}`);
+          await handleControlDeliveryFailure(item, `KEYSTROKE_ERROR: ${err.message}`);
+          inFlight = null;
+          return summarize({ delivered: false, state: claudeState.state });
+        }
+      }
+
+      // Actual tmux delivery.
+      log(
+        `Delivering ${item.type} id=${item.id}` +
+        (item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`) +
+        (targetInstance ? ` -> ${targetInstance}` : '')
+      );
+
+      // Clean-store model (#618): stored conversation rows carry no reply-via —
+      // reconstruct it here (and the "Meanwhile, " prefix for non-slash controls),
+      // same as the single-session path.
+      const deliveryContent = getDeliveryContent(item);
+      const result = await sendToTmux(deliveryContent, {
+        session,
+        statusFile,
+        strictVerify: item.type === 'conversation',
+      });
+
+      if (result === 'submitted') {
+        if (item.type === 'conversation') {
+          markDelivered(item.id);
+          log(`Conversation id=${item.id} delivered`);
+          // Notify the TARGET instance's Activity Monitor (its own am.sock) so its
+          // HealthEngine.onUserMessageDelivered fires — the event-driven auth /
+          // rate-limit / sticky-error check. The single-session path notifies the
+          // default socket; multi-session must target the per-instance socket or
+          // the check never runs for isolated instances (each AM listens on its
+          // own am.sock under getMonitorDir(instance)). Best-effort — a down AM
+          // just means the periodic heartbeat is the only health signal.
+          if (notifyMessageDelivered && targetInstance) {
+            const monDir = getMonitorDir(targetInstance) || path.join(ZYLOS_DIR, 'activity-monitor', targetInstance);
+            notifyMessageDelivered({
+              conversationId: item.id,
+              channel: item.channel,
+              socketPath: path.join(monDir, 'am.sock'),
+            }).catch((err) => log(`Warning: failed to notify AM of delivery: ${err.message}`));
+          }
+        } else {
+          const hasAck = (item.content || '').includes('---- ack via:');
+          if (hasAck) {
+            log(`Control id=${item.id} submitted, waiting ack`);
+          } else {
+            ackControl(item.id);
+            log(`Control id=${item.id} submitted (no-ack mode), marked done`);
+          }
+        }
+
+        // Terminal (or deliberately-held-for-ack) state reached — the finally
+        // must NOT requeue this item even if a later await throws. NOTE the
+        // ack-waiting control above intentionally STAYS 'running' until the
+        // agent acks; releasing it would redeliver in a loop.
+        inFlight = null;
+
+        if (item.require_idle === 1) {
+          await waitForRequireIdleSettlement(item.id, statusFile);
+        }
+
+        // Track delivery time for idle reaping; clear boot grace period.
+        if (targetInstance) {
+          lastDeliveryAt.set(targetInstance, Date.now());
+          autoStartedAt.delete(targetInstance);
+        }
+
+        return summarize({ delivered: true, state: claudeState.state });
+      }
+
+      // Delivery failed.
+      const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
+      log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
+
+      if (item.type === 'control') {
+        await handleControlDeliveryFailure(item, reason);
+      } else {
+        await handleConversationDeliveryFailure(item, statusFile);
+      }
+      inFlight = null; // failure handler owns the row now (requeued or failed)
+
+      return summarize({ delivered: false, state: claudeState.state });
+    }
+
+    // Exhausted skip attempts — all tried items were for offline/busy instances.
+    return summarize({ delivered: false, state: 'skip_exhausted' });
+  } finally {
+    // inFlight is non-null ONLY when a throw escaped mid-delivery, before the
+    // item reached a terminal (or deliberately ack-held) state — release it so
+    // the row isn't stranded in 'running' until the next dispatcher restart.
+    if (inFlight) releaseItem(inFlight);
+    for (const held of heldItems) releaseItem(held);
+  }
+}
