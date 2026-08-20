@@ -89,6 +89,24 @@ describe('task-ops scoping', () => {
     assert.equal(all.length, 3);
   });
 
+  it('listTasks composes reply-channel filtering with instance scope', () => {
+    insertTask(db, spec('task-a-telegram', {
+      target_instance: 'inst-a',
+      reply_channel: 'telegram',
+    }));
+    insertTask(db, spec('task-a-feishu', {
+      target_instance: 'inst-a',
+      reply_channel: 'feishu',
+    }));
+    insertTask(db, spec('task-b-telegram', {
+      target_instance: 'inst-b',
+      reply_channel: 'telegram',
+    }));
+
+    const scoped = listTasks(db, { scope: 'inst-a', replyChannel: 'telegram' });
+    assert.deepEqual(scoped.map(t => t.id), ['task-a-telegram']);
+  });
+
   it('completeTask refuses another instance\'s task (not_found under scope)', () => {
     insertTask(db, spec('task-b2', { target_instance: 'inst-b' }));
 

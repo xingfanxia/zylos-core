@@ -661,6 +661,13 @@ export function ensureCodexHooksTrusted({
   const expectedKeys = configuredHookKeys(hooksPath);
   const trustSnapshot = extractTrustSnapshot(readHooksState(globalConfig), hooksPath, expectedKeys);
   if (
+    trust.trusted === 0
+    && trust.candidates === 0
+    && Object.keys(trustSnapshot).length === 0
+  ) {
+    throw new Error('Codex hook trust failed (empty_trust_snapshot). Native SessionStart bootstrap may not run.');
+  }
+  if (
     expectedKeys.length === 0
     || Object.keys(trustSnapshot).length !== expectedKeys.length
     || Object.values(trustSnapshot).some(value => !value.enabled || !value.trusted_hash)

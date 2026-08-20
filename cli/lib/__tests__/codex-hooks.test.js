@@ -468,8 +468,9 @@ describe('Codex hook trust backstop', () => {
   it('counts candidates and missing currentHash through the real trust helper against a stub app-server', () => {
     const { root, zylosDir } = makeEnv();
 
+    const hooksPath = codexHooksPath(zylosDir);
     const makeHook = (i, withHash) => ({
-      key: `/tmp/hooks.json:session_start:0:${i}`,
+      key: `${hooksPath}:session_start:0:${i}`,
       eventName: 'SessionStart',
       command: ['node', `/tmp/hook-${i}.js`],
       enabled: true,
@@ -481,6 +482,7 @@ describe('Codex hook trust backstop', () => {
     const makeNonCandidates = (withHash) => [
       { ...makeHook(90, withHash), isManaged: true },
       (({ key, ...rest }) => rest)(makeHook(91, withHash)),
+      { ...makeHook(92, withHash), key: `/tmp/unrelated-hooks.json:session_start:0:92` },
     ];
 
     const writeFakeCodexBin = (name, hooks) => {

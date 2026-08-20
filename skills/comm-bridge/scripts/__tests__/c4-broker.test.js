@@ -802,6 +802,15 @@ describe('broker scheduler op', () => {
     assert.equal(b.data.length, 0);
   });
 
+  it('list forwards reply-channel filters without widening caller scope', async () => {
+    const filtered = await broker.handleRequest({
+      op: 'scheduler',
+      params: { action: 'list', replyChannel: 'channel-with-no-tasks' },
+    }, 'inst-a');
+    assert.equal(filtered.ok, true);
+    assert.deepEqual(filtered.data, []);
+  });
+
   it('done refuses another instance\'s task, completes own', async () => {
     const added = await broker.handleRequest({
       op: 'scheduler',
