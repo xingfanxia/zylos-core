@@ -6,13 +6,35 @@ No human supervision — execute the full flow autonomously.
 
 ## Step 1: Fetch Conversations
 
-Fetch ALL instances' unsummarized conversations (not just your own):
+Fetch ALL instances' unsummarized conversations (not just your own).
+
+**Do NOT use bare `--unsummarized`.** That flag measures against the *globally* newest
+checkpoint, ignoring `target_instance`. Any other instance's dream checkpoint therefore
+SHADOWS this sync's window: the fetch reports a near-empty range that looks legitimately
+quiet, and every row between this instance's own last checkpoint and the foreign one is
+silently never extracted. Observed 2026-07-30 (122 rows) and again 2026-07-31 (112 rows,
+shadowed by admin checkpoint 698).
+
+Always compute the window from **this instance's own** last checkpoint:
 
 ```bash
-node ~/zylos/.claude/skills/comm-bridge/scripts/c4-fetch.js --unsummarized --all-instances
+# 1. My own last processed id (NOT the global max) — and the current head.
+sqlite3 ~/zylos/comm-bridge/c4.db \
+  "SELECT COALESCE(MAX(end_conversation_id),0) FROM checkpoints WHERE target_instance='scheduler';"
+sqlite3 ~/zylos/comm-bridge/c4.db "SELECT MAX(id) FROM conversations;"
+
+# 2. Fetch that explicit range: begin = <my_last_end> + 1, end = <current max id>.
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-fetch.js \
+  --begin <my_last_end+1> --end <current_max_id> --all-instances
 ```
 
-If the output says "No unsummarized conversations.", skip to Step 5 (still update the activity digest with a "no new activity" note). Otherwise, note the `end_id` from the `[Unsummarized Range]` line — you'll need it for the checkpoint in Step 5.
+If `begin > end` there is genuinely nothing new — skip to Step 5 (still update the activity
+digest with a "no new activity" note). Otherwise carry `<current_max_id>` forward as the
+`end_id` for the checkpoint in Step 5.
+
+Schema notes: the table is `checkpoints` with columns `start_conversation_id` /
+`end_conversation_id` (not `end_id`); `conversations.direction` is lowercase `'in'`/`'out'`.
+An empty query result is unverified, never proof of absence.
 
 ## Step 2: Read Current Shared Knowledge
 
@@ -102,9 +124,12 @@ If conversations were fetched in Step 1, create a checkpoint to mark them as pro
 node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id> --summary "Shared knowledge sync: <brief summary of what was extracted>"
 ```
 
-Replace `<end_id>` with the value from Step 1's `[Unsummarized Range]` output.
+Replace `<end_id>` with the `<current_max_id>` computed in Step 1 — the same value that
+bounded the fetch. Never take it from another instance's checkpoint.
 Checkpoints are instance-scoped: run this inside an instance session (where
-`ZYLOS_INSTANCE_ID` is set) or add `--target-instance <id>`.
+`ZYLOS_INSTANCE_ID` is set) or add `--target-instance <id>`. Verify afterwards that the new
+row's `target_instance` is `scheduler` — a checkpoint written without it re-creates the
+shadowing bug for the next run.
 
 If no conversations were fetched, skip this step.
 
