@@ -109,11 +109,11 @@ function _parseEnvValue(content, key) {
  * the same token mask it — we fall through to the live probe so a genuine token
  * expiry surfaces as a clean `auth_failed`, not a masked `success`.
  *
- * Accepted tradeoff: a token that is present + unexpired but REVOKED server-side
- * still resolves `success` here (no API round-trip). That is not silent — a dead
- * token can't ACK heartbeats, so the session still surfaces via heartbeat-timeout
- * → restart → degraded + admin alert. Detecting revocation directly requires the
- * live API call whose flake this change exists to remove.
+ * Ordinary checks accept a present + unexpired token without a network call.
+ * When the pane independently reports an auth failure, HealthEngine calls
+ * checkAuth({ requireRemote: true }); that corroborating path bypasses this
+ * shortcut and catches server-side revocation without making every routine
+ * health tick depend on a flaky agentic probe.
  *
  * @param {string} [homeDir]
  * @returns {{ found: boolean, kind?: string }}
@@ -203,10 +203,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
   /**
    * Auth check. Primary signal is the INSTALLED credential (deterministic, no
-   * subprocess): a well-formed long-lived token/key present in any location
-   * Claude Code reads IS authentication → success. Only when NO credential is
-   * installed do we fall through to the live `claude -p ping --max-turns 1`
-   * probe for a definitive "genuinely logged out" answer.
+   * subprocess). A caller that already observed an auth-failure pane signal can
+   * pass requireRemote to verify server-side access and bypass the local-token
+   * shortcut. With no installed credential, the live probe remains the fallback.
    *
    * Rationale: the probe is a full agentic round-trip that flakes on
    * SessionStart-hook "Reached max turns", quota 429/overload, and unknown
@@ -218,14 +217,17 @@ export class ClaudeAdapter extends RuntimeAdapter {
    *   { status: 'failure' }   — explicit auth failure (no credential / logged out)
    *   { status: 'uncertain' } — probe could not confirm either way
    *
+   * @param {{requireRemote?: boolean}} [options]
    * @returns {Promise<{status: 'success'|'failure'|'uncertain', reason: string}>}
    */
-  async checkAuth() {
+  async checkAuth({ requireRemote = false } = {}) {
     // Fast path: a well-formed long-lived credential is installed → auth is
     // valid. Deterministic, flake-proof, and the case that holds ~100% of the
     // time on a setup-token fleet.
     const cred = _resolveInstalledCredential();
-    if (cred.found) return { status: 'success', reason: `credential_present:${cred.kind}` };
+    if (cred.found && !requireRemote) {
+      return { status: 'success', reason: `credential_present:${cred.kind}` };
+    }
 
     // No credential found in any known location — genuinely unconfigured/logged
     // out. Fall through to the live probe for a definitive signal (and so
@@ -268,6 +270,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
       const output = (err.stdout ?? '') + (err.stderr ?? '');
       if (output.includes('authentication_error')) {
         return { status: 'failure', reason: 'cli_probe_authentication_error' };
+      }
+      if (/organization has disabled Claude subscription access/i.test(output)) {
+        return { status: 'failure', reason: 'cli_probe_subscription_disabled' };
       }
       const isTransient =
         output.includes('rate_limit_error') ||

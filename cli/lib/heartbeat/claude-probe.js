@@ -54,6 +54,7 @@ const AUTH_FAILURE_PATTERNS = [
   /invalid api key/i,
   /unauthorized/i,
   /(?:oauth|login|session|credential) token (?:has )?expired/i,
+  /organization has disabled Claude subscription access/i,
 ];
 
 /**

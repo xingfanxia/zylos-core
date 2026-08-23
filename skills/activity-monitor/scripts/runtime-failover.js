@@ -13,6 +13,8 @@ const SINGLE_PROFILE_FILE = path.join(ZYLOS_DIR, '.zylos', 'runtime-profiles.jso
 const CONFIG_FILE = path.join(ZYLOS_DIR, '.zylos', 'config.json');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
 const DEFAULT_POLL_MS = Number.parseInt(process.env.RUNTIME_FAILOVER_POLL_MS || '', 10) || 10_000;
+const HEALTH_FAILOVER_STATES = new Set(['rate_limited', 'auth_failed', 'degraded', 'down']);
+const QUARANTINE_HEALTH_STATES = new Set(['auth_failed', 'degraded', 'down']);
 
 function readJson(filePath, fallback = null) {
   try {
@@ -59,25 +61,36 @@ export function chooseRuntimeProfile({
   minDwellMs = 300_000,
   autoRecover = true,
   wrapOnExhausted = false,
+  blockedProfiles = [],
 } = {}) {
   const currentIndex = chain.indexOf(currentProfile);
   if (currentIndex < 0) return { profile: chain[0] || currentProfile, reason: 'profile_not_in_chain' };
 
   const current = profiles[currentProfile] || {};
   const currentUsage = providerUsageState(providerUsage, current.usage_provider, nowMs);
-  const healthLimited = currentHealth === 'rate_limited';
+  const blocked = new Set(Array.isArray(blockedProfiles) ? blockedProfiles : Object.keys(blockedProfiles || {}));
+  const healthLimited = HEALTH_FAILOVER_STATES.has(currentHealth);
   const usageLimited = currentUsage.available && currentUsage.usedPercent >= switchThreshold;
+
+  // A profile switch carries the previous adapter's persisted health until the
+  // new adapter completes a functional heartbeat. Give that probe one dwell
+  // window before chaining again, otherwise one stale `degraded` status can
+  // race through every fallback tier in consecutive daemon polls.
+  if (healthLimited && changedAtMs > 0 && nowMs - changedAtMs < minDwellMs) {
+    return { profile: currentProfile, reason: 'no_change' };
+  }
 
   if (healthLimited || usageLimited) {
     for (let i = currentIndex + 1; i < chain.length; i++) {
       const candidateId = chain[i];
+      if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
       const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
       if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
         return {
           profile: candidateId,
           reason: healthLimited
-            ? `health_rate_limited:${currentProfile}`
+            ? `health_${currentHealth}:${currentProfile}`
             : `usage_exhausted:${current.usage_provider}`,
         };
       }
@@ -90,13 +103,14 @@ export function chooseRuntimeProfile({
     if (wrapOnExhausted) {
       for (let i = 0; i < currentIndex; i++) {
         const candidateId = chain[i];
+        if (blocked.has(candidateId)) continue;
         const candidate = profiles[candidateId] || {};
         const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
         if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
           return {
             profile: candidateId,
             reason: healthLimited
-              ? `health_rate_limited_wrap:${currentProfile}`
+              ? `health_${currentHealth}_wrap:${currentProfile}`
               : `usage_exhausted_wrap:${current.usage_provider}`,
           };
         }
@@ -108,6 +122,7 @@ export function chooseRuntimeProfile({
   if (autoRecover && currentIndex > 0 && nowMs - changedAtMs >= minDwellMs) {
     for (let i = 0; i < currentIndex; i++) {
       const candidateId = chain[i];
+      if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
       const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
       if (!candidate.usage_provider || (state.available && state.usedPercent < recoverThreshold)) {
@@ -140,12 +155,18 @@ export function planRuntimeFailover({
     if (healthByInstance[instanceId] === 'suspended') continue;
     const currentProfile = instance.runtime_profile || chain[0];
     const changedAtMs = Date.parse(instance.runtime_profile_changed_at || '') || 0;
+    const blockedProfiles = instance.runtime_failover_blocked_profiles
+      && typeof instance.runtime_failover_blocked_profiles === 'object'
+      && !Array.isArray(instance.runtime_failover_blocked_profiles)
+      ? instance.runtime_failover_blocked_profiles
+      : {};
+    const currentHealth = healthByInstance[instanceId] || 'ok';
     const decision = chooseRuntimeProfile({
       currentProfile,
       chain,
       profiles,
       providerUsage,
-      currentHealth: healthByInstance[instanceId] || 'ok',
+      currentHealth,
       switchThreshold: Number(policy.switch_threshold) || 98,
       recoverThreshold: Number(policy.recover_threshold) || 80,
       minDwellMs: Math.max(0, Number(policy.min_dwell_sec) || 0) * 1000,
@@ -153,10 +174,25 @@ export function planRuntimeFailover({
       nowMs,
       autoRecover: policy.auto_recover !== false,
       wrapOnExhausted: policy.wrap_on_exhausted === true,
+      blockedProfiles,
     });
     if (decision.profile === currentProfile) continue;
 
     const target = profiles[decision.profile];
+    if (QUARANTINE_HEALTH_STATES.has(currentHealth)) {
+      // Quota failures self-expire from provider usage windows. Functional
+      // failures do not have a trustworthy recovery signal, so quarantine the
+      // failed profile until an operator clears this persisted entry after
+      // repairing credentials/provider access. This prevents auto-recover from
+      // bouncing a healthy fallback back into a known-bad provider.
+      instance.runtime_failover_blocked_profiles = {
+        ...blockedProfiles,
+        [currentProfile]: {
+          health: currentHealth,
+          blocked_at: new Date(nowMs).toISOString(),
+        },
+      };
+    }
     instance.runtime_profile = decision.profile;
     instance.runtime = target.runtime;
     instance.runtime_profile_changed_at = new Date(nowMs).toISOString();
@@ -192,6 +228,11 @@ export function planSingleSessionRuntimeFailover({
   if (!policy.enabled || chain.length < 2) return { document: next, changes };
 
   const currentProfile = next.active_profile || chain[0];
+  const currentBlockedProfiles = next.runtime_failover_blocked_profiles
+    && typeof next.runtime_failover_blocked_profiles === 'object'
+    && !Array.isArray(next.runtime_failover_blocked_profiles)
+    ? next.runtime_failover_blocked_profiles
+    : {};
   const decision = chooseRuntimeProfile({
     currentProfile,
     chain,
@@ -205,10 +246,20 @@ export function planSingleSessionRuntimeFailover({
     nowMs,
     autoRecover: policy.auto_recover !== false,
     wrapOnExhausted: policy.wrap_on_exhausted === true,
+    blockedProfiles: currentBlockedProfiles,
   });
   if (decision.profile === currentProfile) return { document: next, changes };
 
   const target = profiles[decision.profile];
+  if (QUARANTINE_HEALTH_STATES.has(currentHealth)) {
+    next.runtime_failover_blocked_profiles = {
+      ...currentBlockedProfiles,
+      [currentProfile]: {
+        health: currentHealth,
+        blocked_at: new Date(nowMs).toISOString(),
+      },
+    };
+  }
   next.active_profile = decision.profile;
   next.active_runtime = target.runtime;
   next.runtime_profile_changed_at = new Date(nowMs).toISOString();
