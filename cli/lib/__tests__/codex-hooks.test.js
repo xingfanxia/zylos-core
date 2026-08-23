@@ -19,6 +19,7 @@ import {
   installCoreCodexHook,
   isCodexTrustValid,
   readHooksState,
+  restoreCodexStateRuntimeAccess,
   trustCodexHooksWithAppServer,
   uninstallCoreCodexHook,
 } from '../codex-hooks.js';
@@ -197,6 +198,58 @@ describe('Codex core hook installer', () => {
 });
 
 describe('Codex hook trust backstop', () => {
+  it('repairs isolated state-runtime SQLite ownership without touching credentials', () => {
+    const { homeDir } = makeEnv();
+    const codexHome = path.join(homeDir, '.codex-subscription');
+    fs.mkdirSync(codexHome, { recursive: true });
+    for (const name of [
+      'state_5.sqlite',
+      'state_5.sqlite-wal',
+      'state_5.sqlite-shm',
+      'auth.json',
+      'config.toml',
+      'goals_1.sqlite',
+    ]) {
+      fs.writeFileSync(path.join(codexHome, name), 'fixture');
+    }
+    const calls = [];
+
+    const result = restoreCodexStateRuntimeAccess({
+      homeDir,
+      codexHome,
+      runAsUser: 'zylos-pan',
+      execFileSyncImpl: (file, args) => calls.push([file, args]),
+    });
+
+    assert.deepEqual(result.repaired.map(file => path.basename(file)).sort(), [
+      'state_5.sqlite',
+      'state_5.sqlite-shm',
+      'state_5.sqlite-wal',
+    ]);
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(([file, args]) =>
+      file === 'sudo'
+      && args[0] === '-n'
+      && args[1] === 'chown'
+      && args[2] === '--no-dereference'
+      && args[3] === 'zylos-pan:zylos-pan'
+    ));
+    assert.equal(calls.some(([, args]) => args.some(arg => /auth\.json|config\.toml|goals_1/.test(arg))), false);
+  });
+
+  it('refuses to repair a Codex state path outside the isolated runtime home', () => {
+    const { root, homeDir } = makeEnv();
+    assert.throws(
+      () => restoreCodexStateRuntimeAccess({
+        homeDir,
+        codexHome: path.join(root, 'other-profile'),
+        runAsUser: 'zylos-pan',
+        execFileSyncImpl: () => {},
+      }),
+      /outside runtime home/
+    );
+  });
+
   it('runs app-server trust as the isolated persona user', () => {
     const { homeDir, zylosDir } = makeEnv();
     const codexHome = path.join(homeDir, '.codex-subscription');
