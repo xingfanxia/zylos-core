@@ -16,13 +16,31 @@ const fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-fakebin-')
 const fakeCodexPath = path.join(fakeBinDir, 'codex');
 fs.writeFileSync(
   fakeCodexPath,
-  '#!/usr/bin/env bash\nif [ -n "$FAKE_CODEX_EXIT" ]; then exit "$FAKE_CODEX_EXIT"; fi\necho "${FAKE_CODEX_STATUS:-Not logged in}" >&2\nexit 0\n',
+  [
+    '#!/usr/bin/env bash',
+    'if [ "$1" = "exec" ]; then',
+    '  if [ "$FAKE_CODEX_EXEC" = "refresh_failed" ]; then',
+    '    echo "Your access token could not be refreshed. Please log out and sign in again." >&2',
+    '    exit 1',
+    '  fi',
+    '  if [ "$FAKE_CODEX_EXEC" = "success" ]; then',
+    '    echo "{\\"type\\":\\"turn.completed\\"}"',
+    '    exit 0',
+    '  fi',
+    '  echo "unexpected exec failure" >&2',
+    '  exit 1',
+    'fi',
+    'if [ -n "$FAKE_CODEX_EXIT" ]; then exit "$FAKE_CODEX_EXIT"; fi',
+    'echo "${FAKE_CODEX_STATUS:-Not logged in}" >&2',
+    'exit 0',
+    '',
+  ].join('\n'),
   { mode: 0o755 }
 );
 process.env.CODEX_BIN = fakeCodexPath;
 after(() => { try { fs.rmSync(fakeBinDir, { recursive: true, force: true }); } catch {} });
 
-const { CodexAdapter } = await import('../runtime/codex.js');
+const { CodexAdapter, buildCodexProfileCommand } = await import('../runtime/codex.js');
 
 afterEach(() => {
   while (tmpDirs.length > 0) {
@@ -47,6 +65,7 @@ afterEach(() => {
 
   delete process.env.FAKE_CODEX_STATUS;
   delete process.env.FAKE_CODEX_EXIT;
+  delete process.env.FAKE_CODEX_EXEC;
 });
 
 describe('Codex auth checks', () => {
@@ -204,6 +223,71 @@ describe('Codex auth checks', () => {
 
     assert.equal(result.status, 'success');
     assert.equal(result.reason, 'codex_login_status');
+  });
+
+  it('chatgpt: remote verification catches a non-refreshable access token', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-auth-test-'));
+    tmpDirs.push(tmpHome);
+    const codexHome = path.join(tmpHome, '.codex-subscription');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: 'fixture' },
+    }));
+    process.env.FAKE_CODEX_STATUS = 'Logged in using ChatGPT';
+    process.env.FAKE_CODEX_EXEC = 'refresh_failed';
+
+    const adapter = new CodexAdapter({ runtimeProfile: {
+      id: 'codex-subscription',
+      runtimeHome: tmpHome,
+      codexHome,
+    } });
+    const result = await adapter.checkAuth({ requireRemote: true });
+
+    assert.equal(result.status, 'failure');
+    assert.equal(result.reason, 'codex_exec_token_refresh_failed');
+  });
+
+  it('chatgpt: remote verification accepts a completed Codex turn', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-auth-test-'));
+    tmpDirs.push(tmpHome);
+    const codexHome = path.join(tmpHome, '.codex-subscription');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'chatgpt',
+      tokens: { access_token: 'fixture' },
+    }));
+    process.env.FAKE_CODEX_STATUS = 'Logged in using ChatGPT';
+    process.env.FAKE_CODEX_EXEC = 'success';
+
+    const adapter = new CodexAdapter({ runtimeProfile: {
+      id: 'codex-subscription',
+      runtimeHome: tmpHome,
+      codexHome,
+    } });
+    const result = await adapter.checkAuth({ requireRemote: true });
+
+    assert.equal(result.status, 'success');
+    assert.equal(result.reason, 'codex_exec_probe');
+  });
+
+  it('runs isolated auth commands as the persona that owns mutable state', () => {
+    const command = buildCodexProfileCommand({
+      args: ['login', 'status'],
+      runtimeHome: '/home/zylos-pan',
+      codexHome: '/home/zylos-pan/.codex-subscription',
+      osUser: 'zylos-pan',
+      codexBin: '/usr/bin/codex',
+    });
+
+    assert.equal(command.file, 'sudo');
+    assert.deepEqual(command.args.slice(0, 7), [
+      '-n', '-u', 'zylos-pan', '-H', '--', '/usr/bin/env', 'HOME=/home/zylos-pan',
+    ]);
+    assert.ok(command.args.includes('CODEX_HOME=/home/zylos-pan/.codex-subscription'));
+    assert.ok(command.args.includes('/usr/bin/codex'));
+    assert.deepEqual(command.args.slice(-2), ['login', 'status']);
+    assert.equal(command.options.cwd, '/home/zylos-pan');
   });
 
   it('chatgpt/no-auth: returns uncertain when codex login status output is unparseable', async () => {
