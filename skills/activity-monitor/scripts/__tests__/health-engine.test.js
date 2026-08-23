@@ -84,6 +84,25 @@ describe('HealthEngine', () => {
 
       assert.deepEqual(calls.enqueueHeartbeat, ['primary']);
     });
+
+    it('cold-start grace resets inherited health and probes when warmup ends', () => {
+      const { deps, calls } = createMockDeps();
+      let nowMs = 1_000_000;
+      const engine = new HealthEngine(deps, {
+        heartbeatInterval: 1800,
+        now: () => nowMs,
+      });
+      engine.setHealth('degraded', 'previous_profile_failed');
+
+      engine.notifyColdStart(30);
+      engine.runMaintenanceCycle(true, 1029);
+      assert.equal(engine.health, 'ok');
+      assert.deepEqual(calls.enqueueHeartbeat, []);
+
+      nowMs = 1_030_000;
+      engine.runMaintenanceCycle(true, 1030);
+      assert.deepEqual(calls.enqueueHeartbeat, ['primary']);
+    });
   });
 
   describe('primary heartbeat', () => {

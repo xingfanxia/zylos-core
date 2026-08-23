@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -6,6 +9,7 @@ import {
   planRuntimeFailover,
   planSingleSessionRuntimeFailover,
 } from '../runtime-failover.js';
+import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 
 const profiles = {
   'claude-subscription': { runtime: 'claude', usage_provider: 'claude' },
@@ -395,5 +399,41 @@ describe('runtime failover selection', () => {
         blocked_at: '1970-01-01T00:00:10.000Z',
       },
     });
+  });
+});
+
+describe('runtime switch signaling', () => {
+  it('writes a private cold-start signal for the replacement profile', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-runtime-switch-'));
+    let signalPath;
+
+    try {
+      signalPath = writeRuntimeSwitchSignal({
+        zylosDir,
+        change: {
+          instanceId: 'user-elaine',
+          fromProfile: 'claude-subscription',
+          toProfile: 'codex-subscription',
+          reason: 'health_degraded:claude-subscription',
+        },
+        nowMs: 10_000,
+        graceSec: 30,
+      });
+
+      assert.equal(signalPath, path.join(zylosDir, '.zylos', 'runtime-switches', 'user-elaine.json'));
+      assert.deepEqual(JSON.parse(fs.readFileSync(signalPath, 'utf8')), {
+        version: 1,
+        instance_id: 'user-elaine',
+        from_profile: 'claude-subscription',
+        to_profile: 'codex-subscription',
+        reason: 'health_degraded:claude-subscription',
+        switched_at: '1970-01-01T00:00:10.000Z',
+        grace_sec: 30,
+      });
+      assert.equal(fs.statSync(signalPath).mode & 0o777, 0o600);
+    } finally {
+      assert.equal(fs.statSync(path.dirname(signalPath)).mode & 0o777, 0o700);
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
   });
 });

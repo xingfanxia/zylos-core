@@ -116,7 +116,7 @@ export class HealthEngine {
     this.healthState = options.initialHealth ?? 'ok';
     this.healthReason = options.initialReason ?? '';
     this.restartFailureCount = 0;
-    this.lastHeartbeatAt = Math.floor(Date.now() / 1000);
+    this.lastHeartbeatAt = Math.floor(this.now() / 1000);
     this.lastRecoveryAt = 0;
     this.lastDownCheckAt = 0;
     // If resuming in recovering state (e.g., PM2 restart mid-recovery),
@@ -234,7 +234,13 @@ export class HealthEngine {
    * @param {number} seconds - Grace period duration
    */
   notifyColdStart(seconds) {
-    this.warmupUntil = Math.floor(Date.now() / 1000) + seconds;
+    const nowSec = Math.floor(this.now() / 1000);
+    this.warmupUntil = nowSec + seconds;
+    // Make the first functional probe due exactly when warmup ends. Carrying
+    // the previous profile's degraded health into a fresh adapter caused a
+    // five-second post-restart probe to race Codex startup and quarantine a
+    // healthy fallback before it could consume the heartbeat.
+    this.lastHeartbeatAt = nowSec - this.heartbeatInterval + seconds;
     this.setHealth('ok', `cold_start_grace_${seconds}s`);
     this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
@@ -727,7 +733,7 @@ export class HealthEngine {
   enqueueHeartbeat(phase) {
     const ok = this.deps.enqueueHeartbeat(phase);
     if (ok && phase === 'primary') {
-      this.lastHeartbeatAt = Math.floor(Date.now() / 1000);
+      this.lastHeartbeatAt = Math.floor(this.now() / 1000);
     }
     return ok;
   }

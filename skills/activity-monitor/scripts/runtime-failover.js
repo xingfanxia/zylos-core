@@ -6,6 +6,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../../multi-session/file-lock.js';
+import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -350,6 +351,18 @@ export function applyRuntimeFailover({
         writeJsonAtomic(SINGLE_PROFILE_FILE, planned.document);
         updateConfiguredRuntime(changes[0].runtime);
       }
+    });
+  }
+
+  // Publish every cold-start signal before restarting the first monitor. If a
+  // later PM2 restart fails, its durable signal still protects the next boot
+  // from inheriting the previous adapter's degraded heartbeat state.
+  for (const change of changes) {
+    if (change.singleSession) continue;
+    writeRuntimeSwitchSignal({
+      zylosDir: ZYLOS_DIR,
+      change,
+      nowMs,
     });
   }
 
