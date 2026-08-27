@@ -15,6 +15,7 @@
  */
 
 import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +30,7 @@ import {
 import {
   ladderDeadlineMs,
   perUserSuffix,
+  readFlagStatus,
   sweepStaleFlags,
   tLinkMs,
   waitForFlag,
@@ -47,6 +49,10 @@ export const SHARD_EMIT_BUDGET_MS = 5_500;
 // shard-sequencer.js): a fixed name under shared /tmp is unwritable for the
 // second zylos user on a multi-user host.
 const SPILL_ROOT_NAME = `zylos-shard-spill-${perUserSuffix()}`;
+
+export function startupContextRequired(env = process.env) {
+  return /^(?:1|true|yes|on)$/i.test(String(env.ZYLOS_REQUIRE_STARTUP_CONTEXT || ''));
+}
 
 export function installProcessBackstop({
   totalBudgetMs = DEFAULT_TOTAL_BUDGET_MS,
@@ -224,6 +230,7 @@ export async function runSessionStartOrchestrator(payload = {}, {
   budgets = STEP_BUDGETS_MS,
   stdout = process.stdout,
   hardBackstopTimer = null,
+  requireHealthyContext = startupContextRequired(),
   actions = {
     memoryInject: runMemoryInject,
     c4SessionInit: runC4SessionInit,
@@ -235,7 +242,7 @@ export async function runSessionStartOrchestrator(payload = {}, {
   const totalTimer = hardBackstopTimer || installProcessBackstop({ totalBudgetMs });
 
   try {
-    await runStep({
+    const memoryResult = await runStep({
       name: 'memory-inject',
       source,
       budgetMs: budgets.memoryInject,
@@ -244,7 +251,7 @@ export async function runSessionStartOrchestrator(payload = {}, {
       stdout,
     });
 
-    await runStep({
+    const c4Result = await runStep({
       name: 'c4-session-init',
       source,
       budgetMs: budgets.c4SessionInit,
@@ -252,6 +259,22 @@ export async function runSessionStartOrchestrator(payload = {}, {
       writeStdout: true,
       stdout,
     });
+
+    const contextFailures = [
+      ['memory-inject', memoryResult],
+      ['c4-session-init', c4Result],
+    ].filter(([, result]) => !result.ok).map(([name]) => `${name}: failed`);
+    if (requireHealthyContext && contextFailures.length > 0) {
+      const notice = formatSection(
+        'STARTUP CONTEXT BLOCKED',
+        [
+          'Required startup context did not load cleanly.',
+          ...contextFailures.map(failure => `- ${failure}`),
+          'Do not continue work or answer external messages. Wait for an operator to repair the runtime and start a fresh session.',
+        ].join('\n'),
+      );
+      writeAllSync(stdout.fd ?? 1, `${notice}\n`);
+    }
 
     const sideEffects = [
       runStep({
@@ -262,12 +285,13 @@ export async function runSessionStartOrchestrator(payload = {}, {
       }),
     ];
 
-    if (source === 'compact') {
+    if (source === 'compact' || (requireHealthyContext && contextFailures.length > 0)) {
       await logStep({
         name: 'session-start-prompt',
         source,
-        status: 'skipped',
+        status: source === 'compact' ? 'skipped' : 'blocked',
         durationMs: 0,
+        extra: contextFailures.length > 0 ? `context=${contextFailures.join('|')}` : '',
       });
     } else {
       sideEffects.push(runStep({
@@ -334,7 +358,10 @@ async function runShardSideEffect(name, payload, {
   chain,
   sessionId,
   linkMs,
+  stdout,
   waitForFlagImpl,
+  readFlagStatusImpl,
+  requireHealthyContext,
   sequencerOptions = {},
 }) {
   if (name === SIDE_EFFECT_NAMES.foreground) {
@@ -365,6 +392,48 @@ async function runShardSideEffect(name, payload, {
     });
     waitExtra = `wait=${wait.ok ? 'ok' : 'timeout'}:${wait.waitedMs}`;
   }
+
+  if (requireHealthyContext) {
+    const failures = [];
+    if (!sessionId) {
+      failures.push('session_id: missing');
+    } else {
+      const tailResult = tail
+        ? readFlagStatusImpl(sessionId, tail.name, sequencerOptions)
+        : { ok: false, reason: 'missing', roundId: null };
+      const roundId = tailResult.roundId || null;
+      for (const shard of chain) {
+        const result = readFlagStatusImpl(sessionId, shard.name, sequencerOptions);
+        if (!result.ok) {
+          failures.push(`${shard.name}: ${result.reason}`);
+        } else if (!result.roundId) {
+          failures.push(`${shard.name}: round missing`);
+        } else if (roundId && result.roundId !== roundId) {
+          failures.push(`${shard.name}: round mismatch`);
+        }
+      }
+    }
+    if (failures.length > 0) {
+      const notice = formatSection(
+        'STARTUP CONTEXT BLOCKED',
+        [
+          'Required startup context did not load cleanly.',
+          ...failures.map(failure => `- ${failure}`),
+          'Do not continue work or answer external messages. Wait for an operator to repair the runtime and start a fresh session.',
+        ].join('\n'),
+      );
+      writeAllSync(stdout.fd ?? 1, `${notice}\n`);
+      console.error(`[session-start-orchestrator] startup prompt blocked: ${failures.join(', ')}`);
+      await logStep({
+        name: 'session-start-prompt',
+        source,
+        status: 'blocked',
+        durationMs: 0,
+        extra: `${waitExtra}:context=${failures.join('|')}`,
+      });
+      return;
+    }
+  }
   await runStep({
     name: 'session-start-prompt',
     source,
@@ -389,7 +458,9 @@ export async function runSessionStartShard(name, payload = {}, {
   linkMs = tLinkMs(),
   resolveShardImpl = resolveShard,
   waitForFlagImpl = waitForFlag,
+  readFlagStatusImpl = readFlagStatus,
   writeFlagImpl = writeFlag,
+  requireHealthyContext = startupContextRequired(),
   registerExitFlagImpl = fn => process.once('exit', fn),
   actions = {
     foreground: runForeground,
@@ -422,7 +493,10 @@ export async function runSessionStartShard(name, payload = {}, {
       chain: resolved.chain,
       sessionId,
       linkMs,
+      stdout,
       waitForFlagImpl,
+      readFlagStatusImpl,
+      requireHealthyContext,
       sequencerOptions,
     });
     return;
@@ -436,6 +510,7 @@ export async function runSessionStartShard(name, payload = {}, {
   // entirely rather than risk cross-session flag poisoning.
   let waitNote = '';
   let waitExtra = 'wait=none';
+  let roundId = null;
   const predecessor = shard.chainIndex > 0 ? chain[shard.chainIndex - 1] : null;
   if (predecessor && sessionId) {
     const wait = await waitForFlagImpl(sessionId, predecessor.name, {
@@ -444,9 +519,13 @@ export async function runSessionStartShard(name, payload = {}, {
     });
     waitExtra = `wait=${wait.ok ? 'ok' : 'timeout'}:${wait.waitedMs}`;
     if (!wait.ok) waitNote = `predecessor "${predecessor.name}" not ready after ${wait.waitedMs}ms, continued`;
+    if (wait.ok) {
+      roundId = readFlagStatusImpl(sessionId, predecessor.name, sequencerOptions).roundId || null;
+    }
   } else if (!sessionId) {
     console.error(`[session-start-orchestrator] shard "${name}": no session_id in hook payload; emitting without serialization`);
   }
+  if (sessionId && !roundId) roundId = randomUUID();
 
   let body = '';
   let status = 'ok';
@@ -498,7 +577,11 @@ export async function runSessionStartShard(name, payload = {}, {
   // shard's slot, so successors must not burn their ladder deadline waiting
   // for a shard that already spoke.
   if (sessionId) {
-    registerExitFlagImpl(() => writeFlagImpl(sessionId, shard.name, sequencerOptions));
+    registerExitFlagImpl(() => writeFlagImpl(sessionId, shard.name, {
+      ...sequencerOptions,
+      roundId,
+      status,
+    }));
   }
 
   await logStep({
