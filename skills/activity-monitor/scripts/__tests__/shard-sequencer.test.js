@@ -13,6 +13,7 @@ import {
   flagRoot,
   ladderDeadlineMs,
   perUserSuffix,
+  readFlagStatus,
   sessionFlagDir,
   sweepStaleFlags,
   tLinkMs,
@@ -63,6 +64,40 @@ describe('shard-sequencer flag chain', () => {
     const result = await waitForFlag('sess-a', 'identity', { deadlineMs: 120, pollMs: 10, tmpdir });
     assert.equal(result.ok, false);
     assert.ok(result.waitedMs >= 120);
+  });
+
+  it('records and reads the shard result without changing wait semantics', () => {
+    const tmpdir = makeTmpdir();
+    writeFlag('sess-a', 'identity', { tmpdir, status: 'failed', roundId: 'round-a' });
+
+    assert.deepEqual(readFlagStatus('sess-a', 'identity', { tmpdir, freshAfterMs: 0 }), {
+      ok: false,
+      status: 'failed',
+      reason: 'failed',
+      roundId: 'round-a',
+    });
+  });
+
+  it('treats legacy completion flags as healthy during a rolling upgrade', () => {
+    const tmpdir = makeTmpdir();
+    const target = flagPath('sess-a', 'identity', { tmpdir });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, '1');
+
+    assert.deepEqual(readFlagStatus('sess-a', 'identity', { tmpdir, freshAfterMs: 0 }), {
+      ok: true,
+      status: 'ok',
+      reason: 'legacy',
+    });
+  });
+
+  it('does not accept a missing or stale flag as healthy', () => {
+    const tmpdir = makeTmpdir();
+    assert.equal(readFlagStatus('sess-a', 'identity', { tmpdir, freshAfterMs: 0 }).reason, 'missing');
+
+    writeFlag('sess-a', 'identity', { tmpdir });
+    const future = Date.now() + 60_000;
+    assert.equal(readFlagStatus('sess-a', 'identity', { tmpdir, freshAfterMs: future }).reason, 'stale');
   });
 
   it('sanitizes hostile session ids to a single segment under the flag root', () => {
