@@ -88,6 +88,33 @@ describe('c4-send basic', () => {
       assert.deepEqual(sent, ['Hello broadcast!']);
     });
   });
+
+  it('attributes the audit out-row to ZYLOS_INSTANCE_ID', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      setupMockChannel(tmpDir, 'mock-channel');
+
+      const scopedEnv = { ...env, ZYLOS_INSTANCE_ID: 'admin' };
+      const { status } = cli(['mock-channel', 'endpoint1', 'Scoped reply'], scopedEnv);
+      assert.equal(status, 0);
+
+      const [out] = dbRecent(scopedEnv);
+      assert.equal(out.direction, 'out');
+      assert.equal(out.target_instance, 'admin');
+    });
+  });
+
+  it('keeps the audit out-row unscoped when ZYLOS_INSTANCE_ID is absent', () => {
+    withTmpDir(({ tmpDir, env }) => {
+      setupMockChannel(tmpDir, 'mock-channel');
+
+      const { status } = cli(['mock-channel', 'endpoint1', 'Single-session reply'], env);
+      assert.equal(status, 0);
+
+      const [out] = dbRecent(env);
+      assert.equal(out.direction, 'out');
+      assert.equal(out.target_instance, null);
+    });
+  });
 });
 
 // -- validation --
@@ -200,14 +227,16 @@ describe('c4-send failed channel', () => {
       fs.mkdirSync(skillDir, { recursive: true });
       fs.writeFileSync(path.join(skillDir, 'send.js'), 'process.exit(1);');
 
-      cli(['bad-channel', 'Hello'], env);
+      const scopedEnv = { ...env, ZYLOS_INSTANCE_ID: 'admin' };
+      cli(['bad-channel', 'Hello'], scopedEnv);
 
       // The user never received this — the audit row must not read 'delivered'
       // (a phantom delivered out-row masks unanswered-inbound re-surfacing).
-      const rows = dbRecent(env);
+      const rows = dbRecent(scopedEnv);
       const out = rows.find((r) => r.direction === 'out' && r.channel === 'bad-channel');
       assert.ok(out, 'audit out-row exists');
       assert.equal(out.status, 'failed');
+      assert.equal(out.target_instance, 'admin');
     });
   });
 });
