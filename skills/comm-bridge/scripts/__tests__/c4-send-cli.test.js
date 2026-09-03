@@ -136,15 +136,20 @@ describe('c4-send validation', () => {
     });
   });
 
-  it('errors when channel script not found', () => {
+  it('marks the scoped audit row failed when channel send.js is missing', () => {
     withTmpDir(({ tmpDir, env }) => {
       // Create the channel directory but no send.js
       const skillDir = path.join(tmpDir, '.claude', 'skills', 'fake-channel');
       fs.mkdirSync(skillDir, { recursive: true });
 
-      const { stderr, status } = cli(['fake-channel', 'Hello'], env);
+      const scopedEnv = { ...env, ZYLOS_INSTANCE_ID: 'admin' };
+      const { stderr, status } = cli(['fake-channel', 'Hello'], scopedEnv);
       assert.equal(status, 1);
       assert.ok(stderr.includes('Channel script not found'));
+
+      const [out] = dbRecent(scopedEnv);
+      assert.equal(out.status, 'failed');
+      assert.equal(out.target_instance, 'admin');
     });
   });
 });
