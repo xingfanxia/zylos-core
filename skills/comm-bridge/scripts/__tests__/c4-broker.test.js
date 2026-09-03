@@ -405,11 +405,37 @@ describe('broker handleRequest', () => {
     assert.match(toOwner.error, /channel_send_failed/); // passed auth, reached the (failing) channel
   });
 
-  it('send: M3 — out-row is NULL-targeted (not replayed into the caller\'s unsummarized)', async () => {
-    const before = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
-    await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'reply text' } }, 'inst-a');
-    const after = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
-    assert.equal(after, before, 'own outbound message must not count toward unsummarized');
+  it('send: stores the caller on the out-row and includes it in only that caller\'s history', async () => {
+    const sent = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'web-console', endpoint: 'console-1', content: 'scoped reply text' },
+    }, 'inst-b');
+    assert.equal(sent.ok, true, sent.error);
+
+    const row = getDb().prepare(
+      'SELECT id, direction, status, target_instance FROM conversations WHERE id = ?'
+    ).get(sent.data.conversation_id);
+    assert.equal(row.direction, 'out');
+    assert.equal(row.status, 'delivered');
+    assert.equal(row.target_instance, 'inst-b');
+
+    const ownRange = await broker.handleRequest({ op: 'unsummarized' }, 'inst-b');
+    assert.equal(ownRange.ok, true);
+    assert.ok(ownRange.data.begin_id <= row.id && ownRange.data.end_id >= row.id);
+
+    const ownUnsummarized = await broker.handleRequest({ op: 'fetch', params: { unsummarized: true } }, 'inst-b');
+    assert.equal(ownUnsummarized.ok, true);
+    assert.ok(
+      ownUnsummarized.data.conversations.some((conversation) => conversation.id === row.id),
+      'caller must see its delivered outbound in unsummarized history',
+    );
+
+    const crossFetch = await broker.handleRequest({
+      op: 'fetch',
+      params: { begin: row.id, end: row.id },
+    }, 'inst-a');
+    assert.equal(crossFetch.ok, true);
+    assert.deepEqual(crossFetch.data.conversations, [], 'another caller must not see the outbound row');
   });
 
   it('send: deliveryAction survives the broker hop into the audit row', async () => {
@@ -433,8 +459,9 @@ describe('broker handleRequest', () => {
     }, 'inst-a');
     assert.equal(r.ok, false);
     assert.match(r.error, /channel_send_failed/);
-    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    const row = getDb().prepare('SELECT status, target_instance FROM conversations WHERE id = ?').get(r.data.conversation_id);
     assert.equal(row.status, 'failed');
+    assert.equal(row.target_instance, 'inst-a', 'failed audit rows retain caller attribution');
   });
 });
 
@@ -670,9 +697,8 @@ describe('broker void op', () => {
     assert.equal(r.data.recorded, true);
     assert.ok(Number.isInteger(r.data.conversation_id));
     // Void is scoped to the caller (target_instance = caller) and 'delivered', so
-    // that instance's own next session-init reads the handoff back — unlike
-    // real-channel out-rows which are NULL-targeted (M3). Assert the row shape
-    // directly (immune to the sibling checkpoint's id boundary).
+    // that instance's own next session-init reads the handoff back. Assert the
+    // row shape directly (immune to the sibling checkpoint's id boundary).
     const row = getDb().prepare('SELECT direction, channel, status, target_instance FROM conversations WHERE id = ?').get(r.data.conversation_id);
     assert.equal(row.channel, 'void');
     assert.equal(row.direction, 'out');
