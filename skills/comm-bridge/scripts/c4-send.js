@@ -224,11 +224,22 @@ async function main() {
     close();
   }
 
+  // Mark the audit row failed on any non-delivery: the user never received
+  // this, so it must not count as an answer for the unanswered-message
+  // re-surface. This is defined before channel resolution so a missing script
+  // is handled the same as a non-zero exit or spawn failure.
+  const markAuditFailed = () => {
+    if (outRecord?.id == null) return;
+    try { markFailed(outRecord.id); } catch { /* audit-only, best effort */ }
+    try { close(); } catch { /* reopened by markFailed */ }
+  };
+
   const channelScript = path.join(SKILLS_DIR, channel, 'scripts', 'send.js');
 
   if (!fs.existsSync(channelScript)) {
     console.error(`Error: Channel script not found: ${channelScript}`);
     console.error('Channels must provide scripts/send.js (Node.js standard)');
+    markAuditFailed();
     process.exit(1);
   }
 
@@ -237,16 +248,6 @@ async function main() {
   const child = spawn('node', [channelScript, ...scriptArgs], {
     stdio: 'inherit'
   });
-
-  // Mark the audit row failed on any non-delivery: the user never received
-  // this, so it must not count as an answer for the unanswered-message
-  // re-surface. Covers both a non-zero exit ('close') and a spawn failure
-  // ('error' — script unreadable / node missing — where 'close' never fires).
-  const markAuditFailed = () => {
-    if (outRecord?.id == null) return;
-    try { markFailed(outRecord.id); } catch { /* audit-only, best effort */ }
-    try { close(); } catch { /* reopened by markFailed */ }
-  };
 
   child.on('error', (err) => {
     console.error(`[C4] Failed to spawn channel script: ${err.message}`);
