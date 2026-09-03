@@ -324,7 +324,7 @@ export function getUnsummarizedRangeForInstance(instanceId) {
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
   // Only include messages explicitly targeting this instance.
-  // Exclude NULL-targeted rows (legacy/outgoing) to prevent cross-instance context bleed.
+  // Exclude legacy/unscoped NULL-targeted rows to prevent cross-instance context bleed.
   const result = db.prepare(`
     SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count
     FROM conversations
@@ -357,7 +357,7 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
   // Only include messages explicitly targeting this instance.
-  // Exclude NULL-targeted rows (legacy/outgoing) to prevent cross-instance context bleed.
+  // Exclude legacy/unscoped NULL-targeted rows to prevent cross-instance context bleed.
   if (limit) {
     return db.prepare(`
       SELECT * FROM (
@@ -433,6 +433,19 @@ export function getUnansweredDeliveredForInstance(instanceId) {
   `).all(instanceId, afterId);
   if (inbound.length === 0) return [];
 
+  // The first successfully delivered, instance-attributed external reply marks
+  // the global rollout of outbound attribution. NULL out-rows before this id
+  // are historical; NULL out-rows at/after it indicate a producer regression
+  // and must not silently suppress an actionable inbound. Old/single-session
+  // databases with no tagged reply retain their all-NULL compatibility.
+  const taggedOutboundCutoverId = db.prepare(`
+    SELECT MIN(id) AS id FROM conversations
+    WHERE direction = 'out' AND status = 'delivered'
+      AND target_instance IS NOT NULL AND target_instance != ''
+      AND channel NOT IN ('void', 'system')
+      AND (delivery_action IS NULL OR delivery_action != 'status-notice')
+  `).get()?.id ?? null;
+
   // Outbound rows from the earliest candidate onward tell us which chats have
   // since been replied to (and how recently). Only rows that could plausibly be
   // a real answer count:
@@ -442,15 +455,21 @@ export function getUnansweredDeliveredForInstance(instanceId) {
   //  - not a health status-notice (the automated "please resend" auto-reply is
   //    sent precisely BECAUSE the message wasn't processed — counting it as an
   //    answer would hide exactly the messages this function exists to find)
+  //  - owned by this instance, with NULL retained only before the global
+  //    attribution cutover (or when no cutover exists)
   // Keyed by channel+chat so a chat-id collision across channels (telegram
   // numeric id vs another channel's prefix) can't cross-mask.
   const outbound = db.prepare(`
     SELECT id, channel, endpoint_id FROM conversations
     WHERE direction = 'out' AND id >= ?
+      AND (
+        target_instance = ?
+        OR (target_instance IS NULL AND (? IS NULL OR id < ?))
+      )
       AND channel NOT IN ('void', 'system')
       AND status != 'failed'
       AND (delivery_action IS NULL OR delivery_action != 'status-notice')
-  `).all(inbound[0].id);
+  `).all(inbound[0].id, instanceId, taggedOutboundCutoverId, taggedOutboundCutoverId);
   const lastReplyIdByChat = new Map();
   for (const o of outbound) {
     const chat = groupKeyFromEndpoint(o.endpoint_id);
