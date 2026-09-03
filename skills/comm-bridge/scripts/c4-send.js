@@ -211,7 +211,13 @@ async function main() {
 
   let outRecord = null;
   try {
-    outRecord = insertConversation('out', channel, endpoint, message, null, 3, false, deliveryAction);
+    // Preserve single-session compatibility (NULL when no instance identity is
+    // configured), but keep both sides of an identified instance's conversation
+    // visible to its own strictly-scoped history readers.
+    outRecord = insertConversation(
+      'out', channel, endpoint, message, null, 3, false, deliveryAction,
+      process.env.ZYLOS_INSTANCE_ID || null,
+    );
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {

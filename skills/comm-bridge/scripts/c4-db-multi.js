@@ -324,7 +324,7 @@ export function getUnsummarizedRangeForInstance(instanceId) {
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
   // Only include messages explicitly targeting this instance.
-  // Exclude NULL-targeted rows (legacy/outgoing) to prevent cross-instance context bleed.
+  // Exclude legacy/unscoped NULL-targeted rows to prevent cross-instance context bleed.
   const result = db.prepare(`
     SELECT MIN(id) as begin_id, MAX(id) as end_id, COUNT(*) as count
     FROM conversations
@@ -357,7 +357,7 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
   const afterId = lastCheckpoint?.end_conversation_id || 0;
 
   // Only include messages explicitly targeting this instance.
-  // Exclude NULL-targeted rows (legacy/outgoing) to prevent cross-instance context bleed.
+  // Exclude legacy/unscoped NULL-targeted rows to prevent cross-instance context bleed.
   if (limit) {
     return db.prepare(`
       SELECT * FROM (
