@@ -442,15 +442,18 @@ export function getUnansweredDeliveredForInstance(instanceId) {
   //  - not a health status-notice (the automated "please resend" auto-reply is
   //    sent precisely BECAUSE the message wasn't processed — counting it as an
   //    answer would hide exactly the messages this function exists to find)
+  //  - owned by this instance, with NULL retained only for historical replies
+  //    written before outbound attribution existed
   // Keyed by channel+chat so a chat-id collision across channels (telegram
   // numeric id vs another channel's prefix) can't cross-mask.
   const outbound = db.prepare(`
     SELECT id, channel, endpoint_id FROM conversations
     WHERE direction = 'out' AND id >= ?
+      AND (target_instance = ? OR target_instance IS NULL)
       AND channel NOT IN ('void', 'system')
       AND status != 'failed'
       AND (delivery_action IS NULL OR delivery_action != 'status-notice')
-  `).all(inbound[0].id);
+  `).all(inbound[0].id, instanceId);
   const lastReplyIdByChat = new Map();
   for (const o of outbound) {
     const chat = groupKeyFromEndpoint(o.endpoint_id);
