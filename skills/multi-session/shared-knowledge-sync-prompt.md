@@ -28,8 +28,8 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-fetch.js \
   --begin <my_last_end+1> --end <current_max_id> --all-instances
 ```
 
-If `begin > end` there is genuinely nothing new — skip to Step 5 (still update the activity
-digest with a "no new activity" note). Otherwise carry `<current_max_id>` forward as the
+If `begin > end` there is genuinely nothing new — skip to Step 4 to update the activity
+digest with a "no new activity" note, then skip the Step 5 checkpoint. Otherwise carry `<current_max_id>` forward as the
 `end_id` for the checkpoint in Step 5.
 
 Schema notes: the table is `checkpoints` with columns `start_conversation_id` /
