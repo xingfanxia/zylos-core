@@ -338,13 +338,20 @@ Additional optional frontmatter fields for advanced control:
 
 ```yaml
 allowed-tools: Read, Grep     # Tools Claude can use without permission prompt
-model: sonnet                 # Model to use when skill is active
+# Omit model to inherit the active runtime's configured model
 context: fork                 # Run in subagent (isolated context)
 agent: Explore                # Agent type when context: fork
 argument-hint: [args]         # Hint for expected arguments
 disable-model-invocation: true  # User-only (Claude cannot auto-invoke)
 user-invocable: false         # Claude-only (hidden from /menu)
 ```
+
+Keep provider schemas valid. For Codex coding agents, use `gpt-6-astra` with
+`xhigh` reasoning explicitly or inherit an enforced configuration with those
+values. Roles select responsibilities, not model tiers. Claude frontmatter
+does not select OpenAI models; omit its model override and do not describe a
+Claude launch as satisfying the Astra route. Report an unavailable required
+route instead of silently choosing another model.
 
 ##### Body
 

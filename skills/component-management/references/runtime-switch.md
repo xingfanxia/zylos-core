@@ -1,46 +1,44 @@
-# Runtime Switch — Authentication Relay Playbook
+# Runtime Switch — Authentication Recovery
 
 Read this when `zylos runtime <target>` exits with **code 2 (auth required)**.
 The switch command itself (confirmation etiquette, what it does, transition
 notice) is covered by the system instructions; this file holds the full
-per-target authentication relay scripts.
+per-target authentication steps. Honor the existing runtime-change approval;
+authentication does not authorize unrelated activation or service changes.
 
-Credentials are always stored in **two places** so auth persists across
-restarts: the runtime's own credential store and `~/zylos/.env`.
+Never ask users to send API keys, setup tokens, or credential files in chat.
+Never pass secret values in CLI arguments, paste them into logs or reports, or
+read them back for verification. Use the deployment's approved secret manager
+and operator provisioning path for API-key/setup-token installation. If that
+path is not established, report the missing provisioning capability and use a
+supported interactive login only when authorized; do not invent a secret CLI.
 
 ## Switching to Codex (`zylos runtime codex` exits 2)
 
-Ask the user which auth method they prefer. API key is fastest; device auth
-is a good fallback if the user has no API key. Example message:
+Use the method already requested or provisioned. For authorized headless login,
+run `codex login --device-auth` in the target runtime's environment and relay
+only the temporary verification URL/code to the initiating authorized user in
+their private channel. The user completes login with the provider; do not ask
+for a password, key, token, or credential file. For a local browser flow, use
+`codex login`. Wait for successful login before retrying the approved switch.
 
-> "Codex authentication required:
-> 1. **API Key** (recommended, fastest): send me your OpenAI API key (sk-...) and I'll configure it
-> 2. **Device auth** (no API key): I'll start the auth flow and send you a link to complete
-> 3. Browser login
-> Which one?"
-
-- **Option 1 — API key**: user sends the key, run `zylos runtime codex --save-apikey <key>`
-- **Option 2 — Device auth**: run `codex login --device-auth` in shell, capture the URL/code, send to user via IM. After user confirms completion, retry `zylos runtime codex`.
-- **Option 3 — Browser login**: run `codex login` in shell, capture the login URL if available, send to user via IM.
-
-Codex credentials live in `~/.codex/auth.json` and `~/zylos/.env`.
+Codex checks its own credential store (`auth.json` under the effective Codex
+home); see `cli/lib/runtime/codex.js#checkAuth`. That check deliberately does
+not treat an `OPENAI_API_KEY` in `~/zylos/.env` as authentication. An API-key save
+path may mirror credentials into `.env`, but device/browser auth is not an
+always-mirrored two-store contract. Do not inspect or echo stored values.
 
 ## Switching to Claude Code (`zylos runtime claude` exits 2)
 
-Ask the user which auth method they prefer. API key is fastest; setup token
-is a good fallback for automated setups. Example message:
+When a Claude runtime switch is explicitly authorized, use `claude auth login`
+for browser OAuth and have the user complete the provider flow. Relay a login
+URL only to the initiating authorized user. API keys and setup tokens require
+the approved operator provisioning path described above.
 
-> "Claude authentication required:
-> 1. **API Key** (recommended, fastest): send me your Anthropic API key (sk-ant-api...) and I'll configure it
-> 2. **Setup Token** (for automated setups): send me your setup token (sk-ant-oat...) and I'll configure it
-> 3. Browser OAuth login
-> Which one?"
-
-- **Option 1 — API key**: user sends the key, run `zylos runtime claude --save-apikey <key>`
-- **Option 2 — Setup token**: user sends the token, run `zylos runtime claude --save-setup-token <token>`
-- **Option 3 — Browser OAuth**: run `claude auth login` in shell, capture the login URL, send to user via IM. After user confirms, retry `zylos runtime claude`.
-
-Claude credentials live in `~/.claude/settings.json` and `~/zylos/.env`.
+Claude authentication depends on its installed credential/configuration source;
+see `cli/lib/runtime/claude.js`. Do not promise that every auth method stores
+the same data in both settings and `.env`, or copy credentials between them
+merely to satisfy that claim.
 
 ## After authentication succeeds
 

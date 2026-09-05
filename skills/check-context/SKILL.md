@@ -15,19 +15,15 @@ Check current context/token usage. The data source depends on the active runtime
 
 ## How to Use
 
-First, check the active runtime:
-
-```bash
-node -e "try { const c=JSON.parse(require('fs').readFileSync(require('path').join(process.env.HOME,'zylos/.zylos/config.json'),'utf8')); console.log(c.runtime||'claude'); } catch { console.log('claude'); }"
-```
+Identify the active runtime from the current session. If needed, inspect only
+the `runtime` field in `~/zylos/.zylos/config.json`. Missing or unreadable
+metadata means the runtime is unknown; do not silently assume Claude.
 
 ### If Claude runtime
 
-Read the statusLine data file (updated after every turn):
-
-```bash
-cat ~/zylos/activity-monitor/statusline.json
-```
+Read the relevant fields in `~/zylos/activity-monitor/statusline.json` (updated
+after every turn). Confirm the file belongs to the current instance/session
+and report its timestamp; stale data is a last-known observation.
 
 Report from the JSON:
 - **Context usage**: `context_window.used_percentage`% used, `context_window.remaining_percentage`% remaining
@@ -37,22 +33,37 @@ Report from the JSON:
 
 ### If Codex runtime
 
-Read token usage from the most recently modified Codex JSONL session file:
+Prefer token/context metadata exposed by the current session. For a local
+fallback, identify the matching rollout under the active Codex home using its
+session id and `session_meta` identity/cwd. Instance metadata can narrow the
+search, but the newest file across all sessions may belong to another agent.
+If the active rollout cannot be identified, report that limitation.
 
-```bash
-node -e "
-const fs=require('fs'),path=require('path');
-const base=path.join(process.env.HOME,'.codex/sessions');
-let best=null,bestMtime=0;
-function walk(d,depth){if(depth>3)return;try{fs.readdirSync(d).forEach(f=>{const p=path.join(d,f);try{const s=fs.statSync(p);if(s.isDirectory())walk(p,depth+1);else if(f.startsWith('rollout-')&&f.endsWith('.jsonl')&&s.mtimeMs>bestMtime){bestMtime=s.mtimeMs;best=p;}}catch{}});}catch{}}
-walk(base,0);
-if(!best){console.log('No session found');process.exit(0);}
-const lines=fs.readFileSync(best,'utf8').split('\n').filter(Boolean);
-for(let i=lines.length-1;i>=0;i--){try{const j=JSON.parse(lines[i]);if(j.type==='event_msg'&&j.payload?.type==='token_count'&&j.payload.info.last_token_usage){const u=j.payload.info.last_token_usage.input_tokens;const c=j.payload.info.model_context_window||128000;console.log('used:'+u+' ceiling:'+c+' pct:'+Math.round(u/c*100)+'%');process.exit(0);}}catch{}}
-console.log('No token_count event found');
-"
-```
+Read only the latest matching `event_msg` with `payload.type: token_count`:
 
-Report:
-- **Context usage**: pct% used (used / ceiling tokens)
-- Report the pct value clearly so the user knows if rotation is needed (threshold: 75%)
+- `payload.info.last_token_usage.input_tokens` is the last request's context
+  fill. Do not substitute cumulative `total_token_usage`.
+- `payload.info.model_context_window` is the effective ceiling reported by
+  that runtime. Do not apply another percentage reduction to it.
+- Compute `100 * used / ceiling` only when both values are finite, `used` is
+  nonnegative, and `ceiling` is positive. Include the event timestamp and
+  identify this as the last request's measurement.
+
+If the event lacks a ceiling, a confirmed active `model_context_window` setting
+or an exact active-model entry in `models_cache.json` may provide a labelled
+configuration estimate. Account for `effective_context_window_percent` only
+for a raw cache window. Do not use the first cache entry, a stale model's limit,
+or a fixed 128k/model-marketing limit as live evidence. If the effective ceiling
+is unresolved, report available token counts and mark percentage unknown.
+
+For rotation policy, read `codex_new_session_threshold` from the active Zylos
+configuration. The current implementation in
+`cli/lib/runtime/codex.js#getContextMonitor` parses that percentage and falls
+back to 75% when it is missing or outside 1–100; distinguish this configured or
+code-default threshold from the model's context ceiling. Do not invent a
+threshold when the deployed implementation/configuration is unknown.
+
+The daemon's `cli/lib/runtime/codex-context-monitor.js` still has a legacy 128k
+fallback when metadata is unavailable. That fallback is not a measured Astra
+limit. This reporting skill does not change daemon behavior or authorize a
+rotation; use the existing handoff policy for any requested action.

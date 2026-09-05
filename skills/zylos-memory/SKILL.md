@@ -13,7 +13,17 @@ user-invocable: false
 # Memory System
 
 Maintains persistent memory across sessions via tiered markdown files.
-This skill must be run via a runtime-appropriate background subagent mechanism. For Claude, use the Task tool (`subagent_type: general-purpose`, `model: sonnet`, `run_in_background: true`). For Codex, prefer the session's native subagent tools `spawn_agent`/`wait_agent` (host session tools — they do not appear in `codex --help`) with a Codex-supported model; do not hardcode `sonnet`.
+Use a runtime-appropriate background subagent mechanism when available.
+For Claude, use the Task tool (`subagent_type: general-purpose`,
+`run_in_background: true`) and inherit the configured provider model without a
+skill-level override. For Codex, prefer the session's native tools
+`spawn_agent`/`wait_agent` (host session tools, absent from `codex --help`) with
+`gpt-6-astra` and `xhigh` reasoning, explicitly selected or inherited from an
+enforced configuration. Roles do not select lower model or reasoning tiers.
+Claude's schema cannot select an OpenAI model; do not claim it satisfies an
+Astra-only policy. If the required route is unavailable, report that limitation;
+the inline fallback below is allowed only when the active runtime itself meets
+the applicable model policy.
 
 ## Architecture
 
@@ -74,17 +84,21 @@ and do not start another sync writer while one is in flight.
 
 ### Sync Flow
 
-1. Rotate session log if needed:
-   `node ~/zylos/.claude/skills/zylos-memory/scripts/rotate-session.js`
-2. Fetch unsummarized conversations from C4:
+1. Fetch unsummarized conversations from C4:
    `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-fetch.js --unsummarized`
-   If output says "No unsummarized conversations.", skip to step 5
-   (still save current state). Otherwise, note the `end_id` from the
-   `[Unsummarized Range]` line.
-3. Read memory files (`identity.md`, `state.md`, `references.md`, user profiles, `reference/*`, `sessions/current.md`).
-4. Extract and classify updates from conversations into the correct files.
-5. Write memory updates (always — even without new conversations,
-   update `state.md` and `sessions/current.md` with current context).
+   If conversations were returned, note the `end_id` from the
+   `[Unsummarized Range]` line. An empty result does not require a write.
+2. Read the relevant memory files (`identity.md`, `state.md`, `references.md`,
+   user profiles, `reference/*`, `sessions/current.md`) and compare them with
+   new conversation evidence, changed active state, and maintenance needs.
+3. If no conversations were fetched, no durable state or evidence changed,
+   and no log rotation or content repair is needed, finish as a no-op. Leave
+   files and checkpoints unchanged; do not manufacture a sync log entry.
+4. Rotate the session log only if needed with
+   `node ~/zylos/.claude/skills/zylos-memory/scripts/rotate-session.js`, then
+   classify substantive updates into the correct files.
+5. Write only changed memory content. New conversations may require no durable
+   memory update; they can still receive a checkpoint after review.
 6. Audit `references.md` against its content rules
    (`references/references-file-format.md`): relocate rule-violating
    entries to their routed destination (`reference/decisions.md`,
@@ -98,7 +112,7 @@ and do not start another sync writer while one is in flight.
    instead of leaving or appending it. If the file exceeds the 10KB warn
    threshold (`memory-status.js` reports WARN), trim until it is back
    under.
-8. Create checkpoint (only if conversations were fetched in step 2):
+8. Create checkpoint (only if conversations were fetched in step 1):
    `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id> --summary "SUMMARY"`
    (Checkpoints are instance-scoped: run inside an instance session, where
    `ZYLOS_INSTANCE_ID` is set, or pass `--target-instance <id>` explicitly.)
