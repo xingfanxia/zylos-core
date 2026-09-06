@@ -25,6 +25,7 @@ import { assertInstructionReady, buildInstructionFile } from './instruction-buil
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
 import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../config.js';
+import { ensureCodexSkillView } from '../codex-skill-view.js';
 // writeCodexConfig is lazy-loaded inside launch() — top-level import would pull
 // runtime-setup.js (which imports spawnSync) and break test module mocks that
 // don't include spawnSync in their child_process namedExports.
@@ -339,17 +340,9 @@ export class CodexAdapter extends RuntimeAdapter {
     }
     const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
-    // Ensure .agents/skills -> .claude/skills symlink for Codex skill discovery.
-    const agentsDir = path.join(ZYLOS_DIR, '.agents');
-    const agentsSkillsPath = path.join(agentsDir, 'skills');
-    let agentsSkillsExists = false;
-    try { fs.lstatSync(agentsSkillsPath); agentsSkillsExists = true; } catch { /* not present */ }
-    if (!agentsSkillsExists) {
-      try {
-        fs.mkdirSync(agentsDir, { recursive: true });
-        fs.symlinkSync(SKILLS_DIR, agentsSkillsPath);
-      } catch { /* non-fatal */ }
-    }
+    // Native recursive discovery must not walk dependency caches/backups. Keep
+    // installed entrypoints and their relative support files in a bounded view.
+    ensureCodexSkillView({ zylosDir: ZYLOS_DIR, skillsDir: SKILLS_DIR });
 
     // 2. Native SessionStart hook trust is required for startup context.
     // Scope trust to the per-instance cwd so a Codex process launched from an
