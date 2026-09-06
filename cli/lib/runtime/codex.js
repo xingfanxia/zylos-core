@@ -543,7 +543,16 @@ export class CodexAdapter extends RuntimeAdapter {
     const config = getZylosConfig();
     const val = parseInt(config.codex_new_session_threshold, 10);
     const threshold = (!isNaN(val) && val > 0 && val <= 100) ? val / 100 : 0.75;
-    return new CodexContextMonitor({ threshold });
+    const profile = this.config.runtimeProfile || {};
+    const runtimeHome = profile.runtimeHome || os.homedir();
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    return new CodexContextMonitor({
+      threshold,
+      codexHome: profile.codexHome || process.env.CODEX_HOME || path.join(runtimeHome, '.codex'),
+      model: profile.model,
+      tmuxSession: SESSION,
+      cwd: instanceId ? path.join(ZYLOS_DIR, 'instances', instanceId) : ZYLOS_DIR,
+    });
   }
 }
 
