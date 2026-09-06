@@ -65,7 +65,8 @@ export function tmuxKillSession(session) {
 
 /**
  * Send text to a tmux session via the buffer-paste technique.
- * Handles special characters safely.
+ * Uses native bracketed paste and preserves LF so multiline messages remain
+ * one input instead of becoming a burst of Enter-delimited fragments.
  *
  * @param {string} session
  * @param {string} tmpFile - Path to a temp file containing the text
@@ -76,7 +77,7 @@ export function tmuxPasteBuffer(session, tmpFile, bufferName) {
     timeout: CMD_TIMEOUT,
     stdio: 'ignore',
   });
-  execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], {
+  execFileSync('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', session], {
     timeout: CMD_TIMEOUT,
     stdio: 'ignore',
   });
