@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { ContextMonitorBase } from './context-monitor-base.js';
 import { buildProcessTree } from './process-tree.js';
 
@@ -115,7 +116,13 @@ export class CodexContextMonitor extends ContextMonitorBase {
         AND ${this._getThreadScopeSql()}
         AND created_at >= ${Math.floor(started / 1000)}
         ORDER BY created_at ASC;`;
-      const out = this._execFileSync('sqlite3', ['-readonly', path.join(this._codexDir, 'state_5.sqlite'), sql], {
+      // SQLITE_OPEN_READONLY can still create WAL/SHM sidecars as this monitor's
+      // OS user, breaking a persona's writable database. immutable=1 guarantees
+      // a zero-write index read. Uncheckpointed WAL rows may be absent; current
+      // rollout/PID metadata below remains authoritative in that case.
+      const uri = pathToFileURL(path.join(this._codexDir, 'state_5.sqlite'));
+      uri.search = '?mode=ro&immutable=1';
+      const out = this._execFileSync('sqlite3', ['-readonly', uri.href, sql], {
         encoding: 'utf8', stdio: 'pipe', timeout: 5_000,
       });
       candidates = String(out).trim().split('\n').filter((p) => p && this._rolloutMatchesSession(p, started));

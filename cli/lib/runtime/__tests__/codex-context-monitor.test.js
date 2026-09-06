@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { once } from 'node:events';
 import { test } from 'node:test';
 import { CodexContextMonitor } from '../codex-context-monitor.js';
 
@@ -82,7 +84,9 @@ test('valid SQLite index query executes with AND and validates selected metadata
   assert.equal((await f.monitor.getUsage()).used, 77931);
   const query = f.commands.find((c) => c.command === 'sqlite3');
   assert.equal(query.args[0], '-readonly');
-  assert.equal(query.args[1], db);
+  assert.equal(fileURLToPath(query.args[1]), db);
+  assert.equal(new URL(query.args[1]).searchParams.get('immutable'), '1');
+  assert.equal(new URL(query.args[1]).searchParams.get('mode'), 'ro');
   assert.match(query.args[2], /archived = 0\s+AND cwd =/);
 });
 
@@ -92,6 +96,50 @@ test('never interprets SQLite cumulative tokens as current context when token_co
   execFileSync('sqlite3', [path.join(f.codexHome, 'state_5.sqlite'), `CREATE TABLE threads (rollout_path TEXT, archived INTEGER, cwd TEXT, created_at INTEGER, tokens_used INTEGER);
     INSERT INTO threads VALUES ('${file}',0,'${f.cwd}',${started / 1000},99000000);`]);
   assert.equal(await f.monitor.getUsage(), null);
+});
+
+test('operator index reads of a WAL-mode database create no sidecars or database changes', async (t) => {
+  const f = fixture(t);
+  const file = f.rollout();
+  const db = path.join(f.codexHome, 'state_5.sqlite');
+  execFileSync('sqlite3', [db, `PRAGMA journal_mode=WAL;
+    CREATE TABLE threads (rollout_path TEXT, archived INTEGER, cwd TEXT, created_at INTEGER);
+    INSERT INTO threads VALUES ('${file}',0,'${f.cwd}',${started / 1000});`]);
+  assert.equal(fs.existsSync(`${db}-wal`), false);
+  assert.equal(fs.existsSync(`${db}-shm`), false);
+  const before = fs.readFileSync(db);
+  assert.equal((await f.monitor.getUsage()).used, 77931);
+  assert.equal(fs.existsSync(`${db}-wal`), false);
+  assert.equal(fs.existsSync(`${db}-shm`), false);
+  assert.deepEqual(fs.readFileSync(db), before);
+});
+
+test('uncheckpointed WAL index entries do not hide the live filesystem rollout', async (t) => {
+  const f = fixture(t);
+  const file = f.rollout();
+  const db = path.join(f.codexHome, 'state_5.sqlite');
+  execFileSync('sqlite3', [db, `PRAGMA journal_mode=WAL;
+    CREATE TABLE threads (rollout_path TEXT, archived INTEGER, cwd TEXT, created_at INTEGER);`]);
+  const writer = spawn('sqlite3', [db], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('fixture writer timed out')), 3000);
+    writer.stdout.on('data', (chunk) => { if (String(chunk).includes('AX268_READY')) { clearTimeout(timer); resolve(); } });
+    writer.on('error', reject);
+  });
+  try {
+    writer.stdin.write(`INSERT INTO threads VALUES ('${file}',0,'${f.cwd}',${started / 1000});\n.print AX268_READY\n`);
+    await ready;
+    assert.ok(fs.statSync(`${db}-wal`).size > 0);
+    let fallback = false;
+    const original = f.monitor._getRolloutsFromFilesystem.bind(f.monitor);
+    f.monitor._getRolloutsFromFilesystem = (time) => { fallback = true; return original(time); };
+    assert.equal((await f.monitor.getUsage()).used, 77931);
+    assert.equal(fallback, true);
+  } finally {
+    const exited = once(writer, 'exit');
+    writer.stdin.end('.quit\n');
+    await exited;
+  }
 });
 
 test('tmux unavailable and retired-only data return null; live idle context is retained', async (t) => {
