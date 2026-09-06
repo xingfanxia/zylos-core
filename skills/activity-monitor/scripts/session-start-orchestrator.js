@@ -14,11 +14,11 @@
  * Stdout is reserved for context injection payloads in both modes.
  */
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
 import {
   SIDE_EFFECT_NAMES,
@@ -619,7 +619,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
   main().catch((error) => {
     console.error(`[session-start-orchestrator] fatal: ${error?.stack || error?.message || error}`);
     process.exitCode = 0;

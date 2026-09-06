@@ -27,12 +27,12 @@
  * Usage: node c4-session-init.js
  */
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
 import { withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
 import { getInstanceDef } from '../../multi-session/instance-config.js';
-import { fileURLToPath } from 'node:url';
 
 const ENV_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
@@ -339,6 +339,6 @@ function main() {
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
   main();
 }
