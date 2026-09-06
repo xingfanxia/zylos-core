@@ -1,6 +1,7 @@
 import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { Guardian } from '../guardian.js';
 import { HealthEngine } from '../health-engine.js';
 import { ProcSampler } from '../proc-sampler.js';
@@ -208,16 +209,36 @@ export function scheduleStaleRuntimeCleanup(activeAdapter, {
   log,
   setTimeoutImpl = setTimeout,
   execFileSyncImpl = execFileSync,
+  env = process.env,
+  zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
+  lstatSyncImpl = fs.lstatSync,
 }) {
-  // Runs on every startup (not just runtime switches). If the other session is
-  // absent, the kill fails silently. The delay gives a running agent time to
-  // finish its current response before being terminated.
+  // This is a legacy SINGLE-session migration helper. In multi-instance
+  // installs, claude-main is often admin's stable Codex identity: another
+  // persona must never infer a stale engine from that name and kill it.
+  const legacySingleSession = () => {
+    if (env.ZYLOS_INSTANCE_ID) return false;
+    try { if (!fs.statSync(zylosDir).isDirectory()) return false; }
+    catch { return false; } // unknown workspace/access is never permission to kill
+    try {
+      lstatSyncImpl(path.join(zylosDir, 'instances.json'));
+      return false; // presence protects every persona, even malformed/symlink config
+    } catch (error) {
+      return error.code === 'ENOENT'; // unreadable/unknown configuration fails closed
+    }
+  };
+  if (!legacySingleSession()) return;
+  if (!['claude', 'codex'].includes(activeAdapter.runtimeId) ||
+      activeAdapter.sessionName !== `${activeAdapter.runtimeId}-main`) return;
   const otherSession = activeAdapter.runtimeId === 'codex' ? 'claude-main' : 'codex-main';
   // Runtime failover deliberately preserves the persona's stable tmux name
   // (often `claude-main`) across providers. Never mistake that active stable
   // identity for a stale session and kill it ten seconds after every restart.
   if (otherSession === activeAdapter.sessionName) return;
   setTimeoutImpl(() => {
+    // Configuration can change during the grace period. Re-check immediately
+    // before the legacy destructive action instead of trusting startup state.
+    if (!legacySingleSession()) return;
     try {
       execFileSyncImpl('tmux', ['kill-session', '-t', otherSession], { stdio: 'pipe', timeout: 3000 });
       log(`Startup cleanup: killed stale ${otherSession} session from previous runtime`);
