@@ -20,6 +20,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
+import { writeExecutionContextReceipt } from './execution-context-receipt.js';
 import {
   SIDE_EFFECT_NAMES,
   estimateTokens,
@@ -362,6 +363,7 @@ async function runShardSideEffect(name, payload, {
   waitForFlagImpl,
   readFlagStatusImpl,
   requireHealthyContext,
+  recordContextReceipt,
   sequencerOptions = {},
 }) {
   if (name === SIDE_EFFECT_NAMES.foreground) {
@@ -378,10 +380,6 @@ async function runShardSideEffect(name, payload, {
   // injection chain has finished, or the agent starts acting with no memory
   // in context. Wait on the last in-chain shard's flag; fail open past the
   // chain-tail deadline so the prompt is never permanently withheld.
-  if (source === 'compact') {
-    await logStep({ name: 'session-start-prompt', source, status: 'skipped', durationMs: 0 });
-    return;
-  }
 
   let waitExtra = '';
   const tail = chain.at(-1);
@@ -393,6 +391,7 @@ async function runShardSideEffect(name, payload, {
     waitExtra = `wait=${wait.ok ? 'ok' : 'timeout'}:${wait.waitedMs}`;
   }
 
+  let validatedRoundId = null;
   if (requireHealthyContext) {
     const failures = [];
     if (!sessionId) {
@@ -402,6 +401,7 @@ async function runShardSideEffect(name, payload, {
         ? readFlagStatusImpl(sessionId, tail.name, sequencerOptions)
         : { ok: false, reason: 'missing', roundId: null };
       const roundId = tailResult.roundId || null;
+      validatedRoundId = roundId;
       for (const shard of chain) {
         const result = readFlagStatusImpl(sessionId, shard.name, sequencerOptions);
         if (!result.ok) {
@@ -414,6 +414,8 @@ async function runShardSideEffect(name, payload, {
       }
     }
     if (failures.length > 0) {
+      if (recordContextReceipt && sessionId) await recordContextReceipt({ payload, healthy: false,
+        roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures });
       const notice = formatSection(
         'STARTUP CONTEXT BLOCKED',
         [
@@ -433,6 +435,12 @@ async function runShardSideEffect(name, payload, {
       });
       return;
     }
+  }
+  if (recordContextReceipt && sessionId) await recordContextReceipt({ payload, healthy: requireHealthyContext,
+    roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures: [] });
+  if (source === 'compact') {
+    await logStep({ name: 'session-start-prompt', source, status: 'skipped', durationMs: 0 });
+    return;
   }
   await runStep({
     name: 'session-start-prompt',
@@ -461,6 +469,7 @@ export async function runSessionStartShard(name, payload = {}, {
   readFlagStatusImpl = readFlagStatus,
   writeFlagImpl = writeFlag,
   requireHealthyContext = startupContextRequired(),
+  recordContextReceipt,
   registerExitFlagImpl = fn => process.once('exit', fn),
   actions = {
     foreground: runForeground,
@@ -497,6 +506,7 @@ export async function runSessionStartShard(name, payload = {}, {
       waitForFlagImpl,
       readFlagStatusImpl,
       requireHealthyContext,
+      recordContextReceipt,
       sequencerOptions,
     });
     return;
@@ -607,7 +617,10 @@ async function main() {
   const payload = await readStdinPayload();
   try {
     if (shardName) {
-      await runSessionStartShard(shardName, payload);
+      await runSessionStartShard(shardName, payload, {
+        recordContextReceipt: input => writeExecutionContextReceipt({ ...input,
+          zylosDir: process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos') }),
+      });
     } else {
       await runSessionStartOrchestrator(payload, {
         totalBudgetMs: DEFAULT_TOTAL_BUDGET_MS,
