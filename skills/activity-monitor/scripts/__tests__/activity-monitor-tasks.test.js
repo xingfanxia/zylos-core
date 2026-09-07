@@ -2,12 +2,19 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { createActivityMonitorTaskScheduler } from '../tasks/activity-monitor-tasks.js';
 
-function createScheduler({ primary, healthCheckEnabled = true }) {
+function createScheduler({ primary, healthCheckEnabled = true, usageMonitorEnabled = false }) {
   let healthChecks = 0;
+  let usageChecks = 0;
   const usageMonitor = {
-    isMonitorEnabled: () => false,
+    isMonitorEnabled: () => usageMonitorEnabled,
     isAlertEnabled: () => false,
     isPrimaryInstance: () => primary,
+    canRunTask: () => true,
+    getLastMonitorRunAt: () => 0,
+    runMonitor: () => {
+      usageChecks++;
+      return true;
+    },
   };
 
   const scheduler = createActivityMonitorTaskScheduler({
@@ -41,7 +48,11 @@ function createScheduler({ primary, healthCheckEnabled = true }) {
     log: () => {},
   });
 
-  return { scheduler, healthChecks: () => healthChecks };
+  return {
+    scheduler,
+    healthChecks: () => healthChecks,
+    usageChecks: () => usageChecks,
+  };
 }
 
 describe('activity-monitor task routing', () => {
@@ -57,6 +68,21 @@ describe('activity-monitor task routing', () => {
 
     assert.equal(test.scheduler.tick({ agentRunning: true, health: 'ok' }), 0);
     assert.equal(test.healthChecks(), 0);
+  });
+
+  it('keeps ordinary per-instance monitoring enabled on a non-primary instance', () => {
+    const test = createScheduler({ primary: false, usageMonitorEnabled: true });
+
+    assert.equal(test.scheduler.tick({
+      agentRunning: true,
+      health: 'ok',
+      state: 'idle',
+      idleSeconds: 60,
+      currentTime: 1000,
+      apiActivity: null,
+    }), 1);
+    assert.equal(test.healthChecks(), 0);
+    assert.equal(test.usageChecks(), 1);
   });
 
   it('keeps the health-check feature toggle effective on the primary instance', () => {
