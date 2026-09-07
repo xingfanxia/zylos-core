@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { execFileSync, spawn } from 'node:child_process';
 import { fetchCodexAccountUsage, normalizeCodexAccountUsage, readCodexAccountRateLimits } from '../codex-account-usage.js';
 
 function fixture(t) {
@@ -144,4 +145,41 @@ test('native RPC failures publish a controlled code without credential-bearing r
   assert.equal(result.fetched_at, null);
   assert.doesNotMatch(JSON.stringify(result), /SECRET_RPC_BODY|token-should-never-escape/);
   assert.throws(() => process.kill(Number(fs.readFileSync(fake.pid)), 0), { code: 'ESRCH' });
+});
+
+
+test('cleanup kills a surviving private-group child after its wrapper leader exits', { skip: process.platform === 'win32' }, async (t) => {
+  const f = fixture(t), bin = path.join(f.home, 'wrapper');
+  const leaderFile = path.join(f.home, 'leader-pid'), descendantFile = path.join(f.home, 'descendant-pid');
+  const descendantCode = `const fs=require('node:fs');process.on('SIGTERM',()=>{});fs.writeFileSync(${JSON.stringify(descendantFile)},String(process.pid));setInterval(()=>{},1000);`;
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+const fs=require('node:fs'),{spawn}=require('node:child_process'),readline=require('node:readline');
+fs.writeFileSync(${JSON.stringify(leaderFile)},String(process.pid));
+spawn(process.execPath,['-e',${JSON.stringify(descendantCode)}],{stdio:'ignore'});
+process.on('SIGTERM',()=>process.exit(0));
+const reply=(id,result)=>process.stdout.write(JSON.stringify({id,result})+'\\n');
+readline.createInterface({input:process.stdin}).on('line',m=>{m=JSON.parse(m);
+if(m.method==='initialize')reply(m.id,{});
+if(m.method==='account/rateLimits/read'){const ready=setInterval(()=>{if(fs.existsSync(${JSON.stringify(descendantFile)})){clearInterval(ready);reply(m.id,${JSON.stringify(f.response())});}},10);}
+});setInterval(()=>{},1000);
+`, { mode: 0o700 });
+  // Capture ownership in memory so cleanup works even after fixture-file removal.
+  let testGroupPid;
+  t.after(() => { if (testGroupPid) { try { process.kill(-testGroupPid, 'SIGKILL'); } catch {} } });
+  const start = Date.now();
+  const result = await readCodexAccountRateLimits({ codexHome: f.home, codexBin: bin, timeoutMs: 2000,
+    spawnImpl: (...args) => { const child = spawn(...args); testGroupPid = child.pid; return child; } });
+  assert.equal(result.rateLimits.primary.usedPercent, 39);
+  assert.ok(Date.now() - start < 2500);
+  assert.throws(() => process.kill(Number(fs.readFileSync(leaderFile)), 0), { code: 'ESRCH' });
+  const descendantPid = Number(fs.readFileSync(descendantFile));
+  const running = () => {
+    try {
+      const state = execFileSync('ps', ['-o', 'stat=', '-p', String(descendantPid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+      return state && !state.startsWith('Z'); // OS owns reaping this orphan, never this collector.
+    } catch { return false; }
+  };
+  const deadline = Date.now() + 500;
+  while (running() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(Boolean(running()), false, 'TERM-ignoring descendant must not survive leader exit');
 });
