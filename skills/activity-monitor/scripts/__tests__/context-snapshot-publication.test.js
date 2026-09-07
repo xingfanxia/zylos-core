@@ -22,13 +22,13 @@ test('publishes current Codex context to getMonitorDir and invalidates stale eng
   const file = path.join(stateDir, 'context-window.json');
   fs.writeFileSync(file, JSON.stringify({ runtime: 'claude', percent_used: 17 }));
   let clock = Date.now();
-  let usage = { used: 210000, ceiling: 258400, source: 'rollout_token_count', rolloutPath: '/profile/sessions/2026/01/01/rollout-idle.jsonl' };
+  let usage = { actualModel: 'gpt-6-astra', actualReasoningEffort: 'high', actualModelSource: 'rollout_turn_context', actualModelObservedAt: '2026-01-01T00:00:00Z', used: 210000, ceiling: 258400, source: 'rollout_token_count', rolloutPath: '/profile/sessions/2026/01/01/rollout-idle.jsonl' };
   const monitor = new ContextMonitorBase();
   monitor.getUsage = async () => usage;
   monitor.startPolling = (options) => { monitor.options = options; };
   const handoffs = [];
   const adapter = { runtimeId: 'codex', displayName: 'Codex', config: {
-    runtimeProfile: { id: 'codex-azure', model: 'gpt-6-astra' },
+    runtimeProfile: { id: 'codex-azure', model: 'gpt-6-astra', reasoningEffort: 'xhigh' },
   }, getContextMonitor: () => monitor };
   startContextMonitor(adapter, { monitorDir: getMonitorDir(), instanceId: 'group', nowMs: () => clock,
     enqueueContextRotationHandoff: (reading) => { handoffs.push(reading); assert.equal(JSON.parse(fs.readFileSync(file)).used_tokens, reading.used); },
@@ -40,6 +40,11 @@ test('publishes current Codex context to getMonitorDir and invalidates stale eng
   assert.equal(snapshot.runtime, 'codex');
   assert.equal(snapshot.instance_id, 'group');
   assert.equal(snapshot.runtime_profile, 'codex-azure');
+  assert.equal(snapshot.configured_model, 'gpt-6-astra');
+  assert.equal(snapshot.configured_reasoning_effort, 'xhigh');
+  assert.equal(snapshot.actual_model, 'gpt-6-astra');
+  assert.equal(snapshot.actual_reasoning_effort, 'high');
+  assert.equal(snapshot.actual_model_observed_at, '2026-01-01T00:00:00Z');
   assert.equal(snapshot.used_tokens, 210000);
   assert.equal(snapshot.percent_used, 81);
   assert.equal(handoffs.length, 1);
@@ -56,6 +61,8 @@ test('publishes current Codex context to getMonitorDir and invalidates stale eng
   await monitor.checkThreshold(monitor.options);
   snapshot = JSON.parse(fs.readFileSync(file));
   assert.equal(snapshot.status, 'unknown');
+  assert.equal(snapshot.actual_model, null);
+  assert.equal(snapshot.actual_reasoning_effort, null);
   assert.equal(snapshot.used_tokens, null);
   assert.equal(snapshot.percent_used, null);
 });

@@ -230,3 +230,37 @@ test('missing effective event ceiling and unknown profile window yield no sample
   f.rollout({ rows: [event] });
   assert.equal(await f.monitor.getUsage(), null);
 });
+
+
+test('publishes only actual root turn model/effort and preserves old idle turn timestamps', async (t) => {
+  const f = fixture(t);
+  const context = (model, effort) => ({ type: 'turn_context', timestamp: '2026-09-06T12:00:01Z',
+    payload: { model, effort, secret: 'PRIVATE_TRANSCRIPT', developer_instructions: 'DO_NOT_EXPORT' } });
+  const file = f.rollout({ rows: [context('gpt-6-astra', 'high'), f.count(50000)] });
+  f.monitor._model = 'gpt-5.6-sol'; // configured policy is not an observation
+  f.rollout({ id: 'child', source: { subagent: { thread_spawn: { parent_thread_id: 'root' } } },
+    rows: [f.meta('root'), context('gpt-5.6-sol', 'low'), f.count(99000)] });
+  let usage = await f.monitor.getUsage();
+  assert.equal(usage.actualModel, 'gpt-6-astra');
+  assert.equal(usage.actualReasoningEffort, 'high');
+  assert.equal(usage.actualModelObservedAt, '2026-09-06T12:00:01.000Z');
+  assert.equal(usage.actualModelSource, 'rollout_turn_context');
+  assert.doesNotMatch(JSON.stringify(usage), /PRIVATE_TRANSCRIPT|DO_NOT_EXPORT/);
+  fs.appendFileSync(file, JSON.stringify({ type: 'response_item', payload: 'x'.repeat(100000) }) + '\n' + JSON.stringify(f.count(55000)) + '\n');
+  assert.equal((await f.monitor.getUsage()).actualModel, 'gpt-6-astra');
+  fs.appendFileSync(file, [context('gpt-5.6-sol', 'medium'), f.count(60000)].map(JSON.stringify).join('\n') + '\n');
+  assert.equal((await f.monitor.getUsage()).actualModel, 'gpt-5.6-sol');
+  fs.appendFileSync(file, [context('private/path', 'invalid'), f.count(65000)].map(JSON.stringify).join('\n') + '\n');
+  assert.equal((await f.monitor.getUsage()).actualModel, undefined);
+});
+
+test('new current rollout cannot inherit previous observed model metadata', async (t) => {
+  const f = fixture(t);
+  const old = f.rollout({ rows: [{ type: 'turn_context', timestamp: '2026-09-06T12:00:01Z',
+    payload: { model: 'gpt-6-astra', effort: 'high' } }, f.count(50000)] });
+  f.monitor._openRollouts = () => [old];
+  assert.equal((await f.monitor.getUsage()).actualModel, 'gpt-6-astra');
+  const next = f.rollout({ id: 'new', time: started + 300000 });
+  f.monitor._openRollouts = () => [next];
+  assert.equal((await f.monitor.getUsage()).actualModel, undefined);
+});
