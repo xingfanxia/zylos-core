@@ -179,6 +179,10 @@ describe('instance-config — with instances.json', () => {
     expect(mod.isPrimary('user-betty')).toBe(false);
   });
 
+  it('isPrimary() fails closed for an explicit unknown instance', () => {
+    expect(mod.isPrimary('unknown-instance')).toBe(false);
+  });
+
   // ── getDefaultInstance ────────────────────────────────────────
 
   it('getDefaultInstance() returns instance with default:true', () => {
