@@ -25,6 +25,7 @@ import { assertInstructionReady, buildInstructionFile } from './instruction-buil
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
 import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../config.js';
+import { operatorTavilyProfileArgs } from '../operator-tavily-profile.js';
 import { ensureCodexSkillView } from '../codex-skill-view.js';
 // writeCodexConfig is lazy-loaded inside launch() — top-level import would pull
 // runtime-setup.js (which imports spawnSync) and break test module mocks that
@@ -379,7 +380,15 @@ export class CodexAdapter extends RuntimeAdapter {
       profile.model ? ` -m ${profile.model}` : '',
       profile.reasoningEffort ? ` -c model_reasoning_effort=\"${profile.reasoningEffort}\"` : '',
     ].join('');
-    const codexCmd = `${CODEX_BIN}${bypassFlag}${modelFlags}`;
+    const launchArgs = [];
+    if (bypassPermissions) launchArgs.push('--dangerously-bypass-approvals-and-sandbox');
+    if (profile.model) launchArgs.push('-m', profile.model);
+    if (profile.reasoningEffort) launchArgs.push('-c', `model_reasoning_effort="${profile.reasoningEffort}"`);
+    const operatorMcpArgs = operatorTavilyProfileArgs({
+      instanceId, osUser, runtimeHome, codexHome, instanceCwd, zylosDir: ZYLOS_DIR, existingArgs: launchArgs,
+    });
+    launchArgs.push(...operatorMcpArgs);
+    const codexCmd = `${CODEX_BIN}${bypassFlag}${modelFlags}${operatorMcpArgs.length ? ' -p zylos-tavily' : ''}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'codex-exit.log');
@@ -447,11 +456,7 @@ export class CodexAdapter extends RuntimeAdapter {
 
       // Build launch spec. Credential values live only in the 0600 spec file;
       // they never appear in tmux args or the process command line.
-      const args = [];
-      if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox');
-      if (profile.model) args.push('-m', profile.model);
-      if (profile.reasoningEffort) args.push('-c', `model_reasoning_effort="${profile.reasoningEffort}"`);
-      args.push(kickPrompt);
+      const args = [...launchArgs, kickPrompt];
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
       const specPath = writeLaunchSpec({
