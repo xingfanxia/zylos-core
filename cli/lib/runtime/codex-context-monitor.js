@@ -14,6 +14,7 @@ import { ContextMonitorBase } from './context-monitor-base.js';
 import { buildProcessTree } from './process-tree.js';
 
 const TAIL_BYTES = 65_536;
+const METADATA_BYTES = 4 * 1024 * 1024;
 
 export class CodexContextMonitor extends ContextMonitorBase {
   constructor(opts = {}) {
@@ -25,6 +26,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
     this._execFileSync = opts.execFileSync || execFileSync;
     this._buildProcessTree = opts.buildProcessTree || buildProcessTree;
     this._cachedRollout = null;
+    this._cachedMetadata = null;
   }
 
   async getUsage() {
@@ -83,11 +85,52 @@ export class CodexContextMonitor extends ContextMonitorBase {
           if (!Number.isFinite(used) || used < 0) continue;
           const ceiling = info.model_context_window ?? this._getModelCeiling();
           if (!Number.isFinite(ceiling) || ceiling <= 0) return null;
-          return { used, ceiling, source: 'rollout_token_count', rolloutPath };
+          return { used, ceiling, source: 'rollout_token_count', rolloutPath, ...this._readRuntimeMetadata(rolloutPath) };
         } catch { /* partial tail boundary or incomplete JSONL write */ }
       }
     } catch { /* missing/unreadable session is not a zero reading */ }
     return null;
+  }
+
+  _readRuntimeMetadata(rolloutPath) {
+    // Only called after root/process/cwd validation. Never export transcript
+    // bodies, prompts, paths or arbitrary turn_context fields as model telemetry.
+    try {
+      const stat = fs.statSync(rolloutPath);
+      const cached = this._cachedMetadata;
+      const same = cached?.path === rolloutPath && cached.ino === stat.ino &&
+        cached.dev === stat.dev && cached.offset <= stat.size;
+      const start = same && stat.size - cached.offset <= METADATA_BYTES
+        ? cached.offset : Math.max(0, stat.size - METADATA_BYTES);
+      let metadata = same && start === cached.offset ? cached.metadata : null;
+      const buf = Buffer.alloc(stat.size - start);
+      const fd = fs.openSync(rolloutPath, 'r');
+      try { fs.readSync(fd, buf, 0, buf.length, start); }
+      finally { fs.closeSync(fd); }
+      const end = buf.lastIndexOf(10);
+      const complete = end >= 0 ? buf.subarray(0, end + 1).toString('utf8') : '';
+      let lines = complete.split('\n');
+      if (start > 0 && !(same && start === cached.offset)) lines = lines.slice(1);
+      for (const line of lines) {
+        if (!line.includes('"turn_context"')) continue;
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (event.type !== 'turn_context') continue;
+        metadata = null; // malformed newer metadata cannot preserve a prior model
+        const { model, effort } = event.payload || {};
+        const observed = Date.parse(event.timestamp);
+        if (typeof model !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,79}$/.test(model) ||
+          !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort) ||
+          !Number.isFinite(observed)) continue;
+        metadata = { actualModel: model, actualReasoningEffort: effort,
+          actualModelSource: 'rollout_turn_context', actualModelObservedAt: new Date(observed).toISOString() };
+      }
+      this._cachedMetadata = { path: rolloutPath, ino: stat.ino, dev: stat.dev,
+        offset: start + end + 1, metadata };
+      // A partially written new turn must not appear to use the previous model.
+      const partial = buf.subarray(end + 1).toString('utf8');
+      return partial.includes('"turn_context"') ? {} : metadata || {};
+    } catch { return {}; }
   }
 
   _getActiveRolloutPath() {
