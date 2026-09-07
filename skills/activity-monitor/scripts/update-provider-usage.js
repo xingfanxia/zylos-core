@@ -6,10 +6,11 @@ import os from 'os';
 import { execFileSync } from 'child_process';
 import { readClaudeUsageFromMonitorFiles } from './usage-monitor-file-reader.js';
 import { readCodexUsageFromActiveRollout } from './usage-codex-rollout-reader.js';
+import { fetchCodexAccountUsage } from './codex-account-usage.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
-const DEFAULT_INTERVAL_MS = Number.parseInt(process.env.PROVIDER_USAGE_INTERVAL_MS || '', 10) || 5 * 60 * 1000;
+const DEFAULT_INTERVAL_MS = Number.parseInt(process.env.PROVIDER_USAGE_INTERVAL_MS || '', 10) || 60 * 1000;
 const DEFAULT_RETRY_MS = Number.parseInt(process.env.PROVIDER_USAGE_RETRY_MS || '', 10) || 60 * 1000;
 const DEFAULT_CODEXBAR_BIN = process.env.CODEXBAR_BIN || path.join(ZYLOS_DIR, 'bin', 'codexbar');
 const DEFAULT_CODEX_SUBSCRIPTION_HOME = process.env.CODEX_SUBSCRIPTION_HOME
@@ -196,7 +197,11 @@ export function fetchCodexNativeUsage({
     return {
       provider: 'codex',
       available: false,
-      fetched_at: now,
+      quota_authoritative: false,
+      fetched_at: null,
+      observed_at: null,
+      checked_at: now,
+      freshness: 'unknown',
       source: 'zylos-native-rollout',
       error: 'No Codex subscription rate-limit event found',
       primary: null,
@@ -214,10 +219,18 @@ export function fetchCodexNativeUsage({
     resets_at: resetsAt == null ? null : new Date(Number(resetsAt) * 1000).toISOString(),
     reset_description: resetDescription || null,
   };
+  const observedMs = Date.parse(usage.observedAt);
+  const observedAt = Number.isFinite(observedMs) ? new Date(observedMs).toISOString() : null;
+  const age = observedAt ? Date.parse(now) - observedMs : null;
   return {
     provider: 'codex',
-    available: true,
-    fetched_at: now,
+    available: false,
+    quota_authoritative: false,
+    fetched_at: null,
+    observed_at: observedAt,
+    checked_at: now,
+    freshness: age !== null && age > 180000 ? 'stale' : 'unknown',
+    error: 'Official Codex quota unavailable; retained rollout data is historical',
     source: 'zylos-native-rollout',
     version: null,
     account_email: null,
@@ -235,11 +248,12 @@ export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
   fs.renameSync(tmpPath, filePath);
 }
 
-export function runProviderUsageOnce({
+export async function runProviderUsageOnce({
   execFileSyncImpl = execFileSync,
   filePath = PROVIDER_USAGE_FILE,
   fetchClaudeNativeUsageImpl = fetchClaudeNativeUsage,
   fetchCodexNativeUsageImpl = fetchCodexNativeUsage,
+  fetchCodexAccountUsageImpl = fetchCodexAccountUsage,
   log = console.log,
 } = {}) {
   const fetchedAt = new Date().toISOString();
@@ -256,17 +270,11 @@ export function runProviderUsageOnce({
       };
     }
   }
-  let codex = fetchProviderUsage('codex', { execFileSyncImpl, codexbarBin, now: fetchedAt });
+  let codex = await fetchCodexAccountUsageImpl({ codexHome: DEFAULT_CODEX_SUBSCRIPTION_HOME });
   if (!codex.available) {
     const nativeCodex = fetchCodexNativeUsageImpl({ now: fetchedAt });
-    if (nativeCodex.available) {
-      codex = nativeCodex;
-    } else {
-      codex = {
-        ...codex,
-        fallback_error: nativeCodex.error || null,
-      };
-    }
+    codex = { ...nativeCodex, available: false, quota_authoritative: false, fetched_at: null,
+      api_error: codex.error || 'quota_probe_failed' };
   }
   const payload = {
     updated_at: fetchedAt,
@@ -296,7 +304,7 @@ export async function runDaemon({
   while (true) {
     let delay = intervalMs;
     try {
-      once({ log });
+      await once({ log });
     } catch (err) {
       delay = retryMs;
       error(`[update-provider-usage] ${err.message}`);
@@ -311,7 +319,7 @@ async function main() {
     await runDaemon();
     return;
   }
-  runProviderUsageOnce();
+  await runProviderUsageOnce();
 }
 
 if (process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN !== '1') {
