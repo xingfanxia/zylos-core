@@ -17,6 +17,7 @@
  * part so no fork context is lost.
  */
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -218,7 +219,7 @@ async function runCli() {
   }
 }
 
-if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) {
+if (isCliEntry(import.meta.url)) {
   runCli().catch(() => {
     // Best-effort.
   });

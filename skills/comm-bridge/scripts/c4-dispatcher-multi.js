@@ -583,6 +583,7 @@ export async function processWithMultiSession(helpers) {
       // same as the single-session path.
       const deliveryContent = getDeliveryContent(item);
       const result = await sendToTmux(deliveryContent, {
+        deliveryId: `${item.type}:${item.id}`,
         session,
         statusFile,
         strictVerify: item.type === 'conversation',

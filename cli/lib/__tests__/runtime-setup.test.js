@@ -35,6 +35,17 @@ after(() => {
 });
 
 describe('renderCodexProjectConfig', () => {
+  it('loads the full Zylos instruction chain instead of truncating its engineering workflow', () => {
+    for (const existing of ['', 'project_doc_max_bytes = 32768\n']) {
+      const rendered = renderCodexProjectConfig(existing);
+      assert.match(rendered, /^project_doc_max_bytes = 131072$/m);
+      assert.equal(renderCodexProjectConfig(rendered), rendered);
+    }
+    const larger = renderCodexProjectConfig('project_doc_max_bytes = 262144\nmodel = "custom-model"\n');
+    assert.match(larger, /^project_doc_max_bytes = 262144$/m);
+    assert.match(larger, /^model = "custom-model"$/m);
+  });
+
   it('includes headless settings, features, and notice suppression', () => {
     const content = renderCodexProjectConfig();
     assert.match(content, /check_for_update_on_startup = false/);

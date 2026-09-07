@@ -64,7 +64,8 @@ import {
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
-  isUsageOverlayCapture as sharedIsUsageOverlayCapture
+  isUsageOverlayCapture as sharedIsUsageOverlayCapture,
+  readTmuxInputState
 } from './tmux-input-state.js';
 import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
 
@@ -363,68 +364,36 @@ export function checkClaudeFallbackInputBox(capture) {
  * Multi-session: session parameter defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
 export function checkInputBoxByCursor(session = TMUX_SESSION) {
-  const cursorX = getCursorX(session);
-  if (cursorX < 0) return 'indeterminate';
-  if (cursorX > CURSOR_EMPTY_THRESHOLD) return 'has_content';
-
-  // cursor_x ≤ threshold — could be truly empty or multi-line wrapped input.
-  // Capture the pane and compare prompt line Y with cursor Y.
-  const cursorY = getCursorY(session);
-  if (cursorY < 0) return 'indeterminate';
-
-  let capture;
-  try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-      encoding: 'utf8', stdio: 'pipe', timeout: 5000
-    });
-  } catch {
-    return 'indeterminate';
-  }
-
-  const promptY = findPromptY(capture);
-  if (promptY < 0) return 'indeterminate';
-
-  // If cursor is on the prompt line itself, input is empty.
-  // If cursor is below the prompt line, there's wrapped multi-line content.
-  return cursorY === promptY ? 'empty' : 'has_content';
+  return readTmuxInputState({ sessionName: session }).inputState;
 }
 
-/**
- * Unified detector:
- * - Codex: cursor-only.
- * - Claude: cursor-first; if it reports has_content, fallback to text parser.
- * Multi-session: session defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
- */
-export function checkInputBox(session = TMUX_SESSION) {
-  const cursorState = checkInputBoxByCursor(session);
-  if (cursorState !== 'has_content') {
-    return cursorState;
-  }
-
-  if (ACTIVE_RUNTIME !== 'claude') {
-    return cursorState;
-  }
-
-  let capture;
+export function runtimeForSession(session = TMUX_SESSION) {
   try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-      encoding: 'utf8', stdio: 'pipe', timeout: 5000
-    });
-  } catch {
-    return cursorState;
-  }
+    const config = JSON.parse(readFileSync(path.join(path.dirname(ACTIVITY_MONITOR_DIR), 'instances.json'), 'utf8'));
+    for (const [id, inst] of Object.entries(config.instances || {})) {
+      if ((inst.tmux_session || `${inst.runtime || ACTIVE_RUNTIME}-${id}`) !== session) continue;
+      return config.runtime_profiles?.[inst.runtime_profile]?.runtime || inst.runtime || ACTIVE_RUNTIME;
+    }
+  } catch { /* single-session installation */ }
+  return ACTIVE_RUNTIME;
+}
 
-  const fallbackState = checkClaudeFallbackInputBox(capture);
-  return fallbackState === 'indeterminate' ? cursorState : fallbackState;
+function deliveryInputState(session, runtime, execFileSyncImpl = execFileSync) {
+  const state = readTmuxInputState({ sessionName: session, execFileSyncImpl });
+  if (runtime === 'claude' && state.inputState === 'has_content') {
+    const fallback = checkClaudeFallbackInputBox(state.capture);
+    if (fallback !== 'indeterminate') return { ...state, inputState: fallback };
+  }
+  return state;
+}
+
+export function checkInputBox(session = TMUX_SESSION) {
+  return deliveryInputState(session, runtimeForSession(session)).inputState;
 }
 
 export function isUsageOverlayCapture(capture) {
   return sharedIsUsageOverlayCapture(capture);
 }
-
-// Empty prompt threshold: cursor at column 0, 1, or 2 means the input box
-// is empty (cursor sits right after the prompt char, e.g. ">" = column 2).
-const CURSOR_EMPTY_THRESHOLD = 2;
 
 export function getCursorX(session = TMUX_SESSION) {
   try {
@@ -452,98 +421,155 @@ export function getCursorY(session = TMUX_SESSION) {
   }
 }
 
-async function submitAndVerify(session = TMUX_SESSION) {
-  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+// A failed observation leaves ownership with the same delivery. Its retry
+// resumes verification/Enter, never pastes a second copy into the composer.
+const pendingSubmissions = new Map();
+// Receipts exist only for reconciled/retired ambiguous deliveries, keyed by C4
+// row identity. A later retry cannot replay their old payload into a new pane.
+const submissionReceipts = new Map();
 
-  for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
-    await sleep(ENTER_VERIFY_WAIT_MS);
-    const state = checkInputBox(session);
-
-    if (state === 'empty') {
-      return { verified: true, state: 'empty' };
+export function retireSubmission(deliveryId, { pendingSubmissions: submissions = pendingSubmissions,
+  submissionReceipts: receipts = submissionReceipts } = {}) {
+  for (const [session, pending] of submissions) {
+    if (pending.deliveryId === deliveryId) {
+      pending.terminal = true;
+      receipts.set(`${session}\0${deliveryId}`, 'verify_failed');
     }
-
-    if (state === 'indeterminate') {
-      log(`Enter verify attempt ${attempt + 1}: indeterminate state, checking for overlay`);
-      try {
-        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-          encoding: 'utf8', stdio: 'pipe', timeout: 5000
-        });
-        if (isUsageOverlayCapture(capture)) {
-          log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-          execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
-        }
-      } catch { /* capture failed, continue retry loop */ }
-      continue;
-    }
-
-    // state === 'has_content' — message wasn't submitted, retry Enter
-    log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   }
+}
 
-  return { verified: false, state: 'has_content' };
+function wasReplaced(pending, state) {
+  return !!(pending.paneIdentity && state.paneIdentity && pending.paneIdentity !== state.paneIdentity);
+}
+
+function replacementResult(pending) {
+  return { verified: !!(pending.shutdown && pending.observed && pending.enterSent), state: 'replaced' };
+}
+
+export async function submitAndVerify(session, {
+  pending, readState, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
+} = {}) {
+  const enter = () => execFileSyncImpl('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+  if (!pending.observed) {
+    // Native bracketed paste is asynchronous. An old empty frame cannot prove
+    // that the newly pasted message was consumed. Observe its populated
+    // composer before sending Enter and before accepting a later empty frame.
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const state = readState();
+      if (wasReplaced(pending, state)) return replacementResult(pending);
+      if (state.inputState === 'has_content' && !state.usageOverlay) {
+        pending.observed = true;
+        break;
+      }
+      await sleepImpl(250);
+    }
+    if (!pending.observed) return { verified: false, state: 'paste_unobserved' };
+  }
+  if (!pending.enterSent) {
+    enter();
+    pending.enterSent = true;
+  }
+  for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
+    await sleepImpl(ENTER_VERIFY_WAIT_MS);
+    const state = readState();
+    if (wasReplaced(pending, state)) return replacementResult(pending);
+    if (state.inputState === 'empty') return { verified: true, state: 'empty' };
+    // A working model must never receive repeated Enter, nor an Escape that
+    // could interrupt it. Keep the delivery pending until its composer clears.
+    if (state.inProgressCapture) return { verified: false, state: 'working' };
+    if (state.inputState === 'has_content' && !state.usageOverlay) {
+      logImpl(`Enter verify attempt ${attempt + 1}: owned input remains, retrying Enter`);
+      enter();
+    }
+  }
+  return { verified: false, state: 'indeterminate' };
 }
 
 async function sendToTmux(message, options = {}) {
-  const strictVerify = options.strictVerify === true;
   const session = options.session || TMUX_SESSION;
-  // Multi-session: the "is the agent actually dead" fallback below must consult
-  // the TARGET instance's status files, not the primary's defaults.
+  const runtime = options.runtime || runtimeForSession(session);
+  const exec = options.execFileSyncImpl || execFileSync;
+  const wait = options.sleepImpl || sleep;
+  const readState = options.readInputStateImpl || (() => deliveryInputState(session, runtime, exec));
+  const submissions = options.pendingSubmissions || pendingSubmissions;
+  const receipts = options.submissionReceipts || submissionReceipts;
   const statusFile = options.statusFile || AGENT_STATUS_FILE;
-  const acceptShutdownAfterSubmit = options.acceptShutdownAfterSubmit === true;
-  const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
-  const delayMs = getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8'));
-
-  try {
-    execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
-    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
-  } catch (err) {
-    log(`Error pasting to tmux: ${err.message}`);
-    logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
-    return 'paste_error';
-  } finally {
+  const deliveryId = options.deliveryId || sanitized;
+  const receiptKey = `${session}\0${deliveryId}`;
+  if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+  let pending = submissions.get(session);
+  let initial = readState();
+  if (pending && wasReplaced(pending, initial)) {
+    const consumed = replacementResult(pending).verified;
+    receipts.set(`${session}\0${pending.deliveryId}`, consumed ? 'submitted' : 'verify_failed');
+    submissions.delete(session);
+    pending = null;
+    if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+  }
+  if (pending && pending.deliveryId !== deliveryId) {
+    // The old row may have exhausted retries or been manually submitted. Only
+    // confirmed empty input releases it; occupied text is never cleared.
+    if (initial.inputState !== 'empty' || (!pending.terminal && !(pending.observed && pending.enterSent))) return 'verify_failed';
+    await wait(100);
+    const confirmed = readState();
+    if (confirmed.inputState !== 'empty' || confirmed.paneIdentity !== initial.paneIdentity) return 'verify_failed';
+    receipts.set(`${session}\0${pending.deliveryId}`, pending.terminal ? 'verify_failed' : 'submitted');
+    submissions.delete(session);
+    pending = null;
+    initial = confirmed;
+  }
+  if (pending && initial.inputState === 'has_content' && !initial.usageOverlay) pending.observed = true;
+  if (!pending) {
+    if (initial.inputState !== 'empty' || initial.usageOverlay) return 'verify_failed';
+    const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
     try {
-      execFileSync('tmux', ['delete-buffer', '-b', bufferName], { stdio: 'pipe', timeout: 5000 });
-    } catch {
-      // Ignore buffer deletion errors.
+      exec('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
+      // -p uses the native bracketed-paste protocol; -r preserves newlines.
+      // Without these, tmux changes LF to Enter and Codex's paste-burst parser
+      // may split one message into several inputs or swallow the submit key.
+      exec('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
+      pending = { deliveryId, message: sanitized, paneIdentity: initial.paneIdentity,
+        observed: false, enterSent: false, terminal: false,
+        shutdown: options.acceptShutdownAfterSubmit || (runtime === 'codex' && sanitized.trim() === '/exit') };
+      submissions.set(session, pending);
+    } catch (err) {
+      log(`Error pasting to tmux: ${err.message}`);
+      logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
+      return 'paste_error';
+    } finally {
+      try { exec('tmux', ['delete-buffer', '-b', bufferName], { stdio: 'pipe', timeout: 5000 }); }
+      catch { /* private buffer may already be gone */ }
     }
+    await wait(getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8')));
   }
-
-  await sleep(delayMs);
-
-  let verifyResult = { verified: false, state: 'indeterminate' };
-  try {
-    verifyResult = await submitAndVerify(session);
-  } catch (err) {
-    log(`Warning: Enter verification error: ${err.message}`);
+  let result = { verified: false, state: 'indeterminate' };
+  try { result = await submitAndVerify(session, { pending, readState, execFileSyncImpl: exec, sleepImpl: wait }); }
+  catch (err) { log(`Warning: Enter verification error: ${err.message}`); }
+  if (result.verified) {
+    submissions.delete(session);
+    if (result.state === 'replaced') receipts.set(receiptKey, 'submitted');
+    return 'submitted';
   }
-
-  // Conversation delivery must be strict: if we cannot verify submission,
-  // retry instead of marking delivered to avoid false positives.
-  if (!verifyResult.verified && strictVerify) {
-    log(`Verification failed in strict mode (state=${verifyResult.state}) — marking as verify_failed`);
+  if (result.state === 'replaced') {
+    submissions.delete(session);
+    receipts.set(receiptKey, 'verify_failed');
     return 'verify_failed';
   }
-
-  // For non-conversation controls, preserve prior permissive behavior when the
-  // process is confirmed alive (only hard-fail if process is dead/offline).
-  if (!verifyResult.verified) {
-    const procState = readProcState(statusFile);
-    const agentState = getAgentState(statusFile);
-    if ((procState && procState.alive === false) ||
-        agentState.state === 'offline' || agentState.state === 'stopped') {
-      if (acceptShutdownAfterSubmit) {
-        log('Verification failed after lifecycle shutdown control; treating paste+Enter as submitted');
-        return 'submitted';
-      }
-      log('Verification failed and agent is dead/offline — marking as verify_failed');
-      return 'verify_failed';
+  // /exit intentionally removes the UI after its observed submit. Every other
+  // control needs the same submission proof as a conversation; process liveness
+  // alone cannot establish that a pasted message reached the model.
+  if (pending.observed && pending.enterSent && pending.shutdown) {
+    const proc = readProcState(statusFile);
+    const state = getAgentState(statusFile);
+    if (proc?.alive === false || state.state === 'offline' || state.state === 'stopped') {
+      submissions.delete(session);
+      receipts.set(receiptKey, 'submitted');
+      return 'submitted';
     }
   }
-
-  return 'submitted';
+  log(`Submission remains unverified (state=${result.state}); retaining pasted input for retry`);
+  return 'verify_failed';
 }
 
 export function isBypassState(item) {
@@ -609,6 +635,7 @@ async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_
 
     if (nextCount >= MAX_RETRIES) {
       markFailed(msg.id);
+      retireSubmission(`conversation:${msg.id}`);
       log(`FAILED: conversation id=${msg.id} channel=${msg.channel} marked as failed after ${nextCount} retries`);
       logDeliveryFailure('conversation', msg.id, 'MAX_RETRIES', { channel: msg.channel, retries: nextCount });
       return;
@@ -631,6 +658,7 @@ async function handleControlDeliveryFailure(control, reason) {
   if (!transition) return;
 
   if (transition.status === 'failed') {
+    retireSubmission(`control:${control.id}`);
     log(`FAILED: control id=${control.id} marked as failed after ${transition.retry_count} retries (${reason})`);
     logDeliveryFailure('control', control.id, reason, { retries: transition.retry_count });
     return;
@@ -861,6 +889,7 @@ async function processNextMessage() {
   log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
   const deliveryContent = getDeliveryContent(item);
   const result = await sendToTmux(deliveryContent, {
+    deliveryId: `${item.type}:${item.id}`,
     strictVerify: item.type === 'conversation',
     acceptShutdownAfterSubmit: isCodexExitLifecycleControl(item)
   });
