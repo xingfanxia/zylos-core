@@ -4,11 +4,9 @@ import path from 'path';
 import { shouldStartUsageCheck } from './usage-check-engine.js';
 import {
   classifyCodexRateLimitWindows,
-  readCodexUsageFromActiveRollout,
 } from './usage-codex-rollout-reader.js';
 import {
   readClaudeUsageFromMonitorFiles,
-  readCodexUsageFromMonitorFile,
   readStatuslineWithDiagnostics
 } from './usage-monitor-file-reader.js';
 
@@ -81,6 +79,11 @@ export class UsageMonitor {
 
   runMonitor({ currentTime }) {
     if (!this.usageProvider) return true;
+    if (this.usageProvider === 'codex') {
+      this.refreshCodexUsageState(currentTime);
+      this.lastUsageCheckAt = currentTime;
+      return true;
+    }
     let snapshot = null;
     let source = null;
     if (this.usageProvider === 'claude') {
@@ -89,23 +92,6 @@ export class UsageMonitor {
         usageStateFile: this.options.usageStateFile
       });
       source = snapshot?.statusShape || 'none';
-    } else {
-      // The active rollout is the live subscription source. usage-codex.json is
-      // this monitor's own persisted output, so preferring it would keep a
-      // stale value forever after a profile/account switch.
-      snapshot = readCodexUsageFromActiveRollout({
-        codexHome: this.options.codexHome,
-        instanceId: this.options.instanceId,
-      });
-      source = snapshot?.statusShape || 'rollout-missing';
-
-      if (!snapshot) {
-        snapshot = readCodexUsageFromMonitorFile({
-          usageStateFile: this.options.usageCodexStateFile
-        });
-        source = snapshot?.statusShape || 'usage-codex-missing';
-        if (snapshot) this.options.log('Usage monitor (codex): live rollout unavailable, using persisted snapshot');
-      }
     }
 
     if (!snapshot) {
@@ -171,7 +157,15 @@ export class UsageMonitor {
       });
     };
 
-    const state = this.loadUsageState();
+    // Alert execution can be delayed after runMonitor. Re-read the account
+    // observation now; persisted percentages never authorize a Codex alert.
+    const state = this.usageProvider === 'codex'
+      ? this.refreshCodexUsageState(currentTime)
+      : this.loadUsageState();
+    if (this.usageProvider === 'codex' && state.available !== true) {
+      writeCheckedState({ lastObservedTier: 'unknown' });
+      return true;
+    }
     if (!state) {
       this.options.log(`Usage alert (${this.usageProvider}): no usage state available`);
       writeCheckedState();
@@ -179,7 +173,7 @@ export class UsageMonitor {
     }
 
     const weekly = state.weeklyAll?.percent;
-    if (weekly === null || weekly === undefined) {
+    if ((weekly === null || weekly === undefined) && !(this.usageProvider === 'codex' && Number.isFinite(state.fiveHour?.percent))) {
       this.options.log(`Usage alert (${this.usageProvider}): no weekly usage metric available`);
       writeCheckedState();
       return true;
@@ -207,14 +201,16 @@ export class UsageMonitor {
       session: state.session?.percent,
       weeklyAll: state.weeklyAll?.percent,
       weeklySonnet: state.weeklySonnet?.percent,
-      weeklyAllResets: state.weeklyAll?.resets
+      weeklyAllResets: state.weeklyAll?.resets,
+      fiveHour: state.fiveHour?.percent,
+      fiveHourResets: state.fiveHour?.resets,
     };
     this.options.log(`Usage alert (${this.usageProvider}): notifying owner for tier=${tier}`);
     this.sendNotification(formatUsageNotification(usage, tier, this.usageProvider));
     writeCheckedState({
       lastObservedTier: tier,
       lastNotifiedTier: tier,
-      lastNotifiedAt: new Date().toISOString(),
+      lastNotifiedAt: checkedAt,
     });
     return true;
   }
@@ -250,7 +246,9 @@ export class UsageMonitor {
   }
 
   /**
-   * Preferred fleet-alert source: provider-usage.json, written every ~5min by
+   * Preferred fleet-alert source: provider-usage.json. Codex requires a fresh
+   * authoritative account observation and has no historical fallback. Claude
+   * retains its provider/statusline behavior below, written every ~5min by
    * the provider-usage-updater daemon (codexbar) — an ACTIVE query of the
    * shared account's real quota, independent of whether any instance is
    * rendering. Statusline files are passive render exhaust: stale whenever the
@@ -274,6 +272,7 @@ export class UsageMonitor {
     if (!p || p.available !== true) {
       return { ok: false, reason: p?.error ? `unavailable(${String(p.error).slice(0, 80)})` : 'unavailable' };
     }
+    if (this.usageProvider === 'codex') return readAuthoritativeCodex(p, currentTime);
     const fetchedAtSec = Math.floor(new Date(p.fetched_at || doc.updated_at || 0).getTime() / 1000);
     if (!Number.isFinite(fetchedAtSec) || fetchedAtSec <= 0) return { ok: false, reason: 'no_timestamp' };
     const ageSec = currentTime - fetchedAtSec;
@@ -302,6 +301,32 @@ export class UsageMonitor {
     };
   }
 
+  refreshCodexUsageState(currentTime) {
+    const provider = this.readProviderUsage(currentTime);
+    const reading = provider.ok ? provider.reading : null;
+    const weeklyTier = reading ? this.getUsageTier(reading.weekly ?? 0) : 'unknown';
+    const fiveHourTier = reading ? this.getFiveHourTier(reading.fiveHour ?? 0) : 'unknown';
+    const state = {
+      available: provider.ok, quota_authoritative: provider.ok,
+      statusShape: 'codex-account-api', source: 'codex-account-api',
+      checked_at: new Date(currentTime * 1000).toISOString(),
+      // lastCheck is the observation time, not the time this diagnostic copy
+      // was written. Unknown data explicitly clears every retained percentage.
+      observed_at: reading?.observedAt ?? null,
+      lastCheck: reading?.observedAt ?? null,
+      lastCheckEpoch: reading ? Math.floor(Date.parse(reading.observedAt) / 1000) : null,
+      session: { percent: reading?.fiveHour ?? null, resets: reading?.fiveHourResets ?? null },
+      fiveHour: { percent: reading?.fiveHour ?? null, resets: reading?.fiveHourResets ?? null },
+      weeklyAll: { percent: reading?.weekly ?? null, resets: reading?.weeklyAllResets ?? null },
+      weeklySonnet: { percent: null, resets: null },
+      tier: reading ? maxRankTier(weeklyTier, fiveHourTier) : 'unknown', weeklyTier, fiveHourTier,
+      ...(provider.ok ? {} : { error: provider.reason }),
+    };
+    this.writeUsageState(state);
+    this.options.log(`Usage monitor (codex): source=codex-account-api available=${provider.ok} weekly=${state.weeklyAll.percent ?? 'unknown'} tier=${state.tier}`);
+    return state;
+  }
+
   async _runFleetAlertInner({ currentTime }) {
     const fleetState = this.loadFleetAlertState();
     const staleSec = this.options.statuslineStaleSec;
@@ -314,7 +339,7 @@ export class UsageMonitor {
     // Direct read first; the per-instance statusline scan below is now the
     // FALLBACK channel, only walked when the provider read is unusable.
     const provider = this.readProviderUsage(currentTime);
-    const sourceMode = provider.ok ? 'provider' : 'statusline';
+    const sourceMode = provider.ok ? 'provider' : this.usageProvider === 'codex' ? 'unavailable' : 'statusline';
     if (provider.ok) {
       readings.push({
         id: 'provider-usage',
@@ -328,12 +353,12 @@ export class UsageMonitor {
       });
     } else if (provider.reason !== this._lastProviderReason) {
       // in-memory change-dedup (2-min cycles would spam); a restart re-logs once.
-      this.options.log(`Usage fleet alert: provider usage unusable (${provider.reason}) — falling back to statusline scan`);
+      this.options.log(`Usage fleet alert: provider usage unusable (${provider.reason}) — ${this.usageProvider === 'codex' ? 'Codex quota unknown; no statusline fallback' : 'falling back to statusline scan'}`);
     }
     this._lastProviderReason = provider.ok ? null : provider.reason;
 
     const instances = this.options.getAllInstances ? this.options.getAllInstances() : [];
-    const scanList = provider.ok ? [] : (instances.length ? instances : [{ id: null }]);
+    const scanList = provider.ok || this.usageProvider === 'codex' ? [] : (instances.length ? instances : [{ id: null }]);
 
     for (const inst of scanList) {
       const id = inst.id;
@@ -409,10 +434,10 @@ export class UsageMonitor {
     // rule: >=3 sources → median; 1-2 → worst-case (max), admin-only.
     const quorum = sourceMode === 'provider' || usableCount >= 3;
     const fiveHour = quorum
-      ? median(readings.map((r) => r.fiveHour))
+      ? median(readings.map((r) => r.fiveHour).filter(Number.isFinite))
       : Math.max(...readings.map((r) => r.fiveHour));
     const weeklyAll = quorum
-      ? median(readings.map((r) => r.weekly))
+      ? median(readings.map((r) => r.weekly).filter(Number.isFinite))
       : Math.max(...readings.map((r) => r.weekly));
 
     // Window identity + display come from the freshest usable reading.
@@ -478,7 +503,11 @@ export class UsageMonitor {
       this.options.log(`Usage fleet alert: user fan-out suppressed — ${why}`);
     }
 
-    const { userSends, adminSent } = await this.deliverFleetAlert(tier, data, { doUserFanout });
+    const { userSends, adminSent, quotaSuppressed } = await this.deliverFleetAlert(tier, data, { doUserFanout, currentTime });
+    if (quotaSuppressed && !userSends && !adminSent) {
+      this.writeFleetAlertState({ ...carry, lastObservedTier: 'unknown' });
+      return true;
+    }
     this.options.log(
       `Usage fleet alert: delivered tier=${tier} (users=${userSends}, admin=${adminSent}, ` +
       `source=${sourceMode}, sources=${usableCount}, 5h=${fiveHour}% weekly=${weeklyAll}%)`
@@ -507,9 +536,25 @@ export class UsageMonitor {
   // a plain value (sync test fakes) as well as a real Promise. Counts are tallied
   // in the .then callbacks and only read after Promise.all settles, so the
   // `delivered users=X admin=Y` log stays accurate.
-  async deliverFleetAlert(tier, data, { doUserFanout }) {
+  async deliverFleetAlert(tier, data, { doUserFanout, currentTime }) {
     let userSends = 0;
     let adminSent = 0;
+    let quotaSuppressed = false;
+    const startedAt = Date.now();
+    const send = (endpoint, text) => {
+      if (this.usageProvider === 'codex') {
+        const now = currentTime + (Date.now() - startedAt) / 1000;
+        const latest = this.readProviderUsage(now);
+        // Native async fan-out can yield before sending. If the evidence has
+        // changed or expired, wait for the next complete monitor cycle.
+        if (!latest.ok || latest.reading.weekly !== data.weeklyAll || latest.reading.fiveHour !== data.fiveHour ||
+            latest.reading.weeklyAllResets !== data.weeklyAllResets || latest.reading.fiveHourResets !== data.fiveHourResets) {
+          quotaSuppressed = true;
+          return { ok: false, output: 'Codex quota changed or became unavailable before send' };
+        }
+      }
+      return this.options.c4Send('feishu', endpoint, text);
+    };
     const pending = [];
     if (doUserFanout) {
       const userText = formatUserNotification(data, tier);
@@ -519,7 +564,7 @@ export class UsageMonitor {
         const chatIds = Array.isArray(inst.chat_ids) ? inst.chat_ids : [];
         for (const chatId of chatIds) {
           if (!chatId) continue;
-          pending.push(Promise.resolve().then(() => this.options.c4Send('feishu', chatId, userText)).then((res) => {
+          pending.push(Promise.resolve().then(() => send(chatId, userText)).then((res) => {
             if (res?.ok) userSends++;
             else this.options.log(`Usage fleet alert: user send failed for ${chatId} (${res?.output})`);
           }));
@@ -529,7 +574,7 @@ export class UsageMonitor {
     // Admin always (caller guarantees tier >= warning here).
     if (this.options.adminChatId) {
       pending.push(Promise.resolve()
-        .then(() => this.options.c4Send('feishu', this.options.adminChatId, formatAdminNotification(data, tier)))
+        .then(() => send(this.options.adminChatId, formatAdminNotification(data, tier)))
         .then((res) => {
           if (res?.ok) adminSent = 1;
           else this.options.log(`Usage fleet alert: admin send failed (${res?.output})`);
@@ -538,7 +583,7 @@ export class UsageMonitor {
       this.options.log('Usage fleet alert: no adminChatId configured — admin alert skipped (check instances.json admin.chat_ids)');
     }
     await Promise.all(pending);
-    return { userSends, adminSent };
+    return { userSends, adminSent, quotaSuppressed };
   }
 
   async emitMonitoringBlind({ currentTime, fleetState, staleSec, usableCount, reasonCounts, loudErrors, providerReason = null }) {
@@ -570,7 +615,7 @@ export class UsageMonitor {
       this.writeFleetAlertState({ ...fleetState, blindAlertedAt: nowIso, lastCheckedAt: nowIso, statErrors: loudErrors });
       return true;
     }
-    const text = formatBlindNotification({ staleSec, usableCount, reasonCounts, providerReason });
+    const text = formatBlindNotification({ staleSec, usableCount, reasonCounts, providerReason, usageProvider: this.usageProvider });
     if (this.options.adminChatId) {
       const res = await Promise.resolve().then(() => this.options.c4Send('feishu', this.options.adminChatId, text));
       this.options.log(`Usage fleet alert: monitoring-blind admin alert (${res?.ok ? 'ok' : 'fail'})`);
@@ -698,6 +743,33 @@ export class UsageMonitor {
   }
 }
 
+function readAuthoritativeCodex(provider, currentTime) {
+  if (provider.source !== 'codex-account-api' || provider.quota_authoritative !== true) return { ok: false, reason: 'non_authoritative' };
+  const observedMs = Date.parse(provider.observed_at);
+  const ageSec = currentTime - observedMs / 1000;
+  if (!Number.isFinite(observedMs)) return { ok: false, reason: 'no_observation_timestamp' };
+  if (ageSec < -30) return { ok: false, reason: 'future_observation' };
+  if (ageSec > 180) return { ok: false, reason: 'stale_observation' };
+  const windows = classifyCodexRateLimitWindows(provider);
+  const validWindow = window => {
+    if (!window) return null;
+    const reset = Date.parse(window.resets_at);
+    if (!Number.isFinite(window.used_percent) || window.used_percent < 0 || window.used_percent > 100 ||
+        !Number.isFinite(reset) || reset <= currentTime * 1000) return false;
+    return { percent: window.used_percent, resets: new Date(reset).toISOString() };
+  };
+  const five = validWindow(windows.fiveHour);
+  const weekly = validWindow(windows.weekly);
+  if (five === false || weekly === false) return { ok: false, reason: 'invalid_or_expired_window' };
+  if (!five && !weekly) return { ok: false, reason: 'no_known_usage_window' };
+  return { ok: true, reading: {
+    fiveHour: five?.percent ?? null, weekly: weekly?.percent ?? null,
+    fiveHourResetsAt: five?.resets ?? null, fiveHourResets: five?.resets ?? null,
+    weeklyAllResetsAt: weekly?.resets ?? null, weeklyAllResets: weekly?.resets ?? null,
+    observedAt: new Date(observedMs).toISOString(), ageSec,
+  } };
+}
+
 function providerLabel(provider) {
   return provider === 'codex' ? 'Codex subscription' : 'Claude subscription';
 }
@@ -711,6 +783,15 @@ function remainingLabel(used) {
 }
 
 function formatUsageNotification(usage, tier, provider = 'claude') {
+  if (provider === 'codex') {
+    const labels = { warning: '⚠️ Usage Warning', high: '🔶 Usage High', critical: '🔴 Usage Critical' };
+    const used = value => value == null ? 'unknown' : `${value}% used / ${remainingLabel(value)} remaining`;
+    return [labels[tier] || 'Usage Alert', '', 'Provider: Codex subscription',
+      `Weekly (all models): ${used(usage.weeklyAll)}`,
+      `Session (5h): ${used(usage.fiveHour)}`,
+      `Weekly resets (UTC): ${usage.weeklyAllResets || 'unknown'}`,
+      `Session resets (UTC): ${usage.fiveHourResets || 'unknown'}`].join('\n');
+  }
   const weekly = usage.weeklyAll ?? 0;
   const session = usage.session ?? 0;
   const resets = usage.weeklyAllResets || 'unknown';
@@ -788,13 +869,13 @@ function formatAdminNotification(data, tier) {
   const usableCount = data.usableCount ?? 0;
   const agg = data.quorum ? '中位数' : '最坏值';
   const sourceLine = data.sourceMode === 'provider'
-    ? `读数来源: provider 直读（codexbar，${data.providerAgeMin ?? '?'} 分钟前查询）`
+    ? `读数来源: provider 直读（${data.usageProvider === 'codex' ? 'Codex account API' : 'codexbar'}，${data.providerAgeMin ?? '?'} 分钟前查询）`
     : `读数来源: ${usableCount} 个实例 statusline（${agg}，直读通道不可用）` +
       (data.sources?.length ? `：${data.sources.join(', ')}` : '');
   const lines = [
     `${tierLabels[tier] || '额度提醒'}（${providerLabel(data.usageProvider)}，${tier}，热点=${hot}）`,
-    `5h: ${data.fiveHour ?? 'null'}% 已用 / ${remainingLabel(data.fiveHour)} 剩余（${data.fiveHourResets || '未知'} 重置）`,
-    `weekly: ${data.weeklyAll ?? 'null'}% 已用 / ${remainingLabel(data.weeklyAll)} 剩余（${data.weeklyAllResets || '未知'} 重置）`,
+    `5h: ${data.fiveHour == null ? 'unknown' : `${data.fiveHour}%`} 已用 / ${remainingLabel(data.fiveHour)} 剩余（${data.fiveHourResets || '未知'} 重置）`,
+    `weekly: ${data.weeklyAll == null ? 'unknown' : `${data.weeklyAll}%`} 已用 / ${remainingLabel(data.weeklyAll)} 剩余（${data.weeklyAllResets || '未知'} 重置）`,
     sourceLine
   ];
   if (!data.quorum) {
@@ -809,7 +890,12 @@ function formatAdminNotification(data, tier) {
 // AND no usable statusline reading exists. That is an actionable ops signal
 // (poll daemon / auth / disk), unlike the old statusline-only blindness which
 // fired whenever the fleet was merely idle or mid-long-turn.
-function formatBlindNotification({ staleSec, usableCount, reasonCounts = {}, providerReason = null }) {
+function formatBlindNotification({ staleSec, usableCount, reasonCounts = {}, providerReason = null, usageProvider }) {
+  if (usageProvider === 'codex') return [
+    '🔴 Codex 额度监控不可用',
+    `原生 account API: ${providerReason || '不可用'}。额度当前未知。`,
+    '检查 provider-usage-updater 与账号认证；历史 rollout/statusline 不可作为额度报警依据。',
+  ].join('\n');
   const parts = [];
   if (reasonCounts.stale) parts.push(`${reasonCounts.stale} 过期`);
   if (reasonCounts.eacces) parts.push(`${reasonCounts.eacces} 权限拒绝(EACCES)`);

@@ -119,6 +119,111 @@ afterEach(() => {
   }
 });
 
+function writeCodexAccountUsage(dir, now, overrides = {}) {
+  const file = path.join(dir, 'activity-monitor', 'provider-usage.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const provider = {
+    provider: 'codex', available: true, quota_authoritative: true, source: 'codex-account-api',
+    observed_at: new Date((now - 20) * 1000).toISOString(), fetched_at: new Date(now * 1000).toISOString(),
+    primary: null,
+    secondary: { used_percent: 48, window_minutes: 10080, resets_at: '2026-09-14T00:43:23+00:00', reset_description: 'untrusted display reset' },
+    ...overrides,
+  };
+  fs.writeFileSync(file, JSON.stringify({ updated_at: new Date(now * 1000).toISOString(), providers: { codex: provider } }));
+  return provider;
+}
+
+describe('Codex quota alert authority', () => {
+  const now = Date.parse('2026-09-07T14:40:00Z') / 1000;
+  const retained = { weeklyAll: { percent: 97, resets: 'Sep 9 18:28' }, session: { percent: null }, tier: 'critical', statusShape: 'usage_codex_json', lastCheck: new Date(now * 1000).toISOString() };
+
+  it('replaces stale local 97% with official 48% without restamping observation or sending an alert', () => {
+    const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+    fs.writeFileSync(path.join(dir, 'usage-codex.json'), JSON.stringify(retained));
+    const provider = writeCodexAccountUsage(dir, now);
+    monitor.runMonitor({ currentTime: now });
+    const state = monitor.loadUsageState();
+    assert.equal(state.weeklyAll.percent, 48); assert.equal(state.tier, 'ok');
+    assert.equal(state.lastCheck, provider.observed_at); assert.equal(state.lastCheckEpoch, now - 20);
+    assert.equal(state.checked_at, new Date(now * 1000).toISOString());
+    assert.equal(state.weeklyAll.resets, '2026-09-14T00:43:23.000Z');
+    assert.equal(state.session.percent, null); assert.equal(state.fiveHour.percent, null);
+    monitor.runAlert({ currentTime: now }); assert.deepEqual(calls.control, []);
+  });
+
+  it('runAlert rereads the official snapshot even if prior diagnostic state is critical', () => {
+    const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+    writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23Z' } });
+    monitor.runMonitor({ currentTime: now }); assert.equal(monitor.loadUsageState().tier, 'critical');
+    writeCodexAccountUsage(dir, now);
+    monitor.runAlert({ currentTime: now }); assert.deepEqual(calls.control, []); assert.equal(monitor.loadUsageState().weeklyAll.percent, 48);
+  });
+
+  it('missing/stale/unavailable/non-authoritative/expired/future snapshots clear old state and never send quota alerts', () => {
+    const variants = [null, { available: false }, { source: 'zylos-native-rollout' }, { quota_authoritative: false },
+      { observed_at: new Date((now - 181) * 1000).toISOString() }, { observed_at: null },
+      { observed_at: new Date((now + 31) * 1000).toISOString() },
+      { secondary: { used_percent: 97, window_minutes: 10080, resets_at: new Date(now * 1000).toISOString() } },
+    ];
+    for (const variant of variants) {
+      const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+      fs.writeFileSync(path.join(dir, 'usage-codex.json'), JSON.stringify(retained));
+      if (variant) writeCodexAccountUsage(dir, now, variant);
+      monitor.runAlert({ currentTime: now });
+      assert.deepEqual(calls.control, []);
+      const state = monitor.loadUsageState(); assert.equal(state.available, false); assert.equal(state.tier, 'unknown');
+      assert.equal(state.weeklyAll.percent, null); assert.equal(state.lastCheck, null); assert.equal(state.observed_at, null);
+    }
+  });
+
+  it('genuine fresh weekly-only 97% alerts with unknown session and explicit UTC reset', () => {
+    const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+    writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23+00:00' } });
+    monitor.runAlert({ currentTime: now });
+    assert.equal(calls.control.length, 1);
+    const text = calls.control[0][2]; assert.match(text, /Weekly \(all models\): 97%/); assert.match(text, /Session \(5h\): unknown/);
+    assert.match(text, /2026-09-14T00:43:23\.000Z/); assert.doesNotMatch(text, /Session.*0%/);
+    monitor.runAlert({ currentTime: now + 10 }); assert.equal(calls.control.length, 1);
+  });
+
+  it('fresh five-hour-only critical quota remains actionable without inventing a weekly reading', () => {
+    const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+    writeCodexAccountUsage(dir, now, { secondary: null, primary: { used_percent: 97, window_minutes: 300, resets_at: new Date((now + 300) * 1000).toISOString() } });
+    monitor.runAlert({ currentTime: now }); assert.equal(calls.control.length, 1);
+    assert.match(calls.control[0][2], /Weekly \(all models\): unknown/); assert.match(calls.control[0][2], /Session \(5h\): 97%/);
+  });
+
+  it('fleet refuses Codex statusline fallback and preserves admin-only unknown monitoring notification', async () => {
+    const { dir, monitor, calls, statuslineFileFor } = makeMonitor({ runtimeId: 'codex' });
+    seed(statuslineFileFor, ['admin', 'user-pan', 'user-limh'], { fiveHour: 99, weekly: 97 }, now);
+    writeCodexAccountUsage(dir, now, { available: false });
+    await monitor.runFleetAlert({ currentTime: now });
+    assert.equal(calls.send.length, 1); assert.equal(calls.send[0].endpoint, 'oc_admin');
+    assert.match(calls.send[0].message, /额度当前未知/); assert.doesNotMatch(calls.send[0].message, /97%|99%|codexbar/);
+  });
+
+  it('fleet uses fresh weekly-only API quota and never presents missing session as zero', async () => {
+    const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+    writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23Z' } });
+    await monitor.runFleetAlert({ currentTime: now });
+    const admin = calls.send.find(call => call.endpoint === 'oc_admin'); assert.ok(admin);
+    assert.match(admin.message, /5h: unknown/); assert.match(admin.message, /weekly: 97%/); assert.match(admin.message, /Codex account API/);
+  });
+
+  it('fleet rechecks provider authority before deferred sends when the source changes after classification', async () => {
+    const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
+    writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23Z' } });
+    const original = monitor.deliverFleetAlert.bind(monitor);
+    monitor.deliverFleetAlert = (tier, data, options) => {
+      writeCodexAccountUsage(dir, now);
+      return original(tier, data, options);
+    };
+    await monitor.runFleetAlert({ currentTime: now });
+    assert.deepEqual(calls.send, []);
+    assert.equal(monitor.loadFleetAlertState().lastAlertedTier, undefined);
+  });
+});
+
 describe('UsageMonitor', () => {
   it('preserves startup check timing semantics for Claude and Codex', () => {
     const claude = makeMonitor();
