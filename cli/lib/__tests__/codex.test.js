@@ -69,6 +69,17 @@ afterEach(() => {
 });
 
 describe('Codex auth checks', () => {
+  it('wires the active isolated runtime profile into automatic context monitoring', () => {
+    const adapter = new CodexAdapter({ runtimeProfile: {
+      runtimeHome: '/home/zylos-pan', codexHome: '/home/zylos-pan/.codex-subscription',
+      model: 'gpt-6-astra',
+    } });
+    const monitor = adapter.getContextMonitor();
+    assert.equal(monitor._codexDir, '/home/zylos-pan/.codex-subscription');
+    assert.equal(monitor._model, 'gpt-6-astra');
+    assert.equal(monitor._tmuxSession, adapter.sessionName);
+  });
+
   it('uses the active profile CODEX_HOME instead of the process home', async () => {
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-auth-test-'));
     tmpDirs.push(tmpHome);

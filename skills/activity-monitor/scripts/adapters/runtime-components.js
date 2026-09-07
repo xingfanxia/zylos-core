@@ -1,5 +1,7 @@
 import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { Guardian } from '../guardian.js';
 import { HealthEngine } from '../health-engine.js';
 import { ProcSampler } from '../proc-sampler.js';
@@ -94,6 +96,9 @@ export function createGuardian(activeAdapter, activeToolPipeline, initialRuntime
 }
 
 export function startContextMonitor(activeAdapter, {
+  monitorDir,
+  instanceId = null,
+  nowMs = Date.now,
   getUnsummarizedCount,
   checkpointThreshold,
   loadContextMonitorState,
@@ -109,8 +114,45 @@ export function startContextMonitor(activeAdapter, {
   const monitor = activeAdapter.getContextMonitor?.() ?? null;
   if (!monitor) return null;
 
+  const publishSample = (sample) => {
+    if (!monitorDir) return;
+    const valid = sample && Number.isFinite(sample.used) && sample.used >= 0 &&
+      Number.isFinite(sample.ceiling) && sample.ceiling > 0;
+    const percentUsed = valid ? Math.round(sample.used / sample.ceiling * 100) : null;
+    const profile = activeAdapter.config?.runtimeProfile || {};
+    const snapshot = {
+      version: 1,
+      runtime: activeAdapter.runtimeId,
+      runtime_profile: profile.id || null,
+      model: profile.model || null,
+      instance_id: instanceId,
+      observed_at: new Date(nowMs()).toISOString(), // poll time, including idle sessions
+      available: !!valid,
+      status: valid ? 'ok' : 'unknown',
+      reason: valid ? null : 'sample_unavailable',
+      used_tokens: valid ? sample.used : null,
+      ceiling_tokens: valid ? sample.ceiling : null,
+      percent_used: percentUsed,
+      percent_remaining: valid ? Math.max(0, 100 - percentUsed) : null,
+      threshold_percent: Math.round(monitor.threshold * 100),
+      source: valid ? sample.source || null : null,
+      rollout_path: valid ? sample.rolloutPath || null : null,
+    };
+    const file = path.join(monitorDir, 'context-window.json');
+    try {
+      fs.mkdirSync(monitorDir, { recursive: true });
+      const tmp = `${file}.tmp.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(snapshot, null, 2) + '\n');
+      fs.renameSync(tmp, file);
+    } catch (error) {
+      // Observability must not disable the threshold/handoff safety mechanism.
+      log(`Context snapshot write failed: ${error.message}`);
+    }
+  };
+  publishSample(null); // invalidate an old engine's file before the first poll
   monitor.startPolling({
     intervalMs: 30_000,
+    onSample: publishSample,
     onExceed: async ({ used, ceiling, ratio }) => {
       const pct = Math.round(ratio * 100);
       log(`Context at ${pct}% (${used}/${ceiling}), requesting new-session handoff`);
@@ -167,16 +209,36 @@ export function scheduleStaleRuntimeCleanup(activeAdapter, {
   log,
   setTimeoutImpl = setTimeout,
   execFileSyncImpl = execFileSync,
+  env = process.env,
+  zylosDir = env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
+  lstatSyncImpl = fs.lstatSync,
 }) {
-  // Runs on every startup (not just runtime switches). If the other session is
-  // absent, the kill fails silently. The delay gives a running agent time to
-  // finish its current response before being terminated.
+  // This is a legacy SINGLE-session migration helper. In multi-instance
+  // installs, claude-main is often admin's stable Codex identity: another
+  // persona must never infer a stale engine from that name and kill it.
+  const legacySingleSession = () => {
+    if (env.ZYLOS_INSTANCE_ID) return false;
+    try { if (!fs.statSync(zylosDir).isDirectory()) return false; }
+    catch { return false; } // unknown workspace/access is never permission to kill
+    try {
+      lstatSyncImpl(path.join(zylosDir, 'instances.json'));
+      return false; // presence protects every persona, even malformed/symlink config
+    } catch (error) {
+      return error.code === 'ENOENT'; // unreadable/unknown configuration fails closed
+    }
+  };
+  if (!legacySingleSession()) return;
+  if (!['claude', 'codex'].includes(activeAdapter.runtimeId) ||
+      activeAdapter.sessionName !== `${activeAdapter.runtimeId}-main`) return;
   const otherSession = activeAdapter.runtimeId === 'codex' ? 'claude-main' : 'codex-main';
   // Runtime failover deliberately preserves the persona's stable tmux name
   // (often `claude-main`) across providers. Never mistake that active stable
   // identity for a stale session and kill it ten seconds after every restart.
   if (otherSession === activeAdapter.sessionName) return;
   setTimeoutImpl(() => {
+    // Configuration can change during the grace period. Re-check immediately
+    // before the legacy destructive action instead of trusting startup state.
+    if (!legacySingleSession()) return;
     try {
       execFileSyncImpl('tmux', ['kill-session', '-t', otherSession], { stdio: 'pipe', timeout: 3000 });
       log(`Startup cleanup: killed stale ${otherSession} session from previous runtime`);

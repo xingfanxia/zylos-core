@@ -25,6 +25,8 @@ import { assertInstructionReady, buildInstructionFile } from './instruction-buil
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
 import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../config.js';
+import { operatorTavilyProfileArgs } from '../operator-tavily-profile.js';
+import { ensureCodexSkillView } from '../codex-skill-view.js';
 // writeCodexConfig is lazy-loaded inside launch() — top-level import would pull
 // runtime-setup.js (which imports spawnSync) and break test module mocks that
 // don't include spawnSync in their child_process namedExports.
@@ -339,17 +341,9 @@ export class CodexAdapter extends RuntimeAdapter {
     }
     const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
-    // Ensure .agents/skills -> .claude/skills symlink for Codex skill discovery.
-    const agentsDir = path.join(ZYLOS_DIR, '.agents');
-    const agentsSkillsPath = path.join(agentsDir, 'skills');
-    let agentsSkillsExists = false;
-    try { fs.lstatSync(agentsSkillsPath); agentsSkillsExists = true; } catch { /* not present */ }
-    if (!agentsSkillsExists) {
-      try {
-        fs.mkdirSync(agentsDir, { recursive: true });
-        fs.symlinkSync(SKILLS_DIR, agentsSkillsPath);
-      } catch { /* non-fatal */ }
-    }
+    // Native recursive discovery must not walk dependency caches/backups. Keep
+    // installed entrypoints and their relative support files in a bounded view.
+    ensureCodexSkillView({ zylosDir: ZYLOS_DIR, skillsDir: SKILLS_DIR });
 
     // 2. Native SessionStart hook trust is required for startup context.
     // Scope trust to the per-instance cwd so a Codex process launched from an
@@ -386,7 +380,15 @@ export class CodexAdapter extends RuntimeAdapter {
       profile.model ? ` -m ${profile.model}` : '',
       profile.reasoningEffort ? ` -c model_reasoning_effort=\"${profile.reasoningEffort}\"` : '',
     ].join('');
-    const codexCmd = `${CODEX_BIN}${bypassFlag}${modelFlags}`;
+    const launchArgs = [];
+    if (bypassPermissions) launchArgs.push('--dangerously-bypass-approvals-and-sandbox');
+    if (profile.model) launchArgs.push('-m', profile.model);
+    if (profile.reasoningEffort) launchArgs.push('-c', `model_reasoning_effort="${profile.reasoningEffort}"`);
+    const operatorMcpArgs = operatorTavilyProfileArgs({
+      instanceId, osUser, runtimeHome, codexHome, instanceCwd, zylosDir: ZYLOS_DIR, existingArgs: launchArgs,
+    });
+    launchArgs.push(...operatorMcpArgs);
+    const codexCmd = `${CODEX_BIN}${bypassFlag}${modelFlags}${operatorMcpArgs.length ? ' -p zylos-tavily' : ''}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'codex-exit.log');
@@ -454,11 +456,7 @@ export class CodexAdapter extends RuntimeAdapter {
 
       // Build launch spec. Credential values live only in the 0600 spec file;
       // they never appear in tmux args or the process command line.
-      const args = [];
-      if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox');
-      if (profile.model) args.push('-m', profile.model);
-      if (profile.reasoningEffort) args.push('-c', `model_reasoning_effort="${profile.reasoningEffort}"`);
-      args.push(kickPrompt);
+      const args = [...launchArgs, kickPrompt];
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
       const specPath = writeLaunchSpec({
@@ -543,7 +541,16 @@ export class CodexAdapter extends RuntimeAdapter {
     const config = getZylosConfig();
     const val = parseInt(config.codex_new_session_threshold, 10);
     const threshold = (!isNaN(val) && val > 0 && val <= 100) ? val / 100 : 0.75;
-    return new CodexContextMonitor({ threshold });
+    const profile = this.config.runtimeProfile || {};
+    const runtimeHome = profile.runtimeHome || os.homedir();
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    return new CodexContextMonitor({
+      threshold,
+      codexHome: profile.codexHome || process.env.CODEX_HOME || path.join(runtimeHome, '.codex'),
+      model: profile.model,
+      tmuxSession: SESSION,
+      cwd: instanceId ? path.join(ZYLOS_DIR, 'instances', instanceId) : ZYLOS_DIR,
+    });
   }
 }
 

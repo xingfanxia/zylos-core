@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { readMergedDotenvVars } from './tmux-env.js';
+import { ensureInstanceTmpDir, readMergedDotenvVars } from './tmux-env.js';
 
 const SIGNAL_NUMBERS = {
   SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGTERM: 15, SIGKILL: 9,
@@ -43,9 +43,19 @@ const personaEnv = spec.personaEnvFile
   ? readMergedDotenvVars([spec.personaEnvFile])
   : {};
 
+const runtimeEnv = { ...personaEnv, ...(spec.env || {}) };
+try {
+  // This process already runs as the persona; never create its private cache
+  // as the service user, and never inherit another persona's temporary path.
+  if (runtimeEnv.ZYLOS_INSTANCE_ID) runtimeEnv.TMPDIR = ensureInstanceTmpDir(runtimeEnv);
+} catch (error) {
+  process.stderr.write(`Failed to prepare runtime temp directory: ${error.message}\n`);
+  process.exit(1);
+}
+
 // 4. Spawn child
 const child = spawn(spec.command, spec.args || [], {
-  env: { ...personaEnv, ...(spec.env || {}) },
+  env: runtimeEnv,
   cwd: spec.cwd || process.cwd(),
   stdio: 'inherit',
 });

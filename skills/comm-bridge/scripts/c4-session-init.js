@@ -27,12 +27,12 @@
  * Usage: node c4-session-init.js
  */
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import { logHookTiming } from './c4-diagnostic.js';
 import { formatSection } from './session-format.js';
 import { withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
 import { getInstanceDef } from '../../multi-session/instance-config.js';
-import { fileURLToPath } from 'node:url';
 
 const ENV_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
@@ -80,12 +80,26 @@ async function withC4Db(label, action, { closeDb = true } = {}) {
 }
 
 /**
- * Emit the last-checkpoint section, or '' when no checkpoint exists yet.
+ * Emit the last-checkpoint section, including explicit absence when none exists.
  * Standalone emitter for the session-start shard orchestrator (payload-first
  * signature); also composed into initC4Session() for the legacy path.
  */
-export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTANCE_ID, closeDb = true } = {}) {
-  const { multi } = await loadInstanceQueries(instanceId);
+async function fetchStartupShard(section, budget = null) {
+  // Socket choice is this process's own instance, never an emitter argument.
+  // The broker authenticates that socket and forces all queries to its caller.
+  const result = await brokerCall('session-init', { section, budget });
+  if (result?.section !== section || typeof result.context !== 'string') {
+    throw new Error(`C4 broker did not return the requested ${section} startup shard`);
+  }
+  return result.context;
+}
+
+export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTANCE_ID, closeDb = true, brokerRouting = true } = {}) {
+  if (brokerRouting && shouldUseBroker()) return fetchStartupShard('checkpoint');
+  const { multi, multiLoadFailed } = await loadInstanceQueries(instanceId);
+  if (instanceId && (multiLoadFailed || !multi?.getLastCheckpointForInstance)) {
+    throw new Error('instance-scoped checkpoint queries unavailable');
+  }
   return withC4Db('c4 checkpoint init', ({ getLastCheckpoint }) => {
     const checkpoint = (instanceId && multi?.getLastCheckpointForInstance)
       ? multi.getLastCheckpointForInstance(instanceId)
@@ -93,12 +107,12 @@ export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTA
 
     // Always surface the last checkpoint. Summary present → show it; summary
     // null → emit a fallback so the block never silently disappears.
-    if (!checkpoint) return '';
+    if (!checkpoint) return formatSection('LAST CHECKPOINT SUMMARY', 'No saved checkpoint exists for this instance.');
     if (checkpoint.summary) {
       return formatSection('LAST CHECKPOINT SUMMARY', checkpoint.summary);
     }
     return formatSection(
-      'LAST CHECKPOINT',
+      'LAST CHECKPOINT SUMMARY',
       `(no summary — checkpoint #${checkpoint.id}, ${checkpoint.timestamp})`,
     );
   }, { closeDb });
@@ -129,8 +143,12 @@ export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTA
  * instance gets per-chat segmentation instead (bounded by the per-group /
  * max-group caps, so message packing is not applied there).
  */
-export async function emitC4Conversations(_payload = null, budget = null, { instanceId = ENV_INSTANCE_ID, closeDb = true } = {}) {
+export async function emitC4Conversations(_payload = null, budget = null, { instanceId = ENV_INSTANCE_ID, closeDb = true, brokerRouting = true } = {}) {
+  if (brokerRouting && shouldUseBroker()) return fetchStartupShard('conversations', budget);
   const { multi, multiLoadFailed } = await loadInstanceQueries(instanceId);
+  if (instanceId && (multiLoadFailed || !multi?.getUnsummarizedRangeForInstance || !multi?.getUnsummarizedConversationsForInstance)) {
+    throw new Error('instance-scoped conversation queries unavailable');
+  }
   return withC4Db('c4 conversations init', async ({
     getUnsummarizedRange,
     getUnsummarizedConversations,
@@ -142,16 +160,6 @@ export async function emitC4Conversations(_payload = null, budget = null, { inst
       SESSION_INIT_GROUP_PER_GROUP,
       SESSION_INIT_GROUP_MAX_GROUPS,
     } = await import('./c4-config.js');
-
-    // Guard: in multi-session mode, never fall back to unfiltered global queries.
-    // Injecting nothing is strictly safer than injecting all instances' conversations.
-    if (instanceId && multiLoadFailed) {
-      console.error(`[c4-session-init] Instance ${instanceId}: instance-scoped queries unavailable, skipping conversation injection`);
-      return formatSection(
-        'RECENT CONVERSATIONS',
-        '(instance-scoped query unavailable — skipped to prevent cross-instance bleed)',
-      );
-    }
 
     // Delivered-but-unanswered user messages (lost to an interruption — restart,
     // not-logged-in, frozen) get an explicit ACTION-REQUIRED flag so a fresh
@@ -301,11 +309,11 @@ export async function emitC4Conversations(_payload = null, budget = null, { inst
  * @param {{ closeDb?: boolean }} [opts] - closeDb:false keeps the shared c4-db
  *   connection open (the broker reuses one handle across requests).
  */
-export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: closeDbAfter = true } = {}) {
+export async function initC4Session(instanceId = ENV_INSTANCE_ID, { closeDb: closeDbAfter = true, brokerRouting = true } = {}) {
   try {
     const sections = [
-      await emitC4Checkpoint(null, { instanceId, closeDb: false }),
-      await emitC4Conversations(null, null, { instanceId, closeDb: closeDbAfter }),
+      await emitC4Checkpoint(null, { instanceId, closeDb: false, brokerRouting }),
+      await emitC4Conversations(null, null, { instanceId, closeDb: closeDbAfter, brokerRouting }),
     ].filter(Boolean);
     return `${sections.join('\n\n')}\n`;
   } catch (err) {
@@ -339,6 +347,6 @@ function main() {
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
   main();
 }

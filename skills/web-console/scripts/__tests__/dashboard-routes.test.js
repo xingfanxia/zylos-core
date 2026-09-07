@@ -14,6 +14,7 @@ const {
   buildRuntimeUsage,
   enrichInstancesForDashboard,
   readUsageWindowSnapshot,
+  readContextWindowSnapshot,
 } = await import('../dashboard-data.js');
 
 afterEach(() => {
@@ -94,13 +95,53 @@ describe('readUsageWindowSnapshot', () => {
 });
 
 describe('context observability helpers', () => {
+  function sample(overrides = {}, options = {}) {
+    const now = Date.parse('2026-09-07T01:00:00Z');
+    const data = { runtime: 'codex', runtime_profile: 'codex-azure', model: 'gpt-6-astra', instance_id: 'group',
+      observed_at: new Date(now).toISOString(), available: true, source: 'rollout_token_count',
+      used_tokens: 210000, ceiling_tokens: 258400, percent_used: 81, percent_remaining: 19,
+      threshold_percent: 75, rollout_path: '/profile/sessions/2026/01/01/rollout-idle.jsonl', ...overrides };
+    return readContextWindowSnapshot({ instanceId: 'group', instanceDef: {
+      runtime: 'codex', runtime_profile: 'codex-azure', state_dir: '/state/group',
+    }, runtimeProfile: { model: 'gpt-6-astra' }, zylosDir: '/zylos', existsSync: () => true,
+    readFileSync: () => JSON.stringify(data), statSync: () => ({ mtimeMs: 0 }), nowMs: now, ...options });
+  }
+
+  it('rejects stale Claude and wrong Codex instance/profile/model snapshots', () => {
+    assert.equal(sample({ runtime: 'claude' }).reason, 'runtime_mismatch');
+    assert.equal(sample({ instance_id: 'admin' }).reason, 'instance_mismatch');
+    assert.equal(sample({ runtime_profile: 'codex-subscription' }).reason, 'profile_mismatch');
+    assert.equal(sample({ model: 'retired-model' }).reason, 'model_mismatch');
+    assert.equal(sample({}, { profileMissing: true }).reason, 'profile_unavailable');
+  });
+
+  it('accepts fresh poll evidence for an idle old rollout but rejects stale or future publication', () => {
+    assert.equal(sample().available, true);
+    assert.equal(sample().age_minutes, 0);
+    assert.equal(sample({ observed_at: '2026-09-07T00:57:59Z' }).reason, 'sample_stale');
+    assert.equal(sample({ observed_at: '2026-09-07T01:00:10Z' }).reason, 'sample_time_invalid');
+  });
+
+  it('preserves explicit unknown and rejects malformed or cumulative-cost readings', () => {
+    const unknown = sample({ available: false, status: 'unknown', reason: 'sample_unavailable' });
+    assert.equal(unknown.available, false);
+    assert.equal(unknown.used_tokens, null);
+    assert.equal(sample({ used_tokens: -1 }).reason, 'sample_tokens_invalid');
+    assert.equal(sample({ ceiling_tokens: 0 }).reason, 'sample_tokens_invalid');
+    assert.equal(sample({ percent_used: 17 }).reason, 'sample_percent_invalid');
+    assert.equal(sample({ source: 'sqlite_fallback' }).reason, 'sample_source_invalid');
+  });
+
   it('reads context window and last handoff snapshots per instance', () => {
     const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-dashboard-context-test-'));
     tmpDirs.push(zylosDir);
     const stateDir = path.join(zylosDir, 'activity-monitor', 'admin');
     fs.mkdirSync(stateDir, { recursive: true });
     fs.writeFileSync(path.join(stateDir, 'context-window.json'), JSON.stringify({
-      observed_at: '2026-04-01T10:00:00.000Z',
+      runtime: 'codex',
+      instance_id: 'admin',
+      observed_at: new Date().toISOString(),
+      rollout_path: '/profile/sessions/rollout-active.jsonl',
       source: 'rollout_token_count',
       used_tokens: 250000,
       ceiling_tokens: 950000,
