@@ -26,6 +26,112 @@ function usage({ claude = null, codex = null } = {}) {
   return { providers: { claude: provider(claude), codex: provider(codex) } };
 }
 
+describe('model and authoritative quota policy', () => {
+  const nowMs = Date.parse('2026-09-07T13:00:00Z');
+  const pinnedProfiles = {
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'high' },
+  };
+  const policy = {
+    enabled: true,
+    chain: Object.keys(pinnedProfiles),
+    required_model: 'gpt-6-astra',
+    required_reasoning_effort: 'high',
+    usage_max_age_sec: 180,
+    auto_recover: true,
+    min_dwell_sec: 0,
+  };
+  function authoritative(used, extra = {}) {
+    const value = usage({ codex: used });
+    Object.assign(value.providers.codex, {
+      quota_authoritative: true,
+      observed_at: new Date(nowMs).toISOString(),
+      fetched_at: new Date(nowMs).toISOString(),
+      ...extra,
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'codex-subscription', chain: policy.chain, profiles: pinnedProfiles,
+      providerUsage: authoritative(98), requiredModel: policy.required_model,
+      requiredReasoningEffort: policy.required_reasoning_effort, usageMaxAgeMs: 180_000,
+      nowMs, minDwellMs: 0, ...extra,
+    });
+  }
+
+  it('switches providers at the same required model and effort', () => {
+    assert.equal(choose().profile, 'codex-azure');
+    assert.equal(choose({ currentHealth: 'auth_failed', providerUsage: authoritative(30) }).profile, 'codex-azure');
+  });
+
+  it('does not switch to Sol, lower effort, or an unpinned fallback', () => {
+    for (const override of [
+      { model: 'gpt-5.6-sol' }, { reasoning_effort: 'medium' }, { reasoning_effort: 'xhigh' },
+      { model: undefined }, { reasoning_effort: undefined },
+    ]) {
+      const result = choose({ profiles: {
+        ...pinnedProfiles, 'codex-azure': { ...pinnedProfiles['codex-azure'], ...override },
+      } });
+      assert.deepEqual(result, { profile: 'codex-subscription', reason: 'fallback_chain_exhausted' });
+    }
+  });
+
+  it('does not recover or wrap into a different model', () => {
+    const changedProfiles = { ...pinnedProfiles, 'codex-subscription': {
+      ...pinnedProfiles['codex-subscription'], model: 'gpt-5.6-sol',
+    } };
+    for (const extra of [{}, { currentHealth: 'down', wrapOnExhausted: true }]) {
+      assert.equal(choose({ currentProfile: 'codex-azure', profiles: changedProfiles,
+        providerUsage: authoritative(1), ...extra }).profile, 'codex-azure');
+    }
+  });
+
+  it('rejects absent matching profiles and respects quarantine during policy convergence', () => {
+    assert.equal(choose({ requiredModel: 'unavailable-model' }).reason, 'model_policy_has_no_eligible_profile');
+    assert.equal(choose({ currentProfile: 'removed-profile', blockedProfiles: ['codex-subscription'] }).profile, 'codex-azure');
+    assert.equal(choose({ currentProfile: 'removed-profile', blockedProfiles: policy.chain }).reason,
+      'model_policy_has_no_eligible_profile');
+  });
+
+  it('ignores rollout observations, stale or future samples for quota switching and recovery', () => {
+    const invalidSamples = [
+      { quota_authoritative: false }, { quota_authoritative: undefined },
+      { observed_at: new Date(nowMs - 181_000).toISOString() },
+      { observed_at: new Date(nowMs + 31_000).toISOString() },
+      { observed_at: 'invalid-date' }, { observed_at: undefined, fetched_at: undefined },
+    ];
+    for (const extra of invalidSamples) {
+      assert.equal(choose({ providerUsage: authoritative(98, extra) }).profile, 'codex-subscription');
+      assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: authoritative(39, extra) }).profile, 'codex-azure');
+    }
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: authoritative(39) }).profile, 'codex-subscription');
+  });
+
+  it('requires a new observation after a window resets instead of inventing zero usage', () => {
+    const value = authoritative(98);
+    value.providers.codex.primary.resets_at = new Date(nowMs - 1).toISOString();
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: value }).profile, 'codex-azure');
+    assert.equal(choose({ providerUsage: value }).profile, 'codex-subscription');
+  });
+
+  it('wires the same policy through both multi-persona and single-session planners', () => {
+    const document = {
+      runtime_profiles: pinnedProfiles, runtime_failover: policy,
+      instances: { group: { runtime: 'codex', runtime_profile: 'codex-azure', runtime_failover_enabled: true,
+        tmux_session: 'claude-group', marker: 'preserve-me' } },
+    };
+    const multi = planRuntimeFailover({ document, providerUsage: authoritative(39), nowMs });
+    assert.equal(multi.document.instances.group.runtime_profile, 'codex-subscription');
+    assert.equal(multi.document.instances.group.marker, 'preserve-me');
+    assert.equal(planRuntimeFailover({ document, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+    const single = { runtime_profiles: pinnedProfiles, runtime_failover: policy, active_profile: 'codex-azure',
+      persona_id: 'single', tmux_session: 'claude-main' };
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(39), nowMs }).document.active_profile, 'codex-subscription');
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+  });
+});
+
 describe('runtime failover selection', () => {
   it('moves Claude subscription to Codex subscription when Claude is full', () => {
     const result = chooseRuntimeProfile({
