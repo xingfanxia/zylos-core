@@ -20,7 +20,7 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
-import { writeExecutionContextReceipt } from './execution-context-receipt.js';
+import { writeExecutionContextReceipt, resolveExecutionContextRoot } from './execution-context-receipt.js';
 import {
   SIDE_EFFECT_NAMES,
   estimateTokens,
@@ -352,6 +352,18 @@ export function composeShardOutput({ header, body, budget, spillPath }) {
   };
 }
 
+async function recordReceiptBestEffort(recordContextReceipt, input, { stdout, source }) {
+  try {
+    await recordContextReceipt(input);
+  } catch (error) {
+    const reason = String(error?.message || error).replace(/\s+/g, ' ').slice(0, 240);
+    console.error(`[session-start-orchestrator] execution context receipt unavailable: ${reason}`);
+    writeAllSync(stdout.fd ?? 1, formatSection('EXECUTION CONTEXT RECEIPT UNAVAILABLE',
+      `Startup evidence could not be saved: ${reason}. No new receipt is available for this hook round.`) + '\n');
+    await logStep({ name: 'execution-context-receipt', source, status: 'failed', durationMs: 0, error });
+  }
+}
+
 async function runShardSideEffect(name, payload, {
   source,
   budgets,
@@ -414,8 +426,8 @@ async function runShardSideEffect(name, payload, {
       }
     }
     if (failures.length > 0) {
-      if (recordContextReceipt && sessionId) await recordContextReceipt({ payload, healthy: false,
-        roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures });
+      if (recordContextReceipt && sessionId) await recordReceiptBestEffort(recordContextReceipt, { payload, healthy: false,
+        roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures }, { stdout, source });
       const notice = formatSection(
         'STARTUP CONTEXT BLOCKED',
         [
@@ -436,8 +448,8 @@ async function runShardSideEffect(name, payload, {
       return;
     }
   }
-  if (recordContextReceipt && sessionId) await recordContextReceipt({ payload, healthy: requireHealthyContext,
-    roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures: [] });
+  if (recordContextReceipt && sessionId) await recordReceiptBestEffort(recordContextReceipt, { payload, healthy: requireHealthyContext,
+    roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures: [] }, { stdout, source });
   if (source === 'compact') {
     await logStep({ name: 'session-start-prompt', source, status: 'skipped', durationMs: 0 });
     return;
@@ -619,7 +631,11 @@ async function main() {
     if (shardName) {
       await runSessionStartShard(shardName, payload, {
         recordContextReceipt: input => writeExecutionContextReceipt({ ...input,
-          zylosDir: process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos') }),
+          zylosDir: resolveExecutionContextRoot({
+            zylosDir: process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'),
+            instanceId: process.env.ZYLOS_INSTANCE_ID || null,
+            cwd: input.payload?.cwd || process.cwd(),
+          }) }),
       });
     } else {
       await runSessionStartOrchestrator(payload, {
