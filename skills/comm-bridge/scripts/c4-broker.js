@@ -54,7 +54,8 @@ import {
   getLastCheckpointForInstance,
   createCheckpointForInstance,
 } from './c4-db-multi.js';
-import { initC4Session } from './c4-session-init.js';
+import { initC4Session, emitC4Checkpoint, emitC4Conversations } from './c4-session-init.js';
+import { DEFAULT_SHARD_BUDGET, withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { sourceTierRoots, checkPathViolation, mediaPathFromContent, mediaContentWithStagedPath, makeUidResolver, stageOwnedMedia } from './egress-policy.js';
 import { getAllInstances, getMonitorDir, getInstanceDef } from '../../multi-session/instance-config.js';
@@ -235,7 +236,7 @@ async function handleRequest(req, caller) {
     case 'enqueue':      return opEnqueue(p, caller);
     case 'ack':          return opAck(p, caller);
     case 'get':          return opGet(p, caller);
-    case 'session-init': return await opSessionInit(caller);
+    case 'session-init': return await opSessionInit(p, caller);
     case 'scheduler':    return opScheduler(p, caller);
     default:             return { ok: false, error: `unknown_op:${op ?? '(none)'}` };
   }
@@ -553,10 +554,31 @@ function opGet(p, caller) {
   return { ok: true, data: { status: row.status } };
 }
 
-async function opSessionInit(caller) {
-  // closeDb:false — keep the broker's shared connection open across requests.
-  const context = await initC4Session(caller, { closeDb: false });
-  return { ok: true, data: { context } };
+async function opSessionInit(p, caller) {
+  if (typeof caller !== 'string' || !caller) return { ok: false, error: 'authenticated_caller_required' };
+  // Only the socket-derived caller reaches the scoped DB emitters. Never pass
+  // request instanceId/target_instance through to them. Explicit direct mode
+  // also prevents recursion when the broker itself has an instance environment.
+  const options = { instanceId: caller, closeDb: false, brokerRouting: false };
+  if (p.section == null) {
+    const context = await initC4Session(caller, { closeDb: false, brokerRouting: false });
+    return { ok: true, data: { context } }; // legacy combined endpoint
+  }
+  if (!['checkpoint', 'conversations'].includes(p.section)) return { ok: false, error: 'invalid_session_init_section' };
+  if (p.budget != null && (typeof p.budget !== 'object' || Array.isArray(p.budget))) return { ok: false, error: 'invalid_session_init_budget' };
+  const budget = {};
+  for (const field of ['maxChars', 'maxTokens']) {
+    const value = p.budget?.[field] ?? DEFAULT_SHARD_BUDGET[field];
+    if (!Number.isInteger(value) || value <= 0) return { ok: false, error: 'invalid_session_init_budget' };
+    budget[field] = Math.min(Math.floor(value), DEFAULT_SHARD_BUDGET[field]);
+  }
+  const context = p.section === 'checkpoint'
+    ? await emitC4Checkpoint(null, options)
+    : await emitC4Conversations(null, budget, options);
+  // A failed/oversized shard is a visible failure, never an empty-success or
+  // an unbounded peer response. The client cannot enlarge the core hook cap.
+  if (!withinBudget(context, budget)) return { ok: false, error: 'session_init_shard_exceeds_budget' };
+  return { ok: true, data: { section: p.section, context } };
 }
 
 /**

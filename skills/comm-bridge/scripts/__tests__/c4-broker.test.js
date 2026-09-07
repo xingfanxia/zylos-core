@@ -368,6 +368,54 @@ describe('broker handleRequest', () => {
     assert.equal(typeof s.data.context, 'string');
   });
 
+  it('startup shard requests keep checkpoint and conversation scope on the authenticated caller', async () => {
+    const { insertConversation } = await import('../c4-db.js');
+    for (const [caller, marker] of [['shard-a', 'SHARD_A'], ['shard-b', 'SHARD_B_PRIVATE']]) {
+      await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: marker + '_CHECKPOINT' } }, caller);
+      insertConversation('in', 'telegram', caller, marker + '_MESSAGE', 'delivered', 3, false, null, caller);
+    }
+    for (const section of ['checkpoint', 'conversations']) {
+      const res = await broker.handleRequest({ op: 'session-init', params: {
+        section, instanceId: 'shard-b', target_instance: 'shard-b', caller: 'shard-b', brokerRouting: true,
+        budget: { maxChars: 1000000, maxTokens: 1000000 },
+      } }, 'shard-a');
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.data.section, section);
+      assert.ok(res.data.context.includes('SHARD_A'));
+      assert.ok(!res.data.context.includes('SHARD_B_PRIVATE'));
+      assert.ok(res.data.context.length <= 10000);
+      assert.equal(res.data.context.includes('=== LAST CHECKPOINT SUMMARY ==='), section === 'checkpoint');
+    }
+  });
+
+  it('startup shard budget is server bounded and failures cannot become empty success', async () => {
+    await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: '大'.repeat(20000) } }, 'large-shard');
+    const large = await broker.handleRequest({ op: 'session-init', params: {
+      section: 'checkpoint', budget: { maxChars: 1000000, maxTokens: 1000000 },
+    } }, 'large-shard');
+    assert.equal(large.ok, false);
+    assert.equal(large.error, 'session_init_shard_exceeds_budget');
+    assert.equal(large.data, undefined);
+    for (const budget of [-1, [], { maxChars: -1 }, { maxTokens: 0 }, { maxChars: 0.5 }]) {
+      const invalid = await broker.handleRequest({ op: 'session-init', params: { section: 'conversations', budget } }, 'shard-a');
+      assert.equal(invalid.ok, false);
+      assert.equal(invalid.error, 'invalid_session_init_budget');
+    }
+    const invalid = await broker.handleRequest({ op: 'session-init', params: { section: 'all-instances' } }, 'shard-a');
+    assert.equal(invalid.ok, false);
+    const unauthenticated = await broker.handleRequest({ op: 'session-init', params: { section: 'checkpoint' } }, '');
+    assert.equal(unauthenticated.ok, false);
+    assert.equal(unauthenticated.error, 'authenticated_caller_required');
+  });
+
+  it('an absent scoped checkpoint emits an explicit stable header', async () => {
+    const res = await broker.handleRequest({ op: 'session-init', params: { section: 'checkpoint' } }, 'no-checkpoint-yet');
+    assert.equal(res.ok, true);
+    assert.ok(res.data.context.includes('=== LAST CHECKPOINT SUMMARY ==='));
+    assert.ok(res.data.context.includes('No saved checkpoint exists for this instance.'));
+    assert.ok(!res.data.context.includes('SHARD_B_PRIVATE'));
+  });
+
   it('rejects unknown ops and missing content', async () => {
     const unknown = await broker.handleRequest({ op: 'nope' }, 'inst-a');
     assert.equal(unknown.ok, false);
