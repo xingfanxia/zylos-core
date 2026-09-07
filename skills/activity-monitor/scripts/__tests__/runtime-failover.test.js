@@ -3,13 +3,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { execFileSync } from 'node:child_process';
 
 import {
+  writeInstancesAtomic,
   chooseRuntimeProfile,
   planRuntimeFailover,
   planSingleSessionRuntimeFailover,
 } from '../runtime-failover.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
+import { withFileLock } from '../../../multi-session/file-lock.js';
 
 const profiles = {
   'claude-subscription': { runtime: 'claude', usage_provider: 'claude' },
@@ -541,5 +544,63 @@ describe('runtime switch signaling', () => {
       assert.equal(fs.statSync(path.dirname(signalPath)).mode & 0o777, 0o700);
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('instances.json atomic access metadata', () => {
+  function fixture(t) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'failover-file-metadata-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const filePath = path.join(dir, 'instances.json');
+    fs.writeFileSync(filePath, '{"before":true}\n', { mode: 0o640 });
+    return { dir, filePath };
+  }
+
+  it('retains the shared supplementary group and mode despite a restrictive daemon umask', (t) => {
+    const alternateGroup = process.getgroups?.().find(gid => gid !== process.getgid());
+    if (alternateGroup === undefined) return t.skip('requires a supplementary group distinct from the writer primary group');
+    const { dir, filePath } = fixture(t);
+    fs.chownSync(filePath, process.getuid(), alternateGroup);
+    const before = fs.statSync(filePath), oldUmask = process.umask(0o077);
+    try {
+      withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, { filePath }));
+    } finally { process.umask(oldUmask); }
+    const after = fs.statSync(filePath);
+    assert.equal(after.uid, before.uid);
+    assert.equal(after.gid, alternateGroup);
+    assert.equal(after.mode & 0o777, 0o640);
+    assert.notEqual(after.ino, before.ino);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filePath)), { after: true });
+    assert.deepEqual(fs.readdirSync(dir), ['instances.json']);
+  });
+
+  it('retains an explicit POSIX ACL across the locked atomic replacement', (t) => {
+    if (process.platform !== 'linux') return t.skip('Linux getfacl/setfacl fixture');
+    try { execFileSync('getfacl', ['--version'], { stdio: 'ignore' }); execFileSync('setfacl', ['--version'], { stdio: 'ignore' }); }
+    catch { return t.skip('POSIX ACL test tools unavailable'); }
+    const { filePath } = fixture(t);
+    execFileSync('setfacl', ['-m', `u:${process.getuid() + 1}:r--`, filePath]);
+    const acl = () => execFileSync('getfacl', ['-cp', filePath], { encoding: 'utf8' });
+    const before = acl();
+    withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, { filePath }));
+    assert.equal(acl(), before);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filePath)), { after: true });
+  });
+
+  it('leaves the original inode, content and permissions intact when metadata copy fails', (t) => {
+    const { dir, filePath } = fixture(t), before = fs.statSync(filePath);
+    assert.throws(() => withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, {
+      filePath,
+      execFileSyncImpl: (_bin, args) => {
+        fs.copyFileSync(filePath, args.at(-1));
+        fs.chmodSync(args.at(-1), 0o600);
+      },
+    })), /access metadata was not preserved/);
+    const after = fs.statSync(filePath);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mode, before.mode);
+    assert.equal(fs.readFileSync(filePath, 'utf8'), '{"before":true}\n');
+    assert.deepEqual(fs.readdirSync(dir), ['instances.json']);
   });
 });

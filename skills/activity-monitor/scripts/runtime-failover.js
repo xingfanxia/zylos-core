@@ -332,11 +332,30 @@ function readHealthByInstance(document) {
   return result;
 }
 
-function writeInstancesAtomic(document) {
-  const tmp = `${INSTANCES_FILE}.tmp.${process.pid}`;
-  const mode = fs.statSync(INSTANCES_FILE).mode & 0o777;
-  fs.writeFileSync(tmp, JSON.stringify(document, null, 2) + '\n', { mode });
-  fs.renameSync(tmp, INSTANCES_FILE);
+// Called inside the instances.json read/modify/write lock. Preserve access for
+// persona UIDs: the daemon's primary group can differ from the shared file's.
+export function writeInstancesAtomic(document, {
+  filePath = INSTANCES_FILE,
+  execFileSyncImpl = execFileSync,
+} = {}) {
+  const before = fs.lstatSync(filePath);
+  if (!before.isFile()) throw new Error('instances.json must be a regular file');
+  const stagingDir = fs.mkdtempSync(`${filePath}.tmp.`);
+  const tmp = path.join(stagingDir, 'instances.json');
+  try {
+    // cp -p preserves owner, group, mode and filesystem ACLs. Keep its staging
+    // copy private, then replace only the contents without changing its inode.
+    execFileSyncImpl('cp', ['-p', '--', filePath, tmp], { stdio: 'pipe', timeout: 5000 });
+    fs.writeFileSync(tmp, JSON.stringify(document, null, 2) + '\n');
+    const after = fs.statSync(tmp);
+    if (after.uid !== before.uid || after.gid !== before.gid
+        || (after.mode & 0o7777) !== (before.mode & 0o7777)) {
+      throw new Error('instances.json access metadata was not preserved');
+    }
+    fs.renameSync(tmp, filePath);
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+  }
 }
 
 function writeJsonAtomic(filePath, document) {
