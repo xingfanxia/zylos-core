@@ -55,7 +55,7 @@ import {
   createCheckpointForInstance,
 } from './c4-db-multi.js';
 import { initC4Session, emitC4Checkpoint, emitC4Conversations } from './c4-session-init.js';
-import { DEFAULT_SHARD_BUDGET, withinBudget } from '../../activity-monitor/scripts/shard-registry.js';
+import { DEFAULT_SHARD_BUDGET } from '../../activity-monitor/scripts/shard-registry.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { sourceTierRoots, checkPathViolation, mediaPathFromContent, mediaContentWithStagedPath, makeUidResolver, stageOwnedMedia } from './egress-policy.js';
 import { getAllInstances, getMonitorDir, getInstanceDef } from '../../multi-session/instance-config.js';
@@ -70,6 +70,9 @@ const SOCKET_MODE = 0o660;
 const RESCAN_INTERVAL_MS = 30_000;
 const CONN_IDLE_MS = 30_000;
 const MAX_LINE_BYTES = 1_000_000;
+// Transport has a byte limit independent of the much smaller inline render
+// budget. The persona's orchestrator owns rendering and its private full spill.
+const SESSION_INIT_TRANSPORT_MAX_BYTES = 1_000_000;
 
 // Real outbound messaging channels the broker will spawn on an agent's behalf.
 // The existence of a `<channel>/scripts/send.js` is NOT authorization
@@ -183,8 +186,15 @@ function scanInstances() {
 
 // ── Connection handling (newline-delimited JSON) ────────────────────
 
-function writeRes(conn, obj) {
-  try { conn.write(JSON.stringify(obj) + '\n'); } catch { /* client closed */ }
+function writeRes(conn, obj, maxBytes = null) {
+  try {
+    let line = JSON.stringify(obj) + '\n';
+    if (maxBytes && Buffer.byteLength(line, 'utf8') > maxBytes) {
+      const id = typeof obj.id === 'number' || (typeof obj.id === 'string' && obj.id.length <= 128) ? obj.id : null;
+      line = JSON.stringify({ id, ok: false, error: 'session_init_transport_limit' }) + '\n';
+    }
+    conn.write(line);
+  } catch { /* client closed */ }
 }
 
 function handleConnection(conn, instanceId) {
@@ -212,7 +222,7 @@ function handleConnection(conn, instanceId) {
       const reqId = (req && req.id != null) ? req.id : null;
       Promise.resolve()
         .then(() => handleRequest(req, instanceId))
-        .then((r) => writeRes(conn, { id: reqId, ...r }))
+        .then((r) => writeRes(conn, { id: reqId, ...r }, req.op === 'session-init' && req.params?.section != null ? SESSION_INIT_TRANSPORT_MAX_BYTES : null))
         .catch((err) => writeRes(conn, { id: reqId, ok: false, error: String(err?.message || err) }));
     }
   });
@@ -554,6 +564,14 @@ function opGet(p, caller) {
   return { ok: true, data: { status: row.status } };
 }
 
+function sessionInitResponse(data) {
+  const response = { ok: true, data };
+  if (Buffer.byteLength(JSON.stringify(response) + '\n', 'utf8') > SESSION_INIT_TRANSPORT_MAX_BYTES) {
+    return { ok: false, error: 'session_init_transport_limit' };
+  }
+  return response;
+}
+
 async function opSessionInit(p, caller) {
   if (typeof caller !== 'string' || !caller) return { ok: false, error: 'authenticated_caller_required' };
   // Only the socket-derived caller reaches the scoped DB emitters. Never pass
@@ -562,7 +580,7 @@ async function opSessionInit(p, caller) {
   const options = { instanceId: caller, closeDb: false, brokerRouting: false };
   if (p.section == null) {
     const context = await initC4Session(caller, { closeDb: false, brokerRouting: false });
-    return { ok: true, data: { context } }; // legacy combined endpoint
+    return { ok: true, data: { context } }; // legacy combined endpoint unchanged
   }
   if (!['checkpoint', 'conversations'].includes(p.section)) return { ok: false, error: 'invalid_session_init_section' };
   if (p.budget != null && (typeof p.budget !== 'object' || Array.isArray(p.budget))) return { ok: false, error: 'invalid_session_init_budget' };
@@ -575,10 +593,11 @@ async function opSessionInit(p, caller) {
   const context = p.section === 'checkpoint'
     ? await emitC4Checkpoint(null, options)
     : await emitC4Conversations(null, budget, options);
-  // A failed/oversized shard is a visible failure, never an empty-success or
-  // an unbounded peer response. The client cannot enlarge the core hook cap.
-  if (!withinBudget(context, budget)) return { ok: false, error: 'session_init_shard_exceeds_budget' };
-  return { ok: true, data: { section: p.section, context } };
+  // The budget above is only an input to existing conversation packing. Group
+  // history and checkpoints can legitimately exceed it: return their complete
+  // scoped content so the persona's composeShardOutput can save an owned spill.
+  // Only the independent RPC byte ceiling rejects the transport response.
+  return sessionInitResponse({ section: p.section, context });
 }
 
 /**

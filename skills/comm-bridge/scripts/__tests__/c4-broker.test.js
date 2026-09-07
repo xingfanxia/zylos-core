@@ -388,14 +388,24 @@ describe('broker handleRequest', () => {
     }
   });
 
-  it('startup shard budget is server bounded and failures cannot become empty success', async () => {
+  it('startup transport is bounded separately from inline rendering and never returns empty success', async () => {
     await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: '大'.repeat(20000) } }, 'large-shard');
     const large = await broker.handleRequest({ op: 'session-init', params: {
       section: 'checkpoint', budget: { maxChars: 1000000, maxTokens: 1000000 },
     } }, 'large-shard');
-    assert.equal(large.ok, false);
-    assert.equal(large.error, 'session_init_shard_exceeds_budget');
-    assert.equal(large.data, undefined);
+    assert.equal(large.ok, true);
+    assert.ok(large.data.context.includes('大'.repeat(20000)));
+    assert.ok(large.data.context.length > 10000);
+    await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: '大'.repeat(400000) } }, 'transport-too-large');
+    const excessive = await broker.handleRequest({ op: 'session-init', params: {
+      section: 'checkpoint', budget: { maxChars: 100000000, maxTokens: 100000000 },
+    } }, 'transport-too-large');
+    assert.equal(excessive.ok, false);
+    assert.equal(excessive.error, 'session_init_transport_limit');
+    assert.equal(excessive.data, undefined);
+    const legacy = await broker.handleRequest({ op: 'session-init' }, 'transport-too-large');
+    assert.equal(legacy.ok, true);
+    assert.ok(legacy.data.context.includes('大'.repeat(400000)));
     for (const budget of [-1, [], { maxChars: -1 }, { maxTokens: 0 }, { maxChars: 0.5 }]) {
       const invalid = await broker.handleRequest({ op: 'session-init', params: { section: 'conversations', budget } }, 'shard-a');
       assert.equal(invalid.ok, false);
