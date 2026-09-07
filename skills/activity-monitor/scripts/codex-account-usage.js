@@ -83,10 +83,19 @@ export async function readCodexAccountRateLimits({ codexHome, codexBin, timeoutM
   child.stdout.setEncoding('utf8');
   let finished = false;
   const exited = new Promise((resolve) => { child.once('exit', () => { finished = true; resolve(); }); child.once('error', () => { finished = true; resolve(); }); });
-  const signal = (kind) => {
-    if (finished) return;
-    try { if (detached && child.pid) process.kill(-child.pid, kind); else child.kill(kind); } catch { /* already exited */ }
+  const groupPid = detached ? child.pid : null;
+  const ownedProcessesRemain = () => {
+    if (!groupPid) return !finished;
+    try { process.kill(-groupPid, 0); return true; }
+    catch (error) { return error.code !== 'ESRCH'; }
   };
+  const signal = (kind) => {
+    // A wrapper can exit before its descendants. Its exit does not release our
+    // responsibility for the dedicated process group created by detached spawn.
+    try { if (groupPid) process.kill(-groupPid, kind); else if (!finished) child.kill(kind); }
+    catch { /* already exited */ }
+  };
+  const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   let timer;
   try {
     return await new Promise((resolve, reject) => {
@@ -121,8 +130,13 @@ export async function readCodexAccountRateLimits({ codexHome, codexBin, timeoutM
   } finally {
     clearTimeout(timer);
     signal('SIGTERM');
-    await Promise.race([exited, new Promise((resolve) => { const t = setTimeout(resolve, 500); t.unref?.(); })]);
-    if (!finished) { signal('SIGKILL'); await exited; }
+    const graceDeadline = Date.now() + 500;
+    while (ownedProcessesRemain() && Date.now() < graceDeadline) await pause(25);
+    if (ownedProcessesRemain()) signal('SIGKILL');
+    // Reap our direct child, without an unbounded wait if its exit cannot be
+    // observed. Orphan descendants are reaped by the OS after the group kill.
+    if (!finished) await Promise.race([exited, pause(500)]);
+    if (!finished) throw fail('quota_probe_cleanup_failed');
   }
 }
 
