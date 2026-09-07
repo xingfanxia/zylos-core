@@ -32,10 +32,25 @@ function windowUsedPercent(window, nowMs) {
   return Number(window.used_percent);
 }
 
-function providerUsageState(providerUsage, provider, nowMs) {
+function providerUsageState(providerUsage, provider, nowMs, maxAgeMs = null) {
   if (!provider) return { available: true, exhausted: false, usedPercent: 0 };
   const data = providerUsage?.providers?.[provider];
   if (!data?.available) return { available: false, exhausted: false, usedPercent: null };
+  // Opt-in policies require a real, recent provider observation. Rewriting a
+  // file containing an old rollout must not make its quota authoritative.
+  if (Number.isFinite(maxAgeMs) && maxAgeMs > 0) {
+    const observedMs = Date.parse(data.observed_at || data.fetched_at || '');
+    const windows = [data.primary, data.secondary, data.tertiary].filter(Boolean);
+    const expiredWindow = windows.some(window => {
+      const resetMs = Date.parse(window.resets_at || '');
+      return Number.isFinite(resetMs) && resetMs <= nowMs;
+    });
+    if (data.quota_authoritative !== true || !Number.isFinite(observedMs)
+        || observedMs > nowMs + 30_000 || nowMs - observedMs > maxAgeMs
+        || expiredWindow) {
+      return { available: false, exhausted: false, usedPercent: null };
+    }
+  }
   const values = [data.primary, data.secondary, data.tertiary]
     .map(window => windowUsedPercent(window, nowMs))
     .filter(Number.isFinite);
@@ -63,13 +78,32 @@ export function chooseRuntimeProfile({
   autoRecover = true,
   wrapOnExhausted = false,
   blockedProfiles = [],
+  requiredModel = null,
+  requiredReasoningEffort = null,
+  usageMaxAgeMs = null,
 } = {}) {
+  if (requiredModel || requiredReasoningEffort) {
+    chain = chain.filter(id => {
+      const profile = profiles[id];
+      return profile && (!requiredModel || profile.model === requiredModel)
+        && (!requiredReasoningEffort || profile.reasoning_effort === requiredReasoningEffort);
+    });
+    if (chain.length === 0) {
+      return { profile: currentProfile, reason: 'model_policy_has_no_eligible_profile' };
+    }
+  }
   const currentIndex = chain.indexOf(currentProfile);
-  if (currentIndex < 0) return { profile: chain[0] || currentProfile, reason: 'profile_not_in_chain' };
+  const blocked = new Set(Array.isArray(blockedProfiles) ? blockedProfiles : Object.keys(blockedProfiles || {}));
+  if (currentIndex < 0) {
+    const target = (requiredModel || requiredReasoningEffort)
+      ? chain.find(id => !blocked.has(id)) : chain[0];
+    return target
+      ? { profile: target, reason: 'profile_not_in_chain' }
+      : { profile: currentProfile, reason: 'model_policy_has_no_eligible_profile' };
+  }
 
   const current = profiles[currentProfile] || {};
-  const currentUsage = providerUsageState(providerUsage, current.usage_provider, nowMs);
-  const blocked = new Set(Array.isArray(blockedProfiles) ? blockedProfiles : Object.keys(blockedProfiles || {}));
+  const currentUsage = providerUsageState(providerUsage, current.usage_provider, nowMs, usageMaxAgeMs);
   const healthLimited = HEALTH_FAILOVER_STATES.has(currentHealth);
   const usageLimited = currentUsage.available && currentUsage.usedPercent >= switchThreshold;
 
@@ -86,7 +120,7 @@ export function chooseRuntimeProfile({
       const candidateId = chain[i];
       if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
-      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
+      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
       if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
         return {
           profile: candidateId,
@@ -106,7 +140,7 @@ export function chooseRuntimeProfile({
         const candidateId = chain[i];
         if (blocked.has(candidateId)) continue;
         const candidate = profiles[candidateId] || {};
-        const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
+        const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
         if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
           return {
             profile: candidateId,
@@ -125,7 +159,7 @@ export function chooseRuntimeProfile({
       const candidateId = chain[i];
       if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
-      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
+      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
       if (!candidate.usage_provider || (state.available && state.usedPercent < recoverThreshold)) {
         return {
           profile: candidateId,
@@ -176,6 +210,9 @@ export function planRuntimeFailover({
       autoRecover: policy.auto_recover !== false,
       wrapOnExhausted: policy.wrap_on_exhausted === true,
       blockedProfiles,
+      requiredModel: policy.required_model,
+      requiredReasoningEffort: policy.required_reasoning_effort,
+      usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
     });
     if (decision.profile === currentProfile) continue;
 
@@ -248,6 +285,9 @@ export function planSingleSessionRuntimeFailover({
     autoRecover: policy.auto_recover !== false,
     wrapOnExhausted: policy.wrap_on_exhausted === true,
     blockedProfiles: currentBlockedProfiles,
+    requiredModel: policy.required_model,
+    requiredReasoningEffort: policy.required_reasoning_effort,
+    usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
   });
   if (decision.profile === currentProfile) return { document: next, changes };
 
@@ -292,11 +332,30 @@ function readHealthByInstance(document) {
   return result;
 }
 
-function writeInstancesAtomic(document) {
-  const tmp = `${INSTANCES_FILE}.tmp.${process.pid}`;
-  const mode = fs.statSync(INSTANCES_FILE).mode & 0o777;
-  fs.writeFileSync(tmp, JSON.stringify(document, null, 2) + '\n', { mode });
-  fs.renameSync(tmp, INSTANCES_FILE);
+// Called inside the instances.json read/modify/write lock. Preserve access for
+// persona UIDs: the daemon's primary group can differ from the shared file's.
+export function writeInstancesAtomic(document, {
+  filePath = INSTANCES_FILE,
+  execFileSyncImpl = execFileSync,
+} = {}) {
+  const before = fs.lstatSync(filePath);
+  if (!before.isFile()) throw new Error('instances.json must be a regular file');
+  const stagingDir = fs.mkdtempSync(`${filePath}.tmp.`);
+  const tmp = path.join(stagingDir, 'instances.json');
+  try {
+    // cp -p preserves owner, group, mode and filesystem ACLs. Keep its staging
+    // copy private, then replace only the contents without changing its inode.
+    execFileSyncImpl('cp', ['-p', '--', filePath, tmp], { stdio: 'pipe', timeout: 5000 });
+    fs.writeFileSync(tmp, JSON.stringify(document, null, 2) + '\n');
+    const after = fs.statSync(tmp);
+    if (after.uid !== before.uid || after.gid !== before.gid
+        || (after.mode & 0o7777) !== (before.mode & 0o7777)) {
+      throw new Error('instances.json access metadata was not preserved');
+    }
+    fs.renameSync(tmp, filePath);
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+  }
 }
 
 function writeJsonAtomic(filePath, document) {

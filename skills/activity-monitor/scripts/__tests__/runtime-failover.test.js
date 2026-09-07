@@ -3,13 +3,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { execFileSync } from 'node:child_process';
 
 import {
+  writeInstancesAtomic,
   chooseRuntimeProfile,
   planRuntimeFailover,
   planSingleSessionRuntimeFailover,
 } from '../runtime-failover.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
+import { withFileLock } from '../../../multi-session/file-lock.js';
 
 const profiles = {
   'claude-subscription': { runtime: 'claude', usage_provider: 'claude' },
@@ -25,6 +28,112 @@ function usage({ claude = null, codex = null } = {}) {
   };
   return { providers: { claude: provider(claude), codex: provider(codex) } };
 }
+
+describe('model and authoritative quota policy', () => {
+  const nowMs = Date.parse('2026-09-07T13:00:00Z');
+  const pinnedProfiles = {
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'high' },
+  };
+  const policy = {
+    enabled: true,
+    chain: Object.keys(pinnedProfiles),
+    required_model: 'gpt-6-astra',
+    required_reasoning_effort: 'high',
+    usage_max_age_sec: 180,
+    auto_recover: true,
+    min_dwell_sec: 0,
+  };
+  function authoritative(used, extra = {}) {
+    const value = usage({ codex: used });
+    Object.assign(value.providers.codex, {
+      quota_authoritative: true,
+      observed_at: new Date(nowMs).toISOString(),
+      fetched_at: new Date(nowMs).toISOString(),
+      ...extra,
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'codex-subscription', chain: policy.chain, profiles: pinnedProfiles,
+      providerUsage: authoritative(98), requiredModel: policy.required_model,
+      requiredReasoningEffort: policy.required_reasoning_effort, usageMaxAgeMs: 180_000,
+      nowMs, minDwellMs: 0, ...extra,
+    });
+  }
+
+  it('switches providers at the same required model and effort', () => {
+    assert.equal(choose().profile, 'codex-azure');
+    assert.equal(choose({ currentHealth: 'auth_failed', providerUsage: authoritative(30) }).profile, 'codex-azure');
+  });
+
+  it('does not switch to Sol, lower effort, or an unpinned fallback', () => {
+    for (const override of [
+      { model: 'gpt-5.6-sol' }, { reasoning_effort: 'medium' }, { reasoning_effort: 'xhigh' },
+      { model: undefined }, { reasoning_effort: undefined },
+    ]) {
+      const result = choose({ profiles: {
+        ...pinnedProfiles, 'codex-azure': { ...pinnedProfiles['codex-azure'], ...override },
+      } });
+      assert.deepEqual(result, { profile: 'codex-subscription', reason: 'fallback_chain_exhausted' });
+    }
+  });
+
+  it('does not recover or wrap into a different model', () => {
+    const changedProfiles = { ...pinnedProfiles, 'codex-subscription': {
+      ...pinnedProfiles['codex-subscription'], model: 'gpt-5.6-sol',
+    } };
+    for (const extra of [{}, { currentHealth: 'down', wrapOnExhausted: true }]) {
+      assert.equal(choose({ currentProfile: 'codex-azure', profiles: changedProfiles,
+        providerUsage: authoritative(1), ...extra }).profile, 'codex-azure');
+    }
+  });
+
+  it('rejects absent matching profiles and respects quarantine during policy convergence', () => {
+    assert.equal(choose({ requiredModel: 'unavailable-model' }).reason, 'model_policy_has_no_eligible_profile');
+    assert.equal(choose({ currentProfile: 'removed-profile', blockedProfiles: ['codex-subscription'] }).profile, 'codex-azure');
+    assert.equal(choose({ currentProfile: 'removed-profile', blockedProfiles: policy.chain }).reason,
+      'model_policy_has_no_eligible_profile');
+  });
+
+  it('ignores rollout observations, stale or future samples for quota switching and recovery', () => {
+    const invalidSamples = [
+      { quota_authoritative: false }, { quota_authoritative: undefined },
+      { observed_at: new Date(nowMs - 181_000).toISOString() },
+      { observed_at: new Date(nowMs + 31_000).toISOString() },
+      { observed_at: 'invalid-date' }, { observed_at: undefined, fetched_at: undefined },
+    ];
+    for (const extra of invalidSamples) {
+      assert.equal(choose({ providerUsage: authoritative(98, extra) }).profile, 'codex-subscription');
+      assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: authoritative(39, extra) }).profile, 'codex-azure');
+    }
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: authoritative(39) }).profile, 'codex-subscription');
+  });
+
+  it('requires a new observation after a window resets instead of inventing zero usage', () => {
+    const value = authoritative(98);
+    value.providers.codex.primary.resets_at = new Date(nowMs - 1).toISOString();
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: value }).profile, 'codex-azure');
+    assert.equal(choose({ providerUsage: value }).profile, 'codex-subscription');
+  });
+
+  it('wires the same policy through both multi-persona and single-session planners', () => {
+    const document = {
+      runtime_profiles: pinnedProfiles, runtime_failover: policy,
+      instances: { group: { runtime: 'codex', runtime_profile: 'codex-azure', runtime_failover_enabled: true,
+        tmux_session: 'claude-group', marker: 'preserve-me' } },
+    };
+    const multi = planRuntimeFailover({ document, providerUsage: authoritative(39), nowMs });
+    assert.equal(multi.document.instances.group.runtime_profile, 'codex-subscription');
+    assert.equal(multi.document.instances.group.marker, 'preserve-me');
+    assert.equal(planRuntimeFailover({ document, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+    const single = { runtime_profiles: pinnedProfiles, runtime_failover: policy, active_profile: 'codex-azure',
+      persona_id: 'single', tmux_session: 'claude-main' };
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(39), nowMs }).document.active_profile, 'codex-subscription');
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+  });
+});
 
 describe('runtime failover selection', () => {
   it('moves Claude subscription to Codex subscription when Claude is full', () => {
@@ -435,5 +544,63 @@ describe('runtime switch signaling', () => {
       assert.equal(fs.statSync(path.dirname(signalPath)).mode & 0o777, 0o700);
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
+  });
+});
+
+
+describe('instances.json atomic access metadata', () => {
+  function fixture(t) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'failover-file-metadata-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const filePath = path.join(dir, 'instances.json');
+    fs.writeFileSync(filePath, '{"before":true}\n', { mode: 0o640 });
+    return { dir, filePath };
+  }
+
+  it('retains the shared supplementary group and mode despite a restrictive daemon umask', (t) => {
+    const alternateGroup = process.getgroups?.().find(gid => gid !== process.getgid());
+    if (alternateGroup === undefined) return t.skip('requires a supplementary group distinct from the writer primary group');
+    const { dir, filePath } = fixture(t);
+    fs.chownSync(filePath, process.getuid(), alternateGroup);
+    const before = fs.statSync(filePath), oldUmask = process.umask(0o077);
+    try {
+      withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, { filePath }));
+    } finally { process.umask(oldUmask); }
+    const after = fs.statSync(filePath);
+    assert.equal(after.uid, before.uid);
+    assert.equal(after.gid, alternateGroup);
+    assert.equal(after.mode & 0o777, 0o640);
+    assert.notEqual(after.ino, before.ino);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filePath)), { after: true });
+    assert.deepEqual(fs.readdirSync(dir), ['instances.json']);
+  });
+
+  it('retains an explicit POSIX ACL across the locked atomic replacement', (t) => {
+    if (process.platform !== 'linux') return t.skip('Linux getfacl/setfacl fixture');
+    try { execFileSync('getfacl', ['--version'], { stdio: 'ignore' }); execFileSync('setfacl', ['--version'], { stdio: 'ignore' }); }
+    catch { return t.skip('POSIX ACL test tools unavailable'); }
+    const { filePath } = fixture(t);
+    execFileSync('setfacl', ['-m', `u:${process.getuid() + 1}:r--`, filePath]);
+    const acl = () => execFileSync('getfacl', ['-cp', filePath], { encoding: 'utf8' });
+    const before = acl();
+    withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, { filePath }));
+    assert.equal(acl(), before);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filePath)), { after: true });
+  });
+
+  it('leaves the original inode, content and permissions intact when metadata copy fails', (t) => {
+    const { dir, filePath } = fixture(t), before = fs.statSync(filePath);
+    assert.throws(() => withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, {
+      filePath,
+      execFileSyncImpl: (_bin, args) => {
+        fs.copyFileSync(filePath, args.at(-1));
+        fs.chmodSync(args.at(-1), 0o600);
+      },
+    })), /access metadata was not preserved/);
+    const after = fs.statSync(filePath);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mode, before.mode);
+    assert.equal(fs.readFileSync(filePath, 'utf8'), '{"before":true}\n');
+    assert.deepEqual(fs.readdirSync(dir), ['instances.json']);
   });
 });

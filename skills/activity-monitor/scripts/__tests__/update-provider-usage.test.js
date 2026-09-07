@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 
@@ -29,12 +32,26 @@ describe('fetchCodexNativeUsage', () => {
       },
     });
 
-    assert.equal(result.available, true);
+    assert.equal(result.available, false);
+    assert.equal(result.quota_authoritative, false);
+    assert.equal(result.fetched_at, null);
     assert.equal(result.source, 'zylos-native-rollout');
     assert.equal(result.primary, null);
     assert.equal(result.secondary.used_percent, 8);
     assert.equal(result.secondary.left_percent, 92);
     assert.equal(result.secondary.window_minutes, 10080);
+  });
+
+  it('preserves the original rollout observation and marks old data unavailable for policy', () => {
+    const result = fetchCodexNativeUsage({ now: '2026-09-07T13:19:23Z', readImpl: () => ({
+      observedAt: '2026-09-05T01:02:20Z', weeklyAllPercent: 98, weeklyAllResetsAt: 1788978510,
+    }) });
+    assert.equal(result.observed_at, '2026-09-05T01:02:20.000Z');
+    assert.equal(result.fetched_at, null);
+    assert.equal(result.freshness, 'stale');
+    assert.equal(result.available, false);
+    assert.equal(result.quota_authoritative, false);
+    assert.equal(result.secondary.used_percent, 98);
   });
 });
 
@@ -173,8 +190,8 @@ describe('fetchClaudeNativeUsage', () => {
 });
 
 describe('runProviderUsageOnce', () => {
-  it('falls back to native Claude probe when CodexBar Claude probe fails', () => {
-    const payload = runProviderUsageOnce({
+  it('falls back to native Claude probe when CodexBar Claude probe fails', async () => {
+    const payload = await runProviderUsageOnce({
       log: () => {},
       execFileSyncImpl: (bin, args) => {
         if (String(args[1]) === '--provider' && String(args[2]) === 'claude') {
@@ -200,6 +217,7 @@ describe('runProviderUsageOnce', () => {
         secondary: { used_percent: 99, left_percent: 1, reset_description: 'Apr 3' },
         tertiary: { used_percent: 6, left_percent: 94, reset_description: 'Apr 6' },
       }),
+      fetchCodexAccountUsageImpl: async () => ({ provider: 'codex', available: true, quota_authoritative: true, source: 'codex-account-api' }),
       filePath: '/tmp/provider-usage-test.json',
     });
 
@@ -207,5 +225,34 @@ describe('runProviderUsageOnce', () => {
     assert.equal(payload.providers.claude.available, true);
     assert.equal(payload.providers.claude.source, 'zylos-native');
     assert.equal(payload.providers.claude.secondary.left_percent, 1);
+  });
+
+  it('prefers fresh official 39% over retained 98%, without a CodexBar quota read', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-quota-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const result = await runProviderUsageOnce({ filePath: path.join(dir, 'usage.json'), log: () => {},
+      execFileSyncImpl: (_bin, args) => { assert.equal(args[2], 'claude'); return JSON.stringify([{ usage: {} }]); },
+      fetchCodexAccountUsageImpl: async () => ({ available: true, quota_authoritative: true, source: 'codex-account-api',
+        observed_at: '2026-09-07T13:19:23Z', fetched_at: '2026-09-07T13:19:23Z', secondary: { used_percent: 39 } }),
+      fetchCodexNativeUsageImpl: () => { throw new Error('historical 98% must not override fresh official quota'); },
+    });
+    assert.equal(result.providers.codex.secondary.used_percent, 39);
+    assert.equal(result.providers.codex.quota_authoritative, true);
+  });
+
+  it('API failure leaves historical data non-authoritative even if a fallback claims availability', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-quota-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const result = await runProviderUsageOnce({ filePath: path.join(dir, 'usage.json'), log: () => {},
+      execFileSyncImpl: () => JSON.stringify([{ usage: {} }]),
+      fetchCodexAccountUsageImpl: async () => ({ available: false, error: 'quota_probe_timeout' }),
+      fetchCodexNativeUsageImpl: () => ({ available: true, fetched_at: '2026-09-07T13:19:23Z',
+        observed_at: '2026-09-05T01:02:20Z', source: 'zylos-native-rollout', secondary: { used_percent: 98 } }),
+    });
+    assert.equal(result.providers.codex.available, false);
+    assert.equal(result.providers.codex.quota_authoritative, false);
+    assert.equal(result.providers.codex.fetched_at, null);
+    assert.equal(result.providers.codex.observed_at, '2026-09-05T01:02:20Z');
+    assert.equal(result.providers.codex.api_error, 'quota_probe_timeout');
   });
 });
