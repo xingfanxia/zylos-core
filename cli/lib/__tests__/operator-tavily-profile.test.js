@@ -44,3 +44,31 @@ test('absent overlays are optional; public, redirected, tampered or wrong-scope 
   fs.unlinkSync(file); assert.deepEqual(operatorTavilyProfileArgs(f), []);
   fs.symlinkSync('/etc/passwd', file); assert.throws(() => operatorTavilyProfileArgs(f), /private/);
 });
+
+test('native model announcement counters do not block later operator launches', t => {
+  const f = fixture(t); const file = path.join(f.codexHome, 'zylos-tavily.config.toml');
+  const original = fs.readFileSync(file, 'utf8');
+  for (const separator of ['', '\n']) {
+    fs.writeFileSync(file, `${original}${separator}[tui.model_availability_nux]\n"gpt-5.6-sol" = 4\ngpt-6-astra = 1\n`);
+    assert.deepEqual(operatorTavilyProfileArgs({ ...f, instanceId: 'scheduler', instanceCwd: path.join(f.zylosDir, 'instances/scheduler') }), ['-p', 'zylos-tavily']);
+  }
+});
+
+test('UI exemption cannot authorize MCP edits, injected settings or untyped counters', t => {
+  const f = fixture(t); const file = path.join(f.codexHome, 'zylos-tavily.config.toml');
+  const original = fs.readFileSync(file, 'utf8');
+  const ui = '\n[tui.model_availability_nux]\ngpt-6-astra = 1\n';
+  for (const text of [
+    original.replace('mcp.tavily.com', 'attacker.invalid') + ui,
+    original + ui + '[mcp_servers.other]\ncommand = "arbitrary"\n',
+    original + ui + '[tui]\nother = true\n',
+    original + ui.replace('= 1', '= "arbitrary"'),
+    original + ui.replace('= 1', '= -1'),
+    original + ui.replace('= 1', '= 1.5'),
+    original + ui.replace('= 1', '= 4294967296'),
+    original + ui.replace('gpt-6-astra', 'command'),
+  ]) {
+    fs.writeFileSync(file, text);
+    assert.throws(() => operatorTavilyProfileArgs(f), /managed Zylos scope/);
+  }
+});
