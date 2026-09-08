@@ -164,6 +164,23 @@ describe('processWithMultiSession — per-instance delivery notify', () => {
     };
   }
 
+  it('uses the target instance terminal and health files for heartbeat auto-ack', async () => {
+    const calls = [];
+    const item = { id: 90, type: 'control', target_instance: 'user-betty', content: 'Heartbeat check. [phase=primary]' };
+    const res = await disp.processWithMultiSession(baseHelpers({ item, notifyCalls: [], overrides: {
+      isBypassState: () => true,
+      readProcState: file => { calls.push(['proc', file]); return { alive: true }; },
+      isAgentConfirmedActive: file => { calls.push(['hooks', file]); return true; },
+      shouldAutoAckHeartbeat: opts => { calls.push(['terminal', opts.session]); return true; },
+    } }));
+    assert.equal(res.delivered, true);
+    assert.deepEqual(calls, [
+      ['proc', disp.resolveStatusFile('user-betty')],
+      ['hooks', disp.resolveStatusFile('user-betty')],
+      ['terminal', 'claude-betty'],
+    ]);
+  });
+
   it('fires notifyMessageDelivered to the target instance am.sock after a conversation delivery', async () => {
     const notifyCalls = [];
     const item = {

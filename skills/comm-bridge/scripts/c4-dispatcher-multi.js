@@ -527,13 +527,13 @@ export async function processWithMultiSession(helpers) {
 
       // Heartbeat auto-ack shortcut.
       if (bypass) {
-        const procState = readProcState();
-        const confirmed = isAgentConfirmedActive();
+        const procState = readProcState(statusFile);
+        const confirmed = isAgentConfirmedActive(statusFile);
         // Starvation guard: if a require_idle control is already held in this
         // cycle (skipped above), widen the auto-ack gate so heartbeats don't
         // bump the idle counter and starve the waiting /clear.
         const requireIdleWaiting = heldItems.some((h) => h.require_idle === 1);
-        if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
+        if (shouldAutoAckHeartbeat({ item, agentState: claudeState, procState, confirmedActive: confirmed, requireIdleWaiting, session })) {
           ackControl(item.id);
           inFlight = null;
           log(`Auto-acked heartbeat id=${item.id} for instance ${item.target_instance || 'default'}${requireIdleWaiting ? ' (require_idle waiting)' : ''}`);

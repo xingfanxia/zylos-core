@@ -64,6 +64,7 @@ import {
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
+  readTmuxInputState,
   isUsageOverlayCapture as sharedIsUsageOverlayCapture
 } from './tmux-input-state.js';
 import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
@@ -72,6 +73,8 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+// A live process does not prove the input channel recovered from a failed send.
+const unresolvedDeliveryFailures = new Set();
 // Observability state (WS-A). lastHeartbeatMs=0 → the first tick emits a
 // heartbeat immediately (a positive "alive" signal at startup), then every
 // HEARTBEAT_INTERVAL_MS. lastTickCompletedAt drives the stuck-tick watchdog and
@@ -263,7 +266,8 @@ export function isRecoveryHeartbeatPhase(phase) {
   return phase === 'recovery' || phase === 'post_restart';
 }
 
-export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive, requireIdleWaiting = false }) {
+export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive, requireIdleWaiting = false, session = TMUX_SESSION,
+  terminalState, deliveryFailed = unresolvedDeliveryFailures.has(session) }) {
   const isHeartbeat = Boolean(item && (item.content || '').includes('Heartbeat check'));
   if (!isHeartbeat) return false;
   const phase = getHeartbeatPhase(item.content);
@@ -277,7 +281,9 @@ export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedA
 
   const agentAlive = agentState?.state !== 'offline' && agentState?.state !== 'stopped';
   if (!agentAlive) return false;
-  if (!procState || procState.alive !== true) return false;
+  if (!procState || procState.alive !== true || procState.frozen === true) return false;
+  const terminal = terminalState ?? readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME });
+  if (deliveryFailed || !terminal.captureOk || terminal.modal || terminal.inputState !== 'empty') return false;
 
   // Busy path: preserve the existing "confirmed active" behavior for live generation.
   if (confirmedActive) {
@@ -363,30 +369,7 @@ export function checkClaudeFallbackInputBox(capture) {
  * Multi-session: session parameter defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
 export function checkInputBoxByCursor(session = TMUX_SESSION) {
-  const cursorX = getCursorX(session);
-  if (cursorX < 0) return 'indeterminate';
-  if (cursorX > CURSOR_EMPTY_THRESHOLD) return 'has_content';
-
-  // cursor_x ≤ threshold — could be truly empty or multi-line wrapped input.
-  // Capture the pane and compare prompt line Y with cursor Y.
-  const cursorY = getCursorY(session);
-  if (cursorY < 0) return 'indeterminate';
-
-  let capture;
-  try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-      encoding: 'utf8', stdio: 'pipe', timeout: 5000
-    });
-  } catch {
-    return 'indeterminate';
-  }
-
-  const promptY = findPromptY(capture);
-  if (promptY < 0) return 'indeterminate';
-
-  // If cursor is on the prompt line itself, input is empty.
-  // If cursor is below the prompt line, there's wrapped multi-line content.
-  return cursorY === promptY ? 'empty' : 'has_content';
+  return readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME }).inputState;
 }
 
 /**
@@ -396,26 +379,12 @@ export function checkInputBoxByCursor(session = TMUX_SESSION) {
  * Multi-session: session defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
 export function checkInputBox(session = TMUX_SESSION) {
-  const cursorState = checkInputBoxByCursor(session);
-  if (cursorState !== 'has_content') {
-    return cursorState;
+  const terminal = readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME });
+  if (terminal.modal || terminal.inputState !== 'has_content' || ACTIVE_RUNTIME !== 'claude') {
+    return terminal.inputState;
   }
-
-  if (ACTIVE_RUNTIME !== 'claude') {
-    return cursorState;
-  }
-
-  let capture;
-  try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-      encoding: 'utf8', stdio: 'pipe', timeout: 5000
-    });
-  } catch {
-    return cursorState;
-  }
-
-  const fallbackState = checkClaudeFallbackInputBox(capture);
-  return fallbackState === 'indeterminate' ? cursorState : fallbackState;
+  const fallbackState = checkClaudeFallbackInputBox(terminal.capture);
+  return fallbackState === 'indeterminate' ? terminal.inputState : fallbackState;
 }
 
 export function isUsageOverlayCapture(capture) {
@@ -452,37 +421,45 @@ export function getCursorY(session = TMUX_SESSION) {
   }
 }
 
-async function submitAndVerify(session = TMUX_SESSION) {
-  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
-
-  for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
-    await sleep(ENTER_VERIFY_WAIT_MS);
-    const state = checkInputBox(session);
-
-    if (state === 'empty') {
-      return { verified: true, state: 'empty' };
-    }
-
-    if (state === 'indeterminate') {
-      log(`Enter verify attempt ${attempt + 1}: indeterminate state, checking for overlay`);
-      try {
-        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-          encoding: 'utf8', stdio: 'pipe', timeout: 5000
-        });
-        if (isUsageOverlayCapture(capture)) {
-          log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-          execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
-        }
-      } catch { /* capture failed, continue retry loop */ }
-      continue;
-    }
-
-    // state === 'has_content' — message wasn't submitted, retry Enter
-    log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+export async function prepareInputForPaste(session = TMUX_SESSION, {
+  readState = () => readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME }),
+  sendKey = (key) => execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 }),
+  wait = sleep,
+} = {}) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const state = readState();
+    if (state.captureOk && !state.modal && state.inputState === 'empty') return true;
+    if (!state.dismissibleOverlay || attempt === 2) return false;
+    log(`Dismissing ${state.dismissibleOverlay} overlay before paste`);
+    sendKey('Escape');
+    await wait(ENTER_VERIFY_WAIT_MS);
   }
+  return false;
+}
 
-  return { verified: false, state: 'has_content' };
+export async function submitAndVerify(session = TMUX_SESSION, {
+  readState = () => readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME }),
+  sendKey = (key) => execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 }),
+  wait = sleep,
+} = {}) {
+  let state = readState();
+  // Recheck after paste: an approval or settings dialog can appear at any time.
+  if (!state.captureOk || state.modal || state.inputState !== 'has_content') {
+    return { verified: false, state: state.modal ? 'modal' : state.inputState };
+  }
+  sendKey('Enter');
+  for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
+    await wait(ENTER_VERIFY_WAIT_MS);
+    state = readState();
+    if (state.modal) {
+      if (state.dismissibleOverlay) sendKey('Escape');
+      // Escape returning to an empty composer does not prove the paste arrived.
+      return { verified: false, state: 'modal' };
+    }
+    if (state.captureOk && state.inputState === 'empty') return { verified: true, state: 'empty' };
+    if (state.captureOk && state.inputState === 'has_content') sendKey('Enter');
+  }
+  return { verified: false, state: state.inputState };
 }
 
 async function sendToTmux(message, options = {}) {
@@ -496,12 +473,19 @@ async function sendToTmux(message, options = {}) {
   const sanitized = sanitizeMessage(message);
   const delayMs = getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8'));
 
+  if (!await prepareInputForPaste(session)) {
+    unresolvedDeliveryFailures.add(session);
+    log('Input channel is unreadable, modal, or non-empty; refusing paste');
+    return 'verify_failed';
+  }
+
   try {
     execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
     execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
   } catch (err) {
     log(`Error pasting to tmux: ${err.message}`);
     logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
+    unresolvedDeliveryFailures.add(session);
     return 'paste_error';
   } finally {
     try {
@@ -520,9 +504,12 @@ async function sendToTmux(message, options = {}) {
     log(`Warning: Enter verification error: ${err.message}`);
   }
 
+  if (!verifyResult.verified) unresolvedDeliveryFailures.add(session);
+  else unresolvedDeliveryFailures.delete(session);
+
   // Conversation delivery must be strict: if we cannot verify submission,
   // retry instead of marking delivered to avoid false positives.
-  if (!verifyResult.verified && strictVerify) {
+  if (!verifyResult.verified && (strictVerify || !acceptShutdownAfterSubmit)) {
     log(`Verification failed in strict mode (state=${verifyResult.state}) — marking as verify_failed`);
     return 'verify_failed';
   }

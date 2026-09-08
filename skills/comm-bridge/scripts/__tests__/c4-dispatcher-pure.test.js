@@ -36,7 +36,9 @@ const {
   isRecoveryHeartbeatPhase,
   shouldAutoAckHeartbeat,
   readJsonFileWithRetry,
-  getDeliveryContent
+  getDeliveryContent,
+  prepareInputForPaste,
+  submitAndVerify
 } = mod;
 
 after(() => {
@@ -321,6 +323,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: { content: 'Heartbeat check. [phase=primary]' },
       agentState: { state: 'busy', health: 'ok', idleSeconds: 0, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: true
     }), true);
@@ -330,6 +333,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: { content: 'Heartbeat check. [phase=recovery]' },
       agentState: { state: 'busy', health: 'recovering', idleSeconds: 0, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: true
     }), false);
@@ -339,6 +343,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: { content: 'Heartbeat check. [phase=post_restart]' },
       agentState: { state: 'busy', health: 'recovering', idleSeconds: 0, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: true
     }), false);
@@ -348,6 +353,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: heartbeatItem,
       agentState: { state: 'idle', health: 'ok', idleSeconds: 3, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false
     }), true);
@@ -357,6 +363,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: { content: 'Heartbeat check. [phase=recovery]' },
       agentState: { state: 'idle', health: 'ok', idleSeconds: 10, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false
     }), false);
@@ -366,6 +373,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: heartbeatItem,
       agentState: { state: 'idle', health: 'ok', idleSeconds: 2, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false
     }), false);
@@ -375,6 +383,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: heartbeatItem,
       agentState: { state: 'idle', health: 'recovering', idleSeconds: 10, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false
     }), false);
@@ -384,6 +393,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: heartbeatItem,
       agentState: { state: 'idle', health: 'ok', idleSeconds: 10, healthy: false },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false
     }), false);
@@ -404,6 +414,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: heartbeatItem,
       agentState: { state: 'idle', health: 'ok', idleSeconds: 1, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false,
       requireIdleWaiting: true
@@ -416,6 +427,7 @@ describe('shouldAutoAckHeartbeat', () => {
     assert.equal(shouldAutoAckHeartbeat({
       item: heartbeatItem,
       agentState: { state: 'busy', health: 'ok', idleSeconds: 0, healthy: true },
+      terminalState: { captureOk: true, modal: false, inputState: 'empty' },
       procState: aliveProc,
       confirmedActive: false,
       requireIdleWaiting: true
@@ -592,5 +604,57 @@ describe('isCodexExitLifecycleControl', () => {
       isCodexExitLifecycleControl({ type: 'control', content: '/exit now' }, 'codex'),
       false
     );
+  });
+});
+
+
+describe('delivery terminal guards', () => {
+  const empty = { captureOk: true, modal: false, inputState: 'empty' };
+  const content = { ...empty, inputState: 'has_content' };
+  const hooks = { captureOk: true, modal: true, inputState: 'indeterminate', dismissibleOverlay: 'hooks' };
+  const approval = { ...hooks, dismissibleOverlay: null };
+  const run = (states, keys) => ({ readState: () => states.shift() ?? empty, sendKey: key => keys.push(key), wait: async () => {} });
+
+  it('cancels a stuck Hooks menu and checks the restored empty prompt before paste', async () => {
+    const keys = [];
+    assert.equal(await prepareInputForPaste('bohe', run([hooks, empty], keys)), true);
+    assert.deepEqual(keys, ['Escape']);
+  });
+  it('refuses approval, unknown modal, unreadable, and existing draft without sending keys', async () => {
+    for (const state of [approval, { ...empty, captureOk: false }, content]) {
+      const keys = [];
+      assert.equal(await prepareInputForPaste('bohe', run([state], keys)), false);
+      assert.deepEqual(keys, []);
+    }
+  });
+  it('does not paste if Escape leaves the menu open', async () => {
+    const keys = [];
+    assert.equal(await prepareInputForPaste('bohe', run([hooks, hooks, hooks], keys)), false);
+    assert.deepEqual(keys, ['Escape', 'Escape']);
+  });
+  it('submits normal input and verifies it cleared', async () => {
+    const keys = [];
+    assert.deepEqual(await submitAndVerify('bohe', run([content, empty], keys)), { verified: true, state: 'empty' });
+    assert.deepEqual(keys, ['Enter']);
+  });
+  it('never retries Enter when a Hooks menu appears during submission', async () => {
+    const keys = [];
+    assert.deepEqual(await submitAndVerify('bohe', run([content, hooks, empty], keys)), { verified: false, state: 'modal' });
+    assert.deepEqual(keys, ['Enter', 'Escape']);
+  });
+  it('does not send Enter into an approval dialog before or after paste', async () => {
+    const keys = [];
+    assert.equal((await submitAndVerify('bohe', run([approval], keys))).verified, false);
+    assert.deepEqual(keys, []);
+    assert.equal((await submitAndVerify('bohe', run([content, approval], keys))).verified, false);
+    assert.deepEqual(keys, ['Enter']);
+  });
+  it('denies heartbeat shortcuts after failures or unhealthy terminal observations even with live hooks', () => {
+    const base = { item: { content: 'Heartbeat check. [phase=primary]' }, agentState: { state: 'idle', health: 'ok', healthy: true, idleSeconds: 30 }, procState: { alive: true }, confirmedActive: true };
+    for (const terminalState of [hooks, approval, content, { ...empty, captureOk: false }]) {
+      assert.equal(shouldAutoAckHeartbeat({ ...base, terminalState }), false);
+    }
+    assert.equal(shouldAutoAckHeartbeat({ ...base, terminalState: empty, deliveryFailed: true }), false);
+    assert.equal(shouldAutoAckHeartbeat({ ...base, terminalState: empty, deliveryFailed: false }), true);
   });
 });
