@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { profileIdentity, readSubscriptionAccountKey } from './codex-account-usage.js';
+import { profileIdentity, readSubscriptionAccountKey, rawCodexQuotaProbeBin } from './codex-account-usage.js';
 
 export const QUOTA_RECOVERY_INTERVAL_MS = 10 * 60_000;
 export const QUOTA_PROOF_MAX_AGE_MS = 10 * 60_000;
@@ -30,7 +30,7 @@ export function reconcileRefreshedAuth({ codexHome, temporaryHome, originalBytes
 
 // One isolated model response, only when recovering a persisted quota hold.
 // No user's workspace, configuration, MCP servers, hooks, plugins or tools.
-export async function probeCodexQuotaRecovery({ codexHome, model, effort, codexBin = '/usr/bin/codex', timeoutMs = 60_000, spawnImpl = spawn } = {}) {
+export async function probeCodexQuotaRecovery({ codexHome, model, effort, codexBin = rawCodexQuotaProbeBin(), timeoutMs = 60_000, spawnImpl = spawn } = {}) {
   const identity = profileIdentity(codexHome);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-quota-proof-'));
   fs.chmodSync(root, 0o700);
@@ -135,7 +135,7 @@ export async function refreshQuotaRecoveryProofs({
   now = () => Date.now(),
   probeImpl = probeCodexQuotaRecovery,
   identityImpl = profileIdentity,
-  codexBin = process.env.CODEX_QUOTA_PROBE_BIN || '/usr/bin/codex',
+  codexBin = rawCodexQuotaProbeBin(),
   cacheFile = path.join(zylosDir, 'activity-monitor', 'codex-quota-recovery.json'),
 } = {}) {
   const holds = collectQuotaHolds(document);
