@@ -117,6 +117,7 @@ export class HealthEngine {
     this.healthReason = options.initialReason ?? '';
     this.restartFailureCount = 0;
     this.lastHeartbeatAt = Math.floor(this.now() / 1000);
+    this.lastFunctionalAckAt = 0;
     this.lastRecoveryAt = 0;
     this.lastDownCheckAt = 0;
     // If resuming in recovering state (e.g., PM2 restart mid-recovery),
@@ -495,6 +496,7 @@ export class HealthEngine {
   }
 
   onHeartbeatSuccess(phase) {
+    this.lastFunctionalAckAt = this.now();
     this.deps.clearHeartbeatPending();
     this.restartFailureCount = 0;
     this.recoveringStartedAt = 0;

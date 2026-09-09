@@ -135,6 +135,75 @@ describe('model and authoritative quota policy', () => {
   });
 });
 
+describe('degraded last-tier recovery', () => {
+  const nowMs = Date.parse('2026-09-09T02:00:00Z');
+  const pinned = Object.fromEntries(['codex-subscription', 'codex-azure'].map(id => [id, {
+    ...profiles[id], model: 'gpt-6-astra', reasoning_effort: 'medium',
+  }]));
+  function authoritative(used = 0, extra = {}) {
+    const value = usage({ codex: used });
+    Object.assign(value.providers.codex, {
+      quota_authoritative: true, observed_at: new Date(nowMs).toISOString(), ...extra,
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'codex-azure', chain: Object.keys(pinned), profiles: pinned,
+      currentHealth: 'degraded', providerUsage: authoritative(),
+      requiredModel: 'gpt-6-astra', requiredReasoningEffort: 'medium', usageMaxAgeMs: 180_000,
+      nowMs, changedAtMs: nowMs - 600_000, minDwellMs: 300_000,
+      autoRecover: true, wrapOnExhausted: false, ...extra,
+    });
+  }
+
+  it('recovers a degraded Azure session into a freshly recovered subscription', () => {
+    assert.deepEqual(choose(), {
+      profile: 'codex-subscription', reason: 'preferred_provider_recovered:codex',
+    });
+  });
+
+  it('does not recover without current authoritative quota below the recovery threshold', () => {
+    for (const providerUsage of [
+      usage(), authoritative(80), authoritative(98),
+      authoritative(0, { quota_authoritative: false }),
+      authoritative(0, { observed_at: new Date(nowMs - 181_000).toISOString() }),
+      authoritative(0, { observed_at: new Date(nowMs + 31_000).toISOString() }),
+      authoritative(0, { primary: { used_percent: 0, resets_at: new Date(nowMs - 1).toISOString() } }),
+    ]) {
+      assert.deepEqual(choose({ providerUsage }), {
+        profile: 'codex-azure', reason: 'fallback_chain_exhausted',
+      });
+    }
+  });
+
+  it('retains quarantine, auto-recovery setting, and model and effort eligibility', () => {
+    for (const extra of [
+      { blockedProfiles: ['codex-subscription'] },
+      { blockedProfiles: { 'codex-subscription': { health: 'auth_failed' } } },
+      { autoRecover: false },
+      ...[{ model: 'gpt-5.6-sol' }, { reasoning_effort: 'high' }].map(override => ({
+        profiles: { ...pinned, 'codex-subscription': { ...pinned['codex-subscription'], ...override } },
+      })),
+    ]) {
+      assert.deepEqual(choose(extra), {
+        profile: 'codex-azure', reason: 'fallback_chain_exhausted',
+      });
+    }
+    assert.deepEqual(choose({ changedAtMs: nowMs - 299_999 }), {
+      profile: 'codex-azure', reason: 'no_change',
+    });
+  });
+
+  it('keeps an available forward fallback ahead of preferred-provider recovery', () => {
+    const forward = 'codex-azure-secondary';
+    assert.deepEqual(choose({ chain: [...Object.keys(pinned), forward],
+      profiles: { ...pinned, [forward]: pinned['codex-azure'] } }), {
+      profile: forward, reason: 'health_degraded:codex-azure',
+    });
+  });
+});
+
 describe('runtime failover selection', () => {
   it('moves Claude subscription to Codex subscription when Claude is full', () => {
     const result = chooseRuntimeProfile({

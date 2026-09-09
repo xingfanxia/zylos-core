@@ -128,3 +128,10 @@ describe('monitor notifyDegradedAdmin (fire-and-forget, never-reject)', () => {
     await assert.doesNotReject(() => monitor.notifyDegradedAdmin(null));
   });
 });
+
+it('explains temporary unavailability without unsupported delivery guarantees', () => {
+  const text = monitor.formatDegradedAdminAlert({ cycleCount: 7, windowSec: 3600, probeIntervalSec: 1200 });
+  assert.match(text, /暂时无法回复/);
+  assert.match(text, /每 20 分钟自动检查一次/);
+  assert.doesNotMatch(text, /不会丢失|先排队|恢复后继续处理|claude 登录|kill-restart/);
+});

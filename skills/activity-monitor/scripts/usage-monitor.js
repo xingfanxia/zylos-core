@@ -1,6 +1,7 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { formatBeijingReset } from './runtime-switch-notices.js';
 import { shouldStartUsageCheck } from './usage-check-engine.js';
 import {
   classifyCodexRateLimitWindows,
@@ -771,7 +772,7 @@ function readAuthoritativeCodex(provider, currentTime) {
 }
 
 function providerLabel(provider) {
-  return provider === 'codex' ? 'Codex subscription' : 'Claude subscription';
+  return provider === 'codex' ? 'Codex 订阅' : 'Claude 订阅';
 }
 
 function remainingPercent(used) {
@@ -782,47 +783,24 @@ function remainingLabel(used) {
   return used == null ? 'unknown' : `${remainingPercent(used)}%`;
 }
 
+function usageLines(data) {
+  const lines = [];
+  for (const [label, value, reset] of [
+    ['本周额度', data.weeklyAll, data.weeklyAllResets],
+    ['最近 5 小时额度', data.fiveHour, data.fiveHourResets],
+  ]) {
+    if (value == null) continue;
+    lines.push(`${label}已用 ${value}%，剩余 ${remainingPercent(value)}%。`);
+    const resetLabel = formatBeijingReset(reset);
+    if (resetLabel) lines.push(`${label}重置时间：${resetLabel}。`);
+  }
+  return lines;
+}
+
 function formatUsageNotification(usage, tier, provider = 'claude') {
-  if (provider === 'codex') {
-    const labels = { warning: '⚠️ Usage Warning', high: '🔶 Usage High', critical: '🔴 Usage Critical' };
-    const used = value => value == null ? 'unknown' : `${value}% used / ${remainingLabel(value)} remaining`;
-    return [labels[tier] || 'Usage Alert', '', 'Provider: Codex subscription',
-      `Weekly (all models): ${used(usage.weeklyAll)}`,
-      `Session (5h): ${used(usage.fiveHour)}`,
-      `Weekly resets (UTC): ${usage.weeklyAllResets || 'unknown'}`,
-      `Session resets (UTC): ${usage.fiveHourResets || 'unknown'}`].join('\n');
-  }
-  const weekly = usage.weeklyAll ?? 0;
-  const session = usage.session ?? 0;
-  const resets = usage.weeklyAllResets || 'unknown';
-
-  const tierLabels = {
-    warning: '⚠️ Usage Warning',
-    high: '🔶 Usage High',
-    critical: '🔴 Usage Critical'
-  };
-
-  const lines = [
-    tierLabels[tier] || 'Usage Alert',
-    '',
-    `Provider: ${providerLabel(provider)}`,
-    `Weekly (all models): ${weekly}% used / ${remainingLabel(weekly)} remaining`,
-    `Session: ${session}% used / ${remainingLabel(session)} remaining`
-  ];
-
-  if (usage.weeklySonnet !== undefined && usage.weeklySonnet !== null) {
-    lines.push(`Weekly (Sonnet): ${usage.weeklySonnet}% used`);
-  }
-
-  lines.push(`Resets: ${resets}`);
-
-  if (tier === 'critical') {
-    lines.push('', 'Approaching plan limit. Consider reducing activity to avoid interruption.');
-  } else if (tier === 'high') {
-    lines.push('', 'Usage is elevated. Monitor closely.');
-  }
-
-  return lines.join('\n');
+  const labels = { warning: '⚠️ 用量提醒', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
+  return [labels[tier] || '用量提醒', `当前用量来自 ${providerLabel(provider)}。`,
+    ...usageLines(usage), '额度不足时可能影响回复；这条是用量提醒，不代表线路已切换。'].join('\n');
 }
 
 function tierRank(tier) {
@@ -854,9 +832,9 @@ function formatUserNotification(data, tier) {
   const hot = data.hotWindow === 'weekly'
     ? { pct: data.weeklyAll ?? 0, reset: data.weeklyAllResets, label: '本周' }
     : { pct: data.fiveHour ?? 0, reset: data.fiveHourResets, label: '5小时窗口' };
-  const reset = hot.reset || '稍后';
+  const reset = formatBeijingReset(hot.reset);
   return `⚠️ 系统提示：${providerLabel(data.usageProvider)} 共享额度已用 ${hot.pct}%、剩余 ${remainingPercent(hot.pct)}%` +
-    `（${hot.label}，${reset} 重置）。` +
+    `（${hot.label}${reset ? `，${reset}重置` : ''}）。` +
     `期间回复可能变慢或暂停，重置后自动恢复，无需重复发送。`;
 }
 
@@ -864,25 +842,13 @@ function formatUserNotification(data, tier) {
 // instances the reading came from (review S1/F2) + the standing tier-switch CTA
 // (AX 2026-07-10 note).
 function formatAdminNotification(data, tier) {
-  const tierLabels = { warning: '⚠️ 额度预警', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
-  const hot = data.hotWindow === 'weekly' ? '周额度(weekly)' : '5小时(5h)';
-  const usableCount = data.usableCount ?? 0;
-  const agg = data.quorum ? '中位数' : '最坏值';
-  const sourceLine = data.sourceMode === 'provider'
-    ? `读数来源: provider 直读（${data.usageProvider === 'codex' ? 'Codex account API' : 'codexbar'}，${data.providerAgeMin ?? '?'} 分钟前查询）`
-    : `读数来源: ${usableCount} 个实例 statusline（${agg}，直读通道不可用）` +
-      (data.sources?.length ? `：${data.sources.join(', ')}` : '');
-  const lines = [
-    `${tierLabels[tier] || '额度提醒'}（${providerLabel(data.usageProvider)}，${tier}，热点=${hot}）`,
-    `5h: ${data.fiveHour == null ? 'unknown' : `${data.fiveHour}%`} 已用 / ${remainingLabel(data.fiveHour)} 剩余（${data.fiveHourResets || '未知'} 重置）`,
-    `weekly: ${data.weeklyAll == null ? 'unknown' : `${data.weeklyAll}%`} 已用 / ${remainingLabel(data.weeklyAll)} 剩余（${data.weeklyAllResets || '未知'} 重置）`,
-    sourceLine
-  ];
-  if (!data.quorum) {
-    lines.push('⚠️ 来源不足 3 个，未向用户群发（仅管理员）。');
-  }
-  lines.push('', '如额度问题反复出现，考虑切换模型档位或升级 Max 套餐（AX 2026-07-10 备注）。');
-  return lines.join('\n');
+  const labels = { warning: '⚠️ 用量提醒', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
+  const source = data.sourceMode === 'provider'
+    ? `这是服务商 ${data.providerAgeMin ?? 0} 分钟前返回的用量。`
+    : `服务商暂时没有返回新用量，以上来自 ${data.usableCount ?? 0} 个助手的最近记录，仅供参考。`;
+  return [labels[tier] || '用量提醒', `当前用量来自 ${providerLabel(data.usageProvider)}。`,
+    ...usageLines(data), source,
+    '额度不足时可能影响回复；这条是用量提醒，不代表线路已切换。'].join('\n');
 }
 
 // Admin-only "monitoring blind" text — emitted only when BOTH channels are

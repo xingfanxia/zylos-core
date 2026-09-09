@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import { processSwitchNotices } from './runtime-switch-notices.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -151,7 +152,8 @@ export function chooseRuntimeProfile({
         }
       }
     }
-    return { profile: currentProfile, reason: 'fallback_chain_exhausted' };
+    // A failed final fallback can still return to a verified recovered
+    // subscription. Keep forward and explicit wrap choices ahead of recovery.
   }
 
   if (autoRecover && currentIndex > 0 && nowMs - changedAtMs >= minDwellMs) {
@@ -169,7 +171,8 @@ export function chooseRuntimeProfile({
     }
   }
 
-  return { profile: currentProfile, reason: 'no_change' };
+  return { profile: currentProfile, reason: (healthLimited || usageLimited)
+    ? 'fallback_chain_exhausted' : 'no_change' };
 }
 
 export function planRuntimeFailover({
@@ -449,8 +452,10 @@ export async function runDaemon({
   error = console.error,
 } = {}) {
   log(`[runtime-failover] daemon started (poll=${pollMs}ms)`);
+  try { await processSwitchNotices({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[runtime-switch-notices] ${err.message}`); }
   while (true) {
     try { apply({ log }); } catch (err) { error(`[runtime-failover] ${err.message}`); }
+    try { await processSwitchNotices({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[runtime-switch-notices] ${err.message}`); }
     await new Promise(resolve => setTimeout(resolve, pollMs));
   }
 }
