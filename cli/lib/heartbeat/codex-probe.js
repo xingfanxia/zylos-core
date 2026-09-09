@@ -55,7 +55,9 @@ export function detectCodexQuotaFromLines(lines, { sinceMs = 0, sessionId } = {}
   for (let i = lines.length - 1; i >= 0; i--) {
     let event;
     try { event = JSON.parse(lines[i]); } catch { continue; }
-    if (event.type !== 'event_msg' || event.payload?.type !== 'task_complete') continue;
+    if (event.type !== 'event_msg') continue;
+    if (event.payload?.type === 'task_started') return { detected: false };
+    if (event.payload?.type !== 'task_complete') continue;
     const failedAtMs = Date.parse(event.timestamp || '');
     if (!Number.isFinite(failedAtMs) || failedAtMs < sinceMs) return { detected: false };
     if (event.payload.error?.codex_error_info !== 'usage_limit_exceeded') return { detected: false };

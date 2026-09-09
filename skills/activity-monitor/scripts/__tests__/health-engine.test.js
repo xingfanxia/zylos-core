@@ -1766,3 +1766,28 @@ describe('HealthEngine', () => {
     });
   });
 });
+
+describe('structured Codex quota maintenance', () => {
+  it('reacts to one terminal quota failure with periodic heartbeat disabled', () => {
+    const { deps, calls } = createMockDeps();
+    deps.detectStructuredRateLimit = () => ({ detected: true, structured: true, source: 'codex_terminal_error' });
+    const engine = new HealthEngine(deps, { heartbeatEnabled: false });
+    try {
+      engine.runMaintenanceCycle(true, Math.floor(Date.now() / 1000));
+      assert.equal(engine.health, 'rate_limited');
+      assert.equal(calls.enqueueHeartbeat.length, 0);
+      assert.equal(calls.killTmuxSession, 0);
+    } finally { engine.destroy(); }
+  });
+  it('ignores textual/unverified quota and does not poll absent engines', () => {
+    const { deps } = createMockDeps(); let scans = 0;
+    deps.detectStructuredRateLimit = () => { scans++; return { detected: true }; };
+    const engine = new HealthEngine(deps, { heartbeatEnabled: false });
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      engine.runMaintenanceCycle(true, now); assert.equal(engine.health, 'ok');
+      engine.runMaintenanceCycle(true, now + 1); assert.equal(scans, 1);
+      engine.runMaintenanceCycle(false, now + 6); assert.equal(scans, 1);
+    } finally { engine.destroy(); }
+  });
+});
