@@ -151,7 +151,8 @@ export function chooseRuntimeProfile({
         }
       }
     }
-    return { profile: currentProfile, reason: 'fallback_chain_exhausted' };
+    // A failed final fallback can still return to a verified recovered
+    // subscription. Keep forward and explicit wrap choices ahead of recovery.
   }
 
   if (autoRecover && currentIndex > 0 && nowMs - changedAtMs >= minDwellMs) {
@@ -169,7 +170,8 @@ export function chooseRuntimeProfile({
     }
   }
 
-  return { profile: currentProfile, reason: 'no_change' };
+  return { profile: currentProfile, reason: (healthLimited || usageLimited)
+    ? 'fallback_chain_exhausted' : 'no_change' };
 }
 
 export function planRuntimeFailover({
