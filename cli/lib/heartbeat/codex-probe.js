@@ -48,6 +48,79 @@ const AUTH_FAILURE_PATTERNS = [
 
 export { AUTH_FAILURE_PATTERNS as _AUTH_FAILURE_PATTERNS };
 
+// A quota failure can omit numerical windows (for example the premium limit).
+// Only a terminal provider error is authoritative; user text and old UI output
+// are not. A later terminal success/error replaces the earlier outcome.
+export function detectCodexQuotaFromLines(lines, { sinceMs = 0, sessionId } = {}) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let event;
+    try { event = JSON.parse(lines[i]); } catch { continue; }
+    if (event.type !== 'event_msg' || event.payload?.type !== 'task_complete') continue;
+    const failedAtMs = Date.parse(event.timestamp || '');
+    if (!Number.isFinite(failedAtMs) || failedAtMs < sinceMs) return { detected: false };
+    if (event.payload.error?.codex_error_info !== 'usage_limit_exceeded') return { detected: false };
+    return { detected: true, structured: true, source: 'codex_terminal_error', sessionId, failedAtMs };
+  }
+  return { detected: false };
+}
+
+function processEnvironment(pid) {
+  // Reading this process-local environment selects the actual credential home,
+  // including isolated instances and Azure. Values never leave this function.
+  const entries = fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+  return Object.fromEntries(entries.filter(entry => entry.includes('=')).map(entry => {
+    const split = entry.indexOf('=');
+    return [entry.slice(0, split), entry.slice(split + 1)];
+  }));
+}
+
+export function readCodexQuotaFailure({
+  foregroundFile,
+  readProcessEnvironment = processEnvironment,
+} = {}) {
+  try {
+    const foreground = JSON.parse(fs.readFileSync(foregroundFile, 'utf8'));
+    const sessionId = foreground.session_id;
+    const observedAt = Number(foreground.observed_at);
+    if (!/^[a-f0-9-]{36}$/i.test(sessionId || '') || !Number.isInteger(foreground.claude_pid)
+        || foreground.claude_pid <= 0 || !Number.isFinite(observedAt) || observedAt <= 0) return { detected: false };
+    // A disappeared/replaced process must not resurrect the old session's error.
+    const env = readProcessEnvironment(foreground.claude_pid);
+    const codexHome = env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex');
+    const authFile = path.join(codexHome, 'auth.json');
+    const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+    if (auth.auth_mode !== 'chatgpt') return { detected: false };
+    const sinceMs = Math.max(observedAt, fs.statSync(authFile).mtimeMs);
+    const sessions = path.join(codexHome, 'sessions');
+    // Match the foreground UUID exactly, never the most recently modified
+    // thread: concurrent CLI or subagent work may share the credential home.
+    let rollout;
+    for (const year of fs.readdirSync(sessions)) {
+      if (!/^\d{4}$/.test(year)) continue;
+      for (const month of fs.readdirSync(path.join(sessions, year))) {
+        if (!/^\d{2}$/.test(month)) continue;
+        for (const day of fs.readdirSync(path.join(sessions, year, month))) {
+          if (!/^\d{2}$/.test(day)) continue;
+          const dir = path.join(sessions, year, month, day);
+          const file = fs.readdirSync(dir).find(name => name.startsWith('rollout-') && name.endsWith(`-${sessionId}.jsonl`));
+          if (file) { rollout = path.join(dir, file); break; }
+        }
+        if (rollout) break;
+      }
+      if (rollout) break;
+    }
+    if (!rollout) return { detected: false };
+    const size = fs.statSync(rollout).size;
+    const bytes = Math.min(size, 262144);
+    const buffer = Buffer.alloc(bytes);
+    const fd = fs.openSync(rollout, 'r');
+    try { fs.readSync(fd, buffer, 0, bytes, size - bytes); } finally { fs.closeSync(fd); }
+    return detectCodexQuotaFromLines(buffer.toString('utf8').split('\n'), { sinceMs, sessionId });
+  } catch {
+    return { detected: false };
+  }
+}
+
 /**
  * Create a Codex CLI heartbeat probe.
  *
@@ -62,6 +135,7 @@ export function createCodexProbe({
   tmuxSession = 'codex-main',
   ackDeadline = 300,
   recoveryAckDeadline = 120,
+  foregroundFile = path.join(path.dirname(pendingFile), 'foreground-session.json'),
 }) {
   return {
 
@@ -128,14 +202,9 @@ export function createCodexProbe({
       }
     },
 
-    /**
-     * Codex CLI (OpenAI) does not have Anthropic-style per-plan usage limits.
-     * Always returns not-detected.
-     *
-     * @returns {{ detected: false }}
-     */
+    /** Read a definitive quota failure from this engine's current session. */
     detectRateLimit() {
-      return { detected: false };
+      return readCodexQuotaFailure({ foregroundFile });
     },
 
     /**
