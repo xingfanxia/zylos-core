@@ -374,7 +374,6 @@ export function applyRuntimeFailover({
   // later PM2 restart fails, its durable signal still protects the next boot
   // from inheriting the previous adapter's degraded heartbeat state.
   for (const change of changes) {
-    if (change.singleSession) continue;
     writeRuntimeSwitchSignal({
       zylosDir: ZYLOS_DIR,
       change,
