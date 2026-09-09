@@ -1450,3 +1450,19 @@ describe('MonitorOrchestrator', () => {
     ]);
   });
 });
+
+describe('legacy single-session profile binding', () => {
+  it('binds profile only when its runtime and pane match the actual adapter', async () => {
+    const { startupRuntimeProfile } = await import('../monitor-orchestrator.js');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'single-profile-'));
+    try {
+      fs.mkdirSync(path.join(dir, '.zylos'));
+      const p = { active_profile: 'codex-azure', active_runtime: 'codex', tmux_session: 'legacy-pane', runtime_profiles: { 'codex-azure': { runtime: 'codex' } } };
+      fs.writeFileSync(path.join(dir, '.zylos/runtime-profiles.json'), JSON.stringify(p));
+      const adapter = { runtimeId: 'codex', sessionName: 'legacy-pane' };
+      assert.equal(startupRuntimeProfile(adapter, { ZYLOS_DIR: dir }), 'codex-azure');
+      assert.equal(startupRuntimeProfile({ ...adapter, sessionName: 'other' }, { ZYLOS_DIR: dir }), null);
+      assert.equal(startupRuntimeProfile(adapter, { ZYLOS_DIR: dir, ZYLOS_INSTANCE_ID: 'admin' }), null);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
