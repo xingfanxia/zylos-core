@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 import { processSwitchNotices } from './runtime-switch-notices.js';
+import { verifiedQuotaRecoveries, readCurrentSubscriptionAccountKeys } from './codex-quota-recovery.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -82,6 +83,7 @@ export function chooseRuntimeProfile({
   requiredModel = null,
   requiredReasoningEffort = null,
   usageMaxAgeMs = null,
+  verifiedRecoveredProfiles = [],
 } = {}) {
   if (requiredModel || requiredReasoningEffort) {
     chain = chain.filter(id => {
@@ -105,6 +107,7 @@ export function chooseRuntimeProfile({
 
   const current = profiles[currentProfile] || {};
   const currentUsage = providerUsageState(providerUsage, current.usage_provider, nowMs, usageMaxAgeMs);
+  const recovered = new Set(verifiedRecoveredProfiles);
   const healthLimited = HEALTH_FAILOVER_STATES.has(currentHealth);
   const usageLimited = currentUsage.available && currentUsage.usedPercent >= switchThreshold;
 
@@ -162,7 +165,7 @@ export function chooseRuntimeProfile({
       if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
       const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
-      if (!candidate.usage_provider || (state.available && state.usedPercent < recoverThreshold)) {
+      if (recovered.has(candidateId) || !candidate.usage_provider || (state.available && state.usedPercent < recoverThreshold)) {
         return {
           profile: candidateId,
           reason: `preferred_provider_recovered:${candidate.usage_provider || candidateId}`,
@@ -179,6 +182,7 @@ export function planRuntimeFailover({
   document,
   providerUsage,
   healthByInstance = {},
+  currentSubscriptionAccountKeys = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -198,6 +202,9 @@ export function planRuntimeFailover({
       && !Array.isArray(instance.runtime_failover_blocked_profiles)
       ? instance.runtime_failover_blocked_profiles
       : {};
+    const currentAccountKeys = currentSubscriptionAccountKeys[instanceId] || {};
+    const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys });
+    const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !recovered.includes(id)));
     const currentHealth = healthByInstance[instanceId] || 'ok';
     const decision = chooseRuntimeProfile({
       currentProfile,
@@ -212,7 +219,8 @@ export function planRuntimeFailover({
       nowMs,
       autoRecover: policy.auto_recover !== false,
       wrapOnExhausted: policy.wrap_on_exhausted === true,
-      blockedProfiles,
+      blockedProfiles: eligibleBlocks,
+      verifiedRecoveredProfiles: recovered,
       requiredModel: policy.required_model,
       requiredReasoningEffort: policy.required_reasoning_effort,
       usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
@@ -220,17 +228,17 @@ export function planRuntimeFailover({
     if (decision.profile === currentProfile) continue;
 
     const target = profiles[decision.profile];
-    if (QUARANTINE_HEALTH_STATES.has(currentHealth)) {
-      // Quota failures self-expire from provider usage windows. Functional
-      // failures do not have a trustworthy recovery signal, so quarantine the
-      // failed profile until an operator clears this persisted entry after
-      // repairing credentials/provider access. This prevents auto-recover from
-      // bouncing a healthy fallback back into a known-bad provider.
+    if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
+    if (QUARANTINE_HEALTH_STATES.has(currentHealth) || (currentHealth === 'rate_limited' && profiles[currentProfile]?.usage_provider === 'codex')) {
+      // An explicit model quota failure can coexist with a low general Codex
+      // quota. Keep it held until a newer same-model success proves recovery.
+      // Existing authentication/degraded holds retain their manual semantics.
       instance.runtime_failover_blocked_profiles = {
-        ...blockedProfiles,
+        ...eligibleBlocks,
         [currentProfile]: {
           health: currentHealth,
           blocked_at: new Date(nowMs).toISOString(),
+          ...(currentHealth === 'rate_limited' ? { account_key: currentAccountKeys[currentProfile] || null, model: profiles[currentProfile]?.model } : {}),
         },
       };
     }
@@ -259,6 +267,7 @@ export function planSingleSessionRuntimeFailover({
   document,
   providerUsage,
   currentHealth = 'ok',
+  currentSubscriptionAccountKeys = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -274,6 +283,8 @@ export function planSingleSessionRuntimeFailover({
     && !Array.isArray(next.runtime_failover_blocked_profiles)
     ? next.runtime_failover_blocked_profiles
     : {};
+  const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys });
+  const eligibleBlocks = Object.fromEntries(Object.entries(currentBlockedProfiles).filter(([id]) => !recovered.includes(id)));
   const decision = chooseRuntimeProfile({
     currentProfile,
     chain,
@@ -287,7 +298,8 @@ export function planSingleSessionRuntimeFailover({
     nowMs,
     autoRecover: policy.auto_recover !== false,
     wrapOnExhausted: policy.wrap_on_exhausted === true,
-    blockedProfiles: currentBlockedProfiles,
+    blockedProfiles: eligibleBlocks,
+    verifiedRecoveredProfiles: recovered,
     requiredModel: policy.required_model,
     requiredReasoningEffort: policy.required_reasoning_effort,
     usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
@@ -295,12 +307,14 @@ export function planSingleSessionRuntimeFailover({
   if (decision.profile === currentProfile) return { document: next, changes };
 
   const target = profiles[decision.profile];
-  if (QUARANTINE_HEALTH_STATES.has(currentHealth)) {
+  if (recovered.length) next.runtime_failover_blocked_profiles = eligibleBlocks;
+  if (QUARANTINE_HEALTH_STATES.has(currentHealth) || (currentHealth === 'rate_limited' && profiles[currentProfile]?.usage_provider === 'codex')) {
     next.runtime_failover_blocked_profiles = {
-      ...currentBlockedProfiles,
+      ...eligibleBlocks,
       [currentProfile]: {
         health: currentHealth,
         blocked_at: new Date(nowMs).toISOString(),
+        ...(currentHealth === 'rate_limited' ? { account_key: currentSubscriptionAccountKeys[currentProfile] || null, model: profiles[currentProfile]?.model } : {}),
       },
     };
   }
@@ -388,6 +402,7 @@ export function applyRuntimeFailover({
       const document = readJson(INSTANCES_FILE, {});
       const planned = planRuntimeFailover({
         document,
+        currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
         providerUsage,
         healthByInstance: readHealthByInstance(document),
         nowMs,
@@ -404,6 +419,7 @@ export function applyRuntimeFailover({
       const currentHealth = status.health || status.health_state || status.state || 'ok';
       const planned = planSingleSessionRuntimeFailover({
         document,
+        currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
         providerUsage,
         currentHealth,
         nowMs,
@@ -420,7 +436,6 @@ export function applyRuntimeFailover({
   // later PM2 restart fails, its durable signal still protects the next boot
   // from inheriting the previous adapter's degraded heartbeat state.
   for (const change of changes) {
-    if (change.singleSession) continue;
     writeRuntimeSwitchSignal({
       zylosDir: ZYLOS_DIR,
       change,

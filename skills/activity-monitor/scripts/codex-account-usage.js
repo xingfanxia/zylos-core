@@ -9,7 +9,7 @@ const MAX_RPC_BYTES = 1_000_000;
 const fail = (code) => Object.assign(new Error(code), { code });
 
 // Hashes only leave this module. Never publish account identifiers or tokens.
-function profileIdentity(codexHome, uid) {
+export function profileIdentity(codexHome, uid = process.getuid?.()) {
   const dir = fs.statSync(codexHome);
   const authPath = path.join(codexHome, 'auth.json');
   const authStat = fs.statSync(authPath);
@@ -17,6 +17,18 @@ function profileIdentity(codexHome, uid) {
   if ((dir.mode & 0o077) || (authStat.mode & 0o077)) throw fail('profile_not_private');
   const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
   if (auth.auth_mode && auth.auth_mode !== 'chatgpt') throw fail('subscription_auth_required');
+  return accountIdentity(auth);
+}
+
+// Metadata-only read for an operator's already-authorized per-persona scope.
+// It does not grant permission to launch a canary inside a different UID home.
+export function readSubscriptionAccountKey(codexHome) {
+  const auth = JSON.parse(fs.readFileSync(path.join(codexHome, 'auth.json'), 'utf8'));
+  if (auth.auth_mode && auth.auth_mode !== 'chatgpt') throw fail('subscription_auth_required');
+  return accountIdentity(auth).accountKey;
+}
+
+function accountIdentity(auth) {
   const accountId = auth.tokens?.account_id || auth.account_id;
   let subject;
   try {

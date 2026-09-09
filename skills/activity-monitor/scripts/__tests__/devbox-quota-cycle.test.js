@@ -13,8 +13,13 @@ test('six-persona controller persists exhaustion, Azure fallback and fresh subsc
   const { detectCodexQuotaFromLines } = await import('../../../../cli/lib/heartbeat/codex-probe.js');
   let nowMs = Date.now();
   const ids = ['admin', 'scheduler', 'user-pan', 'group', 'user-elaine', 'user-sean'];
+  const authHome = path.join(root, 'subscription'); fs.mkdirSync(authHome, { mode: 0o700 });
+  const claims = Buffer.from(JSON.stringify({ sub: 'fixture-user' })).toString('base64url');
+  fs.writeFileSync(path.join(authHome, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'fixture-account', id_token: `e30.${claims}.sig` } }), { mode: 0o600 });
+  const { readSubscriptionAccountKey } = await import('../codex-account-usage.js');
+  const accountKey = readSubscriptionAccountKey(authHome);
   const document = { runtime_profiles: {
-    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', codex_home: authHome, model: 'gpt-6-astra', reasoning_effort: 'medium' },
     'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
   }, runtime_failover: { enabled: true, chain: ['codex-subscription', 'codex-azure'], auto_recover: true,
     min_dwell_sec: 300, usage_max_age_sec: 180, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium' },
@@ -24,7 +29,7 @@ test('six-persona controller persists exhaustion, Azure fallback and fresh subsc
   }])) };
   fs.writeFileSync(path.join(root, 'instances.json'), JSON.stringify(document), { mode: 0o640 });
   const observations = (used, observedMs = nowMs) => ({ providers: { codex: { available: true,
-    quota_authoritative: true, observed_at: new Date(observedMs).toISOString(), source: 'codex-account-api',
+    account_key: accountKey, quota_authoritative: true, observed_at: new Date(observedMs).toISOString(), source: 'codex-account-api',
     primary: { used_percent: used, resets_at: new Date(nowMs + 3600000).toISOString() }, } } });
   const terminal = JSON.stringify({ type: 'event_msg', timestamp: new Date(nowMs).toISOString(),
     payload: { type: 'task_complete', error: { codex_error_info: 'usage_limit_exceeded' } } });
@@ -53,7 +58,9 @@ test('six-persona controller persists exhaustion, Azure fallback and fresh subsc
   nowMs += 301000;
   assert.equal(apply(observations(0, nowMs - 181000)).length, 0, 'stale low usage must not recover');
   assert.equal(apply(observations(100)).length, 0, 'exhausted account must stay on Azure');
-  const recovered = apply(observations(20));
+  assert.equal(apply(observations(20)).length, 0, 'fresh generic low quota alone cannot clear a model quota failure');
+  const proof = observations(20); proof.quota_recovery = { 'codex-subscription': { profile_id: 'codex-subscription', account_key: accountKey, model: 'gpt-6-astra', reasoning_effort: 'medium', ok: true, started_at: new Date(nowMs - 1).toISOString(), observed_at: new Date(nowMs).toISOString() } };
+  const recovered = apply(proof);
   assert.equal(recovered.length, 6);
   assert(recovered.every(x => x.toProfile === 'codex-subscription' && x.reason === 'preferred_provider_recovered:codex'));
   assert.equal(effects.filter(x => x.command === 'pm2').length, 12);
