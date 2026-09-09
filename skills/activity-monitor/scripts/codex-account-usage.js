@@ -4,6 +4,10 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 
+export function rawCodexQuotaProbeBin() {
+  return process.env.CODEX_QUOTA_PROBE_BIN || path.join(path.dirname(process.execPath), 'codex');
+}
+
 export const CODEX_QUOTA_CACHE_MS = 120_000;
 const MAX_RPC_BYTES = 1_000_000;
 const fail = (code) => Object.assign(new Error(code), { code });
@@ -163,7 +167,7 @@ function freshCache(cache, accountKey, nowMs, maxAgeMs) {
 
 export async function fetchCodexAccountUsage({
   codexHome = process.env.CODEX_SUBSCRIPTION_HOME || path.join(os.homedir(), '.codex-subscription'),
-  codexBin = process.env.CODEX_BIN || (fs.existsSync(path.join(os.homedir(), '.local/bin/codex')) ? path.join(os.homedir(), '.local/bin/codex') : 'codex'),
+  codexBin = rawCodexQuotaProbeBin(),
   cacheFile = path.join(codexHome, 'zylos-rate-limits-cache.json'),
   cacheMaxAgeMs = CODEX_QUOTA_CACHE_MS,
   now = () => new Date().toISOString(),
