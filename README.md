@@ -364,7 +364,155 @@ zylos upgrade --self --beta   # Check for beta/prerelease versions
 zylos uninstall --self        # Uninstall zylos entirely
 zylos list                    # List installed components
 zylos search [keyword]        # Search component registry
+zylos upstream status --resolved # Inspect upstream configuration without networking
+zylos upstream refresh       # Refresh the selected remote profile now
 ```
+
+### Upstream routing
+
+After installing Zylos through the official installation method, you can route
+core's GitHub requests through your deployment's API, raw-file and download
+endpoints. Caddy uses the same routes. npm settings remain deployment-owned;
+LLM endpoints and the official Claude installer keep their existing behavior.
+
+```bash
+# Use the URLs supplied by your deployment administrator.
+export npm_config_registry=https://registry.example.com
+export npm_config_better_sqlite3_binary_host_mirror=https://binary.example.com/better-sqlite3
+zylos init --upstream-config https://config.example.com/profile.json
+
+# Or select a fixed local profile:
+zylos init --upstream-config /absolute/path/profile.json
+```
+
+Editable profile template: [templates/upstreams.example.json](templates/upstreams.example.json).
+It starts with the official endpoints; copy it outside the repository and edit
+your private deployment copy before selecting it with `--upstream-config`:
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": "official-1",
+  "providers": {
+    "github": {
+      "apiBase": "https://api.github.com/",
+      "rawBase": "https://raw.githubusercontent.com/",
+      "downloadBase": "https://github.com/"
+    }
+  }
+}
+```
+
+Bases may include a fixed path prefix, but must not include credentials, query
+parameters or fragments. Profiles cannot supply secrets, npm settings or trust
+permissions. Remote profiles require HTTPS.
+There is no built-in regional preset or public proxy service. Private proxy
+addresses belong in deployment-owned files or configuration services, outside
+the open-source repository. A local file may be named `cn.json`; its filename
+has no special meaning to core. `--upstream-config direct` explicitly selects
+the official endpoints. The same option accepts a local file or HTTPS URL.
+The exact value `direct` is reserved; use `./direct` for a file with that name.
+Other URL schemes are rejected; ordinary paths select local files.
+
+**Redirect ownership:** the profile replaces only the initial GitHub request
+entry. Zylos follows subsequent `Location` URLs with HTTPS and token checks for
+custom routes; it does not rewrite each redirect through the profile again.
+The mirror service must handle the complete archive/release download chain,
+including codeload and asset hosts: either follow redirects server-side and
+stream the file, or return mirror URLs with explicit routes to the original
+targets. Preserve target paths, query strings and signed URL semantics. A mirror
+that promises full coverage must fail explicitly on unsupported targets instead
+of sending clients back to an unreachable official host. Client token trust does
+not control the mirror's internal credential forwarding; the service must enforce
+that separately. Validate the deployed mirror with cold-cache archive and release
+downloads while client access to official hosts is blocked. A successful first
+request alone does not establish mirror compatibility.
+
+Remote profile retrieval requires **curl 7.54.0 or newer** for
+`--suppress-connect-headers`; check with `curl --version`. On older curl, use a
+local profile via `--upstream-config` or have the deployment administrator
+provide a supported curl before selecting a remote profile.
+
+Profile retrieval uses curl, like the GitHub downloads, and inherits curl's
+proxy environment (`HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `NO_PROXY`, etc.).
+Set these in the environment that launches Zylos. No `NODE_USE_ENV_PROXY`
+setting is needed. JSON and schema validation remain in Node. Profiles never
+receive the GitHub token, and HTTPS and redirect checks still apply at every
+hop. The profile downloader disables `.curlrc` loading so local curl options
+cannot inject authentication or bypass those checks. A local profile file
+selected with `--upstream-config` avoids the configuration-service request.
+
+Source selection is CLI > process environment > saved settings > direct.
+The sole source environment variable is `ZYLOS_UPSTREAM_CONFIG`, accepting
+the same file, HTTPS URL or `direct` values as `--upstream-config`.
+An empty selected value is an error; unset the variable to use the saved/default source.
+Endpoints combine official defaults with the selected profile; local settings
+do not contain endpoint overrides. `direct` always uses the official endpoints,
+while the local token trust policy remains independent. Unknown or removed
+source inputs and invalid local settings fail explicitly; a valid CLI source
+does not bypass validation of removed environment inputs.
+Both CLI flags and environment source overrides apply only to the current process,
+including successful init; neither changes the saved default source. To configure
+later commands explicitly:
+
+```bash
+zylos upstream set ./cn.json     # validate a local profile and save its absolute path
+zylos upstream set https://config.example.com/upstream.json  # save URL without fetching
+zylos upstream set direct        # save an explicit official default
+zylos upstream clear             # remove only the saved source
+zylos upstream                   # read-only status, including source and selectedBy
+```
+
+Only `upstream set/clear` writes the saved source in
+`$ZYLOS_DIR/.zylos/upstreams.json`. Set validates local profile content or HTTPS
+URL syntax before writing; the next consuming command fetches a saved URL.
+These configuration commands ignore `ZYLOS_UPSTREAM_CONFIG` and reject the
+`--upstream-config` flag: the positional value is what gets saved.
+Clear preserves trust, remote cache and user profile files, and creates no
+settings file if absent. `set direct` and `clear` choose the same endpoints
+without overrides, but status reports `saved` for the former and `default` for
+the latter. Both are still overridden by CLI/environment selections.
+For continued ENV use, the deployment must keep providing the variable.
+Removing it restores the saved source or official default; response caching
+never selects a source by itself. An unconfigured init creates neither an
+upstream settings file nor an upstream cache.
+
+Remote snapshots are cached separately in `.zylos/upstreams-cache.json` for
+24 hours. Upstream-consuming operations refresh expired snapshots, then keep
+one snapshot through the operation and rollback. Ordinary agent startup does
+not refresh profiles. Failed automatic refresh warns and uses a valid cache
+from the same source; first use without a valid cache fails. Explicit refresh
+failure returns nonzero. `upstream status --resolved` is read-only and shows
+the effective routes, cache state and token policy.
+
+Custom hosts do not receive GitHub tokens by default. Any opt-in belongs in
+the local settings' `trust` object (`forwardGitHubToken` and `allowedHosts`),
+never in a remote profile; redirects are checked at each hop. A request that
+starts at a custom endpoint retains this rule throughout its redirect chain,
+even when redirected to an official GitHub host. For private downloads, include
+each host that needs authentication in `allowedHosts` (including official
+redirect destinations), and set `forwardGitHubToken: true`. Redirecting does
+not grant token permission automatically. Custom GitHub routes also disable
+`.curlrc` loading so its auto-follow or authentication options cannot bypass
+these checks. The legacy official direct transport retains its existing behavior.
+
+Persist the two npm variables, and `ZYLOS_UPSTREAM_CONFIG` if used, in the
+environment that starts your supervisor, including after a reboot. The default
+runtime manifest inherits all three names.
+Existing installations retain their customized `.zylos/runtime-env.manifest`:
+add `inherit ZYLOS_UPSTREAM_CONFIG`, `inherit npm_config_registry` and
+`inherit npm_config_better_sqlite3_binary_host_mirror` there if absent. If you
+store the values in `.env` instead, add the corresponding `env NAME` directives.
+A shell export alone does not update an already-running supervisor. Use the
+same ordinary user and writable npm global prefix for init and upgrades;
+`sudo npm` requires separate environment/permission verification.
+
+The npm registry does not redirect git dependencies or arbitrary installer
+downloads. The binary-host variable covers better-sqlite3's supported
+prebuild-install path, not source-build Node headers; validate prebuilds with
+empty caches and no compiler. China-network and international acceptance must
+run in isolated environments. Official first install, OS setup, Claude's
+official installer and LLM traffic are outside the zero-direct-request claim.
 
 ---
 

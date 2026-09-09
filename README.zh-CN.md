@@ -361,6 +361,120 @@ zylos search [keyword]        # 搜索组件注册表
 
 ---
 
+### 上游路由
+
+通过现有官方方式安装 Zylos 后，可以为 core 的 GitHub API、raw 文件和下载请求
+配置部署方提供的入口；Caddy 复用相同路由。npm 配置由部署环境管理，LLM 端点
+和 Claude 官方安装器保持原有行为。
+
+```bash
+# 替换为部署管理员提供的实际地址。
+export npm_config_registry=https://registry.example.com
+export npm_config_better_sqlite3_binary_host_mirror=https://binary.example.com/better-sqlite3
+zylos init --upstream-config https://config.example.com/profile.json
+
+# 或选用固定的本地配置快照：
+zylos init --upstream-config /absolute/path/profile.json
+zylos upstream status --resolved  # 只读查看，不联网
+zylos upstream refresh            # 主动刷新远程配置
+```
+
+可编辑模板见 [templates/upstreams.example.json](templates/upstreams.example.json)。
+模板默认填写官方地址；复制到仓库之外，修改为自己的端点，再通过 `--upstream-config` 指定。
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": "official-1",
+  "providers": {
+    "github": {
+      "apiBase": "https://api.github.com/",
+      "rawBase": "https://raw.githubusercontent.com/",
+      "downloadBase": "https://github.com/"
+    }
+  }
+}
+```
+
+入口允许固定路径前缀，不接受内嵌凭据、query 或 fragment。远程配置只提供端点，
+不能下发秘密、npm 配置或信任授权；必须使用 HTTPS。
+不提供内置地区预设或公共代理服务。私有代理地址应保存在开源仓库之外的部署配置文件
+或配置服务中。本地文件可以叫 `cn.json`，core 不赋予文件名特殊含义。
+`--upstream-config` 统一接受本地文件、HTTPS URL 或 `direct`。
+`direct` 精确值为保留字，显式使用官方端点；同名本地文件请写 `./direct`。
+其他 URL 协议明确报错，普通路径按本地文件处理。
+
+**跳转职责：**profile 只替换首次 GitHub 请求入口。Zylos 对自定义路由继续按
+`Location` 跟随跳转并检查 HTTPS/token 授权，不会再把每一跳按 profile 改写。
+镜像服务须负责完整的 archive/release 下载链，包括 codeload 和文件存储域名：
+可以在服务端跟随跳转并流式返回文件，也可以返回镜像自己的 URL，由明确路由恢复
+真实目标。须保留目标路径、完整 query 和签名 URL 语义。承诺全程镜像的服务遇到
+不支持的目标应明确失败，不能把客户端重定向回不可达的官方域名。客户端 trust
+不约束镜像内部的凭据转发，服务端须另行控制。实际验收应阻断客户端直连官方域名、
+清空下载缓存，再完整下载源码包和 release 文件；首跳成功不等于镜像可用。
+
+远程配置抓取要求 **curl 7.54.0 或更高版本**，以支持 `--suppress-connect-headers`；
+可用 `curl --version` 检查。旧版 curl 环境可通过 `--upstream-config` 使用本地文件，
+或由部署管理员准备支持的 curl 后再选择远程配置。
+
+配置抓取与 GitHub 下载一样使用 curl，继承 curl 的代理环境（`HTTPS_PROXY`、
+`https_proxy`、`ALL_PROXY`、`NO_PROXY` 等）。将变量设置在启动 Zylos 的环境中，
+无需 `NODE_USE_ENV_PROXY`。JSON 与 schema 校验仍由 Node 完成；配置请求不会携带
+GitHub token，每次跳转仍检查 HTTPS 与目标 URL。配置下载禁用 `.curlrc` 自动加载，
+避免其中的选项注入鉴权或绕过检查。通过 `--upstream-config` 指定本地文件则不请求配置服务。
+
+来源优先级为 CLI > 进程环境 > 保存的选择 > direct 默认。唯一来源环境变量是
+`ZYLOS_UPSTREAM_CONFIG`，与 `--upstream-config` 接受相同的文件、HTTPS URL 或 `direct` 值。
+选中的值为空字符串时明确报错；要恢复保存值或默认值，请撤掉变量。
+端点仅由官方默认值与所选 profile 合成，本机设置不再提供端点覆盖层；
+`direct` 始终使用官方端点，本机 token trust 独立保留。未知或废弃的来源入口、
+无效本机设置明确报错；有效 CLI 来源不会跳过对废弃环境变量的检查。
+CLI flag 和 env 来源都只覆盖当前进程，成功的 init 也不例外，都不改已保存的默认来源。
+长期默认来源需要显式配置：
+
+```bash
+zylos upstream set ./cn.json     # 校验本地 profile，保存绝对路径
+zylos upstream set https://config.example.com/upstream.json  # 保存 URL，不发网络请求
+zylos upstream set direct        # 保存显式官方默认值
+zylos upstream clear             # 只撤销保存的来源
+zylos upstream                   # 只读状态，含来源及 selectedBy
+```
+
+仅 `upstream set/clear` 写入 `$ZYLOS_DIR/.zylos/upstreams.json` 中的默认来源。
+set 先校验本地 profile 内容或 HTTPS URL 语法再保存；远程 URL 在下一次需要上游的命令中获取。
+这两个配置命令忽略 `ZYLOS_UPSTREAM_CONFIG`，拒绝 `--upstream-config` flag，只按显式参数配置。
+clear 保留 trust、缓存和用户的 profile 文件；设置文件不存在时不创建。
+`set direct` 和 `clear` 在没有覆盖时都使用官方端点，但前者状态为 `saved`，后者为 `default`；
+两者都可被 CLI/env 覆盖。长期用 env 需由部署环境持续提供变量；撤掉后恢复已保存来源或官方默认值。
+远程响应缓存不能自行决定来源。全新无配置 init 不创建上游设置文件或缓存。
+
+远程快照独立保存在 `.zylos/upstreams-cache.json`，默认有效 24 小时。需要上游的
+操作开始时检查过期并刷新，整个操作及回滚固定使用同一快照；普通 agent 启动
+不刷新配置。自动刷新失败时提示并使用同来源有效旧缓存，首次无缓存则失败；
+手动刷新失败返回非零。`upstream status --resolved` 只读展示来源、缓存、实际
+路由和 token 策略。
+
+自定义 host 默认收不到 GitHub token。显式授权应写入本地设置的 `trust` 对象
+（`forwardGitHubToken` 与 `allowedHosts`），不能由远程 profile 提供；每次
+重定向都检查授权。从自定义入口开始的请求，整条重定向链都遵循此规则，
+即使跳回官方 GitHub host 也一样。私有下载需要将每个须鉴权的 host（含官方跳转目标）
+写入 `allowedHosts`，并设置 `forwardGitHubToken: true`；重定向本身不授予 token 权限。
+自定义 GitHub 路由同样禁用 `.curlrc` 自动加载，防止其自动跳转或鉴权选项绕过检查；
+原有官方直连传输保持既有行为。
+
+两项 npm 变量，以及使用时的 `ZYLOS_UPSTREAM_CONFIG`，须保存在启动 supervisor 的持久环境中，
+确保机器重启后仍存在。新装默认 runtime 清单继承这三个变量名；已有安装保留自定义的
+`.zylos/runtime-env.manifest`，缺少时应加入 `inherit ZYLOS_UPSTREAM_CONFIG`、`inherit npm_config_registry` 和
+`inherit npm_config_better_sqlite3_binary_host_mirror`。如果变量值保存在 `.env`，
+则加入对应的 `env NAME` 指令。仅在当前 shell export 不会更新已运行 supervisor
+的环境。init 与升级应使用同一普通用户和可写的 npm 全局目录；`sudo npm` 需另验
+变量传递和目录权限。
+
+npm registry 不覆盖 git 依赖或任意安装脚本下载；binary-host 变量只覆盖
+better-sqlite3 受支持的 prebuild-install 路径，不覆盖回退编译所需 Node headers。
+预编译验证须空缓存、无编译器。中国网络与国际回归应在隔离环境验收；官方首装、
+OS 准备、Claude 官方安装及 LLM 请求不属于本期零回源保证。
+
 ## 卸载
 
 ```bash
