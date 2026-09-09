@@ -7,6 +7,7 @@ import { execFileSync } from 'child_process';
 import { readClaudeUsageFromMonitorFiles } from './usage-monitor-file-reader.js';
 import { readCodexUsageFromActiveRollout } from './usage-codex-rollout-reader.js';
 import { fetchCodexAccountUsage } from './codex-account-usage.js';
+import { refreshQuotaRecoveryProofs } from './codex-quota-recovery.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
@@ -254,6 +255,8 @@ export async function runProviderUsageOnce({
   fetchClaudeNativeUsageImpl = fetchClaudeNativeUsage,
   fetchCodexNativeUsageImpl = fetchCodexNativeUsage,
   fetchCodexAccountUsageImpl = fetchCodexAccountUsage,
+  refreshQuotaRecoveryProofsImpl = refreshQuotaRecoveryProofs,
+  zylosDir = ZYLOS_DIR,
   log = console.log,
 } = {}) {
   const fetchedAt = new Date().toISOString();
@@ -270,15 +273,22 @@ export async function runProviderUsageOnce({
       };
     }
   }
-  let codex = await fetchCodexAccountUsageImpl({ codexHome: DEFAULT_CODEX_SUBSCRIPTION_HOME });
+  let codex = await fetchCodexAccountUsageImpl({ codexHome: DEFAULT_CODEX_SUBSCRIPTION_HOME,
+    codexBin: process.env.CODEX_QUOTA_PROBE_BIN || '/usr/bin/codex' });
   if (!codex.available) {
     const nativeCodex = fetchCodexNativeUsageImpl({ now: fetchedAt });
     codex = { ...nativeCodex, available: false, quota_authoritative: false, fetched_at: null,
-      api_error: codex.error || 'quota_probe_failed' };
+      account_key: codex.account_key || null, api_error: codex.error || 'quota_probe_failed' };
   }
+  let document;
+  for (const file of [path.join(zylosDir, 'instances.json'), path.join(zylosDir, '.zylos', 'runtime-profiles.json')]) {
+    try { document = JSON.parse(fs.readFileSync(file, 'utf8')); break; } catch { /* next supported layout */ }
+  }
+  const quotaRecovery = await refreshQuotaRecoveryProofsImpl({ zylosDir, document });
   const payload = {
     updated_at: fetchedAt,
     source_bin: codexbarBin,
+    quota_recovery: quotaRecovery,
     providers: {
       claude,
       codex,
