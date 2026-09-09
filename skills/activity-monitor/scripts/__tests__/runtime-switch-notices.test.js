@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { it } from 'node:test';
-import { processSwitchNotices, switchReady, budgetLines, subscriptionLines, readSwitchBudget } from '../runtime-switch-notices.js';
+import { processSwitchNotices, switchReady, budgetLines, subscriptionLines, readSwitchBudget, sendToAdmin } from '../runtime-switch-notices.js';
 
 const now = Date.parse('2026-09-09T04:00:00Z');
 function fixture(t) {
@@ -74,4 +74,15 @@ it('budget reader only uses existing loopback observer and never exposes auth on
   let calls = 0;
   const result = await readSwitchBudget({ budget_token_file: token }, { fetchImpl: async (url, opts) => { calls++; assert.equal(url, 'http://127.0.0.1:18770/budget'); assert.equal(opts.headers.Authorization, 'Bearer private'); throw Error('private'); } });
   assert.equal(result, null); assert.equal(calls, 1);
+});
+
+it('uses the existing C4 admin identity and explicit AX endpoint with stdin message', () => {
+  let called = false;
+  sendToAdmin({ zylosDir: '/tmp/zylos', endpoint: 'oc_admin', message: '测试', phase: 'started' }, { exec: (_bin, args, opts) => {
+    called = true;
+    assert.deepEqual(args, ['/tmp/zylos/.claude/skills/comm-bridge/scripts/c4-send.js', '--delivery-action=runtime-switch-started', 'feishu', 'oc_admin']);
+    assert.equal(opts.env.ZYLOS_INSTANCE_ID, 'admin');
+    assert.equal(opts.input, '测试');
+  } });
+  assert.equal(called, true);
 });

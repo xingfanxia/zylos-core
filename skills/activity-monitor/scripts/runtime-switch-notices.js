@@ -88,11 +88,11 @@ export function switchReady(change, status, instance, nowMs) {
     && Number(status.last_check) * 1000 <= nowMs + 30_000;
 }
 
-function sendToAdmin({ zylosDir, endpoint, message, phase }) {
-  execFileSync(process.execPath, [path.join(zylosDir, '.claude/skills/comm-bridge/scripts/c4-send.js'),
+export function sendToAdmin({ zylosDir, endpoint, message, phase }, { exec = execFileSync } = {}) {
+  exec(process.execPath, [path.join(zylosDir, '.claude/skills/comm-bridge/scripts/c4-send.js'),
     `--delivery-action=runtime-switch-${phase}`, 'feishu', endpoint], {
     input: message, stdio: ['pipe', 'pipe', 'pipe'], timeout: 15_000,
-    env: { ...process.env, ZYLOS_DIR: zylosDir, ZYLOS_INSTANCE: 'admin' },
+    env: { ...process.env, ZYLOS_DIR: zylosDir, ZYLOS_INSTANCE_ID: 'admin' },
   });
 }
 
