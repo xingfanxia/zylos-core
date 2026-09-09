@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { detectCodexQuotaFromLines, readCodexQuotaFailure } from '../heartbeat/codex-probe.js';
+import { createCodexProbe, detectCodexQuotaFromLines, readCodexQuotaFailure } from '../heartbeat/codex-probe.js';
 
 const sessionId = '01a081b5-cf24-7142-89bd-9aff17199579';
 const failedAt = Date.parse('2026-09-09T13:00:03.908Z');
@@ -76,4 +76,11 @@ test('Azure credentials, dead process and missing evidence do not reuse subscrip
   assert.equal(readCodexQuotaFailure(f).detected, false);
   fs.unlinkSync(f.foregroundFile);
   assert.equal(readCodexQuotaFailure(f).detected, false);
+});
+
+test('healthy polling exposes the same structured detector without pane scanning', t => {
+  const f = fixture(t);
+  const probe = createCodexProbe({ pendingFile: path.join(f.root, 'pending.json') });
+  assert.equal(probe.detectStructuredRateLimit, probe.detectRateLimit);
+  assert.deepEqual(probe.detectStructuredRateLimit(), { detected: false });
 });
