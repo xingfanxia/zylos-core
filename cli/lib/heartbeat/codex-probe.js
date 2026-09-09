@@ -137,7 +137,9 @@ export function createCodexProbe({
   recoveryAckDeadline = 120,
   foregroundFile = path.join(path.dirname(pendingFile), 'foreground-session.json'),
 }) {
+  const detectStructuredRateLimit = () => readCodexQuotaFailure({ foregroundFile });
   return {
+    detectStructuredRateLimit,
 
     // ── HeartbeatEngine probe deps ──────────────────────────────────────────
 
@@ -203,9 +205,7 @@ export function createCodexProbe({
     },
 
     /** Read a definitive quota failure from this engine's current session. */
-    detectRateLimit() {
-      return readCodexQuotaFailure({ foregroundFile });
-    },
+    detectRateLimit: detectStructuredRateLimit,
 
     /**
      * Detect auth-failure text in the Codex pane. HealthEngine verifies this
