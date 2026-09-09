@@ -28,6 +28,19 @@ function createMockDeps() {
 }
 
 describe('HealthEngine', () => {
+  it('records readiness only from a functional ACK, never initial healthy state or process restart', () => {
+    const { deps } = createMockDeps();
+    let now = 1000;
+    const engine = new HealthEngine(deps, { now: () => now });
+    assert.equal(engine.lastFunctionalAckAt, 0);
+    engine.onProcessRestarted(now);
+    assert.equal(engine.lastFunctionalAckAt, 0);
+    now = 2000;
+    engine.onHeartbeatSuccess('primary');
+    assert.equal(engine.lastFunctionalAckAt, 2000);
+    engine.destroy();
+  });
+
   describe('maintenance lifecycle', () => {
     it('keeps HeartbeatEngine as a compatibility alias', () => {
       assert.equal(HeartbeatEngine, HealthEngine);

@@ -181,7 +181,7 @@ describe('Codex quota alert authority', () => {
     writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23+00:00' } });
     monitor.runAlert({ currentTime: now });
     assert.equal(calls.control.length, 1);
-    const text = calls.control[0][2]; assert.match(text, /Weekly \(all models\): 97%/); assert.match(text, /Session \(5h\): unknown/);
+    const text = calls.control[0][2]; assert.match(text, /本周额度已用 97%/); assert.doesNotMatch(text, /unknown|最近 5 小时/);
     assert.match(text, /2026-09-14T00:43:23\.000Z/); assert.doesNotMatch(text, /Session.*0%/);
     monitor.runAlert({ currentTime: now + 10 }); assert.equal(calls.control.length, 1);
   });
@@ -190,7 +190,7 @@ describe('Codex quota alert authority', () => {
     const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
     writeCodexAccountUsage(dir, now, { secondary: null, primary: { used_percent: 97, window_minutes: 300, resets_at: new Date((now + 300) * 1000).toISOString() } });
     monitor.runAlert({ currentTime: now }); assert.equal(calls.control.length, 1);
-    assert.match(calls.control[0][2], /Weekly \(all models\): unknown/); assert.match(calls.control[0][2], /Session \(5h\): 97%/);
+    assert.doesNotMatch(calls.control[0][2], /unknown|本周额度/); assert.match(calls.control[0][2], /最近 5 小时额度已用 97%/);
   });
 
   it('fleet refuses Codex statusline fallback and preserves admin-only unknown monitoring notification', async () => {
@@ -207,7 +207,7 @@ describe('Codex quota alert authority', () => {
     writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23Z' } });
     await monitor.runFleetAlert({ currentTime: now });
     const admin = calls.send.find(call => call.endpoint === 'oc_admin'); assert.ok(admin);
-    assert.match(admin.message, /5h: unknown/); assert.match(admin.message, /weekly: 97%/); assert.match(admin.message, /Codex account API/);
+    assert.doesNotMatch(admin.message, /unknown|最近 5 小时/); assert.match(admin.message, /本周额度已用 97%/); assert.match(admin.message, /服务商/);
   });
 
   it('fleet rechecks provider authority before deferred sends when the source changes after classification', async () => {
@@ -304,7 +304,7 @@ describe('UsageMonitor', () => {
 
     assert.equal(calls.control.length, 1);
     assert.deepEqual(calls.control[0].slice(0, 2), ['enqueue', '--content']);
-    assert.match(calls.control[0][2], /Usage Critical/);
+    assert.match(calls.control[0][2], /额度接近上限/);
     const alertState = JSON.parse(fs.readFileSync(path.join(dir, 'usage-alert-state.json'), 'utf8'));
     assert.equal(alertState.lastObservedTier, 'critical');
     assert.equal(alertState.lastNotifiedTier, 'critical');
@@ -356,7 +356,7 @@ describe('UsageMonitor fleet alert', () => {
     assert.deepEqual(calls.send, []);
   });
 
-  it('with only 1-2 fresh sources, alerts admin only and names the sources (no user fan-out)', async () => {
+  it('with only 1-2 fresh sources, alerts admin only and reports limited source count (no user fan-out)', async () => {
     const { monitor, calls, statuslineFileFor } = makeMonitor();
     const now = Math.floor(Date.now() / 1000);
     seed(statuslineFileFor, ['admin', 'user-pan'], { fiveHour: 96, weekly: 20 }, now);
@@ -367,7 +367,7 @@ describe('UsageMonitor fleet alert', () => {
     const adminSends = calls.send.filter(s => s.endpoint === 'oc_admin');
     assert.equal(userSends.length, 0, 'no user fan-out below quorum');
     assert.equal(adminSends.length, 1);
-    assert.match(adminSends[0].message, /admin|user-pan/); // source instances named
+    assert.match(adminSends[0].message, /最近记录，仅供参考/);
     assert.match(adminSends[0].message, /2/); // usable-source count surfaced
   });
 
@@ -444,7 +444,7 @@ describe('UsageMonitor fleet alert', () => {
     assert.equal(calls.send.filter(s => s.endpoint !== 'oc_admin').length, users1 + 2, 'users notified after interval');
   });
 
-  it('admin text carries 5h% + tier-switch CTA + usable count; user text is zh and short', async () => {
+  it('admin text explains known usage and source count without outdated plan advice', async () => {
     const { monitor, calls, statuslineFileFor } = makeMonitor();
     const now = Math.floor(Date.now() / 1000);
     seed(statuslineFileFor, ['admin', 'user-pan', 'user-limh'], { fiveHour: 96, weekly: 20 }, now);
@@ -454,9 +454,10 @@ describe('UsageMonitor fleet alert', () => {
     const admin = calls.send.find(s => s.endpoint === 'oc_admin');
     const user = calls.send.find(s => s.endpoint === 'oc_pan');
     assert.ok(admin, 'admin send present');
-    assert.match(admin.message, /5h/);
+    assert.match(admin.message, /最近 5 小时/);
     assert.match(admin.message, /96/);
-    assert.match(admin.message, /切换/);
+    assert.match(admin.message, /不代表线路已切换/);
+    assert.doesNotMatch(admin.message, /Max|unknown|模型档位/);
     assert.match(admin.message, /3/); // usable-source count
 
     assert.ok(user, 'user send present');
@@ -538,7 +539,7 @@ describe('UsageMonitor fleet alert', () => {
       const admin = calls.send.find(s => s.endpoint === 'oc_admin');
       assert.ok(admin, 'admin alerted from provider read');
       assert.match(admin.message, /96/);
-      assert.match(admin.message, /直读/);
+      assert.match(admin.message, /服务商/);
       // single trusted source == quorum → tier>=high fans out to users
       assert.ok(calls.send.some(s => s.endpoint === 'oc_pan'), 'user fan-out on provider quorum');
     });
@@ -564,7 +565,7 @@ describe('UsageMonitor fleet alert', () => {
       const admin = calls.send.find(s => s.endpoint === 'oc_admin');
       assert.ok(admin, 'fallback alert fires from statusline data');
       assert.match(admin.message, /96/);
-      assert.match(admin.message, /statusline/);
+      assert.match(admin.message, /最近记录/);
       assert.ok(calls.log.some(l => l.includes('falling back to statusline scan')), 'fallback is logged');
     });
 
