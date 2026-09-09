@@ -183,3 +183,18 @@ if(m.method==='account/rateLimits/read'){const ready=setInterval(()=>{if(fs.exis
   while (running() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(Boolean(running()), false, 'TERM-ignoring descendant must not survive leader exit');
 });
+
+test('quota probe uses the raw CLI beside Node, never the active profile wrapper', async () => {
+  const { rawCodexQuotaProbeBin } = await import('../codex-account-usage.js');
+  const saved = process.env.CODEX_QUOTA_PROBE_BIN;
+  const wrapper = process.env.CODEX_BIN;
+  try {
+    delete process.env.CODEX_QUOTA_PROBE_BIN; process.env.CODEX_BIN = '/profile/wrapper';
+    assert.equal(rawCodexQuotaProbeBin(), path.join(path.dirname(process.execPath), 'codex'));
+    process.env.CODEX_QUOTA_PROBE_BIN = '/explicit/raw/codex';
+    assert.equal(rawCodexQuotaProbeBin(), '/explicit/raw/codex');
+  } finally {
+    if (saved === undefined) delete process.env.CODEX_QUOTA_PROBE_BIN; else process.env.CODEX_QUOTA_PROBE_BIN = saved;
+    if (wrapper === undefined) delete process.env.CODEX_BIN; else process.env.CODEX_BIN = wrapper;
+  }
+});

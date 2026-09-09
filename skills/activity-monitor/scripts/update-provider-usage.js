@@ -6,7 +6,7 @@ import os from 'os';
 import { execFileSync } from 'child_process';
 import { readClaudeUsageFromMonitorFiles } from './usage-monitor-file-reader.js';
 import { readCodexUsageFromActiveRollout } from './usage-codex-rollout-reader.js';
-import { fetchCodexAccountUsage } from './codex-account-usage.js';
+import { fetchCodexAccountUsage, rawCodexQuotaProbeBin } from './codex-account-usage.js';
 import { refreshQuotaRecoveryProofs } from './codex-quota-recovery.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -274,7 +274,7 @@ export async function runProviderUsageOnce({
     }
   }
   let codex = await fetchCodexAccountUsageImpl({ codexHome: DEFAULT_CODEX_SUBSCRIPTION_HOME,
-    codexBin: process.env.CODEX_QUOTA_PROBE_BIN || '/usr/bin/codex' });
+    codexBin: rawCodexQuotaProbeBin() });
   if (!codex.available) {
     const nativeCodex = fetchCodexNativeUsageImpl({ now: fetchedAt });
     codex = { ...nativeCodex, available: false, quota_authoritative: false, fetched_at: null,
