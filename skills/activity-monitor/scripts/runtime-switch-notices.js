@@ -8,6 +8,16 @@ const label = id => ({ admin: '管理员助手', group: '群助手', scheduler: 
 const profile = id => id === 'codex-azure' ? 'Azure' : id === 'codex-subscription' ? 'Codex 订阅' : id === 'claude-subscription' ? 'Claude 订阅' : '备用线路';
 const money = value => `$${(value / 1e6).toFixed(2)}`;
 
+export function formatBeijingReset(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:?\d{2})$/.test(value)) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  return `北京时间 ${new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: 'long', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+  }).format(date)}`;
+}
+
 function save(file, state) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
@@ -19,7 +29,7 @@ export function subscriptionLines(usage, nowMs) {
   const data = usage?.providers?.codex;
   const observed = Date.parse(data?.observed_at || data?.fetched_at || '');
   if (!data?.available || data.quota_authoritative !== true || !Number.isFinite(observed)
-      || nowMs - observed > 180_000 || observed > nowMs + 30_000) return ['Codex 订阅的最新用量暂时取不到，恢复读取后再报告。'];
+      || nowMs - observed > 180_000 || observed > nowMs + 30_000) return ['Codex 订阅的最新用量暂时取不到。'];
   const lines = [];
   for (const window of [data.primary, data.secondary, data.tertiary]) {
     if (!window || !Number.isFinite(window.used_percent)) continue;
@@ -27,7 +37,7 @@ export function subscriptionLines(usage, nowMs) {
     if (Number.isFinite(reset) && reset <= nowMs) continue;
     const name = window.window_minutes >= 10080 ? '本周额度' : window.window_minutes === 300 ? '最近 5 小时额度' : '订阅额度';
     lines.push(`Codex ${name}已用 ${window.used_percent}%，剩余 ${Math.max(0, 100 - window.used_percent)}%。`);
-    if (Number.isFinite(reset)) lines.push(`重置时间：${new Date(reset).toISOString()}（UTC）。`);
+    if (Number.isFinite(reset)) lines.push(`重置时间：${formatBeijingReset(new Date(reset).toISOString())}。`);
   }
   return lines.length ? lines : ['Codex 订阅的最新用量暂时取不到。'];
 }
@@ -42,7 +52,7 @@ export function budgetLines(budget, nowMs) {
     return ['Azure 月额度暂时取不到，不能把未知用量当成零；原有额度限制继续生效。'];
   }
   return [
-    `${budget.members.map(label).join('、')} 三人共用的本月 Azure 预算 ${money(budget.limit_microusd)}（${budget.month_utc}，每月 1 日 UTC 重置）。`,
+    `${budget.members.map(label).join('、')} 三人共用的本月 Azure 预算 ${money(budget.limit_microusd)}（${budget.month_utc}，每月 1 日北京时间 08:00 重置）。`,
     `已用 ${money(budget.spent_microusd)}，正在处理的请求预留 ${money(budget.pending_microusd)}，还可用 ${money(budget.available_microusd)}。`,
     '以上按用量折算。管理员、群助手和定时任务助手不计入这笔共享预算，暂无它们的独立花费读数。',
   ];
@@ -81,6 +91,7 @@ export function switchReady(change, status, instance, nowMs) {
   return instance?.runtime_profile === change.toProfile
     && instance.runtime_profile_changed_at === change.changedAt
     && status?.runtime_profile === change.toProfile && status.health === 'ok'
+    && ['idle', 'busy'].includes(status.state)
     && Number(status.runtime_launch_at) >= Date.parse(change.changedAt)
     && Number(status.functional_ack_at) >= Number(status.runtime_launch_at)
     && Number(status.functional_ack_at) <= nowMs

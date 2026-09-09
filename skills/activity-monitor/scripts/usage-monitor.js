@@ -1,6 +1,7 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { formatBeijingReset } from './runtime-switch-notices.js';
 import { shouldStartUsageCheck } from './usage-check-engine.js';
 import {
   classifyCodexRateLimitWindows,
@@ -790,7 +791,8 @@ function usageLines(data) {
   ]) {
     if (value == null) continue;
     lines.push(`${label}已用 ${value}%，剩余 ${remainingPercent(value)}%。`);
-    if (reset) lines.push(`${label}重置时间：${reset}${/Z$/.test(reset) ? '（UTC）' : ''}。`);
+    const resetLabel = formatBeijingReset(reset);
+    if (resetLabel) lines.push(`${label}重置时间：${resetLabel}。`);
   }
   return lines;
 }
@@ -830,9 +832,9 @@ function formatUserNotification(data, tier) {
   const hot = data.hotWindow === 'weekly'
     ? { pct: data.weeklyAll ?? 0, reset: data.weeklyAllResets, label: '本周' }
     : { pct: data.fiveHour ?? 0, reset: data.fiveHourResets, label: '5小时窗口' };
-  const reset = hot.reset || '稍后';
+  const reset = formatBeijingReset(hot.reset);
   return `⚠️ 系统提示：${providerLabel(data.usageProvider)} 共享额度已用 ${hot.pct}%、剩余 ${remainingPercent(hot.pct)}%` +
-    `（${hot.label}，${reset} 重置）。` +
+    `（${hot.label}${reset ? `，${reset}重置` : ''}）。` +
     `期间回复可能变慢或暂停，重置后自动恢复，无需重复发送。`;
 }
 

@@ -176,13 +176,13 @@ describe('Codex quota alert authority', () => {
     }
   });
 
-  it('genuine fresh weekly-only 97% alerts with unknown session and explicit UTC reset', () => {
+  it('genuine fresh weekly-only 97% alert omits unknown session and formats Beijing reset', () => {
     const { dir, monitor, calls } = makeMonitor({ runtimeId: 'codex' });
     writeCodexAccountUsage(dir, now, { secondary: { used_percent: 97, window_minutes: 10080, resets_at: '2026-09-14T00:43:23+00:00' } });
     monitor.runAlert({ currentTime: now });
     assert.equal(calls.control.length, 1);
     const text = calls.control[0][2]; assert.match(text, /本周额度已用 97%/); assert.doesNotMatch(text, /unknown|最近 5 小时/);
-    assert.match(text, /2026-09-14T00:43:23\.000Z/); assert.doesNotMatch(text, /Session.*0%/);
+    assert.match(text, /北京时间 2026年9月14日 08:43/); assert.doesNotMatch(text, /Session.*0%/);
     monitor.runAlert({ currentTime: now + 10 }); assert.equal(calls.control.length, 1);
   });
 

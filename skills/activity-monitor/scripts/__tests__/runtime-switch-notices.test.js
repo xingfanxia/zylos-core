@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { it } from 'node:test';
-import { processSwitchNotices, switchReady, budgetLines, subscriptionLines, readSwitchBudget, sendToAdmin } from '../runtime-switch-notices.js';
+import { processSwitchNotices, switchReady, budgetLines, subscriptionLines, readSwitchBudget, sendToAdmin, formatBeijingReset } from '../runtime-switch-notices.js';
 
 const now = Date.parse('2026-09-09T04:00:00Z');
 function fixture(t) {
@@ -27,12 +27,12 @@ it('batches two changes once, survives restart/retries, and waits for actual loa
   await f.run(now + 60001); assert.equal(f.calls.length, 1);
   for (const id of ['user-pan', 'user-elaine']) {
     fs.mkdirSync(path.join(f.dir, 'activity-monitor', id), { recursive: true });
-    fs.writeFileSync(path.join(f.dir, 'activity-monitor', id, 'agent-status.json'), JSON.stringify({ health: 'ok', runtime_profile: 'codex-azure', runtime_launch_at: now + 1, functional_ack_at: now - 1, last_check: (now + 60001) / 1000 }));
+    fs.writeFileSync(path.join(f.dir, 'activity-monitor', id, 'agent-status.json'), JSON.stringify({ state: 'idle', health: 'ok', runtime_profile: 'codex-azure', runtime_launch_at: now + 1, functional_ack_at: now - 1, last_check: (now + 60001) / 1000 }));
   }
   await f.run(now + 60001); assert.equal(f.calls.length, 1);
   await f.run(now + 300001); assert.equal(f.calls.at(-1).phase, 'delayed');
   await f.run(now + 360002); assert.equal(f.calls.length, 2);
-  for (const id of ['user-pan', 'user-elaine']) fs.writeFileSync(path.join(f.dir, 'activity-monitor', id, 'agent-status.json'), JSON.stringify({ health: 'ok', runtime_profile: 'codex-azure', runtime_launch_at: now + 1, functional_ack_at: now + 380000, last_check: (now + 400000) / 1000 }));
+  for (const id of ['user-pan', 'user-elaine']) fs.writeFileSync(path.join(f.dir, 'activity-monitor', id, 'agent-status.json'), JSON.stringify({ state: 'idle', health: 'ok', runtime_profile: 'codex-azure', runtime_launch_at: now + 1, functional_ack_at: now + 380000, last_check: (now + 400000) / 1000 }));
   await f.run(now + 400000); assert.equal(f.calls.at(-1).phase, 'ready');
   await f.run(now + 500000); assert.equal(f.calls.length, 3);
 });
@@ -56,9 +56,10 @@ it('a newer switch retires unverified old intent and emits a separate return not
 it('does not confuse startup/process health with a functional ACK', () => {
   const change = { toProfile: 'codex-azure', changedAt: new Date(now).toISOString() };
   const instance = { runtime_profile: change.toProfile, runtime_profile_changed_at: change.changedAt };
-  const status = { runtime_profile: change.toProfile, health: 'ok', runtime_launch_at: now + 1, functional_ack_at: now + 2, last_check: now / 1000 };
+  const status = { state: 'idle', runtime_profile: change.toProfile, health: 'ok', runtime_launch_at: now + 1, functional_ack_at: now + 2, last_check: now / 1000 };
   assert.equal(switchReady(change, status, instance, now + 3), true);
-  for (const patch of [{ functional_ack_at: 0 }, { runtime_profile: 'codex-subscription' }, { runtime_launch_at: now - 1 }, { health: 'degraded' }]) assert.equal(switchReady(change, { ...status, ...patch }, instance, now + 3), false);
+  assert.equal(switchReady(change, { ...status, state: 'busy' }, instance, now + 3), true);
+  for (const patch of [{ functional_ack_at: 0 }, { runtime_profile: 'codex-subscription' }, { runtime_launch_at: now - 1 }, { health: 'degraded' }, { state: 'stopped' }, { state: 'offline' }, { state: 'starting' }, { state: null }]) assert.equal(switchReady(change, { ...status, ...patch }, instance, now + 3), false);
 });
 it('reports one shared capped pool, reservations, exempt helpers, and unknown/stale safely', () => {
   const budget = { checked_at: new Date(now).toISOString(), month_utc: '2026-09', members: ['user-pan', 'user-elaine', 'user-sean'], limit_microusd: 1e9, spent_microusd: 1e8, pending_microusd: 1e7, available_microusd: 8.9e8, billing_basis: 'published_openai_token_equivalent' };
@@ -85,4 +86,11 @@ it('uses the existing C4 admin identity and explicit AX endpoint with stdin mess
     assert.equal(opts.input, '测试');
   } });
   assert.equal(called, true);
+});
+
+it('formats reset times in readable Beijing time including a UTC date rollover', () => {
+  assert.equal(formatBeijingReset('2026-09-15T20:45:46Z'), '北京时间 2026年9月16日 04:45');
+  assert.equal(formatBeijingReset('unknown'), null);
+  assert.equal(formatBeijingReset('2026-09-15T20:45:46'), null);
+  assert.doesNotMatch(subscriptionLines({}, now).join(''), /再报告/);
 });

@@ -741,7 +741,7 @@ function formatDegradedAdminAlert({ cycleCount, windowSec, probeIntervalSec }) {
   return [
     `🔴 ${instance.replace(/^user-/, '')} 暂时无法回复`,
     `过去 ${Math.round(windowSec / 60)} 分钟已尝试恢复 ${cycleCount} 次，但还没有收到正常回应。为避免反复重启，系统已放慢重试。`,
-    `接下来每 ${Math.round(probeIntervalSec / 60)} 分钟自动检查一次；收到的消息会先排队，恢复后继续处理。`,
+    `接下来每 ${Math.round(probeIntervalSec / 60)} 分钟自动检查一次，确认是否恢复。`,
     '这条提醒表示恢复尚未成功，不需要重复发送原来的任务。',
   ].join('\n');
 }
