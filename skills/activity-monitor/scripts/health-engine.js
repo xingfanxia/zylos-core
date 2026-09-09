@@ -140,6 +140,7 @@ export class HealthEngine {
 
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
+    this._lastStructuredQuotaScanAt = 0;
 
     // Flap escalation: kill-restart cycle timestamps (epoch sec) in the rolling
     // hour window. Incremented in triggerRecovery; reset ONLY by a functional
@@ -345,6 +346,19 @@ export class HealthEngine {
   runMaintenanceCycle(agentRunning, currentTime) {
     // Fork: skip processing during cold-start grace period
     if (currentTime < this.warmupUntil) return;
+
+    // A verified terminal provider error does not need a second user message or
+    // a failed periodic heartbeat. Only runtimes with a structured detector use
+    // this path; quoted pane text keeps the existing behavioral checks.
+    if (agentRunning && this.healthState === 'ok' && this.deps.detectStructuredRateLimit
+        && currentTime - this._lastStructuredQuotaScanAt >= 5) {
+      this._lastStructuredQuotaScanAt = currentTime;
+      const limit = this.deps.detectStructuredRateLimit();
+      if (limit?.detected === true && limit.structured === true) {
+        this.enterRateLimited(limit.cooldownUntil || currentTime + this.rateLimitDefaultCooldown, limit.resetTime || '');
+        return;
+      }
+    }
 
     // Track agentRunning transitions for process signal acceleration
     this._trackAgentRunning(agentRunning, currentTime);

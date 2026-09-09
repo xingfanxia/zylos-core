@@ -84,3 +84,25 @@ test('healthy polling exposes the same structured detector without pane scanning
   assert.equal(probe.detectStructuredRateLimit, probe.detectRateLimit);
   assert.deepEqual(probe.detectStructuredRateLimit(), { detected: false });
 });
+
+test('a new in-flight turn clears the old terminal quota signal', () => {
+  const started = JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } });
+  assert.equal(detectCodexQuotaFromLines([quota, started]).detected, false);
+});
+
+test('terminal quota signal reaches automatic Azure selection even with an older low numeric sample', async () => {
+  const { HealthEngine } = await import('../../../skills/activity-monitor/scripts/health-engine.js');
+  const { planSingleSessionRuntimeFailover } = await import('../../../skills/activity-monitor/scripts/runtime-failover.js');
+  const engine = new HealthEngine({ detectStructuredRateLimit: () => detectCodexQuotaFromLines([quota], { sessionId }),
+    readHeartbeatPending: () => null, clearHeartbeatPending() {}, log() {} }, { heartbeatEnabled: false });
+  try {
+    engine.runMaintenanceCycle(true, Math.floor(Date.now() / 1000));
+    const result = planSingleSessionRuntimeFailover({ currentHealth: engine.health,
+      document: { active_profile: 'codex-subscription', runtime_profiles: {
+        'codex-subscription': { runtime: 'codex', usage_provider: 'codex' }, 'codex-azure': { runtime: 'codex', usage_provider: null } },
+        runtime_failover: { enabled: true, chain: ['codex-subscription', 'codex-azure'] } },
+      providerUsage: { providers: { codex: { available: true, primary: { used_percent: 60, resets_at: new Date(Date.now() + 86400000).toISOString() } } } } });
+    assert.equal(result.document.active_profile, 'codex-azure');
+    assert.equal(result.changes[0].reason, 'health_rate_limited:codex-subscription');
+  } finally { engine.destroy(); }
+});
