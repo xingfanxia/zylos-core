@@ -197,6 +197,7 @@ export function parseCodexUsageFromRolloutLines(lines) {
       const weeklyAllPercent = weekly?.used_percent ?? null;
 
       return {
+        observedAt: Number.isFinite(Date.parse(event.timestamp)) ? new Date(event.timestamp).toISOString() : null,
         sessionPercent: fiveHourPercent,
         sessionResets: formatResetTime(fiveHour?.resets_at ?? null),
         fiveHourPercent,
