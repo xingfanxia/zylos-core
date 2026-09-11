@@ -3,13 +3,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import { execFileSync } from 'node:child_process';
 
 import {
+  writeInstancesAtomic,
   chooseRuntimeProfile,
   planRuntimeFailover,
   planSingleSessionRuntimeFailover,
 } from '../runtime-failover.js';
+import { readSubscriptionRotationMarkers } from '../codex-quota-recovery.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
+import { withFileLock } from '../../../multi-session/file-lock.js';
 
 const profiles = {
   'claude-subscription': { runtime: 'claude', usage_provider: 'claude' },
@@ -25,6 +29,385 @@ function usage({ claude = null, codex = null } = {}) {
   };
   return { providers: { claude: provider(claude), codex: provider(codex) } };
 }
+
+describe('model and authoritative quota policy', () => {
+  const nowMs = Date.parse('2026-09-07T13:00:00Z');
+  const pinnedProfiles = {
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'high' },
+  };
+  const policy = {
+    enabled: true,
+    chain: Object.keys(pinnedProfiles),
+    required_model: 'gpt-6-astra',
+    required_reasoning_effort: 'high',
+    usage_max_age_sec: 180,
+    auto_recover: true,
+    min_dwell_sec: 0,
+  };
+  function authoritative(used, extra = {}) {
+    const value = usage({ codex: used });
+    Object.assign(value.providers.codex, {
+      quota_authoritative: true,
+      observed_at: new Date(nowMs).toISOString(),
+      fetched_at: new Date(nowMs).toISOString(),
+      ...extra,
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'codex-subscription', chain: policy.chain, profiles: pinnedProfiles,
+      providerUsage: authoritative(98), requiredModel: policy.required_model,
+      requiredReasoningEffort: policy.required_reasoning_effort, usageMaxAgeMs: 180_000,
+      nowMs, minDwellMs: 0, ...extra,
+    });
+  }
+
+  it('switches providers at the same required model and effort', () => {
+    assert.equal(choose().profile, 'codex-azure');
+    assert.equal(choose({ currentHealth: 'auth_failed', providerUsage: authoritative(30) }).profile, 'codex-azure');
+  });
+
+  it('does not switch to Sol, lower effort, or an unpinned fallback', () => {
+    for (const override of [
+      { model: 'gpt-5.6-sol' }, { reasoning_effort: 'medium' }, { reasoning_effort: 'xhigh' },
+      { model: undefined }, { reasoning_effort: undefined },
+    ]) {
+      const result = choose({ profiles: {
+        ...pinnedProfiles, 'codex-azure': { ...pinnedProfiles['codex-azure'], ...override },
+      } });
+      assert.deepEqual(result, { profile: 'codex-subscription', reason: 'fallback_chain_exhausted' });
+    }
+  });
+
+  it('does not recover or wrap into a different model', () => {
+    const changedProfiles = { ...pinnedProfiles, 'codex-subscription': {
+      ...pinnedProfiles['codex-subscription'], model: 'gpt-5.6-sol',
+    } };
+    for (const extra of [{}, { currentHealth: 'down', wrapOnExhausted: true }]) {
+      assert.equal(choose({ currentProfile: 'codex-azure', profiles: changedProfiles,
+        providerUsage: authoritative(1), ...extra }).profile, 'codex-azure');
+    }
+  });
+
+  it('rejects absent matching profiles and respects quarantine during policy convergence', () => {
+    assert.equal(choose({ requiredModel: 'unavailable-model' }).reason, 'model_policy_has_no_eligible_profile');
+    assert.equal(choose({ currentProfile: 'removed-profile', blockedProfiles: ['codex-subscription'] }).profile, 'codex-azure');
+    assert.equal(choose({ currentProfile: 'removed-profile', blockedProfiles: policy.chain }).reason,
+      'model_policy_has_no_eligible_profile');
+  });
+
+  it('ignores rollout observations, stale or future samples for quota switching and recovery', () => {
+    const invalidSamples = [
+      { quota_authoritative: false }, { quota_authoritative: undefined },
+      { observed_at: new Date(nowMs - 181_000).toISOString() },
+      { observed_at: new Date(nowMs + 31_000).toISOString() },
+      { observed_at: 'invalid-date' }, { observed_at: undefined, fetched_at: undefined },
+    ];
+    for (const extra of invalidSamples) {
+      assert.equal(choose({ providerUsage: authoritative(98, extra) }).profile, 'codex-subscription');
+      assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: authoritative(39, extra) }).profile, 'codex-azure');
+    }
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: authoritative(39) }).profile, 'codex-subscription');
+  });
+
+  it('requires a new observation after a window resets instead of inventing zero usage', () => {
+    const value = authoritative(98);
+    value.providers.codex.primary.resets_at = new Date(nowMs - 1).toISOString();
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: value }).profile, 'codex-azure');
+    assert.equal(choose({ providerUsage: value }).profile, 'codex-subscription');
+  });
+
+  it('wires the same policy through both multi-persona and single-session planners', () => {
+    const document = {
+      runtime_profiles: pinnedProfiles, runtime_failover: policy,
+      instances: { group: { runtime: 'codex', runtime_profile: 'codex-azure', runtime_failover_enabled: true,
+        tmux_session: 'claude-group', marker: 'preserve-me' } },
+    };
+    const multi = planRuntimeFailover({ document, providerUsage: authoritative(39), nowMs });
+    assert.equal(multi.document.instances.group.runtime_profile, 'codex-subscription');
+    assert.equal(multi.document.instances.group.marker, 'preserve-me');
+    assert.equal(planRuntimeFailover({ document, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+    const single = { runtime_profiles: pinnedProfiles, runtime_failover: policy, active_profile: 'codex-azure',
+      persona_id: 'single', tmux_session: 'claude-main' };
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(39), nowMs }).document.active_profile, 'codex-subscription');
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+  });
+});
+
+describe('Claude-primary chain with a pinned Codex Azure fallback', () => {
+  const nowMs = Date.parse('2026-09-24T22:00:00Z');
+  const mixedProfiles = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const chain = Object.keys(mixedProfiles);
+  function claudeUsage(used) {
+    const value = usage({ claude: used });
+    Object.assign(value.providers.claude, {
+      quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'claude-subscription', chain, profiles: mixedProfiles,
+      providerUsage: claudeUsage(10), requiredModel: 'gpt-6-astra', requiredReasoningEffort: 'medium',
+      usageMaxAgeMs: 180_000, switchThreshold: 95, recoverThreshold: 90, nowMs, minDwellMs: 0, ...extra,
+    });
+  }
+
+  it('keeps the Claude tier eligible under the Codex model policy', () => {
+    assert.deepEqual(choose(), { profile: 'claude-subscription', reason: 'no_change' });
+    assert.equal(choose({ currentProfile: 'codex-subscription' }).profile, 'claude-subscription');
+  });
+
+  it('falls back to Azure on Claude quota or health failure', () => {
+    assert.equal(choose({ providerUsage: claudeUsage(95) }).profile, 'codex-azure');
+    assert.equal(choose({ currentHealth: 'rate_limited' }).profile, 'codex-azure');
+  });
+
+  it('returns to Claude only on a current authoritative reading below recovery', () => {
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: claudeUsage(89) }).profile, 'claude-subscription');
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: claudeUsage(92) }).profile, 'codex-azure');
+    const frozen = claudeUsage(10);
+    frozen.providers.claude.quota_authoritative = false;
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: frozen }).profile, 'codex-azure');
+  });
+
+  it('still pins the Codex fallback model and effort', () => {
+    const drifted = { ...mixedProfiles, 'codex-azure': { ...mixedProfiles['codex-azure'], model: 'gpt-5.6-sol' } };
+    assert.deepEqual(choose({ profiles: drifted, providerUsage: claudeUsage(99) }),
+      { profile: 'claude-subscription', reason: 'fallback_chain_exhausted' });
+  });
+});
+
+describe('Claude account pool ahead of Azure', () => {
+  const nowMs = Date.parse('2026-09-24T22:00:00Z');
+  const pool = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'claude-ax-cl': { runtime: 'claude', usage_provider: 'claude-ax-cl', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const chain = Object.keys(pool);
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const choose = (currentProfile, main, cl) => chooseRuntimeProfile({
+    currentProfile, chain, profiles: pool, providerUsage: { providers: { claude: seen(main), 'claude-ax-cl': seen(cl) } },
+    requiredModel: 'gpt-6-astra', requiredReasoningEffort: 'medium', usageMaxAgeMs: 180_000,
+    switchThreshold: 95, recoverThreshold: 90, nowMs, minDwellMs: 0,
+  }).profile;
+
+  it('moves to the second account before Azure and to Azure only when both are full', () => {
+    assert.equal(choose('claude-subscription', 97, 15), 'claude-ax-cl');
+    assert.equal(choose('claude-subscription', 97, 96), 'codex-azure');
+    assert.equal(choose('claude-ax-cl', 97, 96), 'codex-azure');
+  });
+
+  it('returns to the first account once it recovers', () => {
+    assert.equal(choose('codex-azure', 97, 40), 'claude-ax-cl');
+    assert.equal(choose('claude-ax-cl', 20, 40), 'claude-subscription');
+  });
+});
+
+describe('policy hold_profiles for a Claude -> Codex subscription -> Azure chain', () => {
+  const nowMs = Date.parse('2026-09-24T23:00:00Z');
+  const profiles3 = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const plan = (profile, { claude, codex, hold }) => planRuntimeFailover({
+    document: {
+      runtime_profiles: profiles3,
+      runtime_failover: { enabled: true, chain: Object.keys(profiles3), switch_threshold: 95, recover_threshold: 90,
+        min_dwell_sec: 0, auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium',
+        usage_max_age_sec: 180, ...(hold ? { hold_profiles: hold } : {}) },
+      instances: { pan: { runtime_profile: profile, runtime_failover_enabled: true, tmux_session: 'claude-user-pan' } },
+    },
+    providerUsage: { providers: { claude: seen(claude), codex: codex == null ? { available: false } : seen(codex) } },
+    nowMs,
+  }).document.instances.pan.runtime_profile;
+
+  it('uses the Codex subscription between Claude and Azure', () => {
+    assert.equal(plan('claude-subscription', { claude: 97, codex: 40 }), 'codex-subscription');
+    assert.equal(plan('codex-subscription', { claude: 97, codex: 96 }), 'codex-azure');
+  });
+
+  it('skips a held Codex subscription forward even when its usage is unknown', () => {
+    assert.equal(plan('claude-subscription', { claude: 97, codex: null, hold: ['codex-subscription'] }), 'codex-azure');
+  });
+
+  it('keeps recovery to Claude while only the Codex tier is held', () => {
+    assert.equal(plan('codex-azure', { claude: 40, codex: 10, hold: ['codex-subscription'] }), 'claude-subscription');
+    assert.equal(plan('codex-azure', { claude: 97, codex: 10, hold: ['codex-subscription'] }), 'codex-azure');
+    assert.equal(plan('codex-azure', { claude: 97, codex: 10 }), 'codex-subscription');
+  });
+});
+
+describe('policy ineligible_profiles for lapsed Claude subscriptions', () => {
+  const nowMs = Date.parse('2026-09-29T12:00:00Z');
+  const chain = {
+    'claude-ax-backup': { runtime: 'claude', usage_provider: 'claude-ax-backup', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'claude-ax-cl': { runtime: 'claude', usage_provider: 'claude-ax-cl', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const run = (profile, ineligible, { changedAgoMs = 10_000 } = {}) => planRuntimeFailover({
+    document: {
+      runtime_profiles: chain,
+      runtime_failover: { enabled: true, chain: Object.keys(chain), switch_threshold: 95, recover_threshold: 90,
+        min_dwell_sec: 300, auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium',
+        usage_max_age_sec: 180, ...(ineligible ? { ineligible_profiles: ineligible } : {}) },
+      instances: { pan: { runtime: chain[profile].runtime, runtime_profile: profile, runtime_failover_enabled: true,
+        tmux_session: 'claude-user-pan', runtime_profile_changed_at: new Date(nowMs - changedAgoMs).toISOString() } },
+    },
+    providerUsage: { providers: { 'claude-ax-backup': seen(10), 'claude-ax-cl': seen(20), codex: seen(30) } },
+    nowMs,
+  });
+
+  it('leaves a lapsed current tier at once, inside the dwell, without quarantining it', () => {
+    const { document, changes } = run('claude-ax-backup', ['claude-ax-backup']);
+    assert.deepEqual(changes.map(c => [c.toProfile, c.reason]), [['claude-ax-cl', 'plan_ineligible:claude-ax-backup']]);
+    assert.equal(document.instances.pan.runtime_failover_blocked_profiles, undefined);
+  });
+
+  it('skips every lapsed tier and never recovers into one', () => {
+    assert.equal(run('claude-ax-backup', ['claude-ax-backup', 'claude-ax-cl']).changes[0].toProfile, 'codex-subscription');
+    assert.equal(run('codex-subscription', ['claude-ax-backup', 'claude-ax-cl'], { changedAgoMs: 600_000 }).changes.length, 0);
+  });
+
+  it('recovers once the resubscribed tier leaves the list', () => {
+    const { changes } = run('claude-ax-cl', [], { changedAgoMs: 600_000 });
+    assert.equal(changes[0].toProfile, 'claude-ax-backup');
+    assert.match(changes[0].reason, /^preferred_provider_recovered/);
+  });
+});
+
+describe('Codex reserve-model downshift guard', () => {
+  const nowMs = Date.parse('2026-09-24T23:00:00Z');
+  const pinned = {
+    'claude-ax-backup': { runtime: 'claude', usage_provider: 'claude-ax-backup', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const snapshot = (patch = {}) => ({ runtime_profile: 'codex-subscription', actual_model: 'gpt-reserve',
+    actual_model_source: 'rollout_thread_settings', actual_model_observed_at: new Date(nowMs - 20_000).toISOString(),
+    observed_at: new Date(nowMs - 5_000).toISOString(), ...patch });
+  const doc = (instance = {}, extraPolicy = {}) => ({
+    runtime_profiles: pinned,
+    runtime_failover: { enabled: true, chain: Object.keys(pinned), switch_threshold: 95, recover_threshold: 90, min_dwell_sec: 300,
+      auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium', usage_max_age_sec: 180, ...extraPolicy },
+    instances: { pan: { runtime: 'codex', runtime_profile: 'codex-subscription', runtime_failover_enabled: true, tmux_session: 'claude-user-pan',
+      runtime_profile_changed_at: new Date(nowMs - 60_000).toISOString(), ...instance } },
+  });
+  const usageAll = (claude, codex) => ({ providers: { 'claude-ax-backup': seen(claude), codex: seen(codex) } });
+
+  it('moves off the reserve model immediately and quarantines the Codex tier', () => {
+    const { document, changes } = planRuntimeFailover({ document: doc(), providerUsage: usageAll(97, 40),
+      modelSnapshots: { pan: snapshot() }, nowMs });
+    assert.equal(changes[0].toProfile, 'codex-azure');
+    assert.equal(changes[0].reason, 'model_downshift:gpt-reserve');
+    assert.equal(document.instances.pan.runtime_failover_blocked_profiles['codex-subscription'].health, 'rate_limited');
+  });
+
+  it('ignores records from another profile, older than the switch, or stale polls', () => {
+    for (const patch of [{ runtime_profile: 'codex-azure' }, { actual_model: 'gpt-6-astra' },
+      { actual_model_observed_at: new Date(nowMs - 120_000).toISOString() }, { observed_at: new Date(nowMs - 600_000).toISOString() }]) {
+      assert.equal(planRuntimeFailover({ document: doc(), providerUsage: usageAll(97, 40),
+        modelSnapshots: { pan: snapshot(patch) }, nowMs }).changes.length, 0);
+    }
+  });
+
+  it('suspends instead of running on the reserve model when no tier is usable, then resumes', () => {
+    const exhausted = doc({ runtime_failover_blocked_profiles: { 'codex-azure': { health: 'degraded' } } });
+    const first = planRuntimeFailover({ document: exhausted, providerUsage: usageAll(97, 40), modelSnapshots: { pan: snapshot() }, nowMs });
+    assert.equal(first.changes[0].suspend, true);
+    assert.equal(first.document.instances.pan.runtime_failover_suspended.reason, 'model_downshift:gpt-reserve');
+    assert.equal(first.document.instances.pan.runtime_profile, 'codex-subscription');
+    const still = planRuntimeFailover({ document: first.document, providerUsage: usageAll(97, 40), nowMs: nowMs + 60_000 });
+    assert.equal(still.changes.length, 0);
+    const resumed = planRuntimeFailover({ document: first.document, providerUsage: usageAll(10, 40), nowMs: nowMs + 120_000 });
+    assert.equal(resumed.changes[0].toProfile, 'claude-ax-backup');
+    assert.equal(resumed.document.instances.pan.runtime_failover_suspended, undefined);
+  });
+});
+
+describe('degraded last-tier recovery', () => {
+  const nowMs = Date.parse('2026-09-09T02:00:00Z');
+  const pinned = Object.fromEntries(['codex-subscription', 'codex-azure'].map(id => [id, {
+    ...profiles[id], model: 'gpt-6-astra', reasoning_effort: 'medium',
+  }]));
+  function authoritative(used = 0, extra = {}) {
+    const value = usage({ codex: used });
+    Object.assign(value.providers.codex, {
+      quota_authoritative: true, observed_at: new Date(nowMs).toISOString(), ...extra,
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'codex-azure', chain: Object.keys(pinned), profiles: pinned,
+      currentHealth: 'degraded', providerUsage: authoritative(),
+      requiredModel: 'gpt-6-astra', requiredReasoningEffort: 'medium', usageMaxAgeMs: 180_000,
+      nowMs, changedAtMs: nowMs - 600_000, minDwellMs: 300_000,
+      autoRecover: true, wrapOnExhausted: false, ...extra,
+    });
+  }
+
+  it('recovers a degraded Azure session into a freshly recovered subscription', () => {
+    assert.deepEqual(choose(), {
+      profile: 'codex-subscription', reason: 'preferred_provider_recovered:codex',
+    });
+  });
+
+  it('does not recover without current authoritative quota below the recovery threshold', () => {
+    for (const providerUsage of [
+      usage(), authoritative(80), authoritative(98),
+      authoritative(0, { quota_authoritative: false }),
+      authoritative(0, { observed_at: new Date(nowMs - 181_000).toISOString() }),
+      authoritative(0, { observed_at: new Date(nowMs + 31_000).toISOString() }),
+      authoritative(0, { primary: { used_percent: 0, resets_at: new Date(nowMs - 1).toISOString() } }),
+    ]) {
+      assert.deepEqual(choose({ providerUsage }), {
+        profile: 'codex-azure', reason: 'fallback_chain_exhausted',
+      });
+    }
+  });
+
+  it('retains quarantine, auto-recovery setting, and model and effort eligibility', () => {
+    for (const extra of [
+      { blockedProfiles: ['codex-subscription'] },
+      { blockedProfiles: { 'codex-subscription': { health: 'auth_failed' } } },
+      { autoRecover: false },
+      ...[{ model: 'gpt-5.6-sol' }, { reasoning_effort: 'high' }].map(override => ({
+        profiles: { ...pinned, 'codex-subscription': { ...pinned['codex-subscription'], ...override } },
+      })),
+    ]) {
+      assert.deepEqual(choose(extra), {
+        profile: 'codex-azure', reason: 'fallback_chain_exhausted',
+      });
+    }
+    assert.deepEqual(choose({ changedAtMs: nowMs - 299_999 }), {
+      profile: 'codex-azure', reason: 'no_change',
+    });
+  });
+
+  it('keeps an available forward fallback ahead of preferred-provider recovery', () => {
+    const forward = 'codex-azure-secondary';
+    assert.deepEqual(choose({ chain: [...Object.keys(pinned), forward],
+      profiles: { ...pinned, [forward]: pinned['codex-azure'] } }), {
+      profile: forward, reason: 'health_degraded:codex-azure',
+    });
+  });
+});
 
 describe('runtime failover selection', () => {
   it('moves Claude subscription to Codex subscription when Claude is full', () => {
@@ -436,4 +819,137 @@ describe('runtime switch signaling', () => {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
   });
+});
+
+
+describe('instances.json atomic access metadata', () => {
+  function fixture(t) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'failover-file-metadata-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const filePath = path.join(dir, 'instances.json');
+    fs.writeFileSync(filePath, '{"before":true}\n', { mode: 0o640 });
+    return { dir, filePath };
+  }
+
+  it('retains the shared supplementary group and mode despite a restrictive daemon umask', (t) => {
+    const alternateGroup = process.getgroups?.().find(gid => gid !== process.getgid());
+    if (alternateGroup === undefined) return t.skip('requires a supplementary group distinct from the writer primary group');
+    const { dir, filePath } = fixture(t);
+    fs.chownSync(filePath, process.getuid(), alternateGroup);
+    const before = fs.statSync(filePath), oldUmask = process.umask(0o077);
+    try {
+      withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, { filePath }));
+    } finally { process.umask(oldUmask); }
+    const after = fs.statSync(filePath);
+    assert.equal(after.uid, before.uid);
+    assert.equal(after.gid, alternateGroup);
+    assert.equal(after.mode & 0o777, 0o640);
+    assert.notEqual(after.ino, before.ino);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filePath)), { after: true });
+    assert.deepEqual(fs.readdirSync(dir), ['instances.json']);
+  });
+
+  it('retains an explicit POSIX ACL across the locked atomic replacement', (t) => {
+    if (process.platform !== 'linux') return t.skip('Linux getfacl/setfacl fixture');
+    try { execFileSync('getfacl', ['--version'], { stdio: 'ignore' }); execFileSync('setfacl', ['--version'], { stdio: 'ignore' }); }
+    catch { return t.skip('POSIX ACL test tools unavailable'); }
+    const { filePath } = fixture(t);
+    execFileSync('setfacl', ['-m', `u:${process.getuid() + 1}:r--`, filePath]);
+    const acl = () => execFileSync('getfacl', ['-cp', filePath], { encoding: 'utf8' });
+    const before = acl();
+    withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, { filePath }));
+    assert.equal(acl(), before);
+    assert.deepEqual(JSON.parse(fs.readFileSync(filePath)), { after: true });
+  });
+
+  it('leaves the original inode, content and permissions intact when metadata copy fails', (t) => {
+    const { dir, filePath } = fixture(t), before = fs.statSync(filePath);
+    assert.throws(() => withFileLock(`${filePath}.lock`, () => writeInstancesAtomic({ after: true }, {
+      filePath,
+      execFileSyncImpl: (_bin, args) => {
+        fs.copyFileSync(filePath, args.at(-1));
+        fs.chmodSync(args.at(-1), 0o600);
+      },
+    })), /access metadata was not preserved/);
+    const after = fs.statSync(filePath);
+    assert.equal(after.ino, before.ino);
+    assert.equal(after.mode, before.mode);
+    assert.equal(fs.readFileSync(filePath, 'utf8'), '{"before":true}\n');
+    assert.deepEqual(fs.readdirSync(dir), ['instances.json']);
+  });
+});
+
+describe('managed account rotation gets first chance before usage fallback', () => {
+  const now = Date.parse('2026-09-13T02:00:00Z');
+  function doc() { return { runtime_profiles: profiles,
+    runtime_failover: { enabled: true, chain: ['codex-subscription', 'codex-azure'], switch_threshold: 95, min_dwell_sec: 300 },
+    instances: { admin: { enabled: true, runtime_failover_enabled: true, runtime_profile: 'codex-subscription' } } }; }
+  const markers = (at, extra = {}) => ({ admin: { 'codex-subscription': {
+    generation: 'a'.repeat(64), available: true, checked_at: at / 1000, ...extra } } });
+  const plan = (document, at, extra = {}) => planRuntimeFailover({ document, nowMs: at,
+    providerUsage: usage({ codex: 95 }), rotationMarkers: markers(at), ...extra });
+  it('waits across daemon restarts and refreshed generations but falls back at the original deadline', () => {
+    const first = plan(doc(), now);
+    assert.deepEqual(first.changes, []); assert.equal(first.stateChanged, true);
+    const saved = JSON.parse(JSON.stringify(first.document));
+    const second = plan(saved, now + 90_000, { rotationMarkers: markers(now + 90_000, { generation: 'b'.repeat(64) }) });
+    assert.deepEqual(second.changes, []); assert.equal(second.stateChanged, false);
+    const last = plan(second.document, now + 120_000);
+    assert.equal(last.changes[0].toProfile, 'codex-azure'); assert.equal(last.changes[0].reason, 'usage_exhausted:codex');
+    assert.equal(last.document.instances.admin.runtime_usage_rotation_wait, undefined);
+  });
+  it('successful fresh low-usage handoff cancels the pending fallback', () => {
+    const first = plan(doc(), now);
+    const next = plan(first.document, now + 60_000, { providerUsage: usage({ codex: 1 }) });
+    assert.deepEqual(next.changes, []); assert.equal(next.stateChanged, true);
+    assert.equal(next.document.instances.admin.runtime_usage_rotation_wait, undefined);
+  });
+  it('missing, stale, malformed, future or exhausted pool evidence never defers fallback', () => {
+    for (const rotationMarkers of [{}, markers(now - 91_000), markers(now, { generation: 'bad' }),
+      markers(now + 31_000), markers(now, { available: false })]) {
+      assert.equal(plan(doc(), now, { rotationMarkers }).changes[0].toProfile, 'codex-azure');
+    }
+  });
+  it('actual native health failures bypass usage grace and preserve existing account-bound holds', () => {
+    for (const health of ['rate_limited', 'auth_failed', 'degraded', 'down']) {
+      const next = plan(doc(), now, { healthByInstance: { admin: health } });
+      assert.equal(next.changes[0].toProfile, 'codex-azure'); assert.match(next.changes[0].reason, /^health_/);
+    }
+  });
+  it('an unknown quota poll cannot re-arm a pending grace period', () => {
+    const first = plan(doc(), now);
+    const unknown = plan(first.document, now + 60_000, { providerUsage: usage({ codex: null }) });
+    assert.deepEqual(unknown.changes, []);
+    assert.equal(plan(unknown.document, now + 120_000).changes[0].toProfile, 'codex-azure');
+  });
+  it('simultaneous rotation-marker and quota gaps cannot renew an expired deadline', () => {
+    const first = plan(doc(), now);
+    const gap = plan(first.document, now + 100_000, { providerUsage: usage({ codex: null }), rotationMarkers: {} });
+    assert.deepEqual(gap.changes, []);
+    assert.equal(plan(gap.document, now + 130_000).changes[0].toProfile, 'codex-azure');
+  });
+  it('single-session planning persists the same bounded wait without changing its route', () => {
+    const multi = doc();
+    const document = { runtime_profiles: multi.runtime_profiles, runtime_failover: multi.runtime_failover, active_profile: 'codex-subscription' };
+    const first = planSingleSessionRuntimeFailover({ document, providerUsage: usage({ codex: 95 }),
+      rotationMarkers: markers(now).admin, nowMs: now });
+    assert.equal(first.stateChanged, true); assert.deepEqual(first.changes, []);
+    const next = planSingleSessionRuntimeFailover({ document: first.document, providerUsage: usage({ codex: 95 }),
+      rotationMarkers: markers(now + 120_000).admin, nowMs: now + 120_000 });
+    assert.equal(next.changes[0].toProfile, 'codex-azure');
+  });
+});
+
+
+it('reads rotation evidence from each configured subscription home, failing closed on missing files', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-markers-'));
+  try {
+    const home = path.join(root, '.codex-subscription'); fs.mkdirSync(home);
+    const marker = { generation: 'a'.repeat(64), available: true, checked_at: 123 };
+    fs.writeFileSync(path.join(home, 'rotation-generation.json'), JSON.stringify(marker));
+    const document = { runtime_profiles: { sub: { usage_provider: 'codex', codex_home: '~/.codex-subscription' } },
+      instances: { admin: {}, tenant: { os_user: 'tenant' } } };
+    assert.deepEqual(readSubscriptionRotationMarkers(document, { homeForUser: user => user ? path.join(root, 'missing') : root }),
+      { admin: { sub: marker }, tenant: { sub: null } });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

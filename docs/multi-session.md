@@ -245,7 +245,11 @@ Directories are created automatically:
 2. Codex writes session history under each configured profile's
    `CODEX_HOME/sessions/.../rollout-*.jsonl`.
 3. `update-token-cache.js` runs from PM2 and merges:
-   - Claude history from `ccusage daily --json --instances --breakdown`
+   - Claude history from `ccusage daily --json --instances --breakdown`:
+     one service-user pass over the shared homes, plus one pass per isolated
+     `os_user` run via `sudo -n -u <os_user>` over that persona's own
+     `.claude` (only aggregate JSON crosses the boundary; a failing persona is
+     recorded in `warnings` without dropping the others)
    - Codex history from the pinned `ccusage@20.0.17 codex session --json`
 4. Zylos maps:
    - Claude project names → instance IDs

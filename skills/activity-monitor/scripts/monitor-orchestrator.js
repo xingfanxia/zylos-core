@@ -1,9 +1,24 @@
 import fs from 'fs';
+import path from 'node:path';
 import {
   WATCHDOG_INTERRUPT_AVAILABLE_IN_SEC,
   evaluateToolWatchdogTransition,
 } from './tool-watchdog.js';
 import { consumeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+
+// Older single-session adapters predate runtimeProfile metadata. Bind the
+// switch signal to the actual runtime and pane in the existing profile file.
+export function startupRuntimeProfile(adapter, env) {
+  if (adapter?.config?.runtimeProfile?.id) return adapter.config.runtimeProfile.id;
+  if (env.ZYLOS_INSTANCE_ID || !env.ZYLOS_DIR) return null;
+  try {
+    const p = JSON.parse(fs.readFileSync(path.join(env.ZYLOS_DIR, '.zylos', 'runtime-profiles.json'), 'utf8'));
+    const selected = p.runtime_profiles?.[p.active_profile];
+    if (p.active_runtime !== adapter.runtimeId || selected?.runtime !== adapter.runtimeId
+        || (p.tmux_session && p.tmux_session !== adapter.sessionName)) return null;
+    return p.active_profile;
+  } catch { return null; }
+}
 
 export class MonitorOrchestrator {
   constructor(deps) {
@@ -52,7 +67,7 @@ export class MonitorOrchestrator {
     const runtimeLaunchAtMs = Number(initialStatus.runtime_launch_at) || nowMs();
 
     const engine = createHealthEngine(adapter, initialStatus);
-    const activeProfile = adapter?.config?.runtimeProfile?.id || null;
+    const activeProfile = startupRuntimeProfile(adapter, env);
     const runtimeSwitchSignal = consumeRuntimeSwitchSignal({
       zylosDir: env.ZYLOS_DIR,
       instanceId: env.ZYLOS_INSTANCE_ID || 'single',
