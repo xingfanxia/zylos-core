@@ -57,8 +57,8 @@ describe('MonitorOrchestrator', () => {
         calls.push(['createHealthEngine', activeAdapter, initialStatus.health]);
         return engine;
       },
-      createGuardian: (activeAdapter, activeToolPipeline, runtimeLaunchAtMs) => {
-        calls.push(['createGuardian', activeAdapter, activeToolPipeline, runtimeLaunchAtMs]);
+      createGuardian: (activeAdapter, activeToolPipeline, runtimeLaunchAtMs, extras) => {
+        calls.push(['createGuardian', activeAdapter, activeToolPipeline, runtimeLaunchAtMs, extras?.monitorDir]);
         return guardian;
       },
       startMessageRouterServer: (activeEngine) => calls.push(['startMessageRouterServer', activeEngine]),
@@ -155,20 +155,30 @@ describe('MonitorOrchestrator', () => {
       'scheduleStaleRuntimeCleanup',
     ]);
     assert.equal(calls.find(([name]) => name === 'startMessageRouterServer')[1], engine);
+    // REL-6: the guardian factory must receive the per-instance monitorDir —
+    // omitting it silently disables the whole suspend/wake gate (the prod bug).
+    assert.equal(calls.find(([name]) => name === 'createGuardian')[4], monitorDir);
   });
 
   it('coordinates runtime liveness tick and restart signaling', async () => {
     const calls = [];
     const engine = {
       id: 'engine',
+      health: 'degraded',
+      isDegradedProbeDue: (currentTime) => {
+        calls.push(['isDegradedProbeDue', currentTime]);
+        return true;
+      },
       start: () => calls.push(['engine.start']),
       setAgentRunning: (running, currentTime) => calls.push(['setAgentRunning', running, currentTime]),
       onProcessRestarted: (currentTime) => calls.push(['onProcessRestarted', currentTime]),
     };
     const guardian = {
       id: 'guardian',
-      tick: async ({ currentTime }) => {
-        calls.push(['guardian.tick', currentTime]);
+      // Live health read: the engine's CURRENT health must reach every tick
+      // (never latched — auth_failed→unavailable flips must un-gate next tick).
+      tick: async ({ currentTime, health, degradedProbeDue }) => {
+        calls.push(['guardian.tick', currentTime, health, degradedProbeDue]);
         return {
           state: 'running',
           attempted_restart: true,
@@ -195,7 +205,8 @@ describe('MonitorOrchestrator', () => {
     assert.deepEqual(calls, [
       ['engine.start'],
       ['checkDailyTruncate'],
-      ['guardian.tick', 123],
+      ['isDegradedProbeDue', 123],
+      ['guardian.tick', 123, 'degraded', true],
       ['setAgentRunning', true, 123],
       ['onProcessRestarted', 123],
     ]);

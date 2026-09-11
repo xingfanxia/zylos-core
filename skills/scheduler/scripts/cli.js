@@ -8,18 +8,49 @@ import { getDb, generateId, now } from './database.js';
 import { getNextRun, isValidCron, describeCron, getDefaultTimezone } from './cron-utils.js';
 import { parseTime, parseDuration, formatTime, getRelativeTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
+import {
+  listTasks, insertTask, completeTask, removeTask, pauseTask, resumeTask,
+  taskHistory, nextTasks, runningTasks, applyTaskUpdates,
+} from './task-ops.js';
+import { shouldUseBroker, brokerCall } from '../../comm-bridge/scripts/c4-client.js';
 
-const db = getDb();
-
-/** Escape special LIKE pattern characters in user input */
-function escapeLike(str) {
-  return str.replace(/[%_!]/g, '!$&');
+// Isolated instances have no direct scheduler.db access — every op routes
+// through the c4-broker 'scheduler' op, which re-runs the same task-ops with
+// the scope forced to the socket-derived caller. Admin/scheduler (and
+// single-session installs) keep the direct path. The DB handle is lazy so an
+// isolated agent never touches the file (it would be EACCES post-harden).
+let _db = null;
+function dbh() {
+  if (!_db) _db = getDb();
+  return _db;
 }
 
-const ALLOWED_UPDATE_COLUMNS = new Set([
-  'name', 'prompt', 'priority', 'require_idle', 'reply_channel', 'reply_endpoint',
-  'miss_threshold', 'type', 'cron_expression', 'interval_seconds', 'next_run_at', 'timezone', 'updated_at'
-]);
+async function schedOp(action, params, direct) {
+  if (shouldUseBroker()) {
+    return await brokerCall('scheduler', { action, ...params });
+  }
+  return direct(dbh());
+}
+
+/** Shared error formatting for task-ops {ok:false} results. */
+function printTaskError(res, taskId, noun = 'task') {
+  if (res.error === 'ambiguous') {
+    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple ${noun}s:`);
+    (res.matches || []).forEach(id => console.error(`  - ${id}`));
+    console.error('Please provide a more specific prefix.');
+  } else if (res.error === 'not_found') {
+    console.error(`Error: ${noun.charAt(0).toUpperCase() + noun.slice(1)} not found: ${taskId}`);
+  } else if (res.error === 'invalid_field') {
+    console.error(`Error: Invalid update field: ${res.field}`);
+  } else if (res.error === 'no_updates') {
+    console.error('Error: No updates provided');
+    console.log('Use --help to see available options');
+  } else if (res.error === 'retarget_forbidden') {
+    console.error('Error: isolated instances cannot change a task\'s target instance');
+  } else {
+    console.error(`Error: ${res.error}`);
+  }
+}
 
 const HELP = `
 Task CLI - Scheduler V2
@@ -57,6 +88,7 @@ Add Options:
   --reply-channel "<source>"      Reply channel (e.g., "telegram", "lark")
   --reply-endpoint "<endpoint>"  Reply endpoint (e.g., "8101553026", "chat_id topic_id")
   --miss-threshold <seconds>  Skip if overdue by more than this (default=300)
+  --target-instance <id>  Target a specific instance (multi-session)
 
 Update Options (same as Add, plus):
   --prompt "<prompt>"     Update task content
@@ -64,6 +96,7 @@ Update Options (same as Add, plus):
                           Disable block-queue-until-idle behavior
                           Legacy alias: --no-require-idle
   --clear-reply           Clear reply configuration
+  --target-instance <id>  Set target instance (empty string clears it)
 
 Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Say hello" --in "30 minutes"
@@ -121,19 +154,14 @@ function parseArgs(args) {
 
 // ===== Commands =====
 
-function cmdList(options = {}) {
+async function cmdList(options = {}) {
   // Show all active tasks including failed ones (so user can see what timed out)
-  let sql = `
-    SELECT * FROM tasks
-    WHERE (status != 'completed' OR type != 'one-time')
-  `;
-  const params = [];
-  if (options['reply-channel']) {
-    sql += ` AND reply_channel = ?`;
-    params.push(options['reply-channel']);
-  }
-  sql += ` ORDER BY priority ASC, next_run_at ASC`;
-  const tasks = db.prepare(sql).all(...params);
+  const replyChannel = options['reply-channel'] || null;
+  const tasks = await schedOp(
+    'list',
+    { replyChannel },
+    (db) => listTasks(db, { replyChannel }),
+  );
 
   if (options.json) {
     console.log(JSON.stringify(tasks, null, 2));
@@ -157,8 +185,9 @@ function cmdList(options = {}) {
     const nextRun = task.status === 'completed' ? 'done'.padEnd(18) :
                     formatTime(task.next_run_at).padEnd(18);
     const name = task.name || task.prompt.substring(0, 30);
+    const instanceTag = task.target_instance ? ` [->${ task.target_instance}]` : '';
 
-    console.log(`  ${id} | ${pri} | ${type} | ${status} | ${nextRun} | ${name}`);
+    console.log(`  ${id} | ${pri} | ${type} | ${status} | ${nextRun} | ${name}${instanceTag}`);
 
     // Show prompt (truncated to 80 chars)
     const promptPreview = task.prompt.substring(0, 80).replace(/\n/g, ' ');
@@ -167,7 +196,7 @@ function cmdList(options = {}) {
   console.log();
 }
 
-function cmdAdd(args, options) {
+async function cmdAdd(args, options) {
   const prompt = args.join(' ');
 
   if (!prompt) {
@@ -238,35 +267,35 @@ function cmdAdd(args, options) {
     return;
   }
 
-  const taskId = generateId();
-  const currentTime = now();
+  // Parse target-instance (multi-session)
+  const targetInstance = options['target-instance'] || null;
 
-  db.prepare(`
-    INSERT INTO tasks (
-      id, name, prompt, type,
-      cron_expression, interval_seconds,
-      next_run_at, priority, status,
-      require_idle, miss_threshold,
-      reply_channel, reply_endpoint,
-      created_at, updated_at, timezone
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    taskId,
-    options.name || prompt.substring(0, 40),  // Default name to truncated prompt
+  const currentTime = now();
+  const spec = {
+    id: generateId(),
+    name: options.name || prompt.substring(0, 40),  // Default name to truncated prompt
     prompt,
     type,
-    cronExpression || null,
-    intervalSeconds || null,
-    nextRunAt,
+    cron_expression: cronExpression || null,
+    interval_seconds: intervalSeconds || null,
+    next_run_at: nextRunAt,
     priority,
-    requireIdle,
-    missThreshold,
-    replyChannel,
-    replyEndpoint,
-    currentTime,
-    currentTime,
-    getDefaultTimezone()
-  );
+    require_idle: requireIdle,
+    miss_threshold: missThreshold,
+    reply_channel: replyChannel,
+    reply_endpoint: replyEndpoint,
+    created_at: currentTime,
+    updated_at: currentTime,
+    timezone: getDefaultTimezone(),
+    target_instance: targetInstance,
+  };
+
+  // Broker path: id/timestamps/target_instance are regenerated server-side
+  // (target is always forced to this instance — agents cannot schedule work
+  // onto another instance).
+  const res = await schedOp('add', { spec }, (db) => insertTask(db, spec));
+  if (!res.ok) return printTaskError(res, spec.id);
+  const taskId = res.task.id;
 
   console.log(`\nTask created: ${taskId}`);
   console.log(`  Type: ${type}`);
@@ -279,178 +308,67 @@ function cmdAdd(args, options) {
   console.log();
 }
 
-function cmdRemove(taskId) {
+async function cmdRemove(taskId) {
   if (!taskId) {
     console.error('Error: Task ID is required');
     return;
   }
 
-  // Support partial ID match
-  const tasks = db.prepare(`
-    SELECT id FROM tasks WHERE id LIKE ? ESCAPE '!'
-  `).all(escapeLike(taskId) + '%');
-
-  if (tasks.length === 0) {
-    console.error(`Error: Task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  db.prepare('DELETE FROM tasks WHERE id = ?').run(tasks[0].id);
-  console.log(`Removed task: ${tasks[0].id}`);
+  const res = await schedOp('remove', { prefix: taskId }, (db) => removeTask(db, taskId));
+  if (!res.ok) return printTaskError(res, taskId);
+  console.log(`Removed task: ${res.task.id}`);
 }
 
-function cmdDone(taskId) {
+async function cmdDone(taskId) {
   if (!taskId) {
     console.error('Error: Task ID is required');
     return;
   }
 
-  // Support partial ID match
-  const tasks = db.prepare(`
-    SELECT * FROM tasks WHERE id LIKE ? ESCAPE '!'
-  `).all(escapeLike(taskId) + '%');
+  const res = await schedOp('done', { prefix: taskId }, (db) => completeTask(db, taskId));
+  if (!res.ok) return printTaskError(res, taskId);
 
-  if (tasks.length === 0) {
-    console.error(`Error: Task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  const task = tasks[0];
-
-  const currentTime = now();
-
-  // Update task status
-  db.prepare(`
-    UPDATE tasks
-    SET status = 'completed', last_run_at = ?, updated_at = ?
-    WHERE id = ?
-  `).run(currentTime, currentTime, task.id);
-
-  // Update history entry
-  const historyEntry = db.prepare(`
-    SELECT id, executed_at FROM task_history
-    WHERE task_id = ? AND status = 'started'
-    ORDER BY executed_at DESC LIMIT 1
-  `).get(task.id);
-
-  if (historyEntry) {
-    const durationMs = (currentTime - historyEntry.executed_at) * 1000;
-    db.prepare(`
-      UPDATE task_history
-      SET status = 'success', completed_at = ?, duration_ms = ?
-      WHERE id = ?
-    `).run(currentTime, durationMs, historyEntry.id);
-  }
-
-  console.log(`Completed task: ${task.id}`);
+  console.log(`Completed task: ${res.task.id}`);
 
   // If recurring/interval, scheduler will handle next run
-  if (task.type !== 'one-time') {
+  if (res.task.type !== 'one-time') {
     console.log('(Scheduler will calculate next run time)');
   }
 }
 
-function cmdPause(taskId) {
+async function cmdPause(taskId) {
   if (!taskId) {
     console.error('Error: Task ID is required');
     return;
   }
 
-  const tasks = db.prepare(`
-    SELECT id FROM tasks WHERE id LIKE ? ESCAPE '!' AND status = 'pending'
-  `).all(escapeLike(taskId) + '%');
-
-  if (tasks.length === 0) {
-    console.error(`Error: Pending task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple pending tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  db.prepare(`
-    UPDATE tasks SET status = 'paused', updated_at = ? WHERE id = ?
-  `).run(now(), tasks[0].id);
-
-  console.log(`Paused task: ${tasks[0].id}`);
+  const res = await schedOp('pause', { prefix: taskId }, (db) => pauseTask(db, taskId));
+  if (!res.ok) return printTaskError(res, taskId, 'pending task');
+  console.log(`Paused task: ${res.task.id}`);
 }
 
-function cmdResume(taskId) {
+async function cmdResume(taskId) {
   if (!taskId) {
     console.error('Error: Task ID is required');
     return;
   }
 
-  const tasks = db.prepare(`
-    SELECT id FROM tasks WHERE id LIKE ? ESCAPE '!' AND status = 'paused'
-  `).all(escapeLike(taskId) + '%');
-
-  if (tasks.length === 0) {
-    console.error(`Error: Paused task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple paused tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  db.prepare(`
-    UPDATE tasks SET status = 'pending', updated_at = ? WHERE id = ?
-  `).run(now(), tasks[0].id);
-
-  console.log(`Resumed task: ${tasks[0].id}`);
+  const res = await schedOp('resume', { prefix: taskId }, (db) => resumeTask(db, taskId));
+  if (!res.ok) return printTaskError(res, taskId, 'paused task');
+  console.log(`Resumed task: ${res.task.id}`);
 }
 
-function cmdHistory(taskId) {
-  let query = `
-    SELECT h.*, t.name, t.prompt
-    FROM task_history h
-    JOIN tasks t ON h.task_id = t.id
-  `;
-  let params = [];
+async function cmdHistory(taskId) {
+  const { entries: history, prefixMatches } = await schedOp(
+    'history', { prefix: taskId || null },
+    (db) => taskHistory(db, { prefix: taskId || null })
+  );
 
-  if (taskId) {
-    query += ` WHERE h.task_id LIKE ? ESCAPE '!'`;
-    params.push(escapeLike(taskId) + '%');
+  if (taskId && prefixMatches.length > 1) {
+    console.log(`\n  ⚠ Warning: Prefix '${taskId}' matches ${prefixMatches.length} tasks:`);
+    prefixMatches.forEach(id => console.log(`    - ${id}`));
+    console.log();
   }
-
-  // Check for ambiguous task prefix before querying history
-  if (taskId) {
-    const matchingTasks = db.prepare(`
-      SELECT id FROM tasks WHERE id LIKE ? ESCAPE '!'
-    `).all(escapeLike(taskId) + '%');
-
-    if (matchingTasks.length > 1) {
-      console.log(`\n  ⚠ Warning: Prefix '${taskId}' matches ${matchingTasks.length} tasks:`);
-      matchingTasks.forEach(t => console.log(`    - ${t.id}`));
-      console.log();
-    }
-  }
-
-  query += ' ORDER BY h.executed_at DESC LIMIT 20';
-
-  const history = db.prepare(query).all(...params);
 
   if (history.length === 0) {
     console.log('No execution history.');
@@ -472,13 +390,8 @@ function cmdHistory(taskId) {
   console.log();
 }
 
-function cmdNext() {
-  const tasks = db.prepare(`
-    SELECT * FROM tasks
-    WHERE status = 'pending'
-    ORDER BY next_run_at ASC
-    LIMIT 5
-  `).all();
+async function cmdNext() {
+  const tasks = await schedOp('next', {}, (db) => nextTasks(db));
 
   if (tasks.length === 0) {
     console.log('No pending tasks.');
@@ -493,12 +406,8 @@ function cmdNext() {
   console.log();
 }
 
-function cmdRunning() {
-  const tasks = db.prepare(`
-    SELECT * FROM tasks
-    WHERE status = 'running'
-    ORDER BY updated_at ASC
-  `).all();
+async function cmdRunning() {
+  const tasks = await schedOp('running', {}, (db) => runningTasks(db));
 
   if (tasks.length === 0) {
     console.log('\n  No running tasks. Safe to compact.\n');
@@ -520,30 +429,12 @@ function cmdRunning() {
   console.log('\n  Run "cli.js done <task-id>" to complete them before /compact\n');
 }
 
-function cmdUpdate(taskId, options) {
+async function cmdUpdate(taskId, options) {
   if (!taskId) {
     console.error('Error: Task ID is required');
     return;
   }
 
-  // Support partial ID match
-  const tasks = db.prepare(`
-    SELECT * FROM tasks WHERE id LIKE ? ESCAPE '!'
-  `).all(escapeLike(taskId) + '%');
-
-  if (tasks.length === 0) {
-    console.error(`Error: Task not found: ${taskId}`);
-    return;
-  }
-
-  if (tasks.length > 1) {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple tasks:`);
-    tasks.forEach(t => console.error(`  - ${t.id}`));
-    console.error('Please provide a more specific prefix.');
-    return;
-  }
-
-  const task = tasks[0];
   const updates = {};
   const updatedFields = [];
 
@@ -593,6 +484,13 @@ function cmdUpdate(taskId, options) {
       updates.reply_endpoint = options['reply-endpoint'];
       updatedFields.push('reply_endpoint');
     }
+  }
+
+  // Update target_instance (empty string clears it)
+  if (options['target-instance'] !== undefined) {
+    const val = options['target-instance'];
+    updates.target_instance = (val === '' || val === true) ? null : val;
+    updatedFields.push('target_instance');
   }
 
   // Update miss_threshold
@@ -659,29 +557,16 @@ function cmdUpdate(taskId, options) {
     updatedFields.push('type', 'schedule');
   }
 
-  // Check if any updates were provided
-  if (Object.keys(updates).length === 0) {
-    console.error('Error: No updates provided');
-    console.log('Use --help to see available options');
-    return;
-  }
+  // Column whitelist + empty-updates validation live in applyTaskUpdates;
+  // the broker additionally rejects target_instance changes (retargeting a
+  // task would be a cross-instance message primitive).
+  const res = await schedOp(
+    'update', { prefix: taskId, updates },
+    (db) => applyTaskUpdates(db, taskId, updates)
+  );
+  if (!res.ok) return printTaskError(res, taskId);
 
-  // Build UPDATE query (validate column names against whitelist)
-  updates.updated_at = now();
-  for (const key of Object.keys(updates)) {
-    if (!ALLOWED_UPDATE_COLUMNS.has(key)) {
-      console.error(`Error: Invalid update field: ${key}`);
-      return;
-    }
-  }
-  const setClauses = Object.keys(updates).map(key => `${key} = ?`).join(', ');
-  const values = Object.values(updates);
-
-  db.prepare(`
-    UPDATE tasks SET ${setClauses} WHERE id = ?
-  `).run(...values, task.id);
-
-  console.log(`\nTask updated: ${task.id}`);
+  console.log(`\nTask updated: ${res.task.id}`);
   console.log(`  Updated fields: ${updatedFields.join(', ')}`);
 
   if (scheduleUpdated) {
@@ -693,7 +578,7 @@ function cmdUpdate(taskId, options) {
 
 // ===== Main =====
 
-function main() {
+async function main() {
   try {
     process.env.TZ = loadTimezone();
   } catch (error) {
@@ -706,37 +591,37 @@ function main() {
 
   switch (command) {
     case 'list':
-      cmdList(options);
+      await cmdList(options);
       break;
     case 'add':
-      cmdAdd(args, options);
+      await cmdAdd(args, options);
       break;
     case 'update':
-      cmdUpdate(args[0], options);
+      await cmdUpdate(args[0], options);
       break;
     case 'remove':
     case 'rm':
     case 'delete':
-      cmdRemove(args[0]);
+      await cmdRemove(args[0]);
       break;
     case 'done':
     case 'complete':
-      cmdDone(args[0]);
+      await cmdDone(args[0]);
       break;
     case 'pause':
-      cmdPause(args[0]);
+      await cmdPause(args[0]);
       break;
     case 'resume':
-      cmdResume(args[0]);
+      await cmdResume(args[0]);
       break;
     case 'history':
-      cmdHistory(args[0]);
+      await cmdHistory(args[0]);
       break;
     case 'next':
-      cmdNext();
+      await cmdNext();
       break;
     case 'running':
-      cmdRunning();
+      await cmdRunning();
       break;
     case 'help':
     case '--help':
@@ -751,4 +636,9 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  // Broker/transport failures land here — fail loud, never fall back to a
+  // direct DB path an isolated agent isn't allowed to touch.
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

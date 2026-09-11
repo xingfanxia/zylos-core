@@ -26,7 +26,17 @@ import { getClaudePid } from './claude-pid.js';
 import { findMatchingToolRule, summarizeToolInput } from './tool-rules.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
-const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+// Multi-session (fork): instance-aware monitor directory.
+// When ZYLOS_INSTANCE_ID is set, the AM writes its state into a per-instance subdir;
+// hooks must mirror that so the right tool-events file is written.
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+let MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+if (INSTANCE_ID) {
+  try {
+    const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+    MONITOR_DIR = getMonitorDir(INSTANCE_ID);
+  } catch { /* fall back to default single-session path */ }
+}
 const TOOL_EVENTS_FILE = path.join(MONITOR_DIR, 'tool-events.jsonl');
 const HOOK_ERROR_LOG = path.join(MONITOR_DIR, 'hook-activity-errors.log');
 

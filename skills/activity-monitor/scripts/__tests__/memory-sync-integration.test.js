@@ -58,6 +58,10 @@ function setupTempZylosDir() {
   // defaults to CJS regardless of the repo's ESM setting.
   fs.writeFileSync(path.join(scriptsDir, 'c4-control.js'), CONTROL_STUB);
   fs.writeFileSync(path.join(scriptsDir, 'c4-db.js'), DB_STUB);
+  // The multi-session fork routes unsummarized reads through c4-client.js so
+  // isolated personas never open c4.db directly. Exercise that production
+  // path with the same deterministic count stub.
+  fs.writeFileSync(path.join(scriptsDir, 'c4-client.js'), DB_STUB);
   setUnsummarizedCount(COUNT_ABOVE);
 }
 

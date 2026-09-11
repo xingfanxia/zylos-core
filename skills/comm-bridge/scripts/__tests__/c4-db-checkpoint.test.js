@@ -98,8 +98,8 @@ describe('getUnsummarizedRange', () => {
   });
 
   it('returns all conversations when no checkpoint exists', () => {
-    mod.insertConversation('in', 'telegram', '123', 'msg1');
-    mod.insertConversation('in', 'telegram', '123', 'msg2');
+    mod.insertConversation('in', 'telegram', '123', 'msg1', 'delivered');
+    mod.insertConversation('in', 'telegram', '123', 'msg2', 'delivered');
     const range = mod.getUnsummarizedRange();
     assert.equal(range.count, 2);
     assert.equal(range.begin_id, 1);
@@ -107,14 +107,23 @@ describe('getUnsummarizedRange', () => {
   });
 
   it('returns only conversations after last checkpoint', () => {
-    mod.insertConversation('in', 'telegram', '123', 'msg1');
-    mod.insertConversation('in', 'telegram', '123', 'msg2');
+    mod.insertConversation('in', 'telegram', '123', 'msg1', 'delivered');
+    mod.insertConversation('in', 'telegram', '123', 'msg2', 'delivered');
     mod.createCheckpoint(1, 'Synced 1');
-    mod.insertConversation('in', 'telegram', '123', 'msg3');
+    mod.insertConversation('in', 'telegram', '123', 'msg3', 'delivered');
     const range = mod.getUnsummarizedRange();
     assert.equal(range.count, 2);
     assert.equal(range.begin_id, 2);
     assert.equal(range.end_id, 3);
+  });
+
+  it('ignores pending conversations that were never delivered to the runtime', () => {
+    mod.insertConversation('in', 'telegram', '123', 'delivered-msg', 'delivered');
+    mod.insertConversation('in', 'telegram', '123', 'pending-msg', 'pending');
+    const range = mod.getUnsummarizedRange();
+    assert.equal(range.count, 1);
+    assert.equal(range.begin_id, 1);
+    assert.equal(range.end_id, 1);
   });
 });
 
@@ -124,7 +133,7 @@ describe('getUnsummarizedConversations', () => {
   beforeEach(resetTables);
 
   it('returns all unsummarized conversations', () => {
-    mod.insertConversation('in', 'telegram', '123', 'msg1');
+    mod.insertConversation('in', 'telegram', '123', 'msg1', 'delivered');
     mod.insertConversation('out', 'telegram', '123', 'reply1');
     const rows = mod.getUnsummarizedConversations();
     assert.equal(rows.length, 2);
@@ -133,7 +142,7 @@ describe('getUnsummarizedConversations', () => {
 
   it('respects limit parameter', () => {
     for (let i = 1; i <= 5; i++) {
-      mod.insertConversation('in', 'telegram', '123', `msg${i}`);
+      mod.insertConversation('in', 'telegram', '123', `msg${i}`, 'delivered');
     }
     const rows = mod.getUnsummarizedConversations(2);
     assert.equal(rows.length, 2);
@@ -143,12 +152,20 @@ describe('getUnsummarizedConversations', () => {
   });
 
   it('excludes conversations before checkpoint', () => {
-    mod.insertConversation('in', 'telegram', '123', 'old');
+    mod.insertConversation('in', 'telegram', '123', 'old', 'delivered');
     mod.createCheckpoint(1, 'Synced');
-    mod.insertConversation('in', 'telegram', '123', 'new');
+    mod.insertConversation('in', 'telegram', '123', 'new', 'delivered');
     const rows = mod.getUnsummarizedConversations();
     assert.equal(rows.length, 1);
     assert.equal(rows[0].content, 'new');
+  });
+
+  it('excludes pending conversations from startup context', () => {
+    mod.insertConversation('in', 'telegram', '123', 'delivered-msg', 'delivered');
+    mod.insertConversation('in', 'telegram', '123', 'pending-msg', 'pending');
+    const rows = mod.getUnsummarizedConversations();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].content, 'delivered-msg');
   });
 });
 

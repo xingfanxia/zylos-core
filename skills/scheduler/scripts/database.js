@@ -26,13 +26,29 @@ export function getDb() {
     try {
       guardDatabase(connection, schema);
       connection.pragma('journal_mode = WAL');
+      // Two long-lived writers share this DB (scheduler daemon + c4-broker);
+      // without a busy_timeout a write collision fails immediately with
+      // SQLITE_BUSY instead of briefly queueing.
+      connection.pragma('busy_timeout = 5000');
       db = connection;
-    } catch (error) { connection.close(); throw error; }
+      // Fork: multi-session target_instance column on top of the core chain.
+      ensureTargetInstanceColumn();
+    } catch (error) { db = null; connection.close(); throw error; }
   }
   return db;
 }
 
 
+/**
+ * Fork: add the multi-session target_instance column to an existing tasks table.
+ * Safe to call repeatedly — checks PRAGMA table_info before altering.
+ */
+function ensureTargetInstanceColumn() {
+  const columnNames = new Set(db.pragma('table_info(tasks)').map(c => c.name));
+  if (!columnNames.has('target_instance')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN target_instance TEXT DEFAULT NULL');
+  }
+}
 
 // Clean up old history entries (older than HISTORY_RETENTION_DAYS)
 export function cleanupHistory() {

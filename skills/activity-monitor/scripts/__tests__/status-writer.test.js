@@ -76,6 +76,26 @@ describe('status-writer', () => {
     });
   });
 
+  it('passes degraded through as a public health state', () => {
+    // The dispatcher holds delivery on any health !== 'ok', so 'degraded' must
+    // surface verbatim (not masked as 'unavailable') for held-reason forensics.
+    assert.equal(publicHealth('degraded'), 'degraded');
+
+    const payload = buildStatusPayload({
+      statusObj: { state: 'offline' },
+      healthEngine: {
+        health: 'degraded',
+        healthReason: 'flap_ceiling_7cyc_1h (recovery_timeout)',
+      },
+    });
+
+    assert.deepEqual(payload, {
+      state: 'offline',
+      unavailable_reason: 'flap_ceiling_7cyc_1h (recovery_timeout)',
+      health: 'degraded',
+    });
+  });
+
   it('writes status atomically to the target file', () => {
     const statusFile = tempStatusFile();
     const ok = writeStatus({

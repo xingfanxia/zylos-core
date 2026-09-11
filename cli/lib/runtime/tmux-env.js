@@ -17,6 +17,55 @@ const EMPTY_MANIFEST = Object.freeze({
 });
 
 /**
+ * Read one or more dotenv files without mutating process.env. Later files win,
+ * which lets a persona-owned env override shared runtime defaults. Duplicate
+ * paths/symlinks are read once. Missing or unreadable files are ignored.
+ */
+export function readMergedDotenvVars(filePaths = []) {
+  const vars = {};
+  const seen = new Set();
+  for (const filePath of filePaths) {
+    if (!filePath) continue;
+    let identity = path.resolve(filePath);
+    try { identity = fs.realpathSync(identity); } catch { /* handled by read below */ }
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+
+    let content;
+    try { content = fs.readFileSync(filePath, 'utf8'); } catch { continue; }
+    for (const line of content.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const eqIdx = trimmed.indexOf('=');
+      if (eqIdx < 1) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      if (!VALID_NAME.test(key)) continue;
+      vars[key] = trimmed.slice(eqIdx + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
+    }
+  }
+  return vars;
+}
+
+/**
+ * Return the persona workspace env only when it is a different file from the
+ * shared root env. The launcher runs as the persona and reads this file after
+ * dropping privileges, so the operator process never needs access to it.
+ */
+export function resolvePersonaDotenvPath(zylosDir, instanceCwd) {
+  if (!instanceCwd || path.resolve(instanceCwd) === path.resolve(zylosDir)) return null;
+  const sharedPath = path.join(zylosDir, '.env');
+  const personaPath = path.join(instanceCwd, '.env');
+  try {
+    const personaReal = fs.realpathSync(personaPath);
+    let sharedReal = null;
+    try { sharedReal = fs.realpathSync(sharedPath); } catch { /* root env may be absent */ }
+    return personaReal === sharedReal ? null : personaPath;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Parse runtime-env.manifest content into structured directives.
  * Line-based format: env NAME, inherit NAME, path_prepend PATH, path_append PATH.
  */
@@ -125,6 +174,17 @@ export function parsePathManifest(value, warnings, keyName) {
 }
 
 /**
+ * Give each Zylos instance its own GitHub CLI config directory.
+ * This prevents per-instance agents from inheriting the operator's ~/.config/gh.
+ */
+export function ensureInstanceGhConfigDir(instanceCwd) {
+  const ghConfigDir = path.join(instanceCwd, '.config', 'gh');
+  fs.mkdirSync(ghConfigDir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(ghConfigDir, 0o700); } catch { /* best effort */ }
+  return ghConfigDir;
+}
+
+/**
  * Parse a comma-separated manifest string into validated variable names.
  * Invalid names are skipped and recorded in warnings.
  */
@@ -154,10 +214,6 @@ function _buildPath(processEnv, platform, pathPrepend, pathAppend, execPath) {
     path.join(home, '.claude', 'bin'),
   ];
 
-  // Pin the node binary that's running core — guarantees tmux child processes
-  // use the same node even when the caller's PATH lacks nvm (e.g. PM2).
-  const execDir = execPath ? [path.dirname(execPath)] : [];
-
   const currentParts = (processEnv.PATH || '').split(':').filter(Boolean);
   const nvmParts = currentParts.filter(p => p.includes('.nvm'));
 
@@ -171,6 +227,17 @@ function _buildPath(processEnv, platform, pathPrepend, pathAppend, execPath) {
     '/usr/sbin', '/usr/bin',
     '/sbin', '/bin',
   ];
+
+  // Pin the node binary that's running core — guarantees tmux child processes
+  // use the same node even when the caller's PATH lacks nvm (e.g. PM2).
+  // When node IS a platform/system binary, skip the pin: hoisting a whole
+  // system dir here would shadow its later position and break the documented
+  // "PREPEND before platform/system base paths" contract (dedup keeps the
+  // first occurrence).
+  const execDir = execPath
+    ? [path.dirname(execPath)].filter(
+        d => !systemPaths.includes(d) && !platformPaths.includes(d))
+    : [];
 
   const allParts = [
     ...userDirs, ...execDir, ...nvmParts,

@@ -14,6 +14,9 @@ describe('session-foreground hook', () => {
   it('writes foreground-session.json from SessionStart input', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     process.env.SESSION_FOREGROUND_DISABLE_MAIN = '1';
+    // Agent sessions export ZYLOS_INSTANCE_ID, which switches the hook to a
+    // per-instance monitor dir — clear it so results match every runner env.
+    delete process.env.ZYLOS_INSTANCE_ID;
     const modulePath = new URL('../session-foreground.js', import.meta.url);
     const { handleSessionForeground } = await import(`${modulePath.href}?t=${Date.now()}-${Math.random()}`);
 

@@ -12,6 +12,18 @@ import path from 'path';
 import os from 'os';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+// Primary-only guard: only run upgrade checks on the primary instance
+if (INSTANCE_ID) {
+  try {
+    const { isPrimary } = await import('../../multi-session/instance-config.js');
+    if (!isPrimary(INSTANCE_ID)) {
+      process.exit(0);
+    }
+  } catch { /* if instance-config unavailable, proceed anyway */ }
+}
+
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
 const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
 const COMPONENTS_JSON = path.join(ZYLOS_DIR, '.zylos', 'components.json');
@@ -135,9 +147,11 @@ function main() {
   }
 
   const content = `Component upgrades available: ${upgrades.join(', ')}. When the user next sends a message, mention these available upgrades and ask if they would like to upgrade.`;
-  const result = runC4Control([
+  const enqueueArgs = [
     'enqueue', '--content', content, '--priority', '3', '--no-ack-suffix'
-  ]);
+  ];
+  if (INSTANCE_ID) enqueueArgs.push('--target-instance', INSTANCE_ID);
+  const result = runC4Control(enqueueArgs);
 
   if (result.ok) {
     const match = result.output.match(/control\s+(\d+)/i);
