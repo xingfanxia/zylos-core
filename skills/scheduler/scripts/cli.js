@@ -268,7 +268,7 @@ async function cmdAdd(args, options) {
   }
 
   // Parse target-instance (multi-session)
-  const targetInstance = options['target-instance'] || null;
+  const targetInstance = options['target-instance'] || process.env.ZYLOS_INSTANCE_ID || null;
 
   const currentTime = now();
   const spec = {

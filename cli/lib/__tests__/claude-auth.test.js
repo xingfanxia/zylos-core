@@ -38,6 +38,10 @@ if (mode === 'rate_limit') {
   console.error('rate_limit_error');
   process.exit(1);
 }
+if (mode === 'subscription_disabled') {
+  console.error('Your organization has disabled Claude subscription access for Claude Code');
+  process.exit(1);
+}
 console.error('unknown failure');
 process.exit(1);
 `,
@@ -169,6 +173,23 @@ describe('checkAuth credential fast-path (deterministic, no probe)', () => {
     assert.equal(result.status, 'success');
     assert.match(result.reason, /^credential_present:/);
     assert.equal(fs.existsSync(envCapturePath), false); // probe never spawned
+  });
+
+  it('remotely verifies a present token when the pane reports an auth failure', async () => {
+    process.env.FAKE_CLAUDE_MODE = 'subscription_disabled';
+    fs.rmSync(envCapturePath, { force: true });
+    const claudeDir = path.join(fakeZylosDir, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(claudeDir, 'settings.local.json'),
+      JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: LONG_TOKEN } })
+    );
+
+    const result = await new ClaudeAdapter({}).checkAuth({ requireRemote: true });
+
+    assert.equal(result.status, 'failure');
+    assert.equal(result.reason, 'cli_probe_subscription_disabled');
+    assert.equal(fs.existsSync(envCapturePath), true, 'remote verification must bypass the token-file shortcut');
   });
 
   it('returns success from ~/.claude/.credentials.json claudeAiOauth with a future expiry', async () => {

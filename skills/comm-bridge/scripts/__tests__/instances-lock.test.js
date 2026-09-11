@@ -47,6 +47,16 @@ describe('withFileLock', () => {
     assert.equal(ran, true);
     assert.equal(fs.existsSync(lockDir), false);
   });
+
+  it('does not reclaim a lock whose ownership record is incomplete', () => {
+    const lockDir = path.join(tmp, 'd.lock');
+    fs.mkdirSync(lockDir);
+    assert.throws(
+      () => withFileLock(lockDir, () => {}, { retries: 1, sleepMs: 1 }),
+      /could not acquire/,
+    );
+    assert.equal(fs.existsSync(lockDir), true);
+  });
 });
 
 describe('updateInstancesConfig — concurrent writers keep both updates', () => {

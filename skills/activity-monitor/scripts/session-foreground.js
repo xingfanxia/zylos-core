@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { getClaudePid } from './claude-pid.js';
 import { isManagedClaudeProcess } from './runtime-generation.js';
 
@@ -67,6 +67,6 @@ function runCli() {
   });
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
   runCli();
 }

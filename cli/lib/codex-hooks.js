@@ -365,6 +365,57 @@ function restoreSharedProfileConfigAccess({ globalConfig, runAsUser, execFileSyn
   }
 }
 
+/**
+ * Repair only Codex's mutable state-runtime SQLite files for an isolated
+ * persona. Older operator-owned launches can leave WAL/SHM sidecars unreadable
+ * to the persona; app-server then exits before hook trust can run. Credentials,
+ * config, logs, goals, memories, and every non-state file stay outside this
+ * repair boundary.
+ */
+export function restoreCodexStateRuntimeAccess({
+  homeDir = os.homedir(),
+  codexHome = null,
+  runAsUser = null,
+  execFileSyncImpl,
+} = {}) {
+  if (!runAsUser || !codexHome) return { repaired: [] };
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(runAsUser)) {
+    throw new Error('Codex state access repair refused invalid runtime user');
+  }
+
+  const runtimeRoot = path.resolve(homeDir);
+  const profileRoot = path.resolve(codexHome);
+  const relative = path.relative(runtimeRoot, profileRoot);
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('Codex state access repair refused path outside runtime home');
+  }
+
+  let entries = [];
+  try { entries = fs.readdirSync(profileRoot); } catch { return { repaired: [] }; }
+  const stateFiles = entries
+    .filter(name => /^state(?:_\d+)?\.sqlite(?:-(?:wal|shm))?$/.test(name))
+    .map(name => path.join(profileRoot, name))
+    .filter(file => {
+      try { return fs.lstatSync(file).isFile(); } catch { return false; }
+    })
+    .sort();
+  const execImpl = execFileSyncImpl || execFileSync;
+
+  try {
+    for (const file of stateFiles) {
+      execImpl('sudo', [
+        '-n', 'chown', '--no-dereference', `${runAsUser}:${runAsUser}`, file,
+      ], {
+        timeout: 10_000,
+        stdio: 'ignore',
+      });
+    }
+  } catch (error) {
+    throw new Error(`Codex hook trust failed (state_access_restore). ${error.message}`);
+  }
+  return { repaired: stateFiles };
+}
+
 export function getCodexVersion({ codexBin = process.env.CODEX_BIN || 'codex', execFileSyncImpl } = {}) {
   const execImpl = execFileSyncImpl || execFileSync;
   return String(execImpl(codexBin, ['--version'], {
@@ -626,6 +677,7 @@ export function ensureCodexHooksTrusted({
   // Recover profiles left persona-only by an interrupted/older app-server
   // trust attempt before any validity/config read occurs.
   restoreSharedProfileConfigAccess({ globalConfig, runAsUser, execFileSyncImpl });
+  restoreCodexStateRuntimeAccess({ homeDir, codexHome, runAsUser, execFileSyncImpl });
 
   const codexVersion = getCodexVersion({ codexBin, execFileSyncImpl });
   const validity = isCodexTrustValid({ zylosDir, projectDir, homeDir, codexHome, codexVersion });

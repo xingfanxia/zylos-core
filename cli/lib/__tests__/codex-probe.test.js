@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
-import { createCodexProbe } from '../heartbeat/codex-probe.js';
+import { createCodexProbe, _AUTH_FAILURE_PATTERNS } from '../heartbeat/codex-probe.js';
 
 let tmpDir;
 let originalPath;
@@ -34,6 +34,12 @@ afterEach(() => {
 });
 
 describe('Codex heartbeat routing', () => {
+  it('detects a ChatGPT token refresh failure as an auth signal', () => {
+    assert.ok(_AUTH_FAILURE_PATTERNS.some(pattern =>
+      pattern.test('Your access token could not be refreshed. Please log out and sign in again.')
+    ));
+  });
+
   it('targets the active persona in multi-session mode', () => {
     process.env.ZYLOS_INSTANCE_ID = 'scheduler';
     const probe = createCodexProbe({ pendingFile: path.join(tmpDir, 'pending.json') });

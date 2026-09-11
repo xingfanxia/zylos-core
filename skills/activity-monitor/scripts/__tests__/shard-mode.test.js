@@ -280,7 +280,7 @@ describe('runSessionStartShard (content shards)', () => {
       stdout: out.stdout,
       tmpdir,
       resolveShardImpl: fakeResolver(chain),
-      writeFlagImpl: (sessionId, name) => flags.push(name),
+      writeFlagImpl: (sessionId, name, options) => flags.push([name, options.status]),
       registerExitFlagImpl: fn => fn(),
     });
 
@@ -288,7 +288,7 @@ describe('runSessionStartShard (content shards)', () => {
     assert.ok(text.startsWith('=== ZYLOS STARTUP CONTEXT [1/2] identity ===\n'));
     assert.match(text, /=== IDENTITY UNAVAILABLE ===/);
     assert.match(text, /failed: boom/);
-    assert.deepEqual(flags, ['identity']);
+    assert.deepEqual(flags, [['identity', 'failed']]);
   });
 
   it('spills the full body and inlines a trimmed copy when over budget', async () => {
@@ -477,6 +477,96 @@ describe('runSessionStartShard (side effects)', () => {
       },
     });
     assert.deepEqual(calls, ['prompt']);
+  });
+
+  it('strict startup context blocks the prompt when any shard result is missing', async () => {
+    const tmpdir = makeTmpdir();
+    const out = tempStdout();
+    const calls = [];
+    writeFlag('sess-1', 'references', { tmpdir, roundId: 'round-a' });
+
+    await runSessionStartShard('start-prompt', { session_id: 'sess-1', source: 'startup' }, {
+      stdout: out.stdout,
+      tmpdir,
+      linkMs: 40,
+      requireHealthyContext: true,
+      resolveShardImpl: fakeResolver(chain),
+      actions: {
+        foreground: async () => {},
+        startupPrompt: async () => calls.push('prompt'),
+      },
+    });
+
+    assert.deepEqual(calls, []);
+    assert.match(out.read(), /=== STARTUP CONTEXT BLOCKED ===/);
+    assert.match(out.read(), /identity: missing/);
+    assert.match(out.read(), /Do not continue work or answer external messages/);
+  });
+
+  it('strict startup context blocks the prompt when a shard emitter failed', async () => {
+    const tmpdir = makeTmpdir();
+    const out = tempStdout();
+    const calls = [];
+    writeFlag('sess-1', 'identity', { tmpdir, status: 'failed', roundId: 'round-a' });
+    writeFlag('sess-1', 'references', { tmpdir, roundId: 'round-a' });
+
+    await runSessionStartShard('start-prompt', { session_id: 'sess-1', source: 'startup' }, {
+      stdout: out.stdout,
+      tmpdir,
+      requireHealthyContext: true,
+      resolveShardImpl: fakeResolver(chain),
+      actions: {
+        foreground: async () => {},
+        startupPrompt: async () => calls.push('prompt'),
+      },
+    });
+
+    assert.deepEqual(calls, []);
+    assert.match(out.read(), /identity: failed/);
+  });
+
+  it('strict startup context enqueues only after every shard reports healthy', async () => {
+    const tmpdir = makeTmpdir();
+    const out = tempStdout();
+    const calls = [];
+    writeFlag('sess-1', 'identity', { tmpdir, roundId: 'round-a' });
+    writeFlag('sess-1', 'references', { tmpdir, roundId: 'round-a' });
+
+    await runSessionStartShard('start-prompt', { session_id: 'sess-1', source: 'startup' }, {
+      stdout: out.stdout,
+      tmpdir,
+      requireHealthyContext: true,
+      resolveShardImpl: fakeResolver(chain),
+      actions: {
+        foreground: async () => {},
+        startupPrompt: async () => calls.push('prompt'),
+      },
+    });
+
+    assert.deepEqual(calls, ['prompt']);
+    assert.equal(out.read(), '');
+  });
+
+  it('strict startup context rejects fresh flags from different trigger rounds', async () => {
+    const tmpdir = makeTmpdir();
+    const out = tempStdout();
+    const calls = [];
+    writeFlag('sess-1', 'identity', { tmpdir, roundId: 'previous-round' });
+    writeFlag('sess-1', 'references', { tmpdir, roundId: 'current-round' });
+
+    await runSessionStartShard('start-prompt', { session_id: 'sess-1', source: 'clear' }, {
+      stdout: out.stdout,
+      tmpdir,
+      requireHealthyContext: true,
+      resolveShardImpl: fakeResolver(chain),
+      actions: {
+        foreground: async () => {},
+        startupPrompt: async () => calls.push('prompt'),
+      },
+    });
+
+    assert.deepEqual(calls, []);
+    assert.match(out.read(), /identity: round mismatch/);
   });
 
   it('start-prompt is skipped on compact', async () => {

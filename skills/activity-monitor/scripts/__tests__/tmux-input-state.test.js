@@ -10,13 +10,11 @@ import {
 function createExecStub({ cursorX = '2', cursorY = '5', capture = 'line\n❯ ', failCapture = false } = {}) {
   return (_cmd, args) => {
     const joined = args.join(' ');
-    if (joined.includes('#{cursor_x}')) return cursorX;
-    if (joined.includes('#{cursor_y}')) return cursorY;
     if (joined.includes('capture-pane')) {
       if (failCapture) {
         throw new Error('capture failed');
       }
-      return capture;
+      return `${capture}\n__ZYLOS_CURSOR__ ${cursorX} ${cursorY} $1 1000 %2 123\n`;
     }
     throw new Error(`unexpected call: ${joined}`);
   };
@@ -135,5 +133,16 @@ describe('tmux-input-state', () => {
   it('does not flag normal output as in-progress', () => {
     const capture = 'Some normal output\nMore output\n❯ ';
     assert.equal(hasInProgressCapture(capture), false);
+  });
+
+  it('treats a Codex ghost suggestion at the empty cursor as empty', () => {
+    const state = readTmuxInputState({ sessionName: 'claude-group', execFileSyncImpl: createExecStub({
+      cursorX: '2', cursorY: '1', capture: 'header\n› Ask Codex to do anything'
+    }) });
+    assert.equal(state.inputState, 'empty');
+  });
+
+  it('recognizes Codex working status and its escape hint', () => {
+    assert.equal(hasInProgressCapture('• Working (5s • esc to interrupt)\n› queued input'), true);
   });
 });
