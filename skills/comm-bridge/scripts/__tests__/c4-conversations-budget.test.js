@@ -13,10 +13,29 @@ const SESSION_INIT_URL = pathToFileURL(fileURLToPath(new URL('../c4-session-init
 const REGISTRY_URL = pathToFileURL(
   fileURLToPath(new URL('../../../activity-monitor/scripts/shard-registry.js', import.meta.url)),
 ).href;
+const DB_URL = pathToFileURL(fileURLToPath(new URL('../c4-db.js', import.meta.url))).href;
+
+// Fork: c4-receive stores inbound rows as 'pending' — only the dispatcher marks
+// 'delivered' after REAL processing (the delivered≠processed overhaul). The
+// emitters read delivered rows, so tests simulate the dispatcher's mark here.
+function markAllDelivered(env) {
+  const script = `
+    const db = await import(${JSON.stringify(DB_URL)});
+    const rows = db.getDb().prepare("SELECT id FROM conversations WHERE status='pending'").all();
+    for (const row of rows) db.markDelivered(row.id);
+    db.close();
+  `;
+  const result = spawnSync('node', ['--input-type=module', '-e', script], {
+    env: { ...process.env, ...env },
+    encoding: 'utf8',
+  });
+  assert.equal(result.status, 0, result.stderr);
+}
 
 // c4-config resolves ZYLOS_DIR at module load, so every emitter call runs in
 // a fresh child process with the tmp dir in its environment.
 function emitConversations(env, budget = null) {
+  markAllDelivered(env);
   const script = `
     const mod = await import(${JSON.stringify(SESSION_INIT_URL)});
     const budget = process.env.TEST_BUDGET ? JSON.parse(process.env.TEST_BUDGET) : null;
@@ -31,6 +50,7 @@ function emitConversations(env, budget = null) {
 }
 
 function emitViaRegistry(env) {
+  markAllDelivered(env);
   const script = `
     const { CORE_SHARDS } = await import(${JSON.stringify(REGISTRY_URL)});
     const shard = CORE_SHARDS.find(s => s.name === 'c4-conversations');

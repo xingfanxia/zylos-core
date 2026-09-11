@@ -9,9 +9,11 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { SESSIONS_DIR, loadTimezoneFromEnv, dateInTimeZone } from './shared.js';
+import { SESSIONS_DIR, loadTimezoneFromEnv, dateInTimeZone, resolveSessionsDir } from './shared.js';
 
-const CURRENT_FILE = path.join(SESSIONS_DIR, 'current.md');
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+const EFFECTIVE_SESSIONS_DIR = resolveSessionsDir(INSTANCE_ID);
+const CURRENT_FILE = path.join(EFFECTIVE_SESSIONS_DIR, 'current.md');
 const MAX_ARCHIVE_SUFFIX = 100;
 
 export function findHeaderDate(text) {
@@ -21,14 +23,14 @@ export function findHeaderDate(text) {
 
 export function resolveArchivePath(baseDate, tz) {
   const safeDate = /^\d{4}-\d{2}-\d{2}$/.test(baseDate) ? baseDate : dateInTimeZone(new Date(), tz);
-  let candidate = path.join(SESSIONS_DIR, `${safeDate}.md`);
+  let candidate = path.join(EFFECTIVE_SESSIONS_DIR, `${safeDate}.md`);
 
   if (!fs.existsSync(candidate)) {
     return candidate;
   }
 
   for (let counter = 1; counter <= MAX_ARCHIVE_SUFFIX; counter++) {
-    candidate = path.join(SESSIONS_DIR, `${safeDate}-${counter}.md`);
+    candidate = path.join(EFFECTIVE_SESSIONS_DIR, `${safeDate}-${counter}.md`);
     if (!fs.existsSync(candidate)) {
       return candidate;
     }
@@ -46,7 +48,7 @@ function main() {
   const tz = loadTimezoneFromEnv();
   const today = dateInTimeZone(new Date(), tz);
 
-  fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  fs.mkdirSync(EFFECTIVE_SESSIONS_DIR, { recursive: true });
 
   if (fs.existsSync(CURRENT_FILE)) {
     const currentContent = fs.readFileSync(CURRENT_FILE, 'utf8');
@@ -69,4 +71,4 @@ function main() {
   console.log(`Created fresh current.md for ${today}`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) main();

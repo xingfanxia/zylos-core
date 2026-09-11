@@ -15,6 +15,12 @@ import { ClaudeAdapter } from './claude.js';
 import { CodexAdapter } from './codex.js';
 import { getZylosConfig } from '../config.js';
 
+// Re-export the process-tree util so deployed skill scripts (activity-monitor's
+// monitor.js / proc-sampler.js) can reach it through the same resolved runtime
+// index path they already import the adapter from.
+export { buildProcessTree, findDescendantPid, hasDescendantProcess, findRuntimePidUnderPane } from './process-tree.js';
+import { getInstanceRuntimeProfile } from '../../../skills/multi-session/runtime-files.js';
+
 // ── Runtime registry ──────────────────────────────────────────────────────
 
 /**
@@ -70,8 +76,42 @@ export function getAdapter(name, config) {
  * @param {object} [config] - Optional config override
  * @returns {import('./base.js').RuntimeAdapter}
  */
-export function getActiveAdapter(config) {
+export function getActiveAdapter(config, opts = {}) {
   const cfg = config ?? getZylosConfig();
-  const runtime = cfg.runtime ?? 'claude';
-  return getAdapter(runtime, cfg);
+  const instanceId = opts.instanceId ?? process.env.ZYLOS_INSTANCE_ID ?? null;
+  const profile = getInstanceRuntimeProfile({
+    zylosDir: opts.zylosDir,
+    instanceId,
+    homeDir: opts.homeDir,
+  });
+  assertValidRuntimeProfile(profile, instanceId);
+  return getAdapter(profile.runtime, { ...cfg, runtimeProfile: profile });
+}
+
+/**
+ * Get an adapter instance for a specific instance.
+ * Falls back to the globally configured runtime in single-session mode.
+ *
+ * @param {object} [opts]
+ * @param {string|null} [opts.instanceId]
+ * @param {object} [opts.config]
+ * @param {string} [opts.zylosDir]
+ * @returns {import('./base.js').RuntimeAdapter}
+ */
+export function getAdapterForInstance(opts = {}) {
+  const cfg = opts.config ?? getZylosConfig();
+  const profile = getInstanceRuntimeProfile({
+    zylosDir: opts.zylosDir,
+    instanceId: opts.instanceId,
+    homeDir: opts.homeDir,
+  });
+  assertValidRuntimeProfile(profile, opts.instanceId);
+  return getAdapter(profile.runtime, { ...cfg, runtimeProfile: profile });
+}
+
+function assertValidRuntimeProfile(profile, instanceId) {
+  if (!profile?.id || profile.errors.length === 0) return;
+  throw new Error(
+    `Invalid runtime profile "${profile.id}" for instance "${instanceId}": ${profile.errors.join(', ')}`
+  );
 }

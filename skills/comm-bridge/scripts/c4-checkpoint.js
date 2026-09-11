@@ -9,13 +9,27 @@
  *
  */
 
-import { createCheckpoint, getCheckpoints, getLastCheckpoint, close } from './c4-db.js';
+import { getCheckpoints, close } from './c4-db.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
+
+const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
+
+// Instance-scoped checkpoint functions (optional)
+let _createCheckpointForInstance = null;
+let _getLastCheckpointForInstance = null;
+try {
+  const multiMod = await import('./c4-db-multi.js');
+  _createCheckpointForInstance = multiMod.createCheckpointForInstance;
+  _getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
+} catch {
+  // c4-db-multi.js not available — use global functions
+}
 
 function usage() {
   console.error('Usage: c4-checkpoint.js <command> [options]');
-  console.error('  create <end_conversation_id> [--summary "<summary>"]');
+  console.error('  create <end_conversation_id> [--summary "<summary>"] [--target-instance <id>]');
   console.error('  list [--limit <n>]');
-  console.error('  latest');
+  console.error('  latest [--target-instance <id>]');
 }
 
 function errorExit(message) {
@@ -43,7 +57,7 @@ function parseNumberArg(args, flag) {
   return value;
 }
 
-function handleCreate(args) {
+async function handleCreate(args) {
   if (args.length < 1 || args[0].startsWith('--')) {
     errorExit('create requires <end_conversation_id>');
   }
@@ -55,11 +69,36 @@ function handleCreate(args) {
 
   const summary = parseStringArg(args, '--summary');
 
-  const result = createCheckpoint(endConversationId, summary);
+  // Isolated agents route through the broker (checkpoint forced to caller).
+  if (shouldUseBroker()) {
+    const result = await brokerCall('checkpoint', { endId: endConversationId, summary });
+    console.log('Checkpoint created:', JSON.stringify(result));
+    return;
+  }
+
+  // Checkpoints MUST be instance-scoped. Readers are strictly scoped
+  // (WHERE target_instance = <id>), so an unscoped NULL-target row is
+  // invisible to every instance AND used to bleed via legacy fallbacks —
+  // never write one silently (2026-07-08 NULL-row incident).
+  const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
+  if (!targetInstance) {
+    errorExit('no target instance: set ZYLOS_INSTANCE_ID or pass --target-instance <id> (unscoped NULL-target checkpoints are forbidden)');
+  }
+  if (!_createCheckpointForInstance) {
+    errorExit('c4-db-multi.js unavailable — cannot create an instance-scoped checkpoint');
+  }
+  const result = _createCheckpointForInstance(endConversationId, summary, targetInstance);
   console.log('Checkpoint created:', JSON.stringify(result));
 }
 
 function handleList(args) {
+  // `list` reads ALL instances' checkpoints (no instance filter). Isolated
+  // agents must not use it as an un-brokered cross-tenant read path (MEDIUM-1);
+  // there is no broker op for the global list. shouldUseBroker() also throws
+  // loudly (SPOF) if an isolated agent's broker is down.
+  if (shouldUseBroker()) {
+    errorExit('checkpoint list is not available for isolated instances (admin-only; use `latest`)');
+  }
   const limit = parseNumberArg(args, '--limit');
   if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
     errorExit('--limit must be a positive integer');
@@ -72,15 +111,31 @@ function handleList(args) {
   console.log(JSON.stringify(rows, null, 2));
 }
 
-function handleLatest() {
-  const row = getLastCheckpoint();
+async function handleLatest(args) {
+  if (shouldUseBroker()) {
+    const row = await brokerCall('checkpoint', { latest: true });
+    if (!row) errorExit('no checkpoints found');
+    console.log(JSON.stringify(row, null, 2));
+    return;
+  }
+  // Same scoping rule as create: a global "latest" crosses instances (that
+  // global fallback is how one instance's summary leaked into another's
+  // context) — require an explicit scope instead of silently widening.
+  const targetInstance = parseStringArg(args, '--target-instance') || INSTANCE_ID;
+  if (!targetInstance) {
+    errorExit('no target instance: set ZYLOS_INSTANCE_ID or pass --target-instance <id>');
+  }
+  if (!_getLastCheckpointForInstance) {
+    errorExit('c4-db-multi.js unavailable — cannot read an instance-scoped checkpoint');
+  }
+  const row = _getLastCheckpointForInstance(targetInstance);
   if (!row) {
     errorExit('no checkpoints found');
   }
   console.log(JSON.stringify(row, null, 2));
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
 
@@ -92,13 +147,13 @@ function main() {
   try {
     switch (command) {
       case 'create':
-        handleCreate(args.slice(1));
+        await handleCreate(args.slice(1));
         break;
       case 'list':
         handleList(args.slice(1));
         break;
       case 'latest':
-        handleLatest();
+        await handleLatest(args.slice(1));
         break;
       default:
         usage();
@@ -109,4 +164,7 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

@@ -28,9 +28,10 @@
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
-import { insertConversation, close } from './c4-db.js';
+import { insertConversation, markFailed, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 function printUsage() {
   console.log('Usage: node c4-send.js <channel> <endpoint_id> <<\'EOF\'');
@@ -61,9 +62,21 @@ async function main() {
     printUsage();
   }
 
-  // Remove --stdin flag if present (backward compat)
-  const cleanArgs = args.filter(a => a !== '--stdin');
-  const hasStdinFlag = cleanArgs.length !== args.length;
+  // Flags are removed from the positional args:
+  //  --stdin                  force stdin mode (backward compat)
+  //  --delivery-action=<tag>  tag the out-row audit record (e.g. c4-receive's
+  //                           unhealthy auto-reply uses 'status-notice' so the
+  //                           unanswered-message re-surface ignores it)
+  const hasStdinFlag = args.includes('--stdin');
+  let deliveryAction = null;
+  const cleanArgs = args.filter((a) => {
+    if (a === '--stdin') return false;
+    if (a.startsWith('--delivery-action=')) {
+      deliveryAction = a.slice('--delivery-action='.length) || null;
+      return false;
+    }
+    return true;
+  });
   const stdinAvailable = !process.stdin.isTTY;
 
   const channel = cleanArgs[0];
@@ -71,9 +84,18 @@ async function main() {
   let message = null;
 
   if (cleanArgs.length === 2 && (stdinAvailable || hasStdinFlag)) {
-    // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin
-    endpoint = cleanArgs[1];
-    message = (await readStdin()).trimEnd();
+    // 2 args (channel + endpoint) with piped stdin or --stdin flag: read from stdin.
+    // But a non-interactive stdin (cron, spawn) may simply be empty — in that case
+    // fall back to the documented 2-arg CLI form (channel + message, no endpoint /
+    // broadcast) instead of erroring, so the [endpoint_id]-optional contract works
+    // outside a TTY too.
+    const stdinData = (await readStdin()).trimEnd();
+    if (stdinData) {
+      endpoint = cleanArgs[1];
+      message = stdinData;
+    } else {
+      message = cleanArgs[1].replace(/\\n/g, '\n');
+    }
   } else if (cleanArgs.length === 1 && (stdinAvailable || hasStdinFlag)) {
     // 1 arg (channel only) with piped stdin: read from stdin
     message = (await readStdin()).trimEnd();
@@ -98,9 +120,26 @@ async function main() {
     process.exit(1);
   }
 
-  // Virtual 'void' channel (#689): record-only, never dispatched.
-  // No skill directory exists for it, so skip channel-path validation and
-  // the channel send script entirely.
+  // Determine broker routing up front — the void channel gate below needs it
+  // too. Isolated agents route sends + audit through the broker (which holds
+  // channel creds, enforces egress policy, and owns the DB). Admin/scheduler
+  // fall through to the legacy direct path. A missing broker socket for an
+  // isolated agent is a loud failure, never a silent legacy fallback.
+  let useBroker;
+  try {
+    useBroker = shouldUseBroker();
+  } catch (err) {
+    console.error(`[C4] ${err.message}`);
+    process.exit(1);
+  }
+
+  // Virtual 'void' channel (#689): record-only, never dispatched. It is
+  // agent-facing (new-session / session-handoff skills write handoff summaries
+  // here), so isolated agents MUST be able to use it — but NEVER via a direct
+  // DB write: post-isolation they have no DB access, so a direct
+  // insertConversation would EACCES-crash, and a NULL-scoped row would not be
+  // picked up by that instance's own instance-scoped session-init. Route it
+  // through the broker, which records the row scoped to the calling instance.
   if (channel === 'void') {
     if (!endpoint) {
       console.error('Error: Endpoint is required for the void channel (e.g. c4-send.js void session-handoff)');
@@ -114,11 +153,25 @@ async function main() {
       process.exit(1);
     }
 
+    if (useBroker) {
+      try {
+        await brokerCall('void', { endpoint, content: message });
+        console.log('[C4] Message recorded on void channel (broker, not dispatched)');
+        process.exit(0);
+      } catch (err) {
+        console.error(`[C4] Broker void record failed: ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    // Admin/scheduler direct path: scope the handoff to this identity's own
+    // instance (ZYLOS_INSTANCE_ID) so its next session-init reads it back; NULL
+    // for an unscoped admin is the global surface, which its global session-init
+    // reads. Unlike real channels (audit only), the DB write IS the delivery for
+    // void — fail loudly.
     try {
-      insertConversation('out', 'void', endpoint, message);
+      insertConversation('out', 'void', endpoint, message, null, 3, false, null, process.env.ZYLOS_INSTANCE_ID || null);
     } catch (err) {
-      // Unlike real channels (where the DB row is an audit trail), the DB
-      // write IS the delivery for void — fail loudly.
       console.error(`[C4] Failed to record void message: ${err.stack}`);
       process.exit(1);
     } finally {
@@ -145,8 +198,20 @@ async function main() {
     }
   }
 
+  if (useBroker) {
+    try {
+      await brokerCall('send', { channel, endpoint, content: message, deliveryAction });
+      console.log(`[C4] Message sent via ${channel} (broker)`);
+      process.exit(0);
+    } catch (err) {
+      console.error(`[C4] Broker send failed: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
+  let outRecord = null;
   try {
-    insertConversation('out', channel, endpoint, message);
+    outRecord = insertConversation('out', channel, endpoint, message, null, 3, false, deliveryAction);
   } catch (err) {
     console.error(`[C4] Warning: DB audit write failed: ${err.stack}`);
   } finally {
@@ -167,11 +232,28 @@ async function main() {
     stdio: 'inherit'
   });
 
+  // Mark the audit row failed on any non-delivery: the user never received
+  // this, so it must not count as an answer for the unanswered-message
+  // re-surface. Covers both a non-zero exit ('close') and a spawn failure
+  // ('error' — script unreadable / node missing — where 'close' never fires).
+  const markAuditFailed = () => {
+    if (outRecord?.id == null) return;
+    try { markFailed(outRecord.id); } catch { /* audit-only, best effort */ }
+    try { close(); } catch { /* reopened by markFailed */ }
+  };
+
+  child.on('error', (err) => {
+    console.error(`[C4] Failed to spawn channel script: ${err.message}`);
+    markAuditFailed();
+    process.exit(1);
+  });
+
   child.on('close', (code) => {
     if (code === 0) {
       console.log(`[C4] Message sent via ${channel}`);
     } else {
       console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);
+      markAuditFailed();
     }
     process.exit(code);
   });
@@ -182,4 +264,7 @@ async function main() {
   });
 }
 
-main();
+main().catch((err) => {
+  console.error(`[C4] ${err?.message || err}`);
+  process.exit(1);
+});

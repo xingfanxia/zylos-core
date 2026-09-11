@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
+import { FORK_REPO } from '../fork-config.js';
 
 const cli = path.resolve(import.meta.dirname, '../../zylos.js');
 const installedVersion = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, '../../../package.json'), 'utf8')).version;
@@ -124,7 +125,7 @@ test('CLI saved routing covers remote registry, real add pipeline, component/sel
   const requests = f.readLog();
   assert.ok(requests.some(r => r.url.includes('/raw/')));
   assert.ok(requests.some(r => r.url.includes('/api/repos/example/zylos-mirror-fixture/tags')));
-  assert.ok(requests.some(r => r.url.includes('/api/repos/zylos-ai/zylos-core/tags')));
+  assert.ok(requests.some(r => r.url.includes(`/api/repos/${FORK_REPO}/tags`)));
   assert.ok(requests.some(r => r.url.includes('/download/example/zylos-mirror-fixture/archive/refs/tags/')));
   for (const req of requests) {
     assert.equal(new URL(req.url).hostname, 'mirror.example.test');

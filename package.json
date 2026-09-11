@@ -12,7 +12,10 @@
     "pretest": "node scripts/install-skill-deps.js",
     "test": "npm run test:jest && npm run test:node",
     "test:jest": "node --experimental-vm-modules node_modules/.bin/jest",
-    "test:node": "node scripts/run-node-tests.js"
+    "test:node": "node scripts/run-node-tests.js",
+    "test:multi-session": "node --experimental-vm-modules node_modules/.bin/jest --runInBand test/multi-session-features.test.js test/multi-session-e2e-db.test.js test/multi-session-memory-and-routes.test.js test/instance-config.test.js test/mixed-runtime-memory.test.js",
+    "test:smoke:roundtrip": "bash test/live-roundtrip-smoke.sh",
+    "test:smoke:full": "bash test/full-smoke-live.sh"
   },
   "repository": {
     "type": "git",

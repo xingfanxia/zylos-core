@@ -128,4 +128,28 @@ describe('tmux-launcher', () => {
     const logContent = fs.readFileSync(exitLog, 'utf8');
     assert.ok(logContent.includes('exit_code=0'), `Exit log should contain exit_code=0: ${logContent}`);
   });
+
+  it('loads a persona-owned env while keeping runtime-controlled values authoritative', () => {
+    const personaEnvFile = path.join(os.tmpdir(), `.zylos-persona-env-${Date.now()}`);
+    fs.writeFileSync(personaEnvFile, 'PERSONA_SERVICE_TOKEN=persona-secret\nHOME=/persona/override\n', { mode: 0o600 });
+    tmpFiles.push(personaEnvFile);
+    const specPath = writeSpec({
+      command: process.execPath,
+      args: ['-e', 'process.stdout.write(JSON.stringify({ token: process.env.PERSONA_SERVICE_TOKEN, home: process.env.HOME }))'],
+      env: { PATH: process.env.PATH, HOME: '/runtime/home' },
+      cwd: os.tmpdir(),
+      personaEnvFile,
+    });
+
+    const output = execFileSync(process.execPath, [LAUNCHER_PATH, specPath], {
+      timeout: 10_000,
+      encoding: 'utf8',
+    });
+    tmpFiles.splice(tmpFiles.indexOf(specPath), 1);
+
+    assert.deepEqual(JSON.parse(output), {
+      token: 'persona-secret',
+      home: '/runtime/home',
+    });
+  });
 });

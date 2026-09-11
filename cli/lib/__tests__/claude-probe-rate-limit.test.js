@@ -1,9 +1,17 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { _RATE_LIMIT_PATTERNS as PATTERNS, _parseResetTime } from '../heartbeat/claude-probe.js';
+import {
+  _RATE_LIMIT_PATTERNS as PATTERNS,
+  _AUTH_FAILURE_PATTERNS as AUTH_PATTERNS,
+  _parseResetTime,
+} from '../heartbeat/claude-probe.js';
 
 function matchesAny(text) {
   return PATTERNS.some(p => p.test(text));
+}
+
+function matchesAuth(text) {
+  return AUTH_PATTERNS.some(p => p.test(text));
 }
 
 describe('RATE_LIMIT_PATTERNS', () => {
@@ -44,6 +52,41 @@ describe('RATE_LIMIT_PATTERNS', () => {
     assert.ok(!matchesAny("The session has started"));
     assert.ok(!matchesAny("Your rate is excellent"));
     assert.ok(!matchesAny("You've hit the mark"));
+  });
+});
+
+describe('AUTH_FAILURE_PATTERNS', () => {
+  it('matches the original auth-error signatures', () => {
+    assert.ok(matchesAuth('API Error: authentication_error'));
+    assert.ok(matchesAuth('Authentication failed'));
+    assert.ok(matchesAuth('auth failed'));
+    assert.ok(matchesAuth('Invalid API key'));
+    assert.ok(matchesAuth('401 Unauthorized'));
+  });
+
+  it('matches genuine token-expiry signatures', () => {
+    assert.ok(matchesAuth('Your OAuth token has expired'));
+    assert.ok(matchesAuth('login token expired'));
+    assert.ok(matchesAuth('session token expired'));
+  });
+
+  it('does NOT match the cosmetic setup-token status line', () => {
+    // "Not logged in · Run /login" is printed permanently by Claude Code's TUI
+    // for an inference-scope setup token, even while the agent is fully
+    // authenticated and actively calling the API. Matching it made every
+    // persona false-trip auth_failed on any heartbeat blip. A genuine logout is
+    // caught by checkAuth's credential resolution, not by this pane text.
+    assert.ok(!matchesAuth('Not logged in'));
+    assert.ok(!matchesAuth('  Not logged in · Please run /login'));
+    assert.ok(!matchesAuth('Please run /login to authenticate'));
+    assert.ok(!matchesAuth('Run `/login` to continue'));
+  });
+
+  it('does not match unrelated conversational text', () => {
+    assert.ok(!matchesAuth('Hello, how are you?'));
+    assert.ok(!matchesAuth('I logged in successfully yesterday'));
+    assert.ok(!matchesAuth('The login page looks great'));
+    assert.ok(!matchesAuth('my session expired but I renewed it')); // no "token"
   });
 });
 

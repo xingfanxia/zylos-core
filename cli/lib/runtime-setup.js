@@ -640,7 +640,9 @@ export function writeCodexConfig(projectDir, opts = {}) {
       'utf8'
     );
 
-    installCoreCodexHook({ zylosDir: projectDir });
+    if (opts.installCoreHook !== false) {
+      installCoreCodexHook({ zylosDir: projectDir });
+    }
 
     return true;
   } catch {

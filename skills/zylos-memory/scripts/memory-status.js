@@ -6,7 +6,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR, BUDGETS, WARN_THRESHOLDS, walkFiles } from './shared.js';
+import { MEMORY_DIR, BUDGETS, WARN_THRESHOLDS, walkFiles, resolveSharedFile, resolveInstanceFile } from './shared.js';
 
 export function formatBytes(bytes) {
   if (bytes < 1024) {
@@ -36,8 +36,14 @@ function main() {
   let warnCount = 0;
   let missingCount = 0;
 
+  const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+
   for (const [name, budget] of Object.entries(BUDGETS)) {
-    const info = fileInfo(path.join(MEMORY_DIR, name));
+    // state.md is per-instance; others are shared
+    const filePath = (name === 'state.md' && instanceId)
+      ? resolveInstanceFile(instanceId, name)
+      : resolveSharedFile(name);
+    const info = fileInfo(filePath);
     if (!info) {
       lines.push(`${name}: MISSING`);
       missingCount += 1;
@@ -86,4 +92,4 @@ function main() {
   process.stdout.write(`${lines.join('\n')}\n`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) main();
