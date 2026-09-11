@@ -35,7 +35,7 @@ function cliRaw(args, env = {}) {
 function withTmpDir(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scheduler-cli-'));
   const dbPath = path.join(tmpDir, 'instance', 'scheduler', 'scheduler.db');
-  const env = { ZYLOS_DIR: path.join(tmpDir, 'instance'), TZ: 'UTC' };
+  const env = { ZYLOS_DIR: path.join(tmpDir, 'instance'), TZ: 'UTC', ZYLOS_INSTANCE_ID: '' };
   for (const [key, name] of Object.entries({ HOME: 'home', PM2_HOME: 'pm2', CODEX_HOME: 'codex', TMPDIR: 'tmp', TMUX_TMPDIR: 'tmux' })) {
     env[key] = path.join(tmpDir, name); fs.mkdirSync(env[key]);
   }
@@ -49,6 +49,20 @@ function withTmpDir(fn) {
 }
 
 describe('cli add', () => {
+  it('keeps trusted scheduled follow-ups on their caller unless explicitly retargeted', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'caller followup', '--in', '30 minutes'], { ...env, ZYLOS_INSTANCE_ID: 'scheduler' });
+      cli(['add', 'explicit target', '--in', '30 minutes', '--target-instance', 'admin'], { ...env, ZYLOS_INSTANCE_ID: 'scheduler' });
+      cli(['add', 'legacy task', '--in', '30 minutes'], env);
+      const db = new Database(dbPath);
+      try {
+        const rows = db.prepare('SELECT name, target_instance FROM tasks').all();
+        const targets = Object.fromEntries(rows.map(row => [row.name, row.target_instance]));
+        assert.deepEqual(targets, { 'caller followup': 'scheduler', 'explicit target': 'admin', 'legacy task': null });
+      } finally { db.close(); }
+    });
+  });
+
   it('creates a cron task with correct timezone column', () => {
     withTmpDir(({ dbPath, env }) => {
       cli(['add', 'test cron task', '--cron', '0 9 * * *'], env);

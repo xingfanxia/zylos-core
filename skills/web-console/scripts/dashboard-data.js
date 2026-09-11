@@ -147,49 +147,65 @@ export function buildUsageWindows(instancesConfig, zylosDir) {
 export function readContextWindowSnapshot({
   instanceId,
   instanceDef,
+  runtimeProfile = null,
+  profileMissing = false,
   zylosDir,
   existsSync = fs.existsSync,
   readFileSync = fs.readFileSync,
   statSync = fs.statSync,
+  nowMs = Date.now(),
+  maxCodexSampleAgeMs = 120_000,
 } = {}) {
+  const runtime = runtimeProfile?.runtime || instanceDef?.runtime || 'claude';
+  const expectedProfile = instanceDef?.runtime_profile || null;
+  const unavailable = (reason, observedAt = null, age = null) => ({
+    runtime,
+    runtime_profile: expectedProfile,
+    available: false,
+    status: 'unknown',
+    reason,
+    observed_at: observedAt,
+    age_minutes: age,
+    source: null,
+    used_tokens: null,
+    ceiling_tokens: null,
+    percent_used: null,
+    percent_remaining: null,
+    threshold_percent: null,
+    rollout_path: null,
+  });
   const stateDir = resolveTilde(instanceDef?.state_dir) || path.join(zylosDir, 'activity-monitor', instanceId);
   const filePath = path.join(stateDir, 'context-window.json');
-  if (!existsSync(filePath)) {
-    return {
-      available: false,
-      observed_at: null,
-      age_minutes: null,
-      source: null,
-      used_tokens: null,
-      ceiling_tokens: null,
-      percent_used: null,
-      percent_remaining: null,
-      threshold_percent: null,
-      rollout_path: null,
-    };
-  }
-
+  if (profileMissing) return unavailable('profile_unavailable');
+  if (!existsSync(filePath)) return unavailable('sample_missing');
   try {
     const data = JSON.parse(readFileSync(filePath, 'utf8'));
-    return {
-      ...data,
-      available: true,
-      age_minutes: Math.floor((Date.now() - statSync(filePath).mtimeMs) / 60000),
-    };
-  } catch {
-    return {
-      available: false,
-      observed_at: null,
-      age_minutes: null,
-      source: null,
-      used_tokens: null,
-      ceiling_tokens: null,
-      percent_used: null,
-      percent_remaining: null,
-      threshold_percent: null,
-      rollout_path: null,
-    };
-  }
+    if (data.runtime !== runtime) return unavailable('runtime_mismatch');
+    if (data.instance_id !== instanceId) return unavailable('instance_mismatch');
+    if (data.runtime_profile && data.runtime_profile !== expectedProfile) return unavailable('profile_mismatch');
+    if (runtime === 'codex') {
+      if ((data.runtime_profile || null) !== expectedProfile) return unavailable('profile_mismatch');
+      if (runtimeProfile?.model && data.model !== runtimeProfile.model) return unavailable('model_mismatch');
+      const observedAt = normalizeDashboardTimestamp(data.observed_at);
+      const observedMs = observedAt ? Date.parse(observedAt) : NaN;
+      const age = Number.isFinite(observedMs) ? Math.max(0, Math.floor((nowMs - observedMs) / 60000)) : null;
+      // This is poll freshness, not token-event or rollout mtime freshness.
+      // A live idle session is republished on each successful 30-second check.
+      if (!Number.isFinite(observedMs) || observedMs > nowMs + 5000) return unavailable('sample_time_invalid');
+      if (nowMs - observedMs > maxCodexSampleAgeMs) return unavailable('sample_stale', observedAt, age);
+      if (data.available === false || data.status === 'unknown') return unavailable(data.reason || 'sample_unavailable', observedAt, age);
+      if (data.source !== 'rollout_token_count' || typeof data.rollout_path !== 'string' || !data.rollout_path) return unavailable('sample_source_invalid', observedAt, age);
+      const used = data.used_tokens;
+      const ceiling = data.ceiling_tokens;
+      if (!Number.isFinite(used) || used < 0 || !Number.isFinite(ceiling) || ceiling <= 0) return unavailable('sample_tokens_invalid', observedAt, age);
+      const pct = Math.round(used / ceiling * 100);
+      if (data.percent_used !== pct || data.percent_remaining !== Math.max(0, 100 - pct) ||
+          !Number.isFinite(data.threshold_percent) || data.threshold_percent <= 0 || data.threshold_percent > 100) return unavailable('sample_percent_invalid', observedAt, age);
+      return { ...data, available: true, observed_at: observedAt, age_minutes: age };
+    }
+    return { ...data, available: data.available !== false,
+      age_minutes: Math.max(0, Math.floor((nowMs - statSync(filePath).mtimeMs) / 60000)) };
+  } catch { return unavailable('sample_unreadable'); }
 }
 
 export function buildContextWindows(instancesConfig, zylosDir) {
@@ -198,6 +214,8 @@ export function buildContextWindows(instancesConfig, zylosDir) {
     windows[id] = readContextWindowSnapshot({
       instanceId: id,
       instanceDef: inst,
+      runtimeProfile: instancesConfig?.runtime_profiles?.[inst.runtime_profile] || null,
+      profileMissing: !!(inst.runtime_profile && !instancesConfig?.runtime_profiles?.[inst.runtime_profile]),
       zylosDir,
     });
   }

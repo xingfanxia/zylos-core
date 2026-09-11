@@ -17,6 +17,7 @@
  * ESM-only, Node 20+.
  */
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import net from 'net';
 import fs from 'fs';
 import path from 'path';
@@ -140,6 +141,6 @@ async function cli() {
   process.exit(1);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
   cli().catch((err) => { console.error(err?.message || err); process.exit(1); });
 }

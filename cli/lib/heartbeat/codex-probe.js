@@ -43,7 +43,10 @@ const AUTH_FAILURE_PATTERNS = [
   /not logged in/i,
   /invalid api key/i,
   /unauthorized/i,
+  /access token could not be refreshed/i,
 ];
+
+export { AUTH_FAILURE_PATTERNS as _AUTH_FAILURE_PATTERNS };
 
 /**
  * Create a Codex CLI heartbeat probe.

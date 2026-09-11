@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 const HOME = os.homedir();
 const DEFAULT_CODEX_DIR = process.env.CODEX_HOME || path.join(HOME, '.codex');
@@ -109,6 +110,7 @@ export function getActiveRolloutPath({
   sqliteFile = path.join(codexHome, 'state_5.sqlite'),
   sessionsDir = path.join(codexHome, 'sessions'),
 } = {}) {
+  let indexedPath = null;
   try {
     const sql = [
       'SELECT rollout_path FROM threads',
@@ -117,12 +119,16 @@ export function getActiveRolloutPath({
       'ORDER BY updated_at DESC',
       'LIMIT 1;'
     ].filter(Boolean).join(' ');
-    const out = execFileSyncImpl('sqlite3', [sqliteFile, sql], {
+    // Read-only SQLite can still create WAL/SHM with the monitor's ownership.
+    // Immutable URI reads never write beside another persona's state database.
+    const uri = pathToFileURL(sqliteFile);
+    uri.search = '?mode=ro&immutable=1';
+    const out = execFileSyncImpl('sqlite3', ['-readonly', uri.href, sql], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
     }).trim();
-    if (out) return out;
+    if (out) indexedPath = out;
   } catch {
     // Fall back to filesystem scan when sqlite3 is unavailable.
   }
@@ -130,6 +136,12 @@ export function getActiveRolloutPath({
   try {
     let bestPath = null;
     let bestMtime = 0;
+    // The immutable index omits uncheckpointed WAL rows. Compare live rollout
+    // files even after an index hit so a newer quota event is not hidden.
+    if (indexedPath && rolloutMatchesInstance(indexedPath, instanceId)) {
+      try { bestMtime = fs.statSync(indexedPath).mtimeMs; bestPath = indexedPath; }
+      catch { /* stale index path */ }
+    }
 
     for (const year of fs.readdirSync(sessionsDir)) {
       const yearDir = path.join(sessionsDir, year);
@@ -153,7 +165,7 @@ export function getActiveRolloutPath({
 
     return bestPath;
   } catch {
-    return null;
+    return indexedPath;
   }
 }
 

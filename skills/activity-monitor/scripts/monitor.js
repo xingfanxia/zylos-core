@@ -1085,6 +1085,8 @@ function createTaskScheduler(activeUsageMonitor) {
 
 function startContextMonitor(activeAdapter) {
   return startRuntimeContextMonitor(activeAdapter, {
+    monitorDir: MONITOR_DIR,
+    instanceId: INSTANCE_ID,
     getUnsummarizedCount,
     checkpointThreshold: CHECKPOINT_THRESHOLD,
     loadContextMonitorState,
