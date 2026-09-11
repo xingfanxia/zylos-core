@@ -116,7 +116,7 @@ export class HealthEngine {
     this.healthState = options.initialHealth ?? 'ok';
     this.healthReason = options.initialReason ?? '';
     this.restartFailureCount = 0;
-    this.lastHeartbeatAt = Math.floor(Date.now() / 1000);
+    this.lastHeartbeatAt = Math.floor(this.now() / 1000);
     this.lastRecoveryAt = 0;
     this.lastDownCheckAt = 0;
     // If resuming in recovering state (e.g., PM2 restart mid-recovery),
@@ -234,7 +234,13 @@ export class HealthEngine {
    * @param {number} seconds - Grace period duration
    */
   notifyColdStart(seconds) {
-    this.warmupUntil = Math.floor(Date.now() / 1000) + seconds;
+    const nowSec = Math.floor(this.now() / 1000);
+    this.warmupUntil = nowSec + seconds;
+    // Make the first functional probe due exactly when warmup ends. Carrying
+    // the previous profile's degraded health into a fresh adapter caused a
+    // five-second post-restart probe to race Codex startup and quarantine a
+    // healthy fallback before it could consume the heartbeat.
+    this.lastHeartbeatAt = nowSec - this.heartbeatInterval + seconds;
     this.setHealth('ok', `cold_start_grace_${seconds}s`);
     this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
@@ -684,7 +690,7 @@ export class HealthEngine {
 
     const authFailure = this.deps.detectAuthFailure ? this.deps.detectAuthFailure() : { detected: false };
     if (authFailure.detected) {
-      const authResult = await this._checkAuth();
+      const authResult = await this._checkAuth({ requireRemote: true });
       if (authResult && authResult.status === 'failure') {
         this.rateLimitConsecutiveHits = 0;
         this.stickyErrorConsecutiveHits = 0;
@@ -727,7 +733,7 @@ export class HealthEngine {
   enqueueHeartbeat(phase) {
     const ok = this.deps.enqueueHeartbeat(phase);
     if (ok && phase === 'primary') {
-      this.lastHeartbeatAt = Math.floor(Date.now() / 1000);
+      this.lastHeartbeatAt = Math.floor(this.now() / 1000);
     }
     return ok;
   }
@@ -740,7 +746,7 @@ export class HealthEngine {
     this.lastRecoveryAt = Math.floor(this.now() / 1000);
 
     if (this.healthState === 'auth_failed') {
-      const authResult = await this._checkAuth();
+      const authResult = await this._checkAuth({ requireRemote: true });
       if (authResult.status === 'success') {
         const now = Math.floor(Date.now() / 1000);
         this.deps.log('Auth probe recovered; restarting session before marking healthy');
@@ -882,10 +888,10 @@ export class HealthEngine {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  async _checkAuth() {
+  async _checkAuth(options) {
     if (typeof this.deps.checkAuth !== 'function') return { status: 'success', reason: 'no_checkAuth' };
     try {
-      return await this.deps.checkAuth();
+      return await this.deps.checkAuth(options);
     } catch (err) {
       return { status: 'failure', reason: err?.message || 'auth_check_failed' };
     }
@@ -902,7 +908,7 @@ export class HealthEngine {
    * failed heartbeat re-runs this verify, and a live agent heals via ACK.
    */
   async _verifyAuthFailedEntry(reason) {
-    const result = await this._checkAuth();
+    const result = await this._checkAuth({ requireRemote: true });
     if (this.healthState !== 'auth_failed') return; // recovered (ACK) or moved on meanwhile
     if (result?.status === 'success') {
       this.deps.log(`auth_failed was a text false positive (live checkAuth OK) — treating as hung session (${reason})`);

@@ -84,6 +84,25 @@ describe('HealthEngine', () => {
 
       assert.deepEqual(calls.enqueueHeartbeat, ['primary']);
     });
+
+    it('cold-start grace resets inherited health and probes when warmup ends', () => {
+      const { deps, calls } = createMockDeps();
+      let nowMs = 1_000_000;
+      const engine = new HealthEngine(deps, {
+        heartbeatInterval: 1800,
+        now: () => nowMs,
+      });
+      engine.setHealth('degraded', 'previous_profile_failed');
+
+      engine.notifyColdStart(30);
+      engine.runMaintenanceCycle(true, 1029);
+      assert.equal(engine.health, 'ok');
+      assert.deepEqual(calls.enqueueHeartbeat, []);
+
+      nowMs = 1_030_000;
+      engine.runMaintenanceCycle(true, 1030);
+      assert.deepEqual(calls.enqueueHeartbeat, ['primary']);
+    });
   });
 
   describe('primary heartbeat', () => {
@@ -498,7 +517,11 @@ describe('HealthEngine', () => {
     it('enters auth_failed (no kill) when a heartbeat fails with auth text and checkAuth confirms', async () => {
       const { deps, calls } = createMockDeps();
       deps.detectAuthFailure = () => ({ detected: true, pattern: 'Not logged in' });
-      deps.checkAuth = async () => ({ status: 'failure', reason: 'cli_probe_not_logged_in' });
+      let authCheckOptions = null;
+      deps.checkAuth = async (options) => {
+        authCheckOptions = options;
+        return { status: 'failure', reason: 'cli_probe_not_logged_in' };
+      };
       const engine = new HeartbeatEngine(deps);
 
       engine.onHeartbeatFailure({ phase: 'primary' }, 'timeout');
@@ -506,6 +529,7 @@ describe('HealthEngine', () => {
 
       assert.equal(engine.health, 'auth_failed');
       assert.equal(calls.killTmuxSession, 0, 'must not kill a session that just needs credentials');
+      assert.deepEqual(authCheckOptions, { requireRemote: true });
     });
 
     it('enters auth_failed from a recovering state too (breaks the restart loop)', async () => {

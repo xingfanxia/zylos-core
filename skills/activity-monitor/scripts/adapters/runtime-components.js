@@ -51,7 +51,9 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
     killTmuxSession: () => activeAdapter.stop(),
-    checkAuth: () => activeAdapter.checkAuth ? activeAdapter.checkAuth() : { status: 'success', reason: 'no_checkAuth' },
+    checkAuth: (options) => activeAdapter.checkAuth
+      ? activeAdapter.checkAuth(options)
+      : { status: 'success', reason: 'no_checkAuth' },
     notifyDegraded, // REL-3: out-of-band admin alert on the flap-ceiling transition
     log,
   }, {

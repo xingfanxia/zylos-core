@@ -63,6 +63,7 @@ const { getMonitorDir: _getMonitorDir } =
 
 const SESSION = process.env.ZYLOS_TMUX_SESSION || 'codex-main';
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
+const CODEX_AUTH_PROBE_PROMPT = 'Reply exactly ZYLOS_AUTH_OK. Do not use tools.';
 
 // When CODEX_BYPASS_PERMISSIONS=false, skip --dangerously-bypass-approvals-and-sandbox.
 // Defaults to enabled for unattended server operation.
@@ -122,7 +123,7 @@ export class CodexAdapter extends RuntimeAdapter {
    *
    * @returns {Promise<{status: 'success'|'failure'|'uncertain', reason: string}>}
    */
-  async checkAuth() {
+  async checkAuth({ requireRemote = false } = {}) {
     const profile = this.config.runtimeProfile || {};
     const runtimeHome = profile.runtimeHome || os.homedir();
     const codexHome = profile.codexHome || process.env.CODEX_HOME || path.join(runtimeHome, '.codex');
@@ -149,16 +150,58 @@ export class CodexAdapter extends RuntimeAdapter {
       // OAuth session straight through the runtime-switch / health-probe auth gate.
       // The status line is written to STDERR (stdout is empty), so combine streams.
       try {
-        const { stdout, stderr } = await execFileAsync(CODEX_BIN, ['login', 'status'], {
-          stdio: 'pipe', encoding: 'utf8', timeout: 10_000,
-          env: { ...process.env, HOME: runtimeHome, CODEX_HOME: codexHome },
+        const command = buildCodexProfileCommand({
+          args: ['login', 'status'],
+          runtimeHome,
+          codexHome,
+          osUser: profile.osUser || null,
+          codexBin: CODEX_BIN,
+          timeout: 10_000,
         });
+        const { stdout, stderr } = await execFileAsync(command.file, command.args, command.options);
         const status = classifyCodexLoginStatus((stdout || '') + (stderr || ''));
-        if (status === 'success') return { status: 'success', reason: 'codex_login_status' };
+        if (status === 'success' && !requireRemote) {
+          return { status: 'success', reason: 'codex_login_status' };
+        }
         if (status === 'failure') return { status: 'failure', reason: 'not_logged_in' };
-        return { status: 'uncertain', reason: 'codex_login_status_uncertain' };
+        if (status !== 'success') return { status: 'uncertain', reason: 'codex_login_status_uncertain' };
       } catch { /* binary missing, killed, or other error */ }
-      return { status: 'uncertain', reason: 'codex_login_status_unavailable' };
+      if (!requireRemote) return { status: 'uncertain', reason: 'codex_login_status_unavailable' };
+
+      // Local login status proves only that a token document exists. When the
+      // pane independently reports auth failure, run one bounded real turn as
+      // the same persona that owns the profile. This catches refresh-token
+      // revocation without making routine health checks consume a turn.
+      const command = buildCodexProfileCommand({
+        args: [
+          'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only',
+          ...(profile.model ? ['-m', profile.model] : []),
+          '-c', 'model_reasoning_effort="low"',
+          CODEX_AUTH_PROBE_PROMPT,
+        ],
+        runtimeHome,
+        codexHome,
+        osUser: profile.osUser || null,
+        codexBin: CODEX_BIN,
+        timeout: 45_000,
+      });
+      try {
+        const { stdout, stderr } = await execFileAsync(command.file, command.args, command.options);
+        const output = `${stdout || ''}\n${stderr || ''}`;
+        if (/access token could not be refreshed/i.test(output)) {
+          return { status: 'failure', reason: 'codex_exec_token_refresh_failed' };
+        }
+        if (/"type"\s*:\s*"turn\.completed"|ZYLOS_AUTH_OK/i.test(output)) {
+          return { status: 'success', reason: 'codex_exec_probe' };
+        }
+        return { status: 'uncertain', reason: 'codex_exec_probe_uncertain' };
+      } catch (error) {
+        const output = `${error.stdout || ''}\n${error.stderr || ''}`;
+        if (/access token could not be refreshed|not logged in|please (?:log out and )?sign in again/i.test(output)) {
+          return { status: 'failure', reason: 'codex_exec_token_refresh_failed' };
+        }
+        return { status: 'uncertain', reason: 'codex_exec_probe_unavailable' };
+      }
     }
 
     // auth_mode = "apikey" — live HTTP probe to OpenAI API.
@@ -502,6 +545,42 @@ export class CodexAdapter extends RuntimeAdapter {
     const threshold = (!isNaN(val) && val > 0 && val <= 100) ? val / 100 : 0.75;
     return new CodexContextMonitor({ threshold });
   }
+}
+
+export function buildCodexProfileCommand({
+  args,
+  runtimeHome,
+  codexHome,
+  osUser = null,
+  codexBin = CODEX_BIN,
+  timeout = 10_000,
+} = {}) {
+  const options = {
+    stdio: 'pipe',
+    encoding: 'utf8',
+    timeout,
+    cwd: runtimeHome,
+    env: { ...process.env, HOME: runtimeHome, CODEX_HOME: codexHome },
+  };
+  if (!osUser) return { file: codexBin, args, options };
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(osUser)) {
+    throw new Error('invalid isolated Codex runtime user');
+  }
+  const relative = path.relative(path.resolve(runtimeHome), path.resolve(codexHome));
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('isolated CODEX_HOME must stay inside runtime home');
+  }
+  return {
+    file: 'sudo',
+    args: [
+      '-n', '-u', osUser, '-H', '--', '/usr/bin/env',
+      `HOME=${runtimeHome}`,
+      `CODEX_HOME=${codexHome}`,
+      codexBin,
+      ...args,
+    ],
+    options,
+  };
 }
 
 
