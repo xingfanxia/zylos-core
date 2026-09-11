@@ -51,6 +51,21 @@ EOF
 Always pipe messages via stdin heredoc — never pass as CLI arguments. See [c4-send](references/c4-send.md) for full reference.
 Treat the heredoc wrapper as fixed shell syntax: only the message body goes between the start line and the closing terminator line, and the terminator itself must never be copied into the actual outgoing message.
 
+**Attachments** are sent by prefixing the message with `[MEDIA:file]<path>` or
+`[MEDIA:image]<path>`. For isolated instances the send is performed by the
+global broker, which runs as a different unix user and cannot read your private
+`~/workspace`. Attach files from your publish area
+`~/zylos/workspace/users/<your-instance>/` (or another broker-readable shared
+path) — an unreadable path is rejected before send with
+`attachment_unreadable: broker cannot read <path>; publish it under ~/zylos/workspace/users/<instance>/ and resend`,
+and no message is delivered. Prefer absolute paths. The `[MEDIA:type]<path>`
+directive occupies its own line — the file path is the rest of that line, so
+put nothing else on it. Text on the other lines is a caption, delivered as a
+separate text message IN ORDER: a lead-in above the directive is sent before the
+file, a caption below it after. (Multiple `[MEDIA:]` directives per message are
+not supported — send one file per message.)
+
+
 ## Database
 
 SQLite at `~/zylos/comm-bridge/c4.db`:

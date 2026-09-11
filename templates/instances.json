@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "default_instance": "admin",
+  "scheduler_instance": "scheduler",
+  "instances": {
+    "admin": {
+      "tmux_session": "claude-main",
+      "runtime": "claude",
+      "enabled": true,
+      "type": "dedicated",
+      "primary": true,
+      "auto_suspend": false,
+      "state_dir": "~/zylos/activity-monitor/admin",
+      "claude_md": "",
+      "description": "Primary admin instance (always-on)"
+    },
+    "scheduler": {
+      "tmux_session": "claude-scheduler",
+      "runtime": "claude",
+      "enabled": true,
+      "type": "dedicated",
+      "primary": false,
+      "auto_suspend": true,
+      "state_dir": "~/zylos/instances/scheduler",
+      "claude_md": "",
+      "description": "Scheduler instance (on-demand, runs scheduled tasks)"
+    },
+    "group": {
+      "tmux_session": "claude-group",
+      "runtime": "claude",
+      "enabled": true,
+      "type": "group",
+      "primary": false,
+      "auto_suspend": false,
+      "state_dir": "~/zylos/instances/group",
+      "claude_md": "",
+      "description": "Group chat instance (handles all group conversations)"
+    }
+  },
+  "routing": {}
+}

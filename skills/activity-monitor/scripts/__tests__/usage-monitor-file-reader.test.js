@@ -65,6 +65,49 @@ describe('usage-monitor-file-reader', () => {
     });
   });
 
+  it('exposes raw reset epochs from statusline rate_limits (Format A)', () => {
+    withTmpDir((tmpDir) => {
+      const statuslineFile = path.join(tmpDir, 'statusline.json');
+      fs.writeFileSync(statuslineFile, JSON.stringify({
+        rate_limits: {
+          primary: { used_percent: 8, resets_at: 1784073000 },
+          secondary: { used_percent: 100, resets_at: 1784340000 }
+        }
+      }));
+
+      const result = readClaudeUsageFromMonitorFiles({
+        statuslineFile,
+        usageStateFile: path.join(tmpDir, 'usage.json')
+      });
+      assert.equal(result.statusShape, 'statusline_rate_limits');
+      assert.equal(result.sessionResetsAt, 1784073000);
+      assert.equal(result.weeklyAllResetsAt, 1784340000);
+    });
+  });
+
+  it('exposes raw reset epochs from statusline five_hour/seven_day (Format B)', () => {
+    withTmpDir((tmpDir) => {
+      const statuslineFile = path.join(tmpDir, 'statusline.json');
+      fs.writeFileSync(statuslineFile, JSON.stringify({
+        context_window: { used_percentage: null },
+        rate_limits: {
+          five_hour: { used_percentage: 0, resets_at: 1784073000 },
+          seven_day: { used_percentage: 100, resets_at: 1784340000 }
+        }
+      }));
+
+      const result = readClaudeUsageFromMonitorFiles({
+        statuslineFile,
+        usageStateFile: path.join(tmpDir, 'usage.json')
+      });
+      assert.equal(result.statusShape, 'statusline_rate_limits');
+      assert.equal(result.fiveHourPercent, 0);
+      assert.equal(result.fiveHourResetsAt, 1784073000);
+      assert.equal(result.weeklyAllPercent, 100);
+      assert.equal(result.weeklyAllResetsAt, 1784340000);
+    });
+  });
+
   it('reads Codex usage from usage-codex.json', () => {
     withTmpDir((tmpDir) => {
       const usageStateFile = path.join(tmpDir, 'usage-codex.json');

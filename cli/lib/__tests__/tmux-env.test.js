@@ -7,7 +7,7 @@ import { afterEach, describe, it } from 'node:test';
 const {
   buildCleanEnv, buildCompatEnv, parseManifest, parsePathManifest,
   parseRuntimeEnvManifest, loadRuntimeEnvManifest, deployManifestTemplate,
-  writeLaunchSpec, readAndDeleteSpec,
+  readMergedDotenvVars, resolvePersonaDotenvPath, writeLaunchSpec, readAndDeleteSpec,
 } = await import('../runtime/tmux-env.js');
 
 const tmpFiles = [];
@@ -19,6 +19,60 @@ afterEach(() => {
   while (tmpDirs.length) {
     try { fs.rmSync(tmpDirs.pop(), { recursive: true }); } catch { }
   }
+});
+
+describe('readMergedDotenvVars', () => {
+  it('merges shared and persona env files with persona values taking precedence', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-dotenv-'));
+    tmpDirs.push(dir);
+    const shared = path.join(dir, 'shared.env');
+    const persona = path.join(dir, 'persona.env');
+    fs.writeFileSync(shared, 'ZYLOS_TMUX_ENV=SHARED,OVERRIDE\nSHARED=one\nOVERRIDE=root\n');
+    fs.writeFileSync(persona, 'ZYLOS_TMUX_ENV=PERSONA,OVERRIDE\nPERSONA=two\nOVERRIDE=persona\n');
+
+    assert.deepEqual(readMergedDotenvVars([shared, persona]), {
+      ZYLOS_TMUX_ENV: 'PERSONA,OVERRIDE',
+      SHARED: 'one',
+      OVERRIDE: 'persona',
+      PERSONA: 'two',
+    });
+  });
+
+  it('reads a symlinked env only once and ignores missing files', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-dotenv-'));
+    tmpDirs.push(dir);
+    const envPath = path.join(dir, '.env');
+    const linkPath = path.join(dir, 'linked.env');
+    fs.writeFileSync(envPath, 'TOKEN="same-file"\n');
+    fs.symlinkSync(envPath, linkPath);
+
+    assert.deepEqual(readMergedDotenvVars([
+      path.join(dir, 'missing.env'),
+      envPath,
+      linkPath,
+    ]), { TOKEN: 'same-file' });
+  });
+});
+
+describe('resolvePersonaDotenvPath', () => {
+  it('returns only a persona env that differs from the shared root file', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-persona-env-'));
+    tmpDirs.push(root);
+    const shared = path.join(root, '.env');
+    const sharedInstance = path.join(root, 'instances', 'shared');
+    const privateInstance = path.join(root, 'instances', 'private');
+    fs.mkdirSync(sharedInstance, { recursive: true });
+    fs.mkdirSync(privateInstance, { recursive: true });
+    fs.writeFileSync(shared, 'ROOT_ONLY=1\n');
+    fs.symlinkSync('../../.env', path.join(sharedInstance, '.env'));
+    fs.writeFileSync(path.join(privateInstance, '.env'), 'PERSONA_ONLY=1\n');
+
+    assert.equal(resolvePersonaDotenvPath(root, sharedInstance), null);
+    assert.equal(
+      resolvePersonaDotenvPath(root, privateInstance),
+      path.join(privateInstance, '.env'),
+    );
+  });
 });
 
 // ── parseManifest ──────────────────────────────────────────────────────────

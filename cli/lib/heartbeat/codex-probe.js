@@ -73,14 +73,22 @@ export function createCodexProbe({
       const deadline = _getAckDeadline(phase, { ackDeadline, recoveryAckDeadline });
       const content = `Heartbeat check. [phase=${phase}]`;
       try {
-        const out = execFileSync('node', [C4_CONTROL, 'enqueue',
+        const args = [C4_CONTROL, 'enqueue',
           '--content', content,
           // Priority 0 = highest. Must not be lowered — heartbeat must jump
           // the queue ahead of conversation messages to avoid false timeout kills.
           '--priority', '0',
           '--bypass-state',
           '--ack-deadline', String(deadline),
-        ], { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
+        ];
+        // Multi-session: direct-path monitors (admin/scheduler) do not use the
+        // broker, so the target must be explicit. Isolated broker callers also
+        // accept this flag safely because the broker enforces the authenticated
+        // instance as the actual target.
+        if (process.env.ZYLOS_INSTANCE_ID) {
+          args.push('--target-instance', process.env.ZYLOS_INSTANCE_ID);
+        }
+        const out = execFileSync('node', args, { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
 
         const match = out.match(/control\s+(\d+)/i);
         if (!match) return false;
@@ -197,4 +205,3 @@ function _writePending(file, data) {
     return false;
   }
 }
-

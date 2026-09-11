@@ -62,7 +62,9 @@ export function sendStatusNotice(claim, message, route = {}, { spawn = spawnSync
   }
   let result;
   try {
-    result = spawn(process.execPath, [script, claim.channel, ...(claim.endpoint ? [claim.endpoint] : ['--stdin'])], {
+    // Fork: the audit row is tagged so an outage reply never counts as the
+    // answer to an instance's unanswered task (getUnansweredDeliveredForInstance).
+    result = spawn(process.execPath, [script, '--delivery-action=status-notice', claim.channel, ...(claim.endpoint ? [claim.endpoint] : ['--stdin'])], {
       input: message, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30000, killSignal: 'SIGKILL',
     });
   } catch {

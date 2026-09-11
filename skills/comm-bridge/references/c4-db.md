@@ -65,10 +65,12 @@ c4-db.js unsummarized
 
 ### checkpoint
 
-Create a checkpoint up to a given conversation id.
+Disabled — it created unscoped (NULL `target_instance`) rows that
+instance-scoped readers can never see. Create checkpoints through
+`c4-checkpoint.js`, which forces an instance scope:
 
 ```bash
-c4-db.js checkpoint <end_conversation_id> [summary]
+c4-checkpoint.js create <end_conversation_id> [--summary "..."] [--target-instance <id>]
 ```
 
 ### checkpoints

@@ -50,6 +50,38 @@ afterEach(() => {
 });
 
 describe('Codex auth checks', () => {
+  it('uses the active profile CODEX_HOME instead of the process home', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-auth-test-'));
+    tmpDirs.push(tmpHome);
+    const codexHome = path.join(tmpHome, '.codex-azure');
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({
+      auth_mode: 'apikey',
+      OPENAI_API_KEY: 'sk-profile-test',
+    }));
+    fs.writeFileSync(
+      path.join(codexHome, 'config.toml'),
+      'openai_base_url = "https://profile.example.com/v1"\n'
+    );
+    process.env.HOME = path.join(tmpHome, 'wrong-home');
+
+    let requestedUrl = '';
+    global.fetch = async (url) => {
+      requestedUrl = String(url);
+      return { status: 200 };
+    };
+
+    const adapter = new CodexAdapter({ runtimeProfile: {
+      id: 'codex-azure',
+      runtimeHome: tmpHome,
+      codexHome,
+    } });
+    const result = await adapter.checkAuth();
+
+    assert.equal(result.status, 'success');
+    assert.equal(requestedUrl, 'https://profile.example.com/v1/models');
+  });
+
   it('uses the configured custom base URL for API key auth checks', async () => {
     const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-auth-test-'));
     tmpDirs.push(tmpHome);

@@ -10,7 +10,18 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || join(homedir(), 'zylos');
-const STATUS_FILE = join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+
+/**
+ * Resolve STATUS_FILE path. Instance-aware when ZYLOS_INSTANCE_ID is set:
+ * uses ~/zylos/activity-monitor/<instanceId>/agent-status.json convention.
+ */
+const STATUS_FILE = (() => {
+  const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+  if (instanceId) {
+    return join(ZYLOS_DIR, 'activity-monitor', instanceId, 'agent-status.json');
+  }
+  return join(ZYLOS_DIR, 'activity-monitor', 'agent-status.json');
+})();
 
 /**
  * Read agent status from ~/zylos/activity-monitor/agent-status.json
@@ -62,6 +73,7 @@ function findC4ReceivePath() {
  * @param {boolean} options.requireIdle - Legacy alias for blockQueueUntilIdle
  * @param {string} options.replyChannel - Reply channel (e.g., 'telegram')
  * @param {string} options.replyEndpoint - Reply endpoint (e.g., user ID)
+ * @param {string} options.targetInstance - Target instance ID for multi-session dispatch
  * @returns {boolean} True if successful
  */
 export function sendViaC4(message, options = {}) {
@@ -70,7 +82,8 @@ export function sendViaC4(message, options = {}) {
     blockQueueUntilIdle = false,
     requireIdle = false,
     replyChannel = null,
-    replyEndpoint = null
+    replyEndpoint = null,
+    targetInstance = null
   } = options;
 
   try {
@@ -91,6 +104,10 @@ export function sendViaC4(message, options = {}) {
 
     if (blockQueueUntilIdle || requireIdle) {
       args.push('--block-queue-until-idle');
+    }
+
+    if (targetInstance) {
+      args.push('--target-instance', targetInstance);
     }
 
     args.push('--priority', String(priority), '--content', message);

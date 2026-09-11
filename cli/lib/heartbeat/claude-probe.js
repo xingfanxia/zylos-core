@@ -35,11 +35,25 @@ const RATE_LIMIT_PATTERNS = [
   /you[''’]ve hit your (?:\w+ )?limit/i,
 ];
 
+// Auth-failure text signatures. HealthEngine.onUserMessageDelivered verifies
+// every hit here with the adapter's live checkAuth() before flipping health to
+// auth_failed, so these can be inclusive without risking a false flip from a
+// user message that merely mentions "unauthorized" etc.
+//
+// DELIBERATELY EXCLUDED: "not logged in" / "run /login". On a long-lived
+// setup-token fleet those strings are printed PERMANENTLY as a cosmetic status
+// line (setup tokens are inference-scope, so Claude Code's TUI can't fetch the
+// account profile and shows "Not logged in · Run /login" even while the agent
+// is actively making authenticated API calls). Matching them made detectAuthFailure
+// fire on every persona on any heartbeat blip → false auth_failed. A GENUINE
+// logout is now caught by checkAuth's credential resolution (no token file →
+// failure), not by scraping this cosmetic pane text.
 const AUTH_FAILURE_PATTERNS = [
   /authentication_error/i,
   /auth(?:entication)? failed/i,
   /invalid api key/i,
   /unauthorized/i,
+  /(?:oauth|login|session|credential) token (?:has )?expired/i,
 ];
 
 /**
@@ -71,14 +85,17 @@ export function createClaudeProbe({
       const deadline = _getAckDeadline(phase, { ackDeadline, recoveryAckDeadline });
       const content = `Heartbeat check. [phase=${phase}]`;
       try {
-        const out = execFileSync('node', [C4_CONTROL, 'enqueue',
+        const args = [C4_CONTROL, 'enqueue',
           '--content', content,
-          // Priority 0 = highest. Must not be lowered — heartbeat must jump
-          // the queue ahead of conversation messages to avoid false timeout kills.
           '--priority', '0',
           '--bypass-state',
           '--ack-deadline', String(deadline),
-        ], { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
+        ];
+        // Multi-session: route heartbeat to the correct instance
+        if (process.env.ZYLOS_INSTANCE_ID) {
+          args.push('--target-instance', process.env.ZYLOS_INSTANCE_ID);
+        }
+        const out = execFileSync('node', args, { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
 
         const match = out.match(/control\s+(\d+)/i);
         if (!match) return false;
@@ -251,7 +268,7 @@ function _parseResetTime(timeStr, dateStr) {
   return Math.floor(target.getTime() / 1000);
 }
 
-export { RATE_LIMIT_PATTERNS as _RATE_LIMIT_PATTERNS, _parseResetTime };
+export { RATE_LIMIT_PATTERNS as _RATE_LIMIT_PATTERNS, AUTH_FAILURE_PATTERNS as _AUTH_FAILURE_PATTERNS, _parseResetTime };
 
 function _writePending(file, data) {
   try {

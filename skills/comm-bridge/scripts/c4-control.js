@@ -3,7 +3,7 @@
  * C4 Communication Bridge - Control Queue Interface
  *
  * Commands:
- *   enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]
+ *   enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]
  *   get --id <control_id>
  *   ack --id <control_id>
  */
@@ -15,10 +15,11 @@ import {
   expireTimedOutControls,
   close
 } from './c4-db.js';
+import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 function usage() {
   console.error('Usage: c4-control.js <enqueue|get|ack> [options]');
-  console.error('  enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]');
+  console.error('  enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]');
   console.error('           Legacy alias: --require-idle');
   console.error('  get --id <control_id>');
   console.error('  ack --id <control_id>');
@@ -65,7 +66,7 @@ function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
-function handleEnqueue(args) {
+async function handleEnqueue(args) {
   const content = parseStringArg(args, '--content');
   if (!content) {
     errorExit('--content is required');
@@ -90,14 +91,32 @@ function handleEnqueue(args) {
   const ackDeadlineAt = ackDeadlineSeconds !== null ? now + ackDeadlineSeconds : null;
   const availableAt = availableInSeconds !== null ? now + availableInSeconds : null;
   const requireIdle = hasFlag(args, '--block-queue-until-idle') || hasFlag(args, '--require-idle');
+  const appendAckSuffix = !hasFlag(args, '--no-ack-suffix');
+  const bypassState = hasFlag(args, '--bypass-state');
 
+  // Isolated agents route through the broker, which forces target_instance to
+  // the authenticated caller (an isolated agent cannot enqueue to another
+  // instance). --target-instance is honored only on the legacy (admin) path.
+  if (shouldUseBroker()) {
+    const data = await brokerCall('enqueue', {
+      content, priority: priority ?? 3, requireIdle, bypassState, appendAckSuffix, ackDeadlineAt, availableAt,
+    });
+    console.log(`OK: enqueued control ${data.id}`);
+    if (data.superseded_count > 0) {
+      console.log(`OK: superseded ${data.superseded_count} equivalent pending control(s)`);
+    }
+    return;
+  }
+
+  const targetInstance = parseStringArg(args, '--target-instance');
   const record = insertControl(content, {
     priority: priority ?? 3,
     requireIdle,
-    bypassState: hasFlag(args, '--bypass-state'),
-    appendAckSuffix: !hasFlag(args, '--no-ack-suffix'),
+    bypassState,
+    appendAckSuffix,
     ackDeadlineAt,
-    availableAt
+    availableAt,
+    targetInstance
   });
 
   console.log(`OK: enqueued control ${record.id}`);
@@ -106,8 +125,13 @@ function handleEnqueue(args) {
   }
 }
 
-function handleGet(args) {
+async function handleGet(args) {
   const id = parseId(args);
+  if (shouldUseBroker()) {
+    const data = await brokerCall('get', { id });
+    console.log(`status=${data.status}`);
+    return;
+  }
   expireTimedOutControls();
   const row = getControlById(id);
   if (!row) {
@@ -116,9 +140,9 @@ function handleGet(args) {
   console.log(`status=${row.status}`);
 }
 
-function handleAck(args) {
+async function handleAck(args) {
   const id = parseId(args);
-  const result = ackControl(id);
+  const result = shouldUseBroker() ? await brokerCall('ack', { id }) : ackControl(id);
   if (!result?.found) {
     errorExit(`control ${id} not found`);
   }
@@ -129,7 +153,7 @@ function handleAck(args) {
   console.log(`OK: control ${id} marked as done`);
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
   const commandArgs = args.slice(1);
@@ -142,13 +166,13 @@ function main() {
   try {
     switch (command) {
       case 'enqueue':
-        handleEnqueue(commandArgs);
+        await handleEnqueue(commandArgs);
         break;
       case 'get':
-        handleGet(commandArgs);
+        await handleGet(commandArgs);
         break;
       case 'ack':
-        handleAck(commandArgs);
+        await handleAck(commandArgs);
         break;
       default:
         usage();
@@ -159,4 +183,7 @@ function main() {
   }
 }
 
-main();
+main().catch((err) => {
+  console.error(`Error: ${err.message}`);
+  process.exit(1);
+});

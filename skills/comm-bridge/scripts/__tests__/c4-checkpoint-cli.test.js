@@ -10,7 +10,9 @@ const CLI_PATH = fileURLToPath(new URL('../c4-checkpoint.js', import.meta.url));
 
 function cli(args, env = {}) {
   const result = spawnSync('node', [CLI_PATH, ...args], {
-    env: { ...process.env, ...env },
+    // Clear ZYLOS_INSTANCE_ID from the runner's env so tests are deterministic
+    // everywhere (agent sessions export it; CI does not). Tests opt in via env.
+    env: { ...process.env, ZYLOS_INSTANCE_ID: '', ...env },
     encoding: 'utf8'
   });
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
@@ -19,12 +21,13 @@ function cli(args, env = {}) {
 /**
  * Create a fresh tmpDir and initialize the DB by running a harmless command.
  * This avoids "[C4-DB] Database initialized" polluting stdout in later calls.
+ * env carries a default instance scope — create/latest refuse to run unscoped.
  */
 function withTmpDir(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-checkpoint-cli-'));
-  const env = { ZYLOS_DIR: tmpDir };
+  const env = { ZYLOS_DIR: tmpDir, ZYLOS_INSTANCE_ID: 'test-instance' };
   // Warm up: initialize DB so subsequent calls have clean stdout.
-  cli(['latest'], env);
+  cli(['list'], env);
   try {
     return fn({ tmpDir, env });
   } finally {
@@ -46,6 +49,7 @@ describe('c4-checkpoint create', () => {
       const json = JSON.parse(stdout.replace('Checkpoint created: ', ''));
       assert.equal(json.start_conversation_id, 1);
       assert.equal(json.end_conversation_id, 10);
+      assert.equal(json.target_instance, 'test-instance');
     });
   });
 
@@ -161,12 +165,81 @@ describe('c4-checkpoint latest', () => {
     });
   });
 
-  it('returns seed checkpoint on fresh DB', () => {
+  it('does not see the unscoped seed checkpoint (strict instance scoping)', () => {
     withTmpDir(({ env }) => {
-      const { stdout, status } = cli(['latest'], env);
+      // The init-db.sql seed row has NULL target_instance — scoped readers
+      // must never surface it (that global fallback was the bleed source).
+      const { stderr, status } = cli(['latest'], env);
+      assert.equal(status, 1);
+      assert.ok(stderr.includes('no checkpoints found'));
+    });
+  });
+});
+
+// -- instance scoping (checkpoints must never be written unscoped) --
+
+describe('c4-checkpoint instance scoping', () => {
+  it('create refuses to run without an instance scope and writes nothing', () => {
+    withTmpDir(({ env }) => {
+      const { stderr, status } = cli(['create', '10', '--summary', 'orphan'], { ...env, ZYLOS_INSTANCE_ID: '' });
+      assert.equal(status, 1);
+      assert.ok(stderr.includes('--target-instance'));
+      // No NULL-target row was written: global list still shows only the seed.
+      const { stdout } = cli(['list'], env);
+      assert.equal(JSON.parse(stdout).length, 1);
+    });
+  });
+
+  it('create honors --target-instance without ZYLOS_INSTANCE_ID', () => {
+    withTmpDir(({ env }) => {
+      const { stdout, status } = cli(
+        ['create', '10', '--summary', 'flagged', '--target-instance', 'flag-inst'],
+        { ...env, ZYLOS_INSTANCE_ID: '' }
+      );
       assert.equal(status, 0);
-      const row = JSON.parse(stdout);
-      assert.equal(row.summary, 'initial');
+      const json = JSON.parse(stdout.replace('Checkpoint created: ', ''));
+      assert.equal(json.target_instance, 'flag-inst');
+    });
+  });
+
+  it('--target-instance overrides ZYLOS_INSTANCE_ID', () => {
+    withTmpDir(({ env }) => {
+      const { stdout, status } = cli(['create', '10', '--target-instance', 'other-inst'], env);
+      assert.equal(status, 0);
+      const json = JSON.parse(stdout.replace('Checkpoint created: ', ''));
+      assert.equal(json.target_instance, 'other-inst');
+    });
+  });
+
+  it('keeps start_conversation_id chains independent per instance', () => {
+    withTmpDir(({ env }) => {
+      cli(['create', '10', '--summary', 'A1'], env);
+      const { stdout } = cli(['create', '20', '--summary', 'B1', '--target-instance', 'other-inst'], env);
+      const json = JSON.parse(stdout.replace('Checkpoint created: ', ''));
+      // other-inst has no prior checkpoint — its chain starts at 1, not 11.
+      assert.equal(json.start_conversation_id, 1);
+      assert.equal(json.end_conversation_id, 20);
+    });
+  });
+
+  it('latest refuses to run without an instance scope', () => {
+    withTmpDir(({ env }) => {
+      const { stderr, status } = cli(['latest'], { ...env, ZYLOS_INSTANCE_ID: '' });
+      assert.equal(status, 1);
+      assert.ok(stderr.includes('--target-instance'));
+    });
+  });
+
+  it('latest honors --target-instance and stays scoped', () => {
+    withTmpDir(({ env }) => {
+      cli(['create', '10', '--summary', 'mine'], env);
+      const ok = cli(['latest', '--target-instance', 'test-instance'], { ...env, ZYLOS_INSTANCE_ID: '' });
+      assert.equal(ok.status, 0);
+      assert.equal(JSON.parse(ok.stdout).summary, 'mine');
+      // A different instance sees nothing — no cross-instance fallback.
+      const other = cli(['latest', '--target-instance', 'other-inst'], env);
+      assert.equal(other.status, 1);
+      assert.ok(other.stderr.includes('no checkpoints found'));
     });
   });
 });

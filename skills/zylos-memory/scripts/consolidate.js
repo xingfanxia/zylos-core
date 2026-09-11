@@ -9,7 +9,10 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { MEMORY_DIR, SESSIONS_DIR, BUDGETS, WARN_THRESHOLDS, REFERENCE_FILES, walkFiles, loadTimezoneFromEnv, dateInTimeZone } from './shared.js';
+import {
+  MEMORY_DIR, SESSIONS_DIR, BUDGETS, WARN_THRESHOLDS, REFERENCE_FILES, walkFiles, loadTimezoneFromEnv, dateInTimeZone,
+  resolveSessionsDir, resolveInstanceFile, resolveSharedFile, resolveReferenceFiles
+} from './shared.js';
 
 export function parseSessionDate(fileName) {
   const match = fileName.match(/^(\d{4}-\d{2}-\d{2})(?:-\d+)?\.md$/);
@@ -18,8 +21,10 @@ export function parseSessionDate(fileName) {
 
 function sessionArchiveCandidates(tz) {
   const candidates = [];
+  const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+  const sessionsDir = resolveSessionsDir(instanceId);
 
-  if (!fs.existsSync(SESSIONS_DIR)) {
+  if (!fs.existsSync(sessionsDir)) {
     return candidates;
   }
 
@@ -27,7 +32,7 @@ function sessionArchiveCandidates(tz) {
   cutoffDate.setDate(cutoffDate.getDate() - 30);
   const cutoffStr = dateInTimeZone(cutoffDate, tz);
 
-  for (const fileName of fs.readdirSync(SESSIONS_DIR)) {
+  for (const fileName of fs.readdirSync(sessionsDir)) {
     if (fileName === 'current.md' || fileName.startsWith('.')) {
       continue;
     }
@@ -48,9 +53,13 @@ function sessionArchiveCandidates(tz) {
 
 function coreBudgetChecks() {
   const checks = [];
+  const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
 
   for (const [name, budget] of Object.entries(BUDGETS)) {
-    const filePath = path.join(MEMORY_DIR, name);
+    // state.md is per-instance; others are shared
+    const filePath = (name === 'state.md' && instanceId)
+      ? resolveInstanceFile(instanceId, name)
+      : resolveSharedFile(name);
     if (!fs.existsSync(filePath)) {
       checks.push({ file: name, exists: false, budgetBytes: budget, overBudget: false });
       continue;
@@ -83,9 +92,17 @@ export function freshnessState(ageDays) {
 
 function referenceFileFreshness() {
   const results = [];
+  const resolvedPaths = resolveReferenceFiles();
+  const resolvedSet = new Set(resolvedPaths);
 
   for (const relPath of REFERENCE_FILES) {
-    const filePath = path.join(MEMORY_DIR, relPath);
+    // Find the resolved path for this reference file
+    const filePath = resolvedPaths.find(p => p.endsWith(relPath)) || path.join(MEMORY_DIR, relPath);
+    if (!resolvedSet.has(filePath) && !fs.existsSync(filePath)) {
+      results.push({ file: relPath, exists: false });
+      continue;
+    }
+
     if (!fs.existsSync(filePath)) {
       results.push({ file: relPath, exists: false });
       continue;
@@ -144,4 +161,4 @@ function main() {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main();
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url))) main();
