@@ -7,6 +7,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import { processSwitchNotices } from './runtime-switch-notices.js';
+import { verifiedQuotaRecoveries, readCurrentSubscriptionAccountKeys, readSubscriptionRotationMarkers } from './codex-quota-recovery.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -32,10 +34,25 @@ function windowUsedPercent(window, nowMs) {
   return Number(window.used_percent);
 }
 
-function providerUsageState(providerUsage, provider, nowMs) {
+function providerUsageState(providerUsage, provider, nowMs, maxAgeMs = null) {
   if (!provider) return { available: true, exhausted: false, usedPercent: 0 };
   const data = providerUsage?.providers?.[provider];
   if (!data?.available) return { available: false, exhausted: false, usedPercent: null };
+  // Opt-in policies require a real, recent provider observation. Rewriting a
+  // file containing an old rollout must not make its quota authoritative.
+  if (Number.isFinite(maxAgeMs) && maxAgeMs > 0) {
+    const observedMs = Date.parse(data.observed_at || data.fetched_at || '');
+    const windows = [data.primary, data.secondary, data.tertiary].filter(Boolean);
+    const expiredWindow = windows.some(window => {
+      const resetMs = Date.parse(window.resets_at || '');
+      return Number.isFinite(resetMs) && resetMs <= nowMs;
+    });
+    if (data.quota_authoritative !== true || !Number.isFinite(observedMs)
+        || observedMs > nowMs + 30_000 || nowMs - observedMs > maxAgeMs
+        || expiredWindow) {
+      return { available: false, exhausted: false, usedPercent: null };
+    }
+  }
   const values = [data.primary, data.secondary, data.tertiary]
     .map(window => windowUsedPercent(window, nowMs))
     .filter(Number.isFinite);
@@ -63,13 +80,39 @@ export function chooseRuntimeProfile({
   autoRecover = true,
   wrapOnExhausted = false,
   blockedProfiles = [],
+  requiredModel = null,
+  requiredReasoningEffort = null,
+  usageMaxAgeMs = null,
+  verifiedRecoveredProfiles = [],
+  usageFailoverNotBeforeMs = 0,
+  skipDwell = false,
 } = {}) {
+  if (requiredModel || requiredReasoningEffort) {
+    // The model policy pins Codex tiers only; a Claude tier carries its own
+    // model/effort and stays eligible in a mixed Claude -> Codex chain.
+    chain = chain.filter(id => {
+      const profile = profiles[id];
+      if (profile && profile.runtime !== 'codex') return true;
+      return profile && (!requiredModel || profile.model === requiredModel)
+        && (!requiredReasoningEffort || profile.reasoning_effort === requiredReasoningEffort);
+    });
+    if (chain.length === 0) {
+      return { profile: currentProfile, reason: 'model_policy_has_no_eligible_profile' };
+    }
+  }
   const currentIndex = chain.indexOf(currentProfile);
-  if (currentIndex < 0) return { profile: chain[0] || currentProfile, reason: 'profile_not_in_chain' };
+  const blocked = new Set(Array.isArray(blockedProfiles) ? blockedProfiles : Object.keys(blockedProfiles || {}));
+  if (currentIndex < 0) {
+    const target = (requiredModel || requiredReasoningEffort)
+      ? chain.find(id => !blocked.has(id)) : chain[0];
+    return target
+      ? { profile: target, reason: 'profile_not_in_chain' }
+      : { profile: currentProfile, reason: 'model_policy_has_no_eligible_profile' };
+  }
 
   const current = profiles[currentProfile] || {};
-  const currentUsage = providerUsageState(providerUsage, current.usage_provider, nowMs);
-  const blocked = new Set(Array.isArray(blockedProfiles) ? blockedProfiles : Object.keys(blockedProfiles || {}));
+  const currentUsage = providerUsageState(providerUsage, current.usage_provider, nowMs, usageMaxAgeMs);
+  const recovered = new Set(verifiedRecoveredProfiles);
   const healthLimited = HEALTH_FAILOVER_STATES.has(currentHealth);
   const usageLimited = currentUsage.available && currentUsage.usedPercent >= switchThreshold;
 
@@ -77,8 +120,12 @@ export function chooseRuntimeProfile({
   // new adapter completes a functional heartbeat. Give that probe one dwell
   // window before chaining again, otherwise one stale `degraded` status can
   // race through every fallback tier in consecutive daemon polls.
-  if (healthLimited && changedAtMs > 0 && nowMs - changedAtMs < minDwellMs) {
+  if (healthLimited && !skipDwell && changedAtMs > 0 && nowMs - changedAtMs < minDwellMs) {
     return { profile: currentProfile, reason: 'no_change' };
+  }
+
+  if (usageLimited && !healthLimited && nowMs < usageFailoverNotBeforeMs) {
+    return { profile: currentProfile, reason: 'subscription_rotation_pending' };
   }
 
   if (healthLimited || usageLimited) {
@@ -86,7 +133,7 @@ export function chooseRuntimeProfile({
       const candidateId = chain[i];
       if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
-      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
+      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
       if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
         return {
           profile: candidateId,
@@ -106,7 +153,7 @@ export function chooseRuntimeProfile({
         const candidateId = chain[i];
         if (blocked.has(candidateId)) continue;
         const candidate = profiles[candidateId] || {};
-        const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
+        const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
         if (!candidate.usage_provider || !state.available || state.usedPercent < switchThreshold) {
           return {
             profile: candidateId,
@@ -117,7 +164,8 @@ export function chooseRuntimeProfile({
         }
       }
     }
-    return { profile: currentProfile, reason: 'fallback_chain_exhausted' };
+    // A failed final fallback can still return to a verified recovered
+    // subscription. Keep forward and explicit wrap choices ahead of recovery.
   }
 
   if (autoRecover && currentIndex > 0 && nowMs - changedAtMs >= minDwellMs) {
@@ -125,8 +173,8 @@ export function chooseRuntimeProfile({
       const candidateId = chain[i];
       if (blocked.has(candidateId)) continue;
       const candidate = profiles[candidateId] || {};
-      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs);
-      if (!candidate.usage_provider || (state.available && state.usedPercent < recoverThreshold)) {
+      const state = providerUsageState(providerUsage, candidate.usage_provider, nowMs, usageMaxAgeMs);
+      if (recovered.has(candidateId) || !candidate.usage_provider || (state.available && state.usedPercent < recoverThreshold)) {
         return {
           profile: candidateId,
           reason: `preferred_provider_recovered:${candidate.usage_provider || candidateId}`,
@@ -135,13 +183,100 @@ export function chooseRuntimeProfile({
     }
   }
 
-  return { profile: currentProfile, reason: 'no_change' };
+  return { profile: currentProfile, reason: (healthLimited || usageLimited)
+    ? 'fallback_chain_exhausted' : 'no_change' };
+}
+
+// A fresh host rotator gets a bounded first chance at the 95% handoff. The
+// deadline is persisted, so daemon restarts and fresh polls cannot extend it.
+// Actual health failures retain their existing immediate fallback semantics.
+function rotationDeadline(state, { policy, profiles, currentProfile, providerUsage, marker, nowMs }) {
+  const quota = providerUsageState(providerUsage, 'codex', nowMs,
+    Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null);
+  const checkedMs = typeof marker?.checked_at === 'number' ? marker.checked_at * 1000 : NaN;
+  const fresh = marker?.available === true && /^[a-f0-9]{64}$/.test(marker.generation || '') &&
+    Number.isFinite(checkedMs) && checkedMs <= nowMs + 30_000 && nowMs - checkedMs <= 90_000;
+  if (profiles[currentProfile]?.usage_provider !== 'codex' ||
+      (quota.available && quota.usedPercent < (Number(policy.switch_threshold) || 98))) {
+    delete state.runtime_usage_rotation_wait;
+    return 0;
+  }
+  // A missing quota observation cannot start a wait or erase one already in
+  // progress. A short monitoring gap must not re-arm the same deadline.
+  if (!fresh || !quota.available) return 0;
+  const prior = state.runtime_usage_rotation_wait;
+  const started = Date.parse(prior?.started_at || '');
+  if (prior?.profile !== currentProfile || !Number.isFinite(started) || started > nowMs) {
+    state.runtime_usage_rotation_wait = { profile: currentProfile, started_at: new Date(nowMs).toISOString() };
+  }
+  return Date.parse(state.runtime_usage_rotation_wait.started_at) + 120_000;
+}
+
+// runtime_failover.hold_profiles: tiers an external owner (the Codex account
+// rotation service) has marked unusable. A held tier is skipped for forward
+// switches and recovery alike, unlike auto_recover=false, which would also stop
+// recovery into every other tier of a mixed chain.
+function heldProfiles(policy) {
+  return new Set([...profileList(policy.hold_profiles), ...ineligibleProfiles(policy)]);
+}
+
+function profileList(value) {
+  return Array.isArray(value) ? value.filter(id => typeof id === 'string') : [];
+}
+
+// runtime_failover.ineligible_profiles: tiers whose subscription is on a free
+// or canceled plan (the rotation service reads each account's plan). Held like
+// hold_profiles, and an instance already on one leaves it at once instead of
+// waiting for the engine to fail. Removal (resubscription) restores recovery.
+function ineligibleProfiles(policy) {
+  return new Set(profileList(policy.ineligible_profiles));
+}
+
+function withHeld(blocked, held) {
+  return held.size ? { ...blocked, ...Object.fromEntries([...held].map(id => [id, { hold: 'policy' }])) } : blocked;
+}
+
+const DOWNSHIFT_SNAPSHOT_MAX_AGE_MS = 180_000;
+
+/**
+ * A ChatGPT-account Codex TUI silently moves a thread to a reserve model
+ * ("Luna Reserve", gpt-reserve) when the account hits a hard usage limit.
+ * No persona may run on a model other than its profile pin: report the
+ * observed model when the live engine's context record (same profile, newer
+ * than the last switch, freshly polled) names a different model.
+ */
+export function observedModelDownshift(snapshot, { profileId, profile, changedAtMs = 0, nowMs = Date.now() } = {}) {
+  if (!snapshot || profile?.runtime !== 'codex' || typeof profile.model !== 'string') return null;
+  const model = snapshot.actual_model;
+  if (snapshot.runtime_profile !== profileId || typeof model !== 'string' || model === profile.model) return null;
+  const seenMs = Date.parse(snapshot.actual_model_observed_at || '');
+  const polledMs = Date.parse(snapshot.observed_at || '');
+  if (!Number.isFinite(seenMs) || seenMs < changedAtMs || !Number.isFinite(polledMs)
+    || nowMs - polledMs > DOWNSHIFT_SNAPSHOT_MAX_AGE_MS || polledMs > nowMs + 30_000) return null;
+  return model;
+}
+
+function firstUsableTier({ chain, profiles, blocked, providerUsage, policy, nowMs }) {
+  const threshold = Number(policy.switch_threshold) || 98;
+  const maxAgeMs = Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null;
+  return chain.find(id => {
+    const profile = profiles[id] || {};
+    if (blocked.has(id)) return false;
+    if (profile.runtime === 'codex' && ((policy.required_model && profile.model !== policy.required_model)
+      || (policy.required_reasoning_effort && profile.reasoning_effort !== policy.required_reasoning_effort))) return false;
+    if (!profile.usage_provider) return true;
+    const state = providerUsageState(providerUsage, profile.usage_provider, nowMs, maxAgeMs);
+    return state.available && state.usedPercent < threshold;
+  }) || null;
 }
 
 export function planRuntimeFailover({
   document,
   providerUsage,
   healthByInstance = {},
+  currentSubscriptionAccountKeys = {},
+  rotationMarkers = {},
+  modelSnapshots = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -150,6 +285,8 @@ export function planRuntimeFailover({
   const chain = Array.isArray(policy.chain) ? policy.chain.filter(id => profiles[id]) : [];
   const changes = [];
   if (!policy.enabled || chain.length < 2) return { document: next, changes };
+  const held = heldProfiles(policy);
+  const ineligible = ineligibleProfiles(policy);
 
   for (const [instanceId, instance] of Object.entries(next.instances || {})) {
     if (instance.enabled === false || instance.runtime_failover_enabled !== true) continue;
@@ -161,8 +298,49 @@ export function planRuntimeFailover({
       && !Array.isArray(instance.runtime_failover_blocked_profiles)
       ? instance.runtime_failover_blocked_profiles
       : {};
-    const currentHealth = healthByInstance[instanceId] || 'ok';
+    const currentAccountKeys = currentSubscriptionAccountKeys[instanceId] || {};
+    const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys })
+      .filter(id => !held.has(id));
+    const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !recovered.includes(id)));
+    if (instance.runtime_failover_suspended) {
+      // Stopped rather than run on a reserve model; resume on the first usable tier.
+      const resume = firstUsableTier({ chain, profiles, blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))),
+        providerUsage, policy, nowMs });
+      if (!resume) continue;
+      if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
+      delete instance.runtime_failover_suspended;
+      instance.runtime_profile = resume;
+      instance.runtime = profiles[resume].runtime;
+      instance.runtime_profile_changed_at = new Date(nowMs).toISOString();
+      instance.runtime_profile_change_reason = 'resumed_after_model_downshift';
+      changes.push({ instanceId, fromProfile: currentProfile, toProfile: resume, runtime: profiles[resume].runtime,
+        reason: 'resumed_after_model_downshift', tmuxSession: instance.tmux_session || `${profiles[resume].runtime}-${instanceId}` });
+      continue;
+    }
+    const leave = ineligible.has(currentProfile) && firstUsableTier({ chain, profiles,
+      blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))), providerUsage, policy, nowMs });
+    if (leave) {
+      const reason = `plan_ineligible:${currentProfile}`;
+      if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
+      delete instance.runtime_usage_rotation_wait;
+      instance.runtime_profile = leave;
+      instance.runtime = profiles[leave].runtime;
+      instance.runtime_profile_changed_at = new Date(nowMs).toISOString();
+      instance.runtime_profile_change_reason = reason;
+      changes.push({ instanceId, fromProfile: currentProfile, toProfile: leave, runtime: profiles[leave].runtime, reason,
+        tmuxSession: instance.tmux_session || `${profiles[leave].runtime}-${instanceId}` });
+      continue;
+    }
+    const downshift = observedModelDownshift(modelSnapshots[instanceId], { profileId: currentProfile,
+      profile: profiles[currentProfile], changedAtMs, nowMs });
+    // A reserve-model switch means the account hit its hard limit: same handling
+    // as an explicit Codex quota failure, without waiting out the dwell.
+    const currentHealth = downshift ? 'rate_limited' : healthByInstance[instanceId] || 'ok';
+    const usageFailoverNotBeforeMs = downshift ? 0 : rotationDeadline(instance, { policy, profiles, currentProfile, providerUsage,
+      marker: rotationMarkers[instanceId]?.[currentProfile], nowMs });
     const decision = chooseRuntimeProfile({
+      skipDwell: Boolean(downshift),
+      usageFailoverNotBeforeMs,
       currentProfile,
       chain,
       profiles,
@@ -175,25 +353,38 @@ export function planRuntimeFailover({
       nowMs,
       autoRecover: policy.auto_recover !== false,
       wrapOnExhausted: policy.wrap_on_exhausted === true,
-      blockedProfiles,
+      blockedProfiles: withHeld(eligibleBlocks, held),
+      verifiedRecoveredProfiles: recovered,
+      requiredModel: policy.required_model,
+      requiredReasoningEffort: policy.required_reasoning_effort,
+      usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
     });
-    if (decision.profile === currentProfile) continue;
+    if (downshift) decision.reason = `model_downshift:${downshift}`;
+    if (decision.profile === currentProfile && !downshift) continue;
 
-    const target = profiles[decision.profile];
-    if (QUARANTINE_HEALTH_STATES.has(currentHealth)) {
-      // Quota failures self-expire from provider usage windows. Functional
-      // failures do not have a trustworthy recovery signal, so quarantine the
-      // failed profile until an operator clears this persisted entry after
-      // repairing credentials/provider access. This prevents auto-recover from
-      // bouncing a healthy fallback back into a known-bad provider.
+    if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
+    if (QUARANTINE_HEALTH_STATES.has(currentHealth) || (currentHealth === 'rate_limited' && profiles[currentProfile]?.usage_provider === 'codex')) {
+      // An explicit model quota failure can coexist with a low general Codex
+      // quota. Keep it held until a newer same-model success proves recovery.
+      // Existing authentication/degraded holds retain their manual semantics.
       instance.runtime_failover_blocked_profiles = {
-        ...blockedProfiles,
+        ...eligibleBlocks,
         [currentProfile]: {
           health: currentHealth,
           blocked_at: new Date(nowMs).toISOString(),
+          ...(currentHealth === 'rate_limited' ? { account_key: currentAccountKeys[currentProfile] || null, model: profiles[currentProfile]?.model } : {}),
         },
       };
     }
+    delete instance.runtime_usage_rotation_wait;
+    if (decision.profile === currentProfile) {
+      // No usable tier: stop the engine instead of letting it run on the reserve model.
+      instance.runtime_failover_suspended = { reason: decision.reason, profile: currentProfile, at: new Date(nowMs).toISOString() };
+      changes.push({ instanceId, fromProfile: currentProfile, toProfile: null, suspend: true, reason: decision.reason,
+        tmuxSession: instance.tmux_session || `${profiles[currentProfile]?.runtime || 'codex'}-${instanceId}` });
+      continue;
+    }
+    const target = profiles[decision.profile];
     instance.runtime_profile = decision.profile;
     instance.runtime = target.runtime;
     instance.runtime_profile_changed_at = new Date(nowMs).toISOString();
@@ -207,7 +398,7 @@ export function planRuntimeFailover({
       tmuxSession: instance.tmux_session || `${target.runtime}-${instanceId}`,
     });
   }
-  return { document: next, changes };
+  return { document: next, changes, stateChanged: JSON.stringify(next) !== JSON.stringify(document || {}) };
 }
 
 /**
@@ -219,6 +410,8 @@ export function planSingleSessionRuntimeFailover({
   document,
   providerUsage,
   currentHealth = 'ok',
+  currentSubscriptionAccountKeys = {},
+  rotationMarkers = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -234,7 +427,14 @@ export function planSingleSessionRuntimeFailover({
     && !Array.isArray(next.runtime_failover_blocked_profiles)
     ? next.runtime_failover_blocked_profiles
     : {};
+  const held = heldProfiles(policy);
+  const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys })
+    .filter(id => !held.has(id));
+  const eligibleBlocks = Object.fromEntries(Object.entries(currentBlockedProfiles).filter(([id]) => !recovered.includes(id)));
+  const usageFailoverNotBeforeMs = rotationDeadline(next, { policy, profiles, currentProfile, providerUsage,
+    marker: rotationMarkers[currentProfile], nowMs });
   const decision = chooseRuntimeProfile({
+    usageFailoverNotBeforeMs,
     currentProfile,
     chain,
     profiles,
@@ -247,20 +447,27 @@ export function planSingleSessionRuntimeFailover({
     nowMs,
     autoRecover: policy.auto_recover !== false,
     wrapOnExhausted: policy.wrap_on_exhausted === true,
-    blockedProfiles: currentBlockedProfiles,
+    blockedProfiles: withHeld(eligibleBlocks, held),
+    verifiedRecoveredProfiles: recovered,
+    requiredModel: policy.required_model,
+    requiredReasoningEffort: policy.required_reasoning_effort,
+    usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
   });
-  if (decision.profile === currentProfile) return { document: next, changes };
+  if (decision.profile === currentProfile) return { document: next, changes, stateChanged: JSON.stringify(next) !== JSON.stringify(document || {}) };
 
   const target = profiles[decision.profile];
-  if (QUARANTINE_HEALTH_STATES.has(currentHealth)) {
+  if (recovered.length) next.runtime_failover_blocked_profiles = eligibleBlocks;
+  if (QUARANTINE_HEALTH_STATES.has(currentHealth) || (currentHealth === 'rate_limited' && profiles[currentProfile]?.usage_provider === 'codex')) {
     next.runtime_failover_blocked_profiles = {
-      ...currentBlockedProfiles,
+      ...eligibleBlocks,
       [currentProfile]: {
         health: currentHealth,
         blocked_at: new Date(nowMs).toISOString(),
+        ...(currentHealth === 'rate_limited' ? { account_key: currentSubscriptionAccountKeys[currentProfile] || null, model: profiles[currentProfile]?.model } : {}),
       },
     };
   }
+  delete next.runtime_usage_rotation_wait;
   next.active_profile = decision.profile;
   next.active_runtime = target.runtime;
   next.runtime_profile_changed_at = new Date(nowMs).toISOString();
@@ -283,6 +490,15 @@ function monitorDirFor(instanceId, instance) {
   return path.join(ZYLOS_DIR, 'activity-monitor', instanceId);
 }
 
+function readModelSnapshots(document) {
+  const result = {};
+  for (const [instanceId, instance] of Object.entries(document?.instances || {})) {
+    const snapshot = readJson(path.join(monitorDirFor(instanceId, instance), 'context-window.json'), null);
+    if (snapshot) result[instanceId] = snapshot;
+  }
+  return result;
+}
+
 function readHealthByInstance(document) {
   const result = {};
   for (const [instanceId, instance] of Object.entries(document?.instances || {})) {
@@ -292,11 +508,30 @@ function readHealthByInstance(document) {
   return result;
 }
 
-function writeInstancesAtomic(document) {
-  const tmp = `${INSTANCES_FILE}.tmp.${process.pid}`;
-  const mode = fs.statSync(INSTANCES_FILE).mode & 0o777;
-  fs.writeFileSync(tmp, JSON.stringify(document, null, 2) + '\n', { mode });
-  fs.renameSync(tmp, INSTANCES_FILE);
+// Called inside the instances.json read/modify/write lock. Preserve access for
+// persona UIDs: the daemon's primary group can differ from the shared file's.
+export function writeInstancesAtomic(document, {
+  filePath = INSTANCES_FILE,
+  execFileSyncImpl = execFileSync,
+} = {}) {
+  const before = fs.lstatSync(filePath);
+  if (!before.isFile()) throw new Error('instances.json must be a regular file');
+  const stagingDir = fs.mkdtempSync(`${filePath}.tmp.`);
+  const tmp = path.join(stagingDir, 'instances.json');
+  try {
+    // cp -p preserves owner, group, mode and filesystem ACLs. Keep its staging
+    // copy private, then replace only the contents without changing its inode.
+    execFileSyncImpl('cp', ['-p', '--', filePath, tmp], { stdio: 'pipe', timeout: 5000 });
+    fs.writeFileSync(tmp, JSON.stringify(document, null, 2) + '\n');
+    const after = fs.statSync(tmp);
+    if (after.uid !== before.uid || after.gid !== before.gid
+        || (after.mode & 0o7777) !== (before.mode & 0o7777)) {
+      throw new Error('instances.json access metadata was not preserved');
+    }
+    fs.renameSync(tmp, filePath);
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+  }
 }
 
 function writeJsonAtomic(filePath, document) {
@@ -326,12 +561,15 @@ export function applyRuntimeFailover({
       const document = readJson(INSTANCES_FILE, {});
       const planned = planRuntimeFailover({
         document,
+        currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
+        rotationMarkers: readSubscriptionRotationMarkers(document),
         providerUsage,
         healthByInstance: readHealthByInstance(document),
+        modelSnapshots: readModelSnapshots(document),
         nowMs,
       });
       changes = planned.changes;
-      if (changes.length > 0) writeInstancesAtomic(planned.document);
+      if (changes.length > 0 || planned.stateChanged) writeInstancesAtomic(planned.document);
     });
   } else if (fs.existsSync(SINGLE_PROFILE_FILE)) {
     withFileLock(`${SINGLE_PROFILE_FILE}.lock`, () => {
@@ -342,14 +580,16 @@ export function applyRuntimeFailover({
       const currentHealth = status.health || status.health_state || status.state || 'ok';
       const planned = planSingleSessionRuntimeFailover({
         document,
+        currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
+        rotationMarkers: readSubscriptionRotationMarkers(document),
         providerUsage,
         currentHealth,
         nowMs,
       });
       changes = planned.changes;
-      if (changes.length > 0) {
+      if (changes.length > 0 || planned.stateChanged) {
         writeJsonAtomic(SINGLE_PROFILE_FILE, planned.document);
-        updateConfiguredRuntime(changes[0].runtime);
+        if (changes.length > 0) updateConfiguredRuntime(changes[0].runtime);
       }
     });
   }
@@ -358,7 +598,7 @@ export function applyRuntimeFailover({
   // later PM2 restart fails, its durable signal still protects the next boot
   // from inheriting the previous adapter's degraded heartbeat state.
   for (const change of changes) {
-    if (change.singleSession) continue;
+    if (change.suspend) continue;
     writeRuntimeSwitchSignal({
       zylosDir: ZYLOS_DIR,
       change,
@@ -374,6 +614,11 @@ export function applyRuntimeFailover({
       });
     } catch { /* absent pane is fine */ }
     const monitorName = change.monitorName || `activity-monitor-${change.instanceId}`;
+    if (change.suspend) {
+      execFileSyncImpl('pm2', ['stop', monitorName], { stdio: 'ignore', timeout: 30_000 });
+      log(`[runtime-failover] ${change.instanceId}: SUSPENDED on ${change.fromProfile} (${change.reason}); no usable tier`);
+      continue;
+    }
     execFileSyncImpl('pm2', ['restart', monitorName, '--update-env'], {
       stdio: 'ignore',
       timeout: 30_000,
@@ -390,8 +635,10 @@ export async function runDaemon({
   error = console.error,
 } = {}) {
   log(`[runtime-failover] daemon started (poll=${pollMs}ms)`);
+  try { await processSwitchNotices({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[runtime-switch-notices] ${err.message}`); }
   while (true) {
     try { apply({ log }); } catch (err) { error(`[runtime-failover] ${err.message}`); }
+    try { await processSwitchNotices({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[runtime-switch-notices] ${err.message}`); }
     await new Promise(resolve => setTimeout(resolve, pollMs));
   }
 }

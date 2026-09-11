@@ -110,23 +110,35 @@ const CCUSAGE_BIN = process.env.CCUSAGE_BIN
   || (fs.existsSync(PINNED_CCUSAGE) ? PINNED_CCUSAGE : 'ccusage');
 
 /**
- * OS-isolated instances write transcripts under their own HOME
- * (/home/<os_user>/.claude/projects), not the service user's. ccusage honors
- * comma-separated CLAUDE_CONFIG_DIR — scan every home we know about.
- * Requires service-user read ACLs on the agent .claude dirs (provisioned by
- * scripts/ops/provision-agent-user.sh).
+ * Claude ccusage targets. Non-isolated instances (admin, scheduler) share the
+ * service user's home and run in one ccusage pass with comma-separated
+ * CLAUDE_CONFIG_DIR. OS-isolated instances own their transcripts
+ * (/home/<os_user>/.claude/projects/*.jsonl, mode 0600), so ccusage runs AS
+ * that os_user via sudo and only the aggregate JSON crosses the boundary.
  */
-function buildClaudeConfigDirs(zylosDir = ZYLOS_DIR) {
-  const dirs = [path.join(os.homedir(), '.claude')];
+export function buildClaudeUsageTargets(zylosDir = ZYLOS_DIR) {
+  const operatorDirs = [path.join(os.homedir(), '.claude')];
+  const personaDirs = new Map();
+  const serviceUser = os.userInfo().username;
   try {
     const config = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
     for (const inst of Object.values(config?.instances || {})) {
-      if (inst?.claude_config_dir && !dirs.includes(inst.claude_config_dir)) {
-        dirs.push(inst.claude_config_dir);
+      if (inst?.os_user && inst.os_user !== serviceUser) {
+        const dir = inst.claude_config_dir || `/home/${inst.os_user}/.claude`;
+        if (!personaDirs.has(inst.os_user)) personaDirs.set(inst.os_user, []);
+        if (!personaDirs.get(inst.os_user).includes(dir)) personaDirs.get(inst.os_user).push(dir);
+      } else if (inst?.claude_config_dir && !operatorDirs.includes(inst.claude_config_dir)) {
+        operatorDirs.push(inst.claude_config_dir);
       }
     }
   } catch { /* single-session or unreadable config — service home only */ }
-  return dirs.filter((d) => { try { return fs.existsSync(d); } catch { return false; } });
+  return [
+    {
+      os_user: null,
+      config_dirs: operatorDirs.filter((d) => { try { return fs.existsSync(d); } catch { return false; } }),
+    },
+    ...Array.from(personaDirs, ([osUser, dirs]) => ({ os_user: osUser, config_dirs: dirs })),
+  ];
 }
 
 function loadKnownInstanceIds(zylosDir = ZYLOS_DIR) {
@@ -591,35 +603,61 @@ export function buildTokenCacheResult(data, now = new Date()) {
   });
 }
 
-function fetchClaudeTokenCacheData({
-  execFileSyncImpl = execFileSync,
-  now = new Date(),
-} = {}) {
-  const sinceDate = new Date(now);
-  sinceDate.setDate(sinceDate.getDate() - DAYS_BACK);
-  const since = sinceDate.toISOString().slice(0, 10).replace(/-/g, '');
+function runClaudeCcusage({ execFileSyncImpl, since, target }) {
+  const ccusageArgs = ['daily', '--json', '--instances', '--breakdown', '--since', since, '--offline'];
+  const configDir = target.config_dirs.join(',');
+  const command = target.os_user ? 'sudo' : CCUSAGE_BIN;
+  const args = target.os_user
+    ? ['-n', '-u', target.os_user, '-H', '--', '/usr/bin/env', `CLAUDE_CONFIG_DIR=${configDir}`, CCUSAGE_BIN, ...ccusageArgs]
+    : ccusageArgs;
 
   let raw;
   try {
-    raw = execFileSyncImpl(CCUSAGE_BIN, ['daily', '--json', '--instances', '--breakdown', '--since', since, '--offline'], {
+    raw = execFileSyncImpl(command, args, {
       encoding: 'utf8',
       timeout: 120_000,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, CLAUDE_CONFIG_DIR: buildClaudeConfigDirs().join(',') },
+      env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
     });
   } catch (err) {
     const detail = err.stderr ? String(err.stderr).trim() : err.message;
     throw new Error(`ccusage failed: ${detail}`);
   }
 
-  let data;
   try {
-    data = JSON.parse(raw);
+    return JSON.parse(raw)?.projects || {};
   } catch (err) {
     throw new Error(`Failed to parse ccusage output: ${err.message}`);
   }
+}
 
-  return buildTokenCacheResult(data, now);
+function fetchClaudeTokenCacheData({
+  execFileSyncImpl = execFileSync,
+  now = new Date(),
+  zylosDir = ZYLOS_DIR,
+} = {}) {
+  const sinceDate = new Date(now);
+  sinceDate.setDate(sinceDate.getDate() - DAYS_BACK);
+  const since = sinceDate.toISOString().slice(0, 10).replace(/-/g, '');
+
+  // One failing target (e.g. a persona sudo/ACL problem) must not drop the
+  // others: collect per-target failures as warnings.
+  const projects = {};
+  const warnings = [];
+  for (const target of buildClaudeUsageTargets(zylosDir)) {
+    try {
+      const targetProjects = runClaudeCcusage({ execFileSyncImpl, since, target });
+      for (const [name, rows] of Object.entries(targetProjects)) {
+        projects[name] = [...(projects[name] || []), ...(Array.isArray(rows) ? rows : [])];
+      }
+    } catch (err) {
+      warnings.push(`${target.os_user ? `claude[${target.os_user}]` : 'claude'}: ${err.message}`);
+    }
+  }
+
+  const result = buildTokenCacheResult({ projects }, now);
+  if (warnings.length) result.warnings = warnings;
+  return result;
 }
 
 function fetchCodexSessionData({
@@ -681,7 +719,7 @@ export function fetchTokenCacheData({
 } = {}) {
   let result;
   try {
-    result = fetchClaudeTokenCacheData({ execFileSyncImpl, now });
+    result = fetchClaudeTokenCacheData({ execFileSyncImpl, now, zylosDir });
   } catch (err) {
     // Claude transcript ACL drift must not suppress independent Codex/Azure
     // token and equivalent-cost reporting.
