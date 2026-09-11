@@ -61,11 +61,12 @@ describe('insertControl', () => {
 
   it('auto-appends ack suffix with the actual id', () => {
     const rec = mod.insertControl('Do something.');
-    assert.ok(rec.content.includes('---- ack via:'));
-    assert.ok(rec.content.includes(`ack --id ${rec.id}`));
+    const controlScriptPath = new URL('../c4-control.js', import.meta.url).pathname;
+    const expectedSuffix = ` ---- ack via: '${process.execPath}' '${controlScriptPath}' ack --id ${rec.id}`;
+    assert.ok(rec.content.endsWith(expectedSuffix));
     // verify persisted value matches
     const row = mod.getControlById(rec.id);
-    assert.ok(row.content.includes(`ack --id ${rec.id}`));
+    assert.ok(row.content.endsWith(expectedSuffix));
   });
 
   it('supports appendAckSuffix=false for clean slash controls', () => {
@@ -164,6 +165,10 @@ describe('insertControl', () => {
   it('strips only a trailing ack suffix when backfilling raw_content', () => {
     assert.equal(
       mod.stripTrailingAckSuffix('literal ---- ack via: inside body ---- ack via: node /tmp/c4-control.js ack --id 7'),
+      'literal ---- ack via: inside body'
+    );
+    assert.equal(
+      mod.stripTrailingAckSuffix("literal ---- ack via: inside body ---- ack via: '/opt/node 24/bin/node' '/tmp/c4 control.js' ack --id 8"),
       'literal ---- ack via: inside body'
     );
     assert.equal(

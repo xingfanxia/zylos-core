@@ -70,6 +70,10 @@ describe('AUTH_FAILURE_PATTERNS', () => {
     assert.ok(matchesAuth('session token expired'));
   });
 
+  it('matches an organization-level subscription denial', () => {
+    assert.ok(matchesAuth('Your organization has disabled Claude subscription access for Claude Code'));
+  });
+
   it('does NOT match the cosmetic setup-token status line', () => {
     // "Not logged in · Run /login" is printed permanently by Claude Code's TUI
     // for an inference-scope setup token, even while the agent is fully

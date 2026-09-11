@@ -7,12 +7,12 @@
  * not just given passive context.
  */
 
+import { isCliEntry } from '../../multi-session/cli-entry.js';
 import { execFile } from 'child_process';
 import { promisify } from 'node:util';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { fileURLToPath } from 'node:url';
 
 const execFileAsync = promisify(execFile);
 
@@ -163,7 +163,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+if (isCliEntry(import.meta.url)) {
   main().catch(() => {
     // Best-effort.
   });

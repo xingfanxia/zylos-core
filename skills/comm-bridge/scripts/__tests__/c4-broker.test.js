@@ -368,6 +368,64 @@ describe('broker handleRequest', () => {
     assert.equal(typeof s.data.context, 'string');
   });
 
+  it('startup shard requests keep checkpoint and conversation scope on the authenticated caller', async () => {
+    const { insertConversation } = await import('../c4-db.js');
+    for (const [caller, marker] of [['shard-a', 'SHARD_A'], ['shard-b', 'SHARD_B_PRIVATE']]) {
+      await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: marker + '_CHECKPOINT' } }, caller);
+      insertConversation('in', 'telegram', caller, marker + '_MESSAGE', 'delivered', 3, false, null, caller);
+    }
+    for (const section of ['checkpoint', 'conversations']) {
+      const res = await broker.handleRequest({ op: 'session-init', params: {
+        section, instanceId: 'shard-b', target_instance: 'shard-b', caller: 'shard-b', brokerRouting: true,
+        budget: { maxChars: 1000000, maxTokens: 1000000 },
+      } }, 'shard-a');
+      assert.equal(res.ok, true, res.error);
+      assert.equal(res.data.section, section);
+      assert.ok(res.data.context.includes('SHARD_A'));
+      assert.ok(!res.data.context.includes('SHARD_B_PRIVATE'));
+      assert.ok(res.data.context.length <= 10000);
+      assert.equal(res.data.context.includes('=== LAST CHECKPOINT SUMMARY ==='), section === 'checkpoint');
+    }
+  });
+
+  it('startup transport is bounded separately from inline rendering and never returns empty success', async () => {
+    await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: '大'.repeat(20000) } }, 'large-shard');
+    const large = await broker.handleRequest({ op: 'session-init', params: {
+      section: 'checkpoint', budget: { maxChars: 1000000, maxTokens: 1000000 },
+    } }, 'large-shard');
+    assert.equal(large.ok, true);
+    assert.ok(large.data.context.includes('大'.repeat(20000)));
+    assert.ok(large.data.context.length > 10000);
+    await broker.handleRequest({ op: 'checkpoint', params: { endId: 0, summary: '大'.repeat(400000) } }, 'transport-too-large');
+    const excessive = await broker.handleRequest({ op: 'session-init', params: {
+      section: 'checkpoint', budget: { maxChars: 100000000, maxTokens: 100000000 },
+    } }, 'transport-too-large');
+    assert.equal(excessive.ok, false);
+    assert.equal(excessive.error, 'session_init_transport_limit');
+    assert.equal(excessive.data, undefined);
+    const legacy = await broker.handleRequest({ op: 'session-init' }, 'transport-too-large');
+    assert.equal(legacy.ok, true);
+    assert.ok(legacy.data.context.includes('大'.repeat(400000)));
+    for (const budget of [-1, [], { maxChars: -1 }, { maxTokens: 0 }, { maxChars: 0.5 }]) {
+      const invalid = await broker.handleRequest({ op: 'session-init', params: { section: 'conversations', budget } }, 'shard-a');
+      assert.equal(invalid.ok, false);
+      assert.equal(invalid.error, 'invalid_session_init_budget');
+    }
+    const invalid = await broker.handleRequest({ op: 'session-init', params: { section: 'all-instances' } }, 'shard-a');
+    assert.equal(invalid.ok, false);
+    const unauthenticated = await broker.handleRequest({ op: 'session-init', params: { section: 'checkpoint' } }, '');
+    assert.equal(unauthenticated.ok, false);
+    assert.equal(unauthenticated.error, 'authenticated_caller_required');
+  });
+
+  it('an absent scoped checkpoint emits an explicit stable header', async () => {
+    const res = await broker.handleRequest({ op: 'session-init', params: { section: 'checkpoint' } }, 'no-checkpoint-yet');
+    assert.equal(res.ok, true);
+    assert.ok(res.data.context.includes('=== LAST CHECKPOINT SUMMARY ==='));
+    assert.ok(res.data.context.includes('No saved checkpoint exists for this instance.'));
+    assert.ok(!res.data.context.includes('SHARD_B_PRIVATE'));
+  });
+
   it('rejects unknown ops and missing content', async () => {
     const unknown = await broker.handleRequest({ op: 'nope' }, 'inst-a');
     assert.equal(unknown.ok, false);
@@ -405,11 +463,37 @@ describe('broker handleRequest', () => {
     assert.match(toOwner.error, /channel_send_failed/); // passed auth, reached the (failing) channel
   });
 
-  it('send: M3 — out-row is NULL-targeted (not replayed into the caller\'s unsummarized)', async () => {
-    const before = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
-    await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'reply text' } }, 'inst-a');
-    const after = (await broker.handleRequest({ op: 'unsummarized' }, 'inst-a')).data.count;
-    assert.equal(after, before, 'own outbound message must not count toward unsummarized');
+  it('send: stores the caller on the out-row and includes it in only that caller\'s history', async () => {
+    const sent = await broker.handleRequest({
+      op: 'send',
+      params: { channel: 'web-console', endpoint: 'console-1', content: 'scoped reply text' },
+    }, 'inst-b');
+    assert.equal(sent.ok, true, sent.error);
+
+    const row = getDb().prepare(
+      'SELECT id, direction, status, target_instance FROM conversations WHERE id = ?'
+    ).get(sent.data.conversation_id);
+    assert.equal(row.direction, 'out');
+    assert.equal(row.status, 'delivered');
+    assert.equal(row.target_instance, 'inst-b');
+
+    const ownRange = await broker.handleRequest({ op: 'unsummarized' }, 'inst-b');
+    assert.equal(ownRange.ok, true);
+    assert.ok(ownRange.data.begin_id <= row.id && ownRange.data.end_id >= row.id);
+
+    const ownUnsummarized = await broker.handleRequest({ op: 'fetch', params: { unsummarized: true } }, 'inst-b');
+    assert.equal(ownUnsummarized.ok, true);
+    assert.ok(
+      ownUnsummarized.data.conversations.some((conversation) => conversation.id === row.id),
+      'caller must see its delivered outbound in unsummarized history',
+    );
+
+    const crossFetch = await broker.handleRequest({
+      op: 'fetch',
+      params: { begin: row.id, end: row.id },
+    }, 'inst-a');
+    assert.equal(crossFetch.ok, true);
+    assert.deepEqual(crossFetch.data.conversations, [], 'another caller must not see the outbound row');
   });
 
   it('send: deliveryAction survives the broker hop into the audit row', async () => {
@@ -433,8 +517,9 @@ describe('broker handleRequest', () => {
     }, 'inst-a');
     assert.equal(r.ok, false);
     assert.match(r.error, /channel_send_failed/);
-    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    const row = getDb().prepare('SELECT status, target_instance FROM conversations WHERE id = ?').get(r.data.conversation_id);
     assert.equal(row.status, 'failed');
+    assert.equal(row.target_instance, 'inst-a', 'failed audit rows retain caller attribution');
   });
 });
 
@@ -670,9 +755,8 @@ describe('broker void op', () => {
     assert.equal(r.data.recorded, true);
     assert.ok(Number.isInteger(r.data.conversation_id));
     // Void is scoped to the caller (target_instance = caller) and 'delivered', so
-    // that instance's own next session-init reads the handoff back — unlike
-    // real-channel out-rows which are NULL-targeted (M3). Assert the row shape
-    // directly (immune to the sibling checkpoint's id boundary).
+    // that instance's own next session-init reads the handoff back. Assert the
+    // row shape directly (immune to the sibling checkpoint's id boundary).
     const row = getDb().prepare('SELECT direction, channel, status, target_instance FROM conversations WHERE id = ?').get(r.data.conversation_id);
     assert.equal(row.channel, 'void');
     assert.equal(row.direction, 'out');

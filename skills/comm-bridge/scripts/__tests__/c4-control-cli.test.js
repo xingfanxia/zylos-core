@@ -18,7 +18,7 @@ function cliRaw(args, env = {}) {
 
 function withTmpDir(fn) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-control-cli-'));
-  const env = { ZYLOS_DIR: tmpDir };
+  const env = { ZYLOS_DIR: tmpDir, ZYLOS_INSTANCE_ID: '' };
   try {
     return fn({ tmpDir, env });
   } finally {
@@ -50,6 +50,35 @@ function getControlRow(tmpDir, id) {
 // -- enqueue --
 
 describe('c4-control enqueue', () => {
+  it('trusted persona lifecycle controls default to self and cannot supersede a sibling', () => {
+    withTmpDir(({ env, tmpDir }) => {
+      const ids = ['admin', 'scheduler'].map(instance => {
+        const result = cliRaw(['enqueue', '--content', '/exit', '--no-ack-suffix'], { ...env, ZYLOS_INSTANCE_ID: instance });
+        assert.equal(result.status, 0, result.stderr);
+        return Number(parseControlId(result.stdout));
+      });
+      const result = spawnSync('sqlite3', ['-json', path.join(tmpDir, 'comm-bridge/c4.db'),
+        `SELECT id, status, target_instance FROM control_queue WHERE id IN (${ids.join(',')}) ORDER BY id;`], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout).map(({ status, target_instance }) => ({ status, target_instance })), [
+        { status: 'pending', target_instance: 'admin' }, { status: 'pending', target_instance: 'scheduler' },
+      ]);
+    });
+  });
+
+  it('retains explicit trusted cross-targeting and the no-instance legacy default', () => {
+    withTmpDir(({ env, tmpDir }) => {
+      const explicit = cliRaw(['enqueue', '--content', 'explicit', '--target-instance', 'admin'], { ...env, ZYLOS_INSTANCE_ID: 'scheduler' });
+      const legacy = cliRaw(['enqueue', '--content', 'legacy'], env);
+      assert.equal(explicit.status, 0, explicit.stderr); assert.equal(legacy.status, 0, legacy.stderr);
+      const ids = [parseControlId(explicit.stdout), parseControlId(legacy.stdout)];
+      const result = spawnSync('sqlite3', ['-json', path.join(tmpDir, 'comm-bridge/c4.db'),
+        `SELECT target_instance FROM control_queue WHERE id IN (${ids.join(',')}) ORDER BY id;`], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), [{ target_instance: 'admin' }, { target_instance: null }]);
+    });
+  });
+
   it('basic enqueue returns OK and id', () => {
     withTmpDir(({ env }) => {
       const { stdout, status } = cliRaw(['enqueue', '--content', 'hello world'], env);
