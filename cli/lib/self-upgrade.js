@@ -39,6 +39,19 @@ import { deployManifestTemplate } from './runtime/tmux-env.js';
 import { writeCodexConfig } from './runtime-setup.js';
 import { getCoreEcosystemPath, restartManagedProcess } from './pm2.js';
 
+// Fork modules loaded lazily to avoid top-level await (breaks node:test imports)
+let _forkConfig;
+let _upstreamMerge;
+async function loadForkModules() {
+  if (_forkConfig === undefined) {
+    try { _forkConfig = await import('./fork-config.js'); } catch { _forkConfig = null; }
+  }
+  if (_forkConfig && _upstreamMerge === undefined) {
+    try { _upstreamMerge = await import('./upstream-merge.js'); } catch { _upstreamMerge = null; }
+  }
+  return { forkConfig: _forkConfig, upstreamMerge: _upstreamMerge };
+}
+
 const REPO = 'zylos-ai/zylos-core';
 
 // ---------------------------------------------------------------------------
@@ -67,11 +80,15 @@ export function getCurrentVersion() {
  * @param {string} [opts.branch] - Branch to read from (reads package.json from branch)
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) tags
  */
-function getLatestVersion({ branch, beta = false } = {}) {
+async function getLatestVersion({ branch, beta = false } = {}) {
+  // Use fork repo when available, otherwise default upstream
+  const { forkConfig } = await loadForkModules();
+  const repo = (forkConfig?.isFork() && forkConfig.FORK_REPO) ? forkConfig.FORK_REPO : REPO;
+
   // When --branch is specified, read package.json from that branch
   if (branch) {
     try {
-      const content = fetchRawFile(REPO, 'package.json', branch);
+      const content = fetchRawFile(repo, 'package.json', branch);
       const pkg = JSON.parse(content);
       return { success: true, version: pkg.version };
     } catch (err) {
@@ -81,7 +98,7 @@ function getLatestVersion({ branch, beta = false } = {}) {
 
   // Default: tag-based detection (unified with component upgrades)
   try {
-    const tagVersion = fetchLatestTag(REPO, { includePrerelease: beta });
+    const tagVersion = fetchLatestTag(repo, { includePrerelease: beta });
     if (tagVersion) {
       return { success: true, version: tagVersion };
     }
@@ -103,13 +120,13 @@ function getLatestVersion({ branch, beta = false } = {}) {
  * @param {boolean} [opts.beta=false] - Include prerelease (beta) versions
  * @returns {object} { success, hasUpdate, current, latest }
  */
-export function checkForCoreUpdates({ branch, beta = false } = {}) {
+export async function checkForCoreUpdates({ branch, beta = false } = {}) {
   const current = getCurrentVersion();
   if (!current.success) {
     return { success: false, error: 'version_not_found', message: current.error };
   }
 
-  const latest = getLatestVersion({ branch, beta });
+  const latest = await getLatestVersion({ branch, beta });
   if (!latest.success) {
     return { success: false, error: 'remote_version_failed', message: latest.error };
   }
@@ -118,11 +135,13 @@ export function checkForCoreUpdates({ branch, beta = false } = {}) {
   // compareSemverDesc(a, b) > 0 means b is higher than a.
   const hasUpdate = compareSemverDesc(current.version, latest.version) > 0;
 
+  const { forkConfig } = await loadForkModules();
   return {
     success: true,
     hasUpdate,
     current: current.version,
     latest: latest.version,
+    needsUpstreamCheck: forkConfig?.needsUpstreamCheck() || false,
   };
 }
 
@@ -474,7 +493,7 @@ export function generateMigrationHints(templatesDir, deps = {}) {
 /**
  * Create self-upgrade context.
  */
-function createContext({ tempDir, newVersion, mode } = {}) {
+function createContext({ tempDir, newVersion, mode, mergeUpstream } = {}) {
   const coreDir = path.join(import.meta.dirname, '..', '..');
 
   return {
@@ -482,6 +501,7 @@ function createContext({ tempDir, newVersion, mode } = {}) {
     tempDir: tempDir || null,
     newVersion: newVersion || null,
     mode: mode || 'merge',
+    skipUpstreamMerge: !mergeUpstream,
     // State tracking
     backupDir: null,
     servicesStopped: [],
@@ -1590,12 +1610,18 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
  * Template migration and Claude restart are handled by Claude after this completes.
  * Lock must be acquired by caller.
  *
- * @param {{ tempDir: string, newVersion: string, onStep?: function }} opts
+ * Fork extension: when called with `mergeUpstream: true`, a step0_mergeUpstream
+ * pre-step is prepended to merge upstream/main into the fork before npm install.
+ *
+ * @param {{ tempDir: string, newVersion: string, mergeUpstream?: boolean, onStep?: function }} opts
  * @param {object} [deps] - Isolated self-upgrade seam for npm, PM2, version, rollback, and finalizer boundaries
  * @returns {object} Upgrade result
  */
-export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps = {}) {
-  const ctx = createContext({ tempDir, newVersion, mode });
+export async function runSelfUpgrade(
+  { tempDir, newVersion, mode, mergeUpstream, onStep } = {},
+  deps = {},
+) {
+  const ctx = createContext({ tempDir, newVersion, mode, mergeUpstream });
 
   const getCurrentVersionFn = deps.getCurrentVersion ?? getCurrentVersion;
   const current = getCurrentVersionFn();
@@ -1604,12 +1630,18 @@ export function runSelfUpgrade({ tempDir, newVersion, mode, onStep } = {}, deps 
   }
   ctx.to = newVersion || null;
 
-  const preInstallSteps = deps.preInstallSteps ?? [
+  const preInstallSteps = [...(deps.preInstallSteps ?? [
     (stepCtx) => step1_backupCoreSkills(stepCtx, deps.step1),
     step2_preUpgradeHook,
     (stepCtx) => step3_stopCoreServices(stepCtx, deps.step3),
     (stepCtx) => step4_npmInstallGlobal(stepCtx, deps.step4),
-  ];
+  ])];
+
+  // Fork: prepend upstream merge step when mergeUpstream is requested
+  const { forkConfig, upstreamMerge } = await loadForkModules();
+  if (forkConfig && mergeUpstream && upstreamMerge) {
+    preInstallSteps.unshift(upstreamMerge.step0_mergeUpstream);
+  }
 
   const total = 13;
   let failedStep = null;

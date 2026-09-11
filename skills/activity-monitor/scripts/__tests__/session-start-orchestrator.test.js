@@ -153,6 +153,18 @@ describe('session-start-orchestrator', () => {
     assert.deepEqual(result.calls.map(([name]) => name), ['memory', 'foreground', 'prompt']);
   });
 
+  it('strict legacy startup blocks the work prompt when C4 context fails', async () => {
+    const result = await runWithActions('startup', {
+      c4SessionInit: async () => { throw new Error('c4 failed'); },
+    }, {
+      requireHealthyContext: true,
+    });
+
+    assert.deepEqual(result.calls.map(([name]) => name), ['memory', 'foreground']);
+    assert.match(result.stdout, /=== STARTUP CONTEXT BLOCKED ===/);
+    assert.match(result.stdout, /c4-session-init: failed/);
+  });
+
   it('continues when foreground side effect fails', async () => {
     const result = await runWithActions('startup', {
       foreground: async () => { throw new Error('foreground failed'); },

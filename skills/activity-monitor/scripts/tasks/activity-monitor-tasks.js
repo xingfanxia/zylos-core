@@ -8,6 +8,7 @@ export function createActivityMonitorTaskScheduler({
   healthCheckInterval,
   usageCheckInterval,
   usageAlertInterval,
+  usageFleetAlertInterval,
   readDailyUpgradeEnabled,
   readHealthCheckEnabled,
   loadDailyUpgradeState,
@@ -58,7 +59,11 @@ export function createActivityMonitorTaskScheduler({
       id: 'health-check',
       type: 'interval',
       intervalSec: healthCheckInterval,
-      enabled: () => readHealthCheckEnabled(),
+      // PM2 and the shared health log are owner-only resources on OS-isolated
+      // installs. A per-instance monitor still runs for every user, so without
+      // this primary gate each user-tier agent receives a task it cannot
+      // execute. Keep one fleet-wide checker on the primary instance.
+      enabled: () => readHealthCheckEnabled() && usageMonitor.isPrimaryInstance(),
       gate: (snapshot) => snapshot.agentRunning === true && snapshot.health === 'ok',
       getLastRunAt: () => loadHealthCheckState()?.last_check_at ?? 0,
       execute: enqueueHealthCheck,
@@ -91,6 +96,19 @@ export function createActivityMonitorTaskScheduler({
       }),
       getLastRunAt: () => usageMonitor.getLastAlertRunAt(),
       execute: (snapshot) => usageMonitor.runAlert(snapshot),
+    },
+    {
+      // Fleet-level near-full alert. Admin-only single-alerter; NOT idle/
+      // active-hours/pending-queue gated — a safety alert must fire during the
+      // busy/kill-loop window that produced the incident. Only skipped when the
+      // admin AM itself is auth_failed (can't send anyway).
+      id: 'usage-fleet-alert',
+      type: 'interval',
+      intervalSec: usageFleetAlertInterval,
+      enabled: () => usageMonitor.isAlertEnabled() && usageMonitor.isPrimaryInstance(),
+      gate: (snapshot) => snapshot.health !== 'auth_failed',
+      getLastRunAt: () => usageMonitor.getLastFleetAlertRunAt(),
+      execute: (snapshot) => usageMonitor.runFleetAlert(snapshot),
     },
   ], {
     getLocalHour,

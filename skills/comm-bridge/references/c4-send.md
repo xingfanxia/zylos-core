@@ -1,6 +1,6 @@
 # c4-send.js — Send Interface
 
-Sends messages from Claude to external channels. Records the outgoing message in DB, then delegates to the channel's `send.js` script.
+Sends messages from Claude to external channels. Records the outgoing message in DB, then delegates to the channel's `send.js` script. When `ZYLOS_INSTANCE_ID` is set, the audit row is attributed to that instance so its strictly scoped history includes the reply; single-session sends without an instance ID remain unscoped for compatibility.
 
 ## Usage
 

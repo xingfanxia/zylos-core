@@ -12,6 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { ensureInstanceTmpDir, readMergedDotenvVars } from './tmux-env.js';
 
 const SIGNAL_NUMBERS = {
   SIGHUP: 1, SIGINT: 2, SIGQUIT: 3, SIGTERM: 15, SIGKILL: 9,
@@ -35,9 +36,26 @@ try {
   process.exit(1);
 }
 
-// 3. Spawn child
+// 3. Read the persona-owned workspace env only after the launcher has dropped
+// to that persona's OS user. Runtime-controlled spec values win, preventing a
+// workspace env from changing HOME, CODEX_HOME, identity, or engine settings.
+const personaEnv = spec.personaEnvFile
+  ? readMergedDotenvVars([spec.personaEnvFile])
+  : {};
+
+const runtimeEnv = { ...personaEnv, ...(spec.env || {}) };
+try {
+  // This process already runs as the persona; never create its private cache
+  // as the service user, and never inherit another persona's temporary path.
+  if (runtimeEnv.ZYLOS_INSTANCE_ID) runtimeEnv.TMPDIR = ensureInstanceTmpDir(runtimeEnv);
+} catch (error) {
+  process.stderr.write(`Failed to prepare runtime temp directory: ${error.message}\n`);
+  process.exit(1);
+}
+
+// 4. Spawn child
 const child = spawn(spec.command, spec.args || [], {
-  env: spec.env || {},
+  env: runtimeEnv,
   cwd: spec.cwd || process.cwd(),
   stdio: 'inherit',
 });
@@ -47,7 +65,7 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(sig, () => child.kill(sig));
 }
 
-// 4. Exit code transparency
+// 5. Exit code transparency
 child.on('exit', (code, signal) => {
   // Write exit log if configured
   if (spec.exitLogFile) {

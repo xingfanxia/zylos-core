@@ -59,12 +59,17 @@ function normalizePersistedUsage(snapshot, statusShape = 'persisted_usage') {
   return {
     sessionPercent: sessionPercent ?? null,
     sessionResets: snapshot.session?.resets ?? null,
+    sessionResetsAt: snapshot.session?.resets_at ?? null,
     weeklyAllPercent: weeklyAllPercent ?? null,
     weeklyAllResets: snapshot.weeklyAll?.resets ?? null,
+    weeklyAllResetsAt: snapshot.weeklyAll?.resets_at ?? null,
     weeklySonnetPercent: weeklySonnetPercent ?? null,
     weeklySonnetResets: snapshot.weeklySonnet?.resets ?? null,
     fiveHourPercent: fiveHourPercent ?? null,
     fiveHourResets: snapshot.fiveHour?.resets ?? null,
+    // Raw reset epoch — persisted usage.json stores only formatted strings, so
+    // this is usually null here; the statusline path below carries the real epoch.
+    fiveHourResetsAt: snapshot.fiveHour?.resets_at ?? null,
     statusShape
   };
 }
@@ -95,12 +100,15 @@ function normalizeClaudeStatusline(status) {
       return {
         sessionPercent,
         sessionResets: formatResetTime(primary?.resets_at ?? null),
+        sessionResetsAt: primary?.resets_at ?? null,
         weeklyAllPercent,
         weeklyAllResets: formatResetTime(secondary?.resets_at ?? null),
+        weeklyAllResetsAt: secondary?.resets_at ?? null,
         weeklySonnetPercent,
         weeklySonnetResets: formatResetTime(sonnet?.resets_at ?? null),
         fiveHourPercent: null,
         fiveHourResets: null,
+        fiveHourResetsAt: null,
         statusShape: 'statusline_rate_limits'
       };
     }
@@ -115,18 +123,50 @@ function normalizeClaudeStatusline(status) {
       return {
         sessionPercent: status.context_window?.used_percentage ?? null,
         sessionResets: null,
+        sessionResetsAt: null,
         weeklyAllPercent: weeklyAllPercentB,
         weeklyAllResets: formatResetTime(sevenDay?.resets_at ?? null),
+        weeklyAllResetsAt: sevenDay?.resets_at ?? null,
         weeklySonnetPercent: null,
         weeklySonnetResets: null,
         fiveHourPercent,
         fiveHourResets: formatResetTime(fiveHour?.resets_at ?? null),
+        fiveHourResetsAt: fiveHour?.resets_at ?? null,
         statusShape: 'statusline_rate_limits'
       };
     }
   }
 
   return normalizePersistedUsage(status, 'statusline_persisted_usage');
+}
+
+/**
+ * Read + normalize a single statusline.json with an explicit error code, so
+ * callers can degrade LOUDLY. Unlike readClaudeUsageFromMonitorFiles (which
+ * swallows every failure to null), this distinguishes:
+ *   - 'ENOENT'  file never written (benign — instance idle/new)
+ *   - 'EACCES'  permission denied (actionable — frozen supplementary groups)
+ *   - 'EPARSE'  unparseable JSON
+ *   - 'EINVALID' parsed but no recognizable usage shape
+ * On success returns { error: null, reading }.
+ * @returns {{ error: string | null, reading: object | null }}
+ */
+export function readStatuslineWithDiagnostics(statuslineFile) {
+  let raw;
+  try {
+    raw = fs.readFileSync(statuslineFile, 'utf8');
+  } catch (err) {
+    return { error: err.code || 'EREAD', reading: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { error: 'EPARSE', reading: null };
+  }
+  const reading = normalizeClaudeStatusline(parsed);
+  if (!reading) return { error: 'EINVALID', reading: null };
+  return { error: null, reading };
 }
 
 export function readClaudeUsageFromMonitorFiles({ statuslineFile, usageStateFile }) {

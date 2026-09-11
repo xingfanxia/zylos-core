@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { MonitorOrchestrator } from '../monitor-orchestrator.js';
+import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 
 describe('MonitorOrchestrator', () => {
   function createHarness(overrides = {}) {
@@ -12,7 +13,12 @@ describe('MonitorOrchestrator', () => {
     fs.rmSync(monitorDir, { recursive: true, force: true });
 
     const calls = [];
-    const env = { TMUX: '/tmp/stale-tmux' };
+    const zylosDir = overrides.zylosDir ?? path.join(monitorDir, 'zylos');
+    const env = {
+      TMUX: '/tmp/stale-tmux',
+      ZYLOS_DIR: zylosDir,
+      ...(overrides.instanceId ? { ZYLOS_INSTANCE_ID: overrides.instanceId } : {}),
+    };
     const adapter = overrides.adapter ?? { runtimeId: 'codex', displayName: 'Codex', sessionName: 'codex-main' };
     const config = { runtime: 'codex' };
     const toolPipeline = overrides.toolPipeline ?? { id: 'toolPipeline' };
@@ -57,8 +63,8 @@ describe('MonitorOrchestrator', () => {
         calls.push(['createHealthEngine', activeAdapter, initialStatus.health]);
         return engine;
       },
-      createGuardian: (activeAdapter, activeToolPipeline, runtimeLaunchAtMs) => {
-        calls.push(['createGuardian', activeAdapter, activeToolPipeline, runtimeLaunchAtMs]);
+      createGuardian: (activeAdapter, activeToolPipeline, runtimeLaunchAtMs, extras) => {
+        calls.push(['createGuardian', activeAdapter, activeToolPipeline, runtimeLaunchAtMs, extras?.monitorDir]);
         return guardian;
       },
       startMessageRouterServer: (activeEngine) => calls.push(['startMessageRouterServer', activeEngine]),
@@ -155,20 +161,81 @@ describe('MonitorOrchestrator', () => {
       'scheduleStaleRuntimeCleanup',
     ]);
     assert.equal(calls.find(([name]) => name === 'startMessageRouterServer')[1], engine);
+    // REL-6: the guardian factory must receive the per-instance monitorDir —
+    // omitting it silently disables the whole suspend/wake gate (the prod bug).
+    assert.equal(calls.find(([name]) => name === 'createGuardian')[4], monitorDir);
+  });
+
+  it('consumes a matching runtime-switch signal before starting health checks', () => {
+    const calls = [];
+    const engine = {
+      id: 'engine',
+      notifyColdStart: (seconds) => calls.push(['notifyColdStart', seconds]),
+      start: () => calls.push(['engine.start']),
+    };
+    const adapter = {
+      runtimeId: 'codex',
+      displayName: 'Codex',
+      sessionName: 'claude-user-elaine',
+      config: { runtimeProfile: { id: 'codex-subscription' } },
+      getHeartbeatDeps: () => ({
+        clearHeartbeatPending: () => calls.push(['clearHeartbeatPending']),
+      }),
+    };
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-runtime-switch-orchestrator-'));
+    const { monitorDir, orchestrator } = createHarness({
+      adapter,
+      engine,
+      initialHealth: 'degraded',
+      log: (message) => calls.push(['log', message]),
+      zylosDir,
+      instanceId: 'user-elaine',
+    });
+    const signalPath = writeRuntimeSwitchSignal({
+      zylosDir,
+      change: {
+        instanceId: 'user-elaine',
+        fromProfile: 'claude-subscription',
+        toProfile: 'codex-subscription',
+        reason: 'health_degraded:claude-subscription',
+      },
+      nowMs: 1000,
+      graceSec: 30,
+    });
+
+    orchestrator.start();
+
+    assert.deepEqual(calls.slice(0, 3), [
+      ['clearHeartbeatPending'],
+      ['notifyColdStart', 30],
+      ['log', 'Runtime switch to codex-subscription: cold-start grace 30s'],
+    ]);
+    assert.equal(fs.existsSync(signalPath), false);
+    assert.ok(calls.findIndex(([name]) => name === 'notifyColdStart')
+      < calls.findIndex(([name]) => name === 'engine.start'));
+    assert.equal(calls.some(([, message]) => typeof message === 'string' && message.includes('Startup with health=')), false);
+    fs.rmSync(zylosDir, { recursive: true, force: true });
   });
 
   it('coordinates runtime liveness tick and restart signaling', async () => {
     const calls = [];
     const engine = {
       id: 'engine',
+      health: 'degraded',
+      isDegradedProbeDue: (currentTime) => {
+        calls.push(['isDegradedProbeDue', currentTime]);
+        return true;
+      },
       start: () => calls.push(['engine.start']),
       setAgentRunning: (running, currentTime) => calls.push(['setAgentRunning', running, currentTime]),
       onProcessRestarted: (currentTime) => calls.push(['onProcessRestarted', currentTime]),
     };
     const guardian = {
       id: 'guardian',
-      tick: async ({ currentTime }) => {
-        calls.push(['guardian.tick', currentTime]);
+      // Live health read: the engine's CURRENT health must reach every tick
+      // (never latched — auth_failed→unavailable flips must un-gate next tick).
+      tick: async ({ currentTime, health, degradedProbeDue }) => {
+        calls.push(['guardian.tick', currentTime, health, degradedProbeDue]);
         return {
           state: 'running',
           attempted_restart: true,
@@ -195,7 +262,8 @@ describe('MonitorOrchestrator', () => {
     assert.deepEqual(calls, [
       ['engine.start'],
       ['checkDailyTruncate'],
-      ['guardian.tick', 123],
+      ['isDegradedProbeDue', 123],
+      ['guardian.tick', 123, 'degraded', true],
       ['setAgentRunning', true, 123],
       ['onProcessRestarted', 123],
     ]);

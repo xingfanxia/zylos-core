@@ -25,6 +25,11 @@ import { assertInstructionReady, buildInstructionFile } from './instruction-buil
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
 import { ZYLOS_DIR, SKILLS_DIR, getZylosConfig } from '../config.js';
+import { operatorTavilyProfileArgs } from '../operator-tavily-profile.js';
+import { ensureCodexSkillView } from '../codex-skill-view.js';
+// writeCodexConfig is lazy-loaded inside launch() — top-level import would pull
+// runtime-setup.js (which imports spawnSync) and break test module mocks that
+// don't include spawnSync in their child_process namedExports.
 import {
   tmuxHasSession,
   tmuxGetPanePid,
@@ -37,25 +42,40 @@ import {
   getProcessName,
   hasChildProcess,
 } from './tmux-helpers.js';
-import { buildCleanEnv, buildCompatEnv, loadRuntimeEnvManifest, writeLaunchSpec } from './tmux-env.js';
+import {
+  buildCleanEnv,
+  buildCompatEnv,
+  ensureInstanceGhConfigDir,
+  loadRuntimeEnvManifest,
+  readMergedDotenvVars,
+  resolvePersonaDotenvPath,
+  writeLaunchSpec,
+} from './tmux-env.js';
 import { classifyCodexLoginStatus } from '../auth-parsers.js';
-import { ensureCodexHooksTrusted } from '../codex-hooks.js';
+import { ensureCodexHooksTrusted, uninstallCoreCodexHook } from '../codex-hooks.js';
 import { buildKickPrompt } from './kick-prompt.js';
+
+// Multi-session: heartbeat pending state must be per-instance (see claude.js —
+// shared-path pending files let instances overwrite each other's pointer and
+// kill healthy sessions). Falls back to the shared dir for single-session.
+const { getMonitorDir: _getMonitorDir } =
+  await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'codex-main';
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'codex-main';
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
+const CODEX_AUTH_PROBE_PROMPT = 'Reply exactly ZYLOS_AUTH_OK. Do not use tools.';
 
 // When CODEX_BYPASS_PERMISSIONS=false, skip --dangerously-bypass-approvals-and-sandbox.
 // Defaults to enabled for unattended server operation.
 const DEFAULT_BYPASS = process.env.CODEX_BYPASS_PERMISSIONS !== 'false';
 
-function getCodexApiBaseUrl() {
+function getCodexApiBaseUrl(codexHome = path.join(os.homedir(), '.codex')) {
   try {
-    const configPath = path.join(os.homedir(), '.codex', 'config.toml');
+    const configPath = path.join(codexHome, 'config.toml');
     const config = fs.readFileSync(configPath, 'utf8');
-    const match = config.match(/^\s*openai_base_url\s*=\s*"([^"]+)"\s*$/m);
+    const match = config.match(/^\s*(?:openai_)?base_url\s*=\s*"([^"]+)"\s*$/m);
     if (match?.[1]) {
       return match[1].replace(/\/+$/, '');
     }
@@ -73,7 +93,7 @@ function getCodexApiBaseUrl() {
 export class CodexAdapter extends RuntimeAdapter {
   get displayName() { return 'Codex'; }
   get runtimeId() { return 'codex'; }
-  get sessionName()  { return 'codex-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -105,13 +125,17 @@ export class CodexAdapter extends RuntimeAdapter {
    *
    * @returns {Promise<{status: 'success'|'failure'|'uncertain', reason: string}>}
    */
-  async checkAuth() {
+  async checkAuth({ requireRemote = false } = {}) {
+    const profile = this.config.runtimeProfile || {};
+    const runtimeHome = profile.runtimeHome || os.homedir();
+    const codexHome = profile.codexHome || process.env.CODEX_HOME || path.join(runtimeHome, '.codex');
+
     // Read auth.json to determine the auth mode.
     let authMode = null;
     let apiKey = '';
     try {
       const authJson = JSON.parse(fs.readFileSync(
-        path.join(os.homedir(), '.codex', 'auth.json'), 'utf8'
+        path.join(codexHome, 'auth.json'), 'utf8'
       ));
       authMode = authJson?.auth_mode || null;
       // Only extract the API key when the mode is explicitly "apikey".
@@ -128,22 +152,65 @@ export class CodexAdapter extends RuntimeAdapter {
       // OAuth session straight through the runtime-switch / health-probe auth gate.
       // The status line is written to STDERR (stdout is empty), so combine streams.
       try {
-        const { stdout, stderr } = await execFileAsync(CODEX_BIN, ['login', 'status'], {
-          stdio: 'pipe', encoding: 'utf8', timeout: 10_000,
+        const command = buildCodexProfileCommand({
+          args: ['login', 'status'],
+          runtimeHome,
+          codexHome,
+          osUser: profile.osUser || null,
+          codexBin: CODEX_BIN,
+          timeout: 10_000,
         });
+        const { stdout, stderr } = await execFileAsync(command.file, command.args, command.options);
         const status = classifyCodexLoginStatus((stdout || '') + (stderr || ''));
-        if (status === 'success') return { status: 'success', reason: 'codex_login_status' };
+        if (status === 'success' && !requireRemote) {
+          return { status: 'success', reason: 'codex_login_status' };
+        }
         if (status === 'failure') return { status: 'failure', reason: 'not_logged_in' };
-        return { status: 'uncertain', reason: 'codex_login_status_uncertain' };
+        if (status !== 'success') return { status: 'uncertain', reason: 'codex_login_status_uncertain' };
       } catch { /* binary missing, killed, or other error */ }
-      return { status: 'uncertain', reason: 'codex_login_status_unavailable' };
+      if (!requireRemote) return { status: 'uncertain', reason: 'codex_login_status_unavailable' };
+
+      // Local login status proves only that a token document exists. When the
+      // pane independently reports auth failure, run one bounded real turn as
+      // the same persona that owns the profile. This catches refresh-token
+      // revocation without making routine health checks consume a turn.
+      const command = buildCodexProfileCommand({
+        args: [
+          'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only',
+          ...(profile.model ? ['-m', profile.model] : []),
+          '-c', 'model_reasoning_effort="low"',
+          CODEX_AUTH_PROBE_PROMPT,
+        ],
+        runtimeHome,
+        codexHome,
+        osUser: profile.osUser || null,
+        codexBin: CODEX_BIN,
+        timeout: 45_000,
+      });
+      try {
+        const { stdout, stderr } = await execFileAsync(command.file, command.args, command.options);
+        const output = `${stdout || ''}\n${stderr || ''}`;
+        if (/access token could not be refreshed/i.test(output)) {
+          return { status: 'failure', reason: 'codex_exec_token_refresh_failed' };
+        }
+        if (/"type"\s*:\s*"turn\.completed"|ZYLOS_AUTH_OK/i.test(output)) {
+          return { status: 'success', reason: 'codex_exec_probe' };
+        }
+        return { status: 'uncertain', reason: 'codex_exec_probe_uncertain' };
+      } catch (error) {
+        const output = `${error.stdout || ''}\n${error.stderr || ''}`;
+        if (/access token could not be refreshed|not logged in|please (?:log out and )?sign in again/i.test(output)) {
+          return { status: 'failure', reason: 'codex_exec_token_refresh_failed' };
+        }
+        return { status: 'uncertain', reason: 'codex_exec_probe_unavailable' };
+      }
     }
 
     // auth_mode = "apikey" — live HTTP probe to OpenAI API.
     // Guard against corrupted auth.json (mode set to "apikey" but key missing).
     if (!apiKey) return { status: 'failure', reason: 'apikey_mode_but_no_key' };
     try {
-      const baseUrl = getCodexApiBaseUrl();
+      const baseUrl = getCodexApiBaseUrl(codexHome);
       const res = await fetch(`${baseUrl}/models`, {
         headers: { Authorization: `Bearer ${apiKey}` },
         signal: AbortSignal.timeout(10_000),
@@ -233,28 +300,95 @@ export class CodexAdapter extends RuntimeAdapter {
     const bypassPermissions = opts.bypassPermissions ?? DEFAULT_BYPASS;
     assertInstructionReady('codex');
 
-    // 1. Ensure .agents/skills → .claude/skills symlink for Codex skill discovery.
-    const agentsDir = path.join(ZYLOS_DIR, '.agents');
-    const agentsSkillsPath = path.join(agentsDir, 'skills');
-    let agentsSkillsExists = false;
-    try { fs.lstatSync(agentsSkillsPath); agentsSkillsExists = true; } catch { /* not present */ }
-    if (!agentsSkillsExists) {
+    // Guardian has already built and validated the split instruction files.
+    // Resolve the per-instance working directory so each Codex instance gets
+    // its own AGENTS.md overlay, memory context, and trusted worktree.
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    const profile = this.config.runtimeProfile || {};
+    let osUser = profile.osUser || null;
+    if (instanceId) {
       try {
-        fs.mkdirSync(agentsDir, { recursive: true });
-        fs.symlinkSync(SKILLS_DIR, agentsSkillsPath);
-      } catch { /* non-fatal */ }
+        const { ensureInstanceCwd, getInstanceDef } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+        osUser ||= getInstanceDef(instanceId)?.os_user || null;
+        if (osUser && !/^[a-z_][a-z0-9_-]{0,31}$/.test(osUser)) {
+          throw new Error(`invalid os_user "${osUser}"`);
+        }
+      } catch (err) {
+        console.error(`[CodexAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+        if (profile.id) throw err;
+      }
     }
+    const runtimeHome = profile.runtimeHome || (osUser ? `/home/${osUser}` : os.homedir());
+    const codexHome = profile.codexHome || process.env.CODEX_HOME || path.join(runtimeHome, '.codex');
+
+    // Keep Codex trust config fresh for both the shared root and any per-instance cwd.
+    // Lazy-imported to keep test mocks (no spawnSync) working — see note at top.
+    let writeCodexConfig;
+    try { ({ writeCodexConfig } = await import('../runtime-setup.js')); } catch { /* test stub */ }
+    if (writeCodexConfig) {
+      try { writeCodexConfig(ZYLOS_DIR); } catch { /* best effort */ }
+      if (instanceCwd !== ZYLOS_DIR) {
+        try {
+          // The shared root hook already resolves through the instance's
+          // .claude symlink. A second generated hook in the instance cwd is
+          // both redundant and independently reviewed by Codex.
+          writeCodexConfig(instanceCwd, { installCoreHook: false });
+          uninstallCoreCodexHook({ zylosDir: instanceCwd });
+        } catch { /* best effort */ }
+      }
+    }
+    const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
+
+    // Native recursive discovery must not walk dependency caches/backups. Keep
+    // installed entrypoints and their relative support files in a bounded view.
+    ensureCodexSkillView({ zylosDir: ZYLOS_DIR, skillsDir: SKILLS_DIR });
 
     // 2. Native SessionStart hook trust is required for startup context.
+    // Scope trust to the per-instance cwd so a Codex process launched from an
+    // instance directory picks up the trusted SessionStart hook (the hook script
+    // itself lives under the shared ZYLOS_DIR).
     ensureCodexHooksTrusted({
       zylosDir: ZYLOS_DIR,
-      projectDir: ZYLOS_DIR,
+      projectDir: instanceCwd,
+      homeDir: runtimeHome,
+      codexHome,
+      runAsUser: osUser,
       codexBin: CODEX_BIN,
     });
 
+    // Codex app-server persists hook trust through an atomic config rewrite.
+    // For OS-isolated personas that replacement is owned by the activity
+    // monitor user and defaults to 0600, even when provisioning installed the
+    // original file as 0660 operator:<persona>. Restore the private group
+    // access before launching Codex as the persona, otherwise the CLI exits 0
+    // immediately after reporting "config.toml: Permission denied".
+    if (osUser) {
+      const profileConfigPath = path.join(codexHome, 'config.toml');
+      try {
+        execFileSync('sudo', ['-n', 'chgrp', osUser, profileConfigPath], { timeout: 10_000 });
+        execFileSync('sudo', ['-n', 'chmod', '0660', profileConfigPath], { timeout: 10_000 });
+      } catch (e) {
+        throw new Error(`Failed to restore Codex profile access for ${osUser}: ${e.message}`);
+      }
+    }
+
     // 3. Build the codex command
     const bypassFlag = bypassPermissions ? ' --dangerously-bypass-approvals-and-sandbox' : '';
-    const codexCmd = `${CODEX_BIN}${bypassFlag}`;
+    const modelFlags = [
+      profile.model ? ` -m ${profile.model}` : '',
+      profile.reasoningEffort ? ` -c model_reasoning_effort=\"${profile.reasoningEffort}\"` : '',
+    ].join('');
+    const launchArgs = [];
+    if (bypassPermissions) launchArgs.push('--dangerously-bypass-approvals-and-sandbox');
+    if (profile.model) launchArgs.push('-m', profile.model);
+    if (profile.reasoningEffort) launchArgs.push('-c', `model_reasoning_effort="${profile.reasoningEffort}"`);
+    const operatorMcpArgs = operatorTavilyProfileArgs({
+      instanceId, osUser, runtimeHome, codexHome, instanceCwd, zylosDir: ZYLOS_DIR, existingArgs: launchArgs,
+    });
+    launchArgs.push(...operatorMcpArgs);
+    const codexCmd = `${CODEX_BIN}${bypassFlag}${modelFlags}${operatorMcpArgs.length ? ' -p zylos-tavily' : ''}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'codex-exit.log');
@@ -265,14 +399,29 @@ export class CodexAdapter extends RuntimeAdapter {
     // (#743/#745). See kick-prompt.js.
     const kickPrompt = buildKickPrompt();
 
+    // Profile launches may change unix identity, credentials, provider, or
+    // model. Rebuild the pane through the launch-spec path so none of that is
+    // smuggled through shell exports and the stable tmux name remains intact.
+    if ((osUser || profile.id) && tmuxHasSession(SESSION)) tmuxKillSession(SESSION);
+
     if (tmuxHasSession(SESSION)) {
       // Existing tmux session — start a fresh Codex process with kick prompt
-      // to trigger SessionStart hook immediately.
-      const cmd = `cd "${ZYLOS_DIR}"; ${codexCmd} "${kickPrompt}"; ${exitLogSnippet}`;
+      // to trigger the SessionStart hook immediately. Re-export instance
+      // identity so subsequent in-session restarts inherit it, and cd to the
+      // per-instance cwd.
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+        ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
+        ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${codexCmd} "${kickPrompt}"; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
-      const dotenvVars = _readDotenvVars();
+      const dotenvVars = readMergedDotenvVars([path.join(ZYLOS_DIR, '.env')]);
+      const personaEnvFile = resolvePersonaDotenvPath(ZYLOS_DIR, instanceCwd);
       const useCleanEnv = dotenvVars.ZYLOS_CLEAN_ENV !== 'false';
       const manifest = useCleanEnv ? loadRuntimeEnvManifest(ZYLOS_DIR) : undefined;
 
@@ -280,19 +429,57 @@ export class CodexAdapter extends RuntimeAdapter {
         ? buildCleanEnv({ processEnv: process.env, dotenvVars, manifest, uid: process.getuid?.() })
         : buildCompatEnv({ processEnv: process.env, dotenvVars });
 
-      // Build launch spec — Codex reads auth from ~/.codex/auth.json via HOME
-      const args = [];
-      if (bypassPermissions) args.push('--dangerously-bypass-approvals-and-sandbox');
-      args.push(kickPrompt);
+      // Multi-session: propagate instance identity into the launched Codex process
+      // so its hooks/skills write to the correct per-instance paths.
+      if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
+      if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
+      if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
+
+      env.HOME = runtimeHome;
+      env.CODEX_HOME = codexHome;
+      if (osUser) {
+        env.USER = osUser;
+        env.LOGNAME = osUser;
+      }
+
+      if (profile.providerEnvKey) {
+        let providerSecret = '';
+        try {
+          const auth = JSON.parse(fs.readFileSync(path.join(codexHome, 'auth.json'), 'utf8'));
+          providerSecret = auth?.OPENAI_API_KEY || auth?.apiKey || '';
+        } catch { /* handled below */ }
+        if (!providerSecret) {
+          throw new Error(`Codex profile "${profile.id || 'unnamed'}" requires ${profile.providerEnvKey}, but auth.json has no API key`);
+        }
+        env[profile.providerEnvKey] = providerSecret;
+      }
+
+      // Build launch spec. Credential values live only in the 0600 spec file;
+      // they never appear in tmux args or the process command line.
+      const args = [...launchArgs, kickPrompt];
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
       const specPath = writeLaunchSpec({
         command: CODEX_BIN,
         args,
         env,
-        cwd: ZYLOS_DIR,
+        cwd: instanceCwd,
+        personaEnvFile,
         exitLogFile,
       });
+
+      if (osUser) {
+        try {
+          execFileSync('sudo', ['-n', 'chown', `${osUser}:${osUser}`, specPath], { timeout: 10_000 });
+        } catch (e) {
+          try { fs.unlinkSync(specPath); } catch { }
+          throw new Error(`Failed to chown launch spec to ${osUser}: ${e.message}`);
+        }
+      }
+
+      const launchCmd = osUser
+        ? `sudo -n -u ${osUser} -H -- "${process.execPath}" "${launcherPath}" "${specPath}"`
+        : `"${process.execPath}" "${launcherPath}" "${specPath}"`;
 
       // tmux args — minimal env for launcher to start
       const tmuxArgs = [
@@ -300,7 +487,7 @@ export class CodexAdapter extends RuntimeAdapter {
         '-e', `PATH=${env.PATH}`,
         '-e', `HOME=${env.HOME}`,
         '-e', `TERM=${env.TERM || 'xterm-256color'}`,
-        '--', `"${process.execPath}" "${launcherPath}" "${specPath}"`,
+        '--', launchCmd,
       ];
 
       try {
@@ -338,7 +525,10 @@ export class CodexAdapter extends RuntimeAdapter {
    * @returns {object}
    */
   getHeartbeatDeps() {
-    const pendingFile = path.join(ZYLOS_DIR, 'activity-monitor', 'codex-heartbeat-pending.json');
+    const monitorDir = _getMonitorDir
+      ? _getMonitorDir()
+      : path.join(ZYLOS_DIR, 'activity-monitor');
+    const pendingFile = path.join(monitorDir, 'codex-heartbeat-pending.json');
     return createCodexProbe({ pendingFile, tmuxSession: SESSION });
   }
 
@@ -351,26 +541,54 @@ export class CodexAdapter extends RuntimeAdapter {
     const config = getZylosConfig();
     const val = parseInt(config.codex_new_session_threshold, 10);
     const threshold = (!isNaN(val) && val > 0 && val <= 100) ? val / 100 : 0.75;
-    return new CodexContextMonitor({ threshold });
+    const profile = this.config.runtimeProfile || {};
+    const runtimeHome = profile.runtimeHome || os.homedir();
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    return new CodexContextMonitor({
+      threshold,
+      codexHome: profile.codexHome || process.env.CODEX_HOME || path.join(runtimeHome, '.codex'),
+      model: profile.model,
+      tmuxSession: SESSION,
+      cwd: instanceId ? path.join(ZYLOS_DIR, 'instances', instanceId) : ZYLOS_DIR,
+    });
   }
+}
+
+export function buildCodexProfileCommand({
+  args,
+  runtimeHome,
+  codexHome,
+  osUser = null,
+  codexBin = CODEX_BIN,
+  timeout = 10_000,
+} = {}) {
+  const options = {
+    stdio: 'pipe',
+    encoding: 'utf8',
+    timeout,
+    cwd: runtimeHome,
+    env: { ...process.env, HOME: runtimeHome, CODEX_HOME: codexHome },
+  };
+  if (!osUser) return { file: codexBin, args, options };
+  if (!/^[a-z_][a-z0-9_-]{0,31}$/.test(osUser)) {
+    throw new Error('invalid isolated Codex runtime user');
+  }
+  const relative = path.relative(path.resolve(runtimeHome), path.resolve(codexHome));
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('isolated CODEX_HOME must stay inside runtime home');
+  }
+  return {
+    file: 'sudo',
+    args: [
+      '-n', '-u', osUser, '-H', '--', '/usr/bin/env',
+      `HOME=${runtimeHome}`,
+      `CODEX_HOME=${codexHome}`,
+      codexBin,
+      ...args,
+    ],
+    options,
+  };
 }
 
 
 // ── Private helpers ────────────────────────────────────────────────────────
-
-function _readDotenvVars() {
-  const vars = {};
-  try {
-    const content = fs.readFileSync(path.join(ZYLOS_DIR, '.env'), 'utf8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx < 1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
-      vars[key] = val;
-    }
-  } catch { /* .env absent */ }
-  return vars;
-}

@@ -13,11 +13,13 @@ import {
   coreSessionStartCommands,
   ensureCodexHooksTrusted,
   ensureHooksFeatureInToml,
+  ensureTrustedProjectsAtPath,
   extractTrustSnapshot,
   hookKeyFor,
   installCoreCodexHook,
   isCodexTrustValid,
   readHooksState,
+  restoreCodexStateRuntimeAccess,
   trustCodexHooksWithAppServer,
   uninstallCoreCodexHook,
 } from '../codex-hooks.js';
@@ -49,19 +51,41 @@ describe('Codex SessionStart boundary', () => {
 });
 
 function writeTrustedState({ homeDir, zylosDir, hash = 'sha256:core' }) {
-  const key = hookKeyFor({ zylosDir, event: 'SessionStart', groupIndex: 0, hookIndex: 0 });
+  const hooksPath = codexHooksPath(zylosDir);
+  const config = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+  const keys = [];
+  for (const [event, groups] of Object.entries(config.hooks || {})) {
+    const eventName = event.replace(/[A-Z]/g, (m, i) => `${i ? '_' : ''}${m.toLowerCase()}`);
+    groups.forEach((group, groupIndex) => {
+      group.hooks.forEach((hook, hookIndex) => {
+        if (hook.command) keys.push(`${hooksPath}:${eventName}:${groupIndex}:${hookIndex}`);
+      });
+    });
+  }
   const globalConfigPath = codexGlobalConfigPath(homeDir);
   fs.mkdirSync(path.dirname(globalConfigPath), { recursive: true });
-  fs.writeFileSync(globalConfigPath, [
+  const lines = [
     '[features]',
     'hooks = true',
     '',
-    `[hooks.state."${key}"]`,
-    'enabled = true',
-    `trusted_hash = "${hash}"`,
+    `[projects."${zylosDir}"]`,
+    'trust_level = "trusted"',
     '',
-  ].join('\n'));
-  return key;
+  ];
+  for (const key of keys) {
+    lines.push(
+      `[hooks.state."${key}"]`,
+      'enabled = true',
+      `trusted_hash = "${hash}"`,
+      '',
+    );
+  }
+  fs.writeFileSync(globalConfigPath, lines.join('\n'));
+  // macOS resolves /var/... temp paths to /private/var/.... Production trusts
+  // both the declared symlink/path and its canonical target, so the fixture
+  // must model the same dual trust entries.
+  ensureTrustedProjectsAtPath(globalConfigPath, [zylosDir]);
+  return keys[0];
 }
 
 describe('Codex core hook installer', () => {
@@ -174,6 +198,89 @@ describe('Codex core hook installer', () => {
 });
 
 describe('Codex hook trust backstop', () => {
+  it('repairs isolated state-runtime SQLite ownership without touching credentials', () => {
+    const { homeDir } = makeEnv();
+    const codexHome = path.join(homeDir, '.codex-subscription');
+    fs.mkdirSync(codexHome, { recursive: true });
+    for (const name of [
+      'state_5.sqlite',
+      'state_5.sqlite-wal',
+      'state_5.sqlite-shm',
+      'auth.json',
+      'config.toml',
+      'goals_1.sqlite',
+    ]) {
+      fs.writeFileSync(path.join(codexHome, name), 'fixture');
+    }
+    const calls = [];
+
+    const result = restoreCodexStateRuntimeAccess({
+      homeDir,
+      codexHome,
+      runAsUser: 'zylos-pan',
+      execFileSyncImpl: (file, args) => calls.push([file, args]),
+    });
+
+    assert.deepEqual(result.repaired.map(file => path.basename(file)).sort(), [
+      'state_5.sqlite',
+      'state_5.sqlite-shm',
+      'state_5.sqlite-wal',
+    ]);
+    assert.equal(calls.length, 3);
+    assert.ok(calls.every(([file, args]) =>
+      file === 'sudo'
+      && args[0] === '-n'
+      && args[1] === 'chown'
+      && args[2] === '--no-dereference'
+      && args[3] === 'zylos-pan:zylos-pan'
+    ));
+    assert.equal(calls.some(([, args]) => args.some(arg => /auth\.json|config\.toml|goals_1/.test(arg))), false);
+  });
+
+  it('refuses to repair a Codex state path outside the isolated runtime home', () => {
+    const { root, homeDir } = makeEnv();
+    assert.throws(
+      () => restoreCodexStateRuntimeAccess({
+        homeDir,
+        codexHome: path.join(root, 'other-profile'),
+        runAsUser: 'zylos-pan',
+        execFileSyncImpl: () => {},
+      }),
+      /outside runtime home/
+    );
+  });
+
+  it('runs app-server trust as the isolated persona user', () => {
+    const { homeDir, zylosDir } = makeEnv();
+    const codexHome = path.join(homeDir, '.codex-subscription');
+    const projectDir = path.join(zylosDir, 'instances', 'user-pan');
+    fs.mkdirSync(projectDir, { recursive: true });
+    let invocation;
+
+    const result = trustCodexHooksWithAppServer({
+      zylosDir,
+      projectDir,
+      homeDir,
+      codexHome,
+      runAsUser: 'zylos-pan',
+      spawnSyncImpl: (file, args, opts) => {
+        invocation = { file, args, opts };
+        return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 8 }) + '\n', stderr: '' };
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(invocation.file, 'sudo');
+    assert.deepEqual(invocation.args.slice(0, 7), [
+      '-n', '-u', 'zylos-pan', '-H', '--', '/usr/bin/env', `HOME=${homeDir}`,
+    ]);
+    assert.ok(invocation.args.includes(`CODEX_HOME=${codexHome}`));
+    assert.ok(invocation.args.includes(`ZYLOS_CODEX_TRUST_CWD=${fs.realpathSync(projectDir)}`));
+    assert.ok(invocation.args.includes(`ZYLOS_CODEX_TRUST_HOOKS_PATH=${codexHooksPath(zylosDir)}`));
+    assert.ok(invocation.args.includes(process.execPath));
+    assert.equal(invocation.opts.cwd, fs.realpathSync(projectDir));
+  });
+
   it('re-trusts all hooks, writes marker, then skips app-server in steady state', () => {
     const { homeDir, zylosDir } = makeEnv();
     installCoreCodexHook({ zylosDir });
@@ -240,18 +347,7 @@ describe('Codex hook trust backstop', () => {
     let spawnCalls = 0;
     const spawnSyncImpl = () => {
       spawnCalls++;
-      const key = hookKeyFor({ zylosDir, event: 'SessionStart', groupIndex: 1, hookIndex: 0 });
-      const globalConfigPath = codexGlobalConfigPath(homeDir);
-      fs.mkdirSync(path.dirname(globalConfigPath), { recursive: true });
-      fs.writeFileSync(globalConfigPath, [
-        '[features]',
-        'hooks = true',
-        '',
-        `[hooks.state."${key}"]`,
-        'enabled = true',
-        'trusted_hash = "sha256:core"',
-        '',
-      ].join('\n'));
+      writeTrustedState({ homeDir, zylosDir });
       return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 1 }) + '\n', stderr: '' };
     };
     const execFileSyncImpl = () => 'codex-cli 0.142.2\n';
@@ -264,18 +360,7 @@ describe('Codex hook trust backstop', () => {
 
     const secondSpawnSyncImpl = () => {
       spawnCalls++;
-      const key = hookKeyFor({ zylosDir, event: 'SessionStart', groupIndex: 0, hookIndex: 0 });
-      const globalConfigPath = codexGlobalConfigPath(homeDir);
-      fs.mkdirSync(path.dirname(globalConfigPath), { recursive: true });
-      fs.writeFileSync(globalConfigPath, [
-        '[features]',
-        'hooks = true',
-        '',
-        `[hooks.state."${key}"]`,
-        'enabled = true',
-        'trusted_hash = "sha256:core"',
-        '',
-      ].join('\n'));
+      writeTrustedState({ homeDir, zylosDir });
       return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 1 }) + '\n', stderr: '' };
     };
 
@@ -384,7 +469,7 @@ describe('Codex hook trust backstop', () => {
           return { status: 0, stdout: JSON.stringify({ ok: true, trusted: 1 }) + '\n', stderr: '' };
         },
       }),
-      /Codex hook trust failed \(empty_trust_snapshot\)/
+      /Codex hook trust failed \(incomplete_trust_snapshot\)/
     );
   });
 
@@ -436,8 +521,9 @@ describe('Codex hook trust backstop', () => {
   it('counts candidates and missing currentHash through the real trust helper against a stub app-server', () => {
     const { root, zylosDir } = makeEnv();
 
+    const hooksPath = codexHooksPath(zylosDir);
     const makeHook = (i, withHash) => ({
-      key: `/tmp/hooks.json:session_start:0:${i}`,
+      key: `${hooksPath}:session_start:0:${i}`,
       eventName: 'SessionStart',
       command: ['node', `/tmp/hook-${i}.js`],
       enabled: true,
@@ -449,6 +535,7 @@ describe('Codex hook trust backstop', () => {
     const makeNonCandidates = (withHash) => [
       { ...makeHook(90, withHash), isManaged: true },
       (({ key, ...rest }) => rest)(makeHook(91, withHash)),
+      { ...makeHook(92, withHash), key: `/tmp/unrelated-hooks.json:session_start:0:92` },
     ];
 
     const writeFakeCodexBin = (name, hooks) => {

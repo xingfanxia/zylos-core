@@ -35,6 +35,17 @@ after(() => {
 });
 
 describe('renderCodexProjectConfig', () => {
+  it('loads the full Zylos instruction chain instead of truncating its engineering workflow', () => {
+    for (const existing of ['', 'project_doc_max_bytes = 32768\n']) {
+      const rendered = renderCodexProjectConfig(existing);
+      assert.match(rendered, /^project_doc_max_bytes = 131072$/m);
+      assert.equal(renderCodexProjectConfig(rendered), rendered);
+    }
+    const larger = renderCodexProjectConfig('project_doc_max_bytes = 262144\nmodel = "custom-model"\n');
+    assert.match(larger, /^project_doc_max_bytes = 262144$/m);
+    assert.match(larger, /^model = "custom-model"$/m);
+  });
+
   it('includes headless settings, features, and notice suppression', () => {
     const content = renderCodexProjectConfig();
     assert.match(content, /check_for_update_on_startup = false/);
@@ -271,6 +282,16 @@ describe('writeCodexConfig', () => {
     const projectContent = fs.readFileSync(projectConfigPath, 'utf8');
     assert.match(projectContent, /user_added = "keep"/);
     assert.match(projectContent, /\[features\][\s\S]*fast_mode = false[\s\S]*multi_agent = true[\s\S]*hooks = true/);
+  });
+
+  it('can write an instance overlay without generating a duplicate hooks file', () => {
+    const projectDir = path.join(fakeZylosDir, 'instances', 'user-pan');
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    assert.equal(writeCodexConfig(projectDir, { installCoreHook: false }), true);
+
+    assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'config.toml')));
+    assert.equal(fs.existsSync(path.join(projectDir, '.codex', 'hooks.json')), false);
   });
 });
 

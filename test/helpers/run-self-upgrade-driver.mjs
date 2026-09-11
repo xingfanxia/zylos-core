@@ -37,7 +37,7 @@ console.log = (...args) => launcherOutput.push(args.join(' '));
 
 let result;
 try {
-  result = runSelfUpgrade({
+  result = await runSelfUpgrade({
     tempDir,
     newVersion: '0.5.4-test',
     mode: 'merge',

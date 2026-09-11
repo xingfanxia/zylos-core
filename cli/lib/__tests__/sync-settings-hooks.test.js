@@ -806,9 +806,9 @@ describe('syncHooks SessionStart orchestrator convergence', () => {
       desiredHooks: desiredClaudeHooks({ existsSync: () => true }),
     });
 
-    // Removing migration-prompt subtracts one command from each of the three
-    // SessionStart matchers; retired per-step hooks remain unchanged.
-    assert.deepEqual(result, { added: 34, updated: 0, removed: 12 });
+    // Upstream's post-migration hook set plus the fork's two PreToolUse guards
+    // (memory-guard and src-egress-guard).
+    assert.deepEqual(result, { added: 36, updated: 0, removed: 12 });
     assertSessionStartUsesOrchestrator(installed);
   });
 

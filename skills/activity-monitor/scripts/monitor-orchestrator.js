@@ -1,8 +1,24 @@
 import fs from 'fs';
+import path from 'node:path';
 import {
   WATCHDOG_INTERRUPT_AVAILABLE_IN_SEC,
   evaluateToolWatchdogTransition,
 } from './tool-watchdog.js';
+import { consumeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+
+// Older single-session adapters predate runtimeProfile metadata. Bind the
+// switch signal to the actual runtime and pane in the existing profile file.
+export function startupRuntimeProfile(adapter, env) {
+  if (adapter?.config?.runtimeProfile?.id) return adapter.config.runtimeProfile.id;
+  if (env.ZYLOS_INSTANCE_ID || !env.ZYLOS_DIR) return null;
+  try {
+    const p = JSON.parse(fs.readFileSync(path.join(env.ZYLOS_DIR, '.zylos', 'runtime-profiles.json'), 'utf8'));
+    const selected = p.runtime_profiles?.[p.active_profile];
+    if (p.active_runtime !== adapter.runtimeId || selected?.runtime !== adapter.runtimeId
+        || (p.tmux_session && p.tmux_session !== adapter.sessionName)) return null;
+    return p.active_profile;
+  } catch { return null; }
+}
 
 export class MonitorOrchestrator {
   constructor(deps) {
@@ -51,9 +67,23 @@ export class MonitorOrchestrator {
     const runtimeLaunchAtMs = Number(initialStatus.runtime_launch_at) || nowMs();
 
     const engine = createHealthEngine(adapter, initialStatus);
-    const guardian = createGuardian(adapter, toolPipeline, runtimeLaunchAtMs);
+    const activeProfile = startupRuntimeProfile(adapter, env);
+    const runtimeSwitchSignal = consumeRuntimeSwitchSignal({
+      zylosDir: env.ZYLOS_DIR,
+      instanceId: env.ZYLOS_INSTANCE_ID || 'single',
+      activeProfile,
+      nowMs: nowMs(),
+    });
+    if (runtimeSwitchSignal) {
+      adapter.getHeartbeatDeps?.()?.clearHeartbeatPending?.();
+      engine.notifyColdStart(runtimeSwitchSignal.grace_sec);
+      log(`Runtime switch to ${activeProfile}: cold-start grace ${runtimeSwitchSignal.grace_sec}s`);
+    }
+    // monitorDir enables the guardian's suspend/wake gate — omitting it here
+    // (the pre-REL-6 wiring) silently disabled signal consumption fleet-wide.
+    const guardian = createGuardian(adapter, toolPipeline, runtimeLaunchAtMs, { monitorDir });
 
-    if (initialHealth === 'rate_limited' && initialStatus.cooldown_until) {
+    if (!runtimeSwitchSignal && initialHealth === 'rate_limited' && initialStatus.cooldown_until) {
       engine.enterRateLimited(initialStatus.cooldown_until, initialStatus.rate_limit_reset || '');
     }
     engine.start();
@@ -70,7 +100,7 @@ export class MonitorOrchestrator {
 
     const contextMonitor = startContextMonitor(adapter);
 
-    if (initialHealth !== 'ok') {
+    if (!runtimeSwitchSignal && initialHealth !== 'ok') {
       log(`Startup with health=${initialHealth}; will verify immediately when ${adapter.displayName} is running`);
     }
 
@@ -100,10 +130,21 @@ export class MonitorOrchestrator {
     checkDailyTruncate();
 
     const { engine, guardian } = this.components;
-    const guardianResult = await guardian.tick({ currentTime });
+    // Health is read LIVE from the engine on every tick (never latched): the
+    // guardian's auth_failed/degraded gate must lift the instant
+    // _verifyAuthFailedEntry flips auth_failed→unavailable or an ACK lands.
+    const guardianResult = await guardian.tick({
+      currentTime,
+      health: engine.health,
+      degradedProbeDue: typeof engine.isDegradedProbeDue === 'function'
+        ? engine.isDegradedProbeDue(currentTime)
+        : false,
+    });
     this.components.runtimeLaunchAtMs = guardianResult.runtimeLaunchAtMs;
     engine.setAgentRunning(guardianResult.state === 'running', currentTime);
     if (guardianResult.attempted_restart) {
+      // Inside the engine this is split: the post-restart probe always fires,
+      // but the counter/backoff reset is gated on flap context (REL-3).
       engine.onProcessRestarted(currentTime);
     }
 

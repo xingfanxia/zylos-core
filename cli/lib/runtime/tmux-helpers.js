@@ -6,6 +6,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import { hasDescendantProcess } from './process-tree.js';
 
 const CMD_TIMEOUT = 3000;
 const LAUNCH_TIMEOUT = 10_000;
@@ -64,7 +65,8 @@ export function tmuxKillSession(session) {
 
 /**
  * Send text to a tmux session via the buffer-paste technique.
- * Handles special characters safely.
+ * Uses native bracketed paste and preserves LF so multiline messages remain
+ * one input instead of becoming a burst of Enter-delimited fragments.
  *
  * @param {string} session
  * @param {string} tmpFile - Path to a temp file containing the text
@@ -75,7 +77,7 @@ export function tmuxPasteBuffer(session, tmpFile, bufferName) {
     timeout: CMD_TIMEOUT,
     stdio: 'ignore',
   });
-  execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], {
+  execFileSync('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', session], {
     timeout: CMD_TIMEOUT,
     stdio: 'ignore',
   });
@@ -154,21 +156,17 @@ export function getProcessName(pid) {
 }
 
 /**
- * Check if a PID has a child matching a pattern.
+ * Check if a PID has a DESCENDANT process matching `pattern` (runtime name).
+ * Thin wrapper over the shared process-tree util so every runtime-detection
+ * site handles the os_user nested-sudo launch identically — see
+ * process-tree.js for why a direct-child check is insufficient.
+ *
  * @param {number} parentPid
- * @param {string} pattern
+ * @param {string} pattern  runtime process name, e.g. 'claude' | 'codex'
  * @returns {boolean}
  */
 export function hasChildProcess(parentPid, pattern) {
-  try {
-    execFileSync('pgrep', ['-P', String(parentPid), '-f', pattern], {
-      timeout: CMD_TIMEOUT,
-      stdio: 'ignore',
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  return hasDescendantProcess(parentPid, pattern);
 }
 
 export function isTimeoutError(err) {

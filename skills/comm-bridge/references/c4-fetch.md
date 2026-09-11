@@ -2,6 +2,8 @@
 
 Retrieves the last checkpoint summary and conversations within a specified id range. Used by Memory Sync to load conversation data for summarization.
 
+With `ZYLOS_INSTANCE_ID`, normal fetches are strictly scoped to that instance. Delivered outbound replies now appear alongside inbound messages in unsummarized history; explicit ranges also retain failed-send audit rows. Rows owned by another instance and legacy unscoped rows are excluded. Trusted global callers may opt into cross-instance history with `--all-instances`.
+
 ## Usage
 
 ```bash

@@ -23,7 +23,9 @@
  *   most (k-1) x T_LINK. A flat deadline makes every shard downstream of a
  *   mid-chain failure expire simultaneously and race; the ladder keeps
  *   survivors strictly ordered.
- * - All waits fail open: a missing predecessor delays a shard, never drops it.
+ * - All ordering waits fail open: a missing predecessor delays a shard, never
+ *   drops its context. Deployments that set ZYLOS_REQUIRE_STARTUP_CONTEXT=1
+ *   separately gate the startup work prompt on every fresh shard result.
  */
 
 import fs from 'node:fs';
@@ -115,11 +117,72 @@ export function flagPath(sessionId, shardName, options = {}) {
 export function writeFlag(sessionId, shardName, options = {}) {
   try {
     fs.mkdirSync(sessionFlagDir(sessionId, options), { recursive: true });
-    fs.writeFileSync(flagPath(sessionId, shardName, options), '1');
+    const status = typeof options.status === 'string' && options.status
+      ? options.status
+      : 'ok';
+    const content = options.roundId
+      ? JSON.stringify({ v: 1, status, roundId: options.roundId })
+      : status;
+    fs.writeFileSync(flagPath(sessionId, shardName, options), content);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * Read a fresh shard completion result for the startup-context gate.
+ * Legacy flags contained "1" and are treated as healthy so a rolling deploy
+ * cannot deadlock sessions whose predecessor still runs the previous code.
+ */
+export function readFlagStatus(sessionId, shardName, {
+  tmpdir,
+  freshAfterMs = defaultFreshAfterMs(),
+} = {}) {
+  const target = flagPath(sessionId, shardName, tmpdir ? { tmpdir } : {});
+  let stat;
+  try {
+    stat = fs.statSync(target);
+  } catch {
+    return { ok: false, status: null, reason: 'missing' };
+  }
+  if (stat.mtimeMs < freshAfterMs) {
+    return { ok: false, status: null, reason: 'stale' };
+  }
+
+  let raw;
+  try {
+    raw = fs.readFileSync(target, 'utf8').trim();
+  } catch {
+    return { ok: false, status: null, reason: 'unreadable' };
+  }
+  if (raw === '1') {
+    return { ok: true, status: 'ok', reason: 'legacy' };
+  }
+  if (raw === 'ok') {
+    return { ok: true, status: 'ok', reason: 'ok' };
+  }
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      const status = typeof parsed.status === 'string' && parsed.status
+        ? parsed.status
+        : 'unknown';
+      const roundId = typeof parsed.roundId === 'string' && parsed.roundId
+        ? parsed.roundId
+        : null;
+      return {
+        ok: status === 'ok',
+        status,
+        reason: status,
+        ...(roundId ? { roundId } : {}),
+      };
+    } catch {
+      return { ok: false, status: null, reason: 'unreadable' };
+    }
+  }
+  const status = raw || 'unknown';
+  return { ok: false, status, reason: status };
 }
 
 /**
