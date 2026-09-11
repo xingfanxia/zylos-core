@@ -25,10 +25,33 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const ROUTER_IPC_TIMEOUT_MS = 30000;
+
+/**
+ * Resolve the TARGET instance's AM socket + status file for the route query.
+ * The query must reach the instance that will answer the message — asking the
+ * global/admin AM "are you healthy?" about someone else's session meant a
+ * rate_limited/auth_failed instance NEVER received notifyUserMessage, so user
+ * messages could not trigger its recovery and sat pending forever (2026-07-10
+ * incident: group parked rate_limited 5h past its cooldown while users
+ * re-@-ed the bot). Falls back to the global paths in single-session mode or
+ * when instance resolution is unavailable.
+ */
+async function resolveInstanceMonitorPaths(targetInstance) {
+  if (targetInstance) {
+    try {
+      const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+      const dir = getMonitorDir(targetInstance);
+      if (dir) {
+        return { socketPath: path.join(dir, 'am.sock'), statusFile: path.join(dir, 'agent-status.json') };
+      }
+    } catch { /* single-session / module unavailable */ }
+  }
+  return { socketPath: AM_SOCKET_PATH, statusFile: AGENT_STATUS_FILE };
+}
 const STATUS_NOTICE_COOLDOWN_SECONDS = Number.parseInt(process.env.C4_STATUS_NOTICE_COOLDOWN_SECONDS || '600', 10);
 
 function printUsage() {
-  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] --content "<message>"');
+  console.log('Usage: node c4-receive.js --channel <channel> [--endpoint <endpoint_id>] [--priority <1-3>] [--no-reply] [--block-queue-until-idle] [--json] [--target-instance <id>] --content "<message>"');
   console.log('');
   console.log('Options:');
   console.log('  --no-reply       Mark as not needing a reply target (use for system messages)');
@@ -51,7 +74,8 @@ function parseArgs(args) {
     priority: 3,
     noReply: false,
     requireIdle: false,
-    json: false
+    json: false,
+    targetInstance: null
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -78,6 +102,9 @@ function parseArgs(args) {
       case '--content':
         result.content = args[++i];
         break;
+      case '--target-instance':
+        result.targetInstance = args[++i];
+        break;
       default:
         if (args[i].startsWith('--')) {
           return { error: `Unknown option: ${args[i]}` };
@@ -89,16 +116,16 @@ function parseArgs(args) {
   return result;
 }
 
-function readHealthStatusFile() {
+function readHealthStatusFile(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!fs.existsSync(AGENT_STATUS_FILE)) {
+    if (!fs.existsSync(statusFile)) {
       return { health: 'ok' };
     }
     let status = null;
     let lastErr = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        status = JSON.parse(fs.readFileSync(AGENT_STATUS_FILE, 'utf8'));
+        status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
         break;
       } catch (err) {
         lastErr = err;
@@ -134,8 +161,8 @@ function buildFallbackMessage(status) {
   return "I'm temporarily unavailable but should be back shortly. Please try again in a moment!";
 }
 
-function fallbackFileRoute() {
-  const status = readHealthStatusFile();
+function fallbackFileRoute(statusFile = AGENT_STATUS_FILE) {
+  const status = readHealthStatusFile(statusFile);
   const health = publicHealth(status?.health);
   if (!status || typeof status.health !== 'string' || health === 'ok') {
     return { recovered: true, health: 'ok', fallback: true };
@@ -149,9 +176,9 @@ function fallbackFileRoute() {
   };
 }
 
-function ipcRoute(request) {
+function ipcRoute(request, socketPath = AM_SOCKET_PATH) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(AM_SOCKET_PATH);
+    const socket = net.createConnection(socketPath);
     let data = '';
     let settled = false;
 
@@ -199,7 +226,9 @@ function isValidRouteDecision(decision, noReply) {
   return typeof decision.userMessage === 'string' && decision.userMessage.length > 0;
 }
 
-async function queryRoute(channel, endpoint, noReply) {
+async function queryRoute(channel, endpoint, noReply, monitorPaths = null) {
+  const socketPath = monitorPaths?.socketPath ?? AM_SOCKET_PATH;
+  const statusFile = monitorPaths?.statusFile ?? AGENT_STATUS_FILE;
   try {
     const decision = await ipcRoute({
       version: 1,
@@ -209,13 +238,13 @@ async function queryRoute(channel, endpoint, noReply) {
       endpoint,
       noReply,
       receivedAt: Date.now()
-    });
+    }, socketPath);
     if (!isValidRouteDecision(decision, noReply)) {
       throw new Error('IPC response invalid route decision');
     }
     return decision;
   } catch {
-    return fallbackFileRoute();
+    return fallbackFileRoute(statusFile);
   }
 }
 
@@ -244,7 +273,10 @@ function emitError(json, code, message, exitCode = 1) {
 }
 
 function sendUnhealthyMessage(channel, endpoint, message) {
-  const args = [path.join(__dirname, 'c4-send.js'), channel];
+  // Tag the audit row as a status-notice: this auto-reply exists BECAUSE the
+  // inbound wasn't processed, so getUnansweredDeliveredForInstance must not
+  // count it as an answer to that inbound.
+  const args = [path.join(__dirname, 'c4-send.js'), '--delivery-action=status-notice', channel];
   if (endpoint) args.push(endpoint);
   const result = spawnSync('node', args, {
     input: message,
@@ -310,7 +342,7 @@ async function main() {
     emitError(asJson, 'INVALID_ARGS', parsed.error);
   }
 
-  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json } = parsed;
+  const { channel: rawChannel, endpoint, content, priority, noReply, requireIdle, json, targetInstance: explicitTargetInstance } = parsed;
   let channel = rawChannel;
 
   if (!channel && noReply) {
@@ -346,10 +378,55 @@ async function main() {
     }
   }
 
-  const route = await queryRoute(channel, endpoint, noReply);
+  // Resolve target instance FIRST for multi-session routing (fork extension) —
+  // the health/route query below must be addressed to the TARGET instance's
+  // Activity Monitor, not the global/admin one. Uses the raw endpoint:
+  // instance routing is orthogonal to replyability — a --no-reply message
+  // still routes to the endpoint's instance.
+  let targetInstance = explicitTargetInstance;
+  if (!targetInstance) {
+    try {
+      const { resolveInstance } = await import('./c4-instance-router.js');
+      targetInstance = resolveInstance(endpoint);
+    } catch { /* instance router not available */ }
+  }
+
+  // Health check via AM v3 message-router IPC (with file fallback), against
+  // the target instance's own am.sock / status file. This is what lets a user
+  // message trigger a rate_limited/auth_failed instance's recovery probe
+  // (notifyUserMessage) — routed at the global AM it never reached them.
+  const monitorPaths = await resolveInstanceMonitorPaths(targetInstance);
+  const route = await queryRoute(channel, endpoint, noReply, monitorPaths);
+
+  // Clean-store model (#618): the DB keeps content exactly as received; reply
+  // routing is reconstructed at delivery (dispatcher getDeliveryContent) and
+  // agent-facing formatting (formatConversationsForAgent). endpoint_id doubles
+  // as the replyability signal — NULL when --no-reply.
   const replyEndpoint = noReply ? null : endpoint;
+  // let (not const): upstream's status-cooldown path appends to dbContent below.
   let dbContent = content;
-  const dbStatus = route.recovered ? 'pending' : 'delivered';
+
+  // Check if unknown endpoint should be held for approval (fork extension).
+  // Held rows keep the raw endpoint: checkAndHoldForApproval returns false for
+  // no-reply messages, so a held row is always replyable.
+  try {
+    const { checkAndHoldForApproval, holdAndNotify } = await import('./c4-approve.js');
+    const held = await checkAndHoldForApproval(endpoint, targetInstance, noReply, explicitTargetInstance);
+    if (held) {
+      const record = holdAndNotify(channel, endpoint, dbContent, priority, targetInstance);
+      emitSuccess(json, record.id);
+      close();
+      return;
+    }
+  } catch { /* approval module not available */ }
+
+  // Unhealthy + replyable: store 'delivered' (context-only) and tell the user
+  // to resend below — leaving it pending would double-deliver when they do.
+  // Unhealthy + no-reply (scheduler task prompts, system notices): NOBODY is
+  // told anything, so 'delivered' silently swallowed the message forever —
+  // leave it 'pending' so the dispatcher's health gate holds it and delivers
+  // once the instance recovers.
+  const dbStatus = (route.recovered || noReply) ? 'pending' : 'delivered';
   let cooldown = null;
 
   if (!route.recovered && !noReply) {
@@ -361,7 +438,7 @@ async function main() {
     if (cooldown.suppressed) {
       dbContent += `\n\n[C4] Status notification suppressed by cooldown while health=${statusNoticeType(route)} reason=${statusNoticeReason(route)}.`;
       try {
-        const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, 'suppressed');
+        const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, 'suppressed', targetInstance);
         emitSuccess(json, record.id, 'suppressed');
         return;
       } catch (err) {
@@ -373,9 +450,9 @@ async function main() {
   }
 
   try {
-    const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle);
+    const record = insertConversation('in', channel, replyEndpoint, dbContent, dbStatus, priority, requireIdle, null, targetInstance);
     if (route.recovered || noReply) {
-      emitSuccess(json, record.id, route.recovered ? 'queued' : 'delivered');
+      emitSuccess(json, record.id, 'queued');
       return;
     }
 

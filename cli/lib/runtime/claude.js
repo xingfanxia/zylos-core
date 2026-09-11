@@ -34,11 +34,29 @@ import {
   getProcessName,
   hasChildProcess,
 } from './tmux-helpers.js';
-import { buildCleanEnv, buildCompatEnv, loadRuntimeEnvManifest, writeLaunchSpec } from './tmux-env.js';
+import {
+  buildCleanEnv,
+  buildCompatEnv,
+  ensureInstanceGhConfigDir,
+  loadRuntimeEnvManifest,
+  readMergedDotenvVars,
+  resolvePersonaDotenvPath,
+  writeLaunchSpec,
+} from './tmux-env.js';
+
+// Multi-session: heartbeat pending state must be per-instance. With the shared
+// path, two instances' health engines overwrite each other's pending pointer,
+// each polls the other's control id, and both kill healthy sessions on the
+// resulting false timeouts (2026-07-09 scheduler/user-elaine heartbeat storm).
+// getMonitorDir() honors ZYLOS_INSTANCE_ID + instances.json state_dir and falls
+// back to the shared dir for single-session deployments.
+const { getMonitorDir: _getMonitorDir } =
+  await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'claude-main';
+// Multi-session: allow ZYLOS_TMUX_SESSION env var to override the default
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'claude-main';
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 // When CLAUDE_BYPASS_PERMISSIONS=false, skip --dangerously-skip-permissions.
@@ -71,12 +89,105 @@ function _parseEnvValue(content, key) {
   return m[1].trim().replace(/^(['"])(.*)\1$/, '$2');
 }
 
+/**
+ * Resolve whether a usable Claude credential is INSTALLED, by reading the same
+ * locations Claude Code reads — with NO subprocess and NO API round-trip.
+ *
+ * On this fleet auth is a long-lived, non-rotating setup-token (`sk-ant-oat01-…`,
+ * ~1yr expiry, no refresh token). Its validity is a STATIC property of the
+ * stored credential. The former auth signal — `claude -p ping --max-turns 1` —
+ * is flaky by construction: SessionStart hooks provoke tool use so a one-word
+ * ping hits "Reached max turns", quota pressure returns 429/overload, and MCP/
+ * hook hiccups produce unknown non-zero exits. NONE of those are auth failures,
+ * yet they drove the recurring false `auth_failed` wedges. Checking the
+ * credential directly removes that flake: a present, well-formed token IS auth.
+ *
+ * The SAME setup-token is installed in `settings.local.json` `env` (no expiry
+ * metadata) AND `~/.claude/.credentials.json` `claudeAiOauth` (with `expiresAt`).
+ * `.credentials.json` is therefore checked FIRST and its expiry is AUTHORITATIVE:
+ * if that token is expired we do NOT let the expiry-less env/settings copies of
+ * the same token mask it — we fall through to the live probe so a genuine token
+ * expiry surfaces as a clean `auth_failed`, not a masked `success`.
+ *
+ * Accepted tradeoff: a token that is present + unexpired but REVOKED server-side
+ * still resolves `success` here (no API round-trip). That is not silent — a dead
+ * token can't ACK heartbeats, so the session still surfaces via heartbeat-timeout
+ * → restart → degraded + admin alert. Detecting revocation directly requires the
+ * live API call whose flake this change exists to remove.
+ *
+ * @param {string} [homeDir]
+ * @returns {{ found: boolean, kind?: string }}
+ */
+function _resolveInstalledCredential(homeDir = os.homedir()) {
+  // A usable credential is any Anthropic token/key form: OAuth/setup tokens
+  // (`sk-ant-oat01-…`) and API keys (`sk-ant-api03-…`) all share the `sk-ant-`
+  // prefix and are ≥ ~100 chars. The length floor rejects placeholder/test
+  // strings ("oauth-test", "sk-ant-test") without a network call.
+  const usable = (v) =>
+    typeof v === 'string' && /^sk-ant-/.test(v.trim()) && v.trim().length >= 40;
+
+  // 0. Expiry-authoritative source: ~/.claude/.credentials.json `claudeAiOauth`
+  //    (the only source carrying `expiresAt`). Checked before the env/settings
+  //    copies so an EXPIRED token cannot be masked by its expiry-less mirror.
+  let credExpired = false;
+  try {
+    const creds = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', '.credentials.json'), 'utf8'));
+    const oauth = creds && creds.claudeAiOauth;
+    if (oauth && usable(oauth.accessToken)) {
+      const raw = oauth.expiresAt;
+      const exp = Number(raw);
+      if (raw === undefined || raw === null || exp === 0) {
+        // No expiry recorded → cannot expiry-check; accept the well-formed token.
+        return { found: true, kind: 'credentials.json' };
+      }
+      if (Number.isFinite(exp) && exp > 0) {
+        if (exp > Date.now()) return { found: true, kind: 'credentials.json' };
+        credExpired = true; // present but past-expiry → known-bad, block the mirror
+      } else {
+        // Malformed expiry (NaN / negative) on a well-formed token — don't trust
+        // it; let the live probe adjudicate rather than accept indefinitely.
+        credExpired = true;
+      }
+    }
+  } catch { /* absent / malformed JSON — no expiry verdict, continue */ }
+
+  if (credExpired) return { found: false };
+
+  // 1. Process env (shell / pm2 / applied settings `env`).
+  for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+    if (usable(process.env[k])) return { found: true, kind: `env:${k}` };
+  }
+
+  // 2. ZYLOS `.env` file.
+  try {
+    const envContent = fs.readFileSync(path.join(ZYLOS_DIR, '.env'), 'utf8');
+    for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+      if (usable(_parseEnvValue(envContent, k))) return { found: true, kind: `dotenv:${k}` };
+    }
+  } catch { /* no .env — fall through */ }
+
+  // 3. settings.local.json `env` (project ZYLOS dir, then user home) — the
+  //    fleet-wide long-lived setup-token (mirror of the creds-file token above,
+  //    but WITHOUT expiry metadata, hence checked after the expiry verdict).
+  for (const base of [path.join(ZYLOS_DIR, '.claude'), path.join(homeDir, '.claude')]) {
+    try {
+      const settings = JSON.parse(fs.readFileSync(path.join(base, 'settings.local.json'), 'utf8'));
+      const env = (settings && settings.env) || {};
+      for (const k of ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']) {
+        if (usable(env[k])) return { found: true, kind: `settings:${k}` };
+      }
+    } catch { /* absent / malformed — fall through */ }
+  }
+
+  return { found: false };
+}
+
 // ── ClaudeAdapter ─────────────────────────────────────────────────────────────
 
 export class ClaudeAdapter extends RuntimeAdapter {
   get displayName() { return 'Claude Code'; }
   get runtimeId() { return 'claude'; }
-  get sessionName()  { return 'claude-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
@@ -91,18 +202,34 @@ export class ClaudeAdapter extends RuntimeAdapter {
   // ── Auth ──────────────────────────────────────────────────────────────────
 
   /**
-   * Live auth check via `claude -p ping --max-turns 1` (30s timeout).
-   * End-to-end validation through the same path Claude Code uses at runtime.
-   * Works with all credential types (API keys, setup tokens, OAuth tokens).
+   * Auth check. Primary signal is the INSTALLED credential (deterministic, no
+   * subprocess): a well-formed long-lived token/key present in any location
+   * Claude Code reads IS authentication → success. Only when NO credential is
+   * installed do we fall through to the live `claude -p ping --max-turns 1`
+   * probe for a definitive "genuinely logged out" answer.
+   *
+   * Rationale: the probe is a full agentic round-trip that flakes on
+   * SessionStart-hook "Reached max turns", quota 429/overload, and unknown
+   * non-zero exits — none of which are auth failures. Letting those drive
+   * health was the entire source of the recurring false `auth_failed` wedges.
    *
    * Return values:
-   *   { status: 'success' }   — authenticated
-   *   { status: 'failure' }   — explicit auth failure
+   *   { status: 'success' }   — authenticated (credential present, or probe OK)
+   *   { status: 'failure' }   — explicit auth failure (no credential / logged out)
    *   { status: 'uncertain' } — probe could not confirm either way
    *
    * @returns {Promise<{status: 'success'|'failure'|'uncertain', reason: string}>}
    */
   async checkAuth() {
+    // Fast path: a well-formed long-lived credential is installed → auth is
+    // valid. Deterministic, flake-proof, and the case that holds ~100% of the
+    // time on a setup-token fleet.
+    const cred = _resolveInstalledCredential();
+    if (cred.found) return { status: 'success', reason: `credential_present:${cred.kind}` };
+
+    // No credential found in any known location — genuinely unconfigured/logged
+    // out. Fall through to the live probe for a definitive signal (and so
+    // `zylos doctor` still surfaces a real not-logged-in state).
     // Build subprocess env: inherit current env, inject .env API keys (same as launch()).
     const injectedEnv = { ...process.env };
     let envApiKey = '';
@@ -152,7 +279,25 @@ export class ClaudeAdapter extends RuntimeAdapter {
       if (isTransient) {
         return { status: 'uncertain', reason: 'cli_probe_uncertain' };
       }
-      return { status: 'failure', reason: 'cli_probe_not_authenticated', output: output.slice(0, 500) };
+      // Explicit unauthenticated signals — the only outputs that prove auth is broken.
+      if (
+        output.includes('Not logged in') ||
+        output.includes('Please run /login') ||
+        output.includes('Invalid API key')
+      ) {
+        return { status: 'failure', reason: 'cli_probe_not_authenticated', output: output.slice(0, 500) };
+      }
+      // `claude -p ping --max-turns 1` exits non-zero with "Reached max turns" when the
+      // probe runs inside the full project context (SessionStart hooks provoke tool use,
+      // so a one-word "ping" needs >1 turn). Reaching a turn at all proves an
+      // authenticated API round-trip happened -> success, NOT an auth failure.
+      if (output.includes('Reached max turns')) {
+        return { status: 'success', reason: 'cli_probe_max_turns' };
+      }
+      // Unknown non-zero exit: could not confirm auth either way. Do NOT assert
+      // auth_failed (it gates message routing) — report uncertain so the live agent
+      // heals via heartbeat ACK and the next probe re-checks.
+      return { status: 'uncertain', reason: 'cli_probe_unknown_exit', output: output.slice(0, 500) };
     }
   }
 
@@ -242,9 +387,43 @@ export class ClaudeAdapter extends RuntimeAdapter {
   async launch(opts = {}) {
     const bypassPermissions = opts.bypassPermissions ?? DEFAULT_BYPASS;
     assertInstructionReady('claude');
+    const profile = this.config.runtimeProfile || {};
+    const reasoningEffort = profile.reasoningEffort || null;
 
-    // 1. Pre-accept onboarding/trust dialogs (all auth methods)
-    _ensureOnboardingComplete(ZYLOS_DIR);
+    // Guardian has already built and validated the split instruction files.
+    // Resolve the per-instance working directory for memory, token, and GitHub
+    // CLI isolation before preparing the runtime.
+    const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
+    let instanceCwd = ZYLOS_DIR;
+    let osUser = null;
+    if (instanceId) {
+      try {
+        const { ensureInstanceCwd, getInstanceDef } = await import('../../../skills/multi-session/instance-config.js');
+        instanceCwd = ensureInstanceCwd(instanceId);
+        // OS-level isolation (docs/design/agent-os-isolation.md): instances with
+        // an os_user run Claude as that dedicated unix user instead of the
+        // service user. Provisioned by scripts/ops/provision-agent-user.sh.
+        const candidate = getInstanceDef(instanceId)?.os_user || null;
+        if (candidate) {
+          if (/^[a-z_][a-z0-9_-]{0,31}$/.test(candidate)) {
+            osUser = candidate;
+          } else {
+            console.error(`[ClaudeAdapter] ignoring invalid os_user "${candidate}" for "${instanceId}"`);
+          }
+        }
+      } catch (err) {
+        console.error(`[ClaudeAdapter] ensureInstanceCwd failed for "${instanceId}": ${err.message}`);
+      }
+    }
+
+    // 2. Pre-accept onboarding/trust dialogs (all auth methods).
+    // os_user instances: provisioning owns /home/<os_user>/.claude.json — the
+    // service user cannot (and must not) write into the agent home.
+    if (!osUser) {
+      _ensureOnboardingComplete(ZYLOS_DIR);
+      if (instanceCwd !== ZYLOS_DIR) _ensureOnboardingComplete(instanceCwd);
+    }
+    const ghConfigDir = instanceId ? ensureInstanceGhConfigDir(instanceCwd) : null;
 
     // 3. Detect auth method to avoid "Auth conflict" errors
     const useCredentialsFile = _hasCredentialsFile();
@@ -282,19 +461,39 @@ export class ClaudeAdapter extends RuntimeAdapter {
     const envStripFlags = hasNativeAuth
       ? ' -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY'
       : '';
+
+    // No --continue: CC's resume locks model to original session and double-injects
+    // context (zylos's c4-session-init hook already restores conversation history).
     const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'claude-exit.log');
     const exitLogSnippet = `_ec=$?; echo "[$(date -Iseconds)] exit_code=$_ec" >> "${exitLogFile}"`;
 
+    // os_user instances: a leftover pane belongs to the agent user (or is a
+    // stale service-user shell) — neither can be reused for a privileged
+    // relaunch. Kill and rebuild through the clean new-session pipeline.
+    if (osUser && tmuxHasSession(SESSION)) {
+      tmuxKillSession(SESSION);
+    }
+
     if (tmuxHasSession(SESSION)) {
-      // Existing session — send command via sendMessage, no env rebuild
-      const cmd = `cd "${ZYLOS_DIR}"; ${claudeCmd}; ${exitLogSnippet}`;
+      // Existing session — send command via sendMessage, no env rebuild.
+      // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
+      const envExports = [
+        process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
+        process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
+        reasoningEffort ? `export CLAUDE_EFFORT='${reasoningEffort}'` : '',
+        ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
+        ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
+      ].filter(Boolean).join('; ');
+      const envPrefix = envExports ? `${envExports}; ` : '';
+      const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}; ${exitLogSnippet}`;
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline
-      const dotenvVars = _readDotenvVars();
+      const dotenvVars = readMergedDotenvVars([path.join(ZYLOS_DIR, '.env')]);
+      const personaEnvFile = resolvePersonaDotenvPath(ZYLOS_DIR, instanceCwd);
       const useCleanEnv = dotenvVars.ZYLOS_CLEAN_ENV !== 'false';
       const manifest = useCleanEnv ? loadRuntimeEnvManifest(ZYLOS_DIR) : undefined;
 
@@ -304,6 +503,13 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
       // Strip vars that cause Claude to refuse startup ("already running" detection)
       for (const v of ENV_VARS_TO_STRIP) delete env[v];
+
+      // Multi-session: propagate instance identity into the launched Claude process
+      // so its hooks/skills write to the correct per-instance paths.
+      if (process.env.ZYLOS_INSTANCE_ID) env.ZYLOS_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID;
+      if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
+      if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
+      if (reasoningEffort) env.CLAUDE_EFFORT = reasoningEffort;
 
       // Inject auth tokens
       if (hasNativeAuth) {
@@ -315,6 +521,15 @@ export class ClaudeAdapter extends RuntimeAdapter {
         if (baseUrlValue) env.ANTHROPIC_BASE_URL = baseUrlValue;
       }
 
+      // os_user instances: the agent process gets the agent's own HOME so its
+      // ~/zylos farm dir (per-instance .env + symlinks), credentials symlink,
+      // transcripts, and hook `~` expansion all resolve inside the agent home.
+      if (osUser) {
+        env.HOME = `/home/${osUser}`;
+        env.USER = osUser;
+        env.LOGNAME = osUser;
+      }
+
       // Build launch spec
       const args = [];
       if (bypassPermissions) args.push('--dangerously-skip-permissions');
@@ -324,9 +539,25 @@ export class ClaudeAdapter extends RuntimeAdapter {
         command: CLAUDE_BIN,
         args,
         env,
-        cwd: ZYLOS_DIR,
+        cwd: instanceCwd,
+        personaEnvFile,
         exitLogFile,
       });
+
+      // Spec is 0600 in /tmp (sticky): hand it to the agent user so the
+      // launcher (running as os_user) can read + unlink it.
+      if (osUser) {
+        try {
+          execFileSync('sudo', ['-n', 'chown', `${osUser}:${osUser}`, specPath], { timeout: 10_000 });
+        } catch (e) {
+          try { fs.unlinkSync(specPath); } catch { }
+          throw new Error(`Failed to chown launch spec to ${osUser}: ${e.message}`);
+        }
+      }
+
+      const launchCmd = osUser
+        ? `sudo -n -u ${osUser} -H -- "${process.execPath}" "${launcherPath}" "${specPath}"`
+        : `"${process.execPath}" "${launcherPath}" "${specPath}"`;
 
       // tmux args — only pass minimal env for launcher itself to start
       const tmuxArgs = [
@@ -334,7 +565,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         '-e', `PATH=${env.PATH}`,
         '-e', `HOME=${env.HOME}`,
         '-e', `TERM=${env.TERM || 'xterm-256color'}`,
-        '--', `"${process.execPath}" "${launcherPath}" "${specPath}"`,
+        '--', launchCmd,
       ];
 
       try {
@@ -356,7 +587,10 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @returns {object}
    */
   getHeartbeatDeps() {
-    const pendingFile = path.join(ZYLOS_DIR, 'activity-monitor', 'heartbeat-pending.json');
+    const monitorDir = _getMonitorDir
+      ? _getMonitorDir()
+      : path.join(ZYLOS_DIR, 'activity-monitor');
+    const pendingFile = path.join(monitorDir, 'heartbeat-pending.json');
     return createClaudeProbe({ pendingFile, tmuxSession: SESSION });
   }
 
@@ -374,23 +608,6 @@ export class ClaudeAdapter extends RuntimeAdapter {
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────
-
-function _readDotenvVars() {
-  const vars = {};
-  try {
-    const content = fs.readFileSync(path.join(ZYLOS_DIR, '.env'), 'utf8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx < 1) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const val = trimmed.slice(eqIdx + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
-      vars[key] = val;
-    }
-  } catch { /* .env absent */ }
-  return vars;
-}
 
 function _hasCredentialsFile() {
   try {

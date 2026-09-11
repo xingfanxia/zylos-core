@@ -100,6 +100,8 @@ and do not start another sync writer while one is in flight.
    under.
 8. Create checkpoint (only if conversations were fetched in step 2):
    `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id> --summary "SUMMARY"`
+   (Checkpoints are instance-scoped: run inside an instance session, where
+   `ZYLOS_INSTANCE_ID` is set, or pass `--target-instance <id>` explicitly.)
 9. Confirm completion.
 
 ## Classification Rules
@@ -148,7 +150,8 @@ worked example in `examples/`:
 
 C4 scripts used by sync flow (provided by comm-bridge skill):
 - `c4-fetch.js --unsummarized`: fetch unsummarized conversations and range.
-- `c4-checkpoint.js create <end_id> --summary "..."`: create sync checkpoint.
+- `c4-checkpoint.js create <end_id> --summary "..."`: create sync checkpoint
+  (instance-scoped: needs `ZYLOS_INSTANCE_ID` or `--target-instance <id>`).
 
 ## Consolidation Review
 

@@ -5,17 +5,23 @@
  */
 
 import { execFileSync } from 'child_process';
-import { readFileSync, existsSync, statSync } from 'fs';
-import net from 'net';
 import path from 'path';
+import {
+  readFileSync, existsSync, statSync,
+  openSync as fsOpenSync, writeSync as fsWriteSync,
+  closeSync as fsCloseSync, unlinkSync as fsUnlinkSync,
+} from 'fs';
+import net from 'net';
 import { logDeliveryFailure, saveTmuxCapture } from './c4-diagnostic.js';
 import {
   getNextPending,
   claimConversation,
   requeueConversation,
+  resetOrphanedRunning,
   markDelivered,
   getPendingCount,
   getPendingControlCount,
+  hasPendingRequireIdleControl,
   close,
   incrementRetryCount,
   markFailed,
@@ -46,12 +52,15 @@ import {
   REQUIRE_IDLE_EXECUTION_POLL_MS,
   ACTIVE_RUNTIME,
   TMUX_SESSION,
+  DB_PATH,
   ACTIVITY_MONITOR_DIR,
   AGENT_STATUS_FILE,
   PROC_STATE_FILE,
   API_ACTIVITY_FILE,
   STALE_STATUS_THRESHOLD,
-  TMUX_MISSING_WARN_THRESHOLD
+  TMUX_MISSING_WARN_THRESHOLD,
+  HEARTBEAT_INTERVAL_MS,
+  WATCHDOG_MAX_TICK_MS,
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
@@ -63,9 +72,18 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+// Observability state (WS-A). lastHeartbeatMs=0 → the first tick emits a
+// heartbeat immediately (a positive "alive" signal at startup), then every
+// HEARTBEAT_INTERVAL_MS. lastTickCompletedAt drives the stuck-tick watchdog and
+// is refreshed at the end of BOTH the success and error branches of the loop.
+let lastHeartbeatMs = 0;
+let lastTickCompletedAt = Date.now();
 
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const NOTIFY_DELIVERED_TIMEOUT_MS = 5000;
+// How often the watchdog checks for a stuck tick. Well below WATCHDOG_MAX_TICK_MS
+// so detection latency is bounded; internal implementation detail, not a tuning knob.
+const WATCHDOG_CHECK_INTERVAL_MS = 30000;
 
 function log(message) {
   const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
@@ -76,9 +94,9 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now() } = {}) {
+export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now(), socketPath = AM_SOCKET_PATH } = {}) {
   return new Promise((resolve) => {
-    const socket = net.createConnection(AM_SOCKET_PATH);
+    const socket = net.createConnection(socketPath);
     let settled = false;
 
     function settle() {
@@ -110,6 +128,42 @@ function nowSeconds() {
   return Math.floor(Date.now() / 1000);
 }
 
+// ── Loop liveness decisions (WS-A) ─────────────────────────────────────────
+// Extracted as pure functions with an injected `now` so the heartbeat/watchdog
+// logic is unit-testable without driving the live dispatcher loop.
+
+/** True when at least `intervalMs` has elapsed since the last heartbeat. */
+export function shouldEmitHeartbeat(now, lastHeartbeat, intervalMs = HEARTBEAT_INTERVAL_MS) {
+  return now - lastHeartbeat >= intervalMs;
+}
+
+/**
+ * True only when a tick has been silent strictly LONGER than `maxTickMs`.
+ * Strict `>` keeps a healthy long require_idle delivery (120s deadline + backoffs)
+ * from being falsely killed; an alive-but-erroring loop still refreshes
+ * lastTickCompletedAt each iteration, so it reads as healthy too (review LOW-7).
+ */
+export function isWatchdogExpired(now, lastTick, maxTickMs = WATCHDOG_MAX_TICK_MS) {
+  return now - lastTick > maxTickMs;
+}
+
+/**
+ * Render the periodic liveness line. Emitted unconditionally each interval, so a
+ * gap in these lines means the loop is dead/hung — the exact signal missing
+ * during the 6h04m silence. held/heldReasons default for legacy single-session
+ * results that don't carry them.
+ */
+export function formatHeartbeatLine({ pendingConv, pendingControl, held = 0, heldReasons = {}, state }) {
+  const breakdown = Object.entries(heldReasons).map(([k, v]) => `${k}:${v}`).join(',');
+  return `dispatcher alive: ${pendingConv} pending-conv, ${pendingControl} pending-control, ` +
+    `held=${held}${breakdown ? ` {${breakdown}}` : ''}, state=${state}`;
+}
+
+/** Read-only accessor for the watchdog clock (module-private state), for tests. */
+export function getLastTickCompletedAt() {
+  return lastTickCompletedAt;
+}
+
 export function readJsonFileWithRetry(filePath, attempts = 3) {
   let lastErr = null;
   for (let attempt = 0; attempt < attempts; attempt++) {
@@ -122,19 +176,19 @@ export function readJsonFileWithRetry(filePath, attempts = 3) {
   throw lastErr;
 }
 
-function getAgentState() {
+function getAgentState(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(statusFile)) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'missing' };
     }
 
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     const ageMs = Date.now() - stats.mtimeMs;
     if (ageMs > STALE_STATUS_THRESHOLD) {
       return { state: 'offline', health: 'ok', healthy: false, reason: 'stale' };
     }
 
-    const status = readJsonFileWithRetry(AGENT_STATUS_FILE);
+    const status = readJsonFileWithRetry(statusFile);
     let state = status.state;
 
     if (!state && typeof status.idle_seconds === 'number') {
@@ -158,10 +212,11 @@ function getAgentState() {
  * Read proc-state.json written by the activity monitor's ProcSampler.
  * Returns { alive, frozen, ... } or null if unavailable/stale (>30s).
  */
-function readProcState() {
+function readProcState(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(PROC_STATE_FILE)) return null;
-    const data = readJsonFileWithRetry(PROC_STATE_FILE);
+    const procFile = path.join(path.dirname(statusFile), 'proc-state.json');
+    if (!existsSync(procFile)) return null;
+    const data = readJsonFileWithRetry(procFile);
     const age = nowSeconds() - (data.lastSampleAt || 0);
     if (age > 30) return null;
     return data;
@@ -174,10 +229,11 @@ function readProcState() {
  * Check if agent is confirmed active: api-activity.json must show active_tools > 0
  * AND be fresh (updated within 60s). Prevents stale hook state from gating auto-ack.
  */
-function isAgentConfirmedActive() {
+function isAgentConfirmedActive(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(API_ACTIVITY_FILE)) return false;
-    const data = readJsonFileWithRetry(API_ACTIVITY_FILE);
+    const apiFile = path.join(path.dirname(statusFile), 'api-activity.json');
+    if (!existsSync(apiFile)) return false;
+    const data = readJsonFileWithRetry(apiFile);
     const updatedAt = data?.updated_at ? Math.floor(data.updated_at / 1000) : 0;
     const age = nowSeconds() - updatedAt;
     return (data?.active_tools ?? 0) > 0 && age < 60;
@@ -186,12 +242,12 @@ function isAgentConfirmedActive() {
   }
 }
 
-function isAgentStatusFresh() {
+function isAgentStatusFresh(statusFile = AGENT_STATUS_FILE) {
   try {
-    if (!existsSync(AGENT_STATUS_FILE)) {
+    if (!existsSync(statusFile)) {
       return false;
     }
-    const stats = statSync(AGENT_STATUS_FILE);
+    const stats = statSync(statusFile);
     return (Date.now() - stats.mtimeMs) <= STALE_STATUS_THRESHOLD;
   } catch {
     return false;
@@ -207,7 +263,7 @@ export function isRecoveryHeartbeatPhase(phase) {
   return phase === 'recovery' || phase === 'post_restart';
 }
 
-export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive }) {
+export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive, requireIdleWaiting = false }) {
   const isHeartbeat = Boolean(item && (item.content || '').includes('Heartbeat check'));
   if (!isHeartbeat) return false;
   const phase = getHeartbeatPhase(item.content);
@@ -231,11 +287,18 @@ export function shouldAutoAckHeartbeat({ item, agentState, procState, confirmedA
   // Idle path: only auto-ack the periodic primary probe. Recovery/stuck/down
   // probes must still be delivered end-to-end so the heartbeat engine can
   // observe real failures while the session is idle.
+  //
+  // Starvation guard: when a require_idle control (e.g. /clear) is already
+  // pending behind the sustained-idle threshold, delivering this heartbeat to
+  // Claude would prompt a reply, reset the idle counter, and starve the
+  // waiting control. In that case, auto-ack on any idle moment — the
+  // require_idle check at the consumer side still enforces the threshold for
+  // the actual /clear delivery.
   return (
     phase === 'primary' &&
     agentState?.health === 'ok' &&
     agentState?.state === 'idle' &&
-    agentState?.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS &&
+    (requireIdleWaiting || agentState?.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS) &&
     procState.frozen !== true
   );
 }
@@ -297,20 +360,21 @@ export function checkClaudeFallbackInputBox(capture) {
 
 /**
  * Cursor-based detector: primary signal for all runtimes.
+ * Multi-session: session parameter defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
-export function checkInputBoxByCursor() {
-  const cursorX = getCursorX();
+export function checkInputBoxByCursor(session = TMUX_SESSION) {
+  const cursorX = getCursorX(session);
   if (cursorX < 0) return 'indeterminate';
   if (cursorX > CURSOR_EMPTY_THRESHOLD) return 'has_content';
 
   // cursor_x ≤ threshold — could be truly empty or multi-line wrapped input.
   // Capture the pane and compare prompt line Y with cursor Y.
-  const cursorY = getCursorY();
+  const cursorY = getCursorY(session);
   if (cursorY < 0) return 'indeterminate';
 
   let capture;
   try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
   } catch {
@@ -329,9 +393,10 @@ export function checkInputBoxByCursor() {
  * Unified detector:
  * - Codex: cursor-only.
  * - Claude: cursor-first; if it reports has_content, fallback to text parser.
+ * Multi-session: session defaults to TMUX_SESSION but per-instance dispatch passes the instance session.
  */
-export function checkInputBox() {
-  const cursorState = checkInputBoxByCursor();
+export function checkInputBox(session = TMUX_SESSION) {
+  const cursorState = checkInputBoxByCursor(session);
   if (cursorState !== 'has_content') {
     return cursorState;
   }
@@ -342,7 +407,7 @@ export function checkInputBox() {
 
   let capture;
   try {
-    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+    capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
   } catch {
@@ -358,12 +423,12 @@ export function isUsageOverlayCapture(capture) {
 }
 
 // Empty prompt threshold: cursor at column 0, 1, or 2 means the input box
-// is empty (cursor sits right after the prompt char, e.g. "❯ " = column 2).
+// is empty (cursor sits right after the prompt char, e.g. ">" = column 2).
 const CURSOR_EMPTY_THRESHOLD = 2;
 
-export function getCursorX() {
+export function getCursorX(session = TMUX_SESSION) {
   try {
-    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_x}'], {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_x}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -374,9 +439,9 @@ export function getCursorX() {
   }
 }
 
-export function getCursorY() {
+export function getCursorY(session = TMUX_SESSION) {
   try {
-    const out = execFileSync('tmux', ['display-message', '-p', '-t', TMUX_SESSION, '#{cursor_y}'], {
+    const out = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_y}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
@@ -387,12 +452,12 @@ export function getCursorY() {
   }
 }
 
-async function submitAndVerify() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+async function submitAndVerify(session = TMUX_SESSION) {
+  execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
-    const state = checkInputBox();
+    const state = checkInputBox(session);
 
     if (state === 'empty') {
       return { verified: true, state: 'empty' };
@@ -401,12 +466,12 @@ async function submitAndVerify() {
     if (state === 'indeterminate') {
       log(`Enter verify attempt ${attempt + 1}: indeterminate state, checking for overlay`);
       try {
-        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', TMUX_SESSION], {
+        const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
           encoding: 'utf8', stdio: 'pipe', timeout: 5000
         });
         if (isUsageOverlayCapture(capture)) {
           log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-          execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'], { stdio: 'pipe', timeout: 5000 });
+          execFileSync('tmux', ['send-keys', '-t', session, 'Escape'], { stdio: 'pipe', timeout: 5000 });
         }
       } catch { /* capture failed, continue retry loop */ }
       continue;
@@ -414,7 +479,7 @@ async function submitAndVerify() {
 
     // state === 'has_content' — message wasn't submitted, retry Enter
     log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   }
 
   return { verified: false, state: 'has_content' };
@@ -422,6 +487,10 @@ async function submitAndVerify() {
 
 async function sendToTmux(message, options = {}) {
   const strictVerify = options.strictVerify === true;
+  const session = options.session || TMUX_SESSION;
+  // Multi-session: the "is the agent actually dead" fallback below must consult
+  // the TARGET instance's status files, not the primary's defaults.
+  const statusFile = options.statusFile || AGENT_STATUS_FILE;
   const acceptShutdownAfterSubmit = options.acceptShutdownAfterSubmit === true;
   const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
   const sanitized = sanitizeMessage(message);
@@ -429,7 +498,7 @@ async function sendToTmux(message, options = {}) {
 
   try {
     execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
-    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', TMUX_SESSION], { stdio: 'pipe', timeout: 5000 });
+    execFileSync('tmux', ['paste-buffer', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
   } catch (err) {
     log(`Error pasting to tmux: ${err.message}`);
     logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
@@ -446,7 +515,7 @@ async function sendToTmux(message, options = {}) {
 
   let verifyResult = { verified: false, state: 'indeterminate' };
   try {
-    verifyResult = await submitAndVerify();
+    verifyResult = await submitAndVerify(session);
   } catch (err) {
     log(`Warning: Enter verification error: ${err.message}`);
   }
@@ -461,8 +530,8 @@ async function sendToTmux(message, options = {}) {
   // For non-conversation controls, preserve prior permissive behavior when the
   // process is confirmed alive (only hard-fail if process is dead/offline).
   if (!verifyResult.verified) {
-    const procState = readProcState();
-    const agentState = getAgentState();
+    const procState = readProcState(statusFile);
+    const agentState = getAgentState(statusFile);
     if ((procState && procState.alive === false) ||
         agentState.state === 'offline' || agentState.state === 'stopped') {
       if (acceptShutdownAfterSubmit) {
@@ -487,6 +556,17 @@ export function isKeystrokeControl(item) {
 
 export function parseKeystrokeKey(content) {
   return (content || '').slice('[KEYSTROKE]'.length).trim();
+}
+
+/**
+ * Send a raw key to a tmux session (no buffer paste, no verify). Used for
+ * [KEYSTROKE] controls (auto-approve Enter, watchdog interrupts). Injected into
+ * the multi-session path so per-instance sessions get real keypresses too.
+ * @param {string} session - tmux session name
+ * @param {string} key - tmux send-keys key name (e.g. 'Enter', 'Escape')
+ */
+export function sendKeystroke(session, key) {
+  execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 });
 }
 
 export function isCodexExitLifecycleControl(item, activeRuntime = ACTIVE_RUNTIME) {
@@ -519,8 +599,8 @@ export function getDeliveryContent(item) {
   return (item.type === 'control' && !isSlashCommand) ? `Meanwhile, ${rawContent}` : rawContent;
 }
 
-async function handleConversationDeliveryFailure(msg) {
-  const channelHealthy = isAgentStatusFresh();
+async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_FILE) {
+  const channelHealthy = isAgentStatusFresh(statusFile);
 
   if (channelHealthy) {
     const currentCount = msg.retry_count || 0;
@@ -559,11 +639,11 @@ async function handleControlDeliveryFailure(control, reason) {
   log(`Retry ${transition.retry_count} for control id=${control.id}`);
 }
 
-async function waitForRequireIdleSettlement(msgId) {
+async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FILE) {
   log(`block_queue_until_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms before next dispatch`);
   await sleep(REQUIRE_IDLE_POST_SEND_HOLD_MS);
 
-  let state = getAgentState().state;
+  let state = getAgentState(statusFile).state;
   if (state === 'offline' || state === 'stopped') {
     log(`block_queue_until_idle item id=${msgId}: agent state=${state}, continuing`);
     return;
@@ -577,7 +657,7 @@ async function waitForRequireIdleSettlement(msgId) {
   const deadline = Date.now() + REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS;
   while (Date.now() < deadline) {
     await sleep(REQUIRE_IDLE_EXECUTION_POLL_MS);
-    state = getAgentState().state;
+    state = getAgentState(statusFile).state;
     if (state === 'idle' || state === 'offline' || state === 'stopped') {
       log(`block_queue_until_idle item id=${msgId}: settled with agent state=${state}`);
       return;
@@ -587,8 +667,27 @@ async function waitForRequireIdleSettlement(msgId) {
   log(`block_queue_until_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem() {
+function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances } = {}) {
   const current = nowSeconds();
+
+  // When multi-session provides instance IDs, use instance-filtered queries.
+  if (onlineInstanceIds !== null && getNextPendingControlForInstances && getNextPendingForInstances) {
+    const control = getNextPendingControlForInstances(current, onlineInstanceIds);
+    if (control) {
+      if (claimControl(control.id)) {
+        return { ...control, type: 'control' };
+      }
+      return null;
+    }
+
+    const msg = getNextPendingForInstances(onlineInstanceIds);
+    if (msg && claimConversation(msg.id)) {
+      return { ...msg, type: 'conversation' };
+    }
+
+    return null;
+  }
+
   const control = getNextPendingControl(current);
   if (control) {
     if (claimControl(control.id)) {
@@ -623,10 +722,65 @@ function maybeCleanupControlQueue() {
 }
 
 async function processNextMessage() {
+  // Control maintenance sweeps run in BOTH modes. They used to sit below the
+  // multi-session hook (which returns early), so in multi-session deployments
+  // control timeouts never fired and control_queue retention never ran.
   maybeCleanupControlQueue();
   const timedOut = expireTimedOutControls();
   if (timedOut > 0) {
     log(`Control timeout sweep marked ${timedOut} record(s) as timeout`);
+  }
+
+  // Multi-session dispatch hook. Module-load failure (modules absent) falls
+  // through to single-session; a RUNTIME error inside multi-session dispatch
+  // must NOT — falling through would paste instance-targeted messages into the
+  // default primary pane (cross-instance mis-delivery). Legacy mode (no
+  // instances.json) is signalled via `legacy: true` and falls through cleanly.
+  let multi = null;
+  try {
+    const { processWithMultiSession } = await import('./c4-dispatcher-multi.js');
+    const {
+      getNextPendingForInstances,
+      getPendingTargetInstancesNeedingWake,
+      getNextPendingControlForInstances,
+      markRejected,
+      markControlRejected
+    } = await import('./c4-db-multi.js');
+    multi = {
+      processWithMultiSession,
+      getNextPendingForInstances,
+      getPendingTargetInstancesNeedingWake,
+      getNextPendingControlForInstances,
+      markRejected,
+      markControlRejected,
+    };
+  } catch (e) {
+    if (e.code !== 'ERR_MODULE_NOT_FOUND') log(`Multi-session module load error: ${e.message}`);
+    // Fall through to single-session logic below
+  }
+
+  if (multi) {
+    try {
+      const result = await multi.processWithMultiSession({
+        getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+        releaseItem, isBypassState, shouldAutoAckHeartbeat,
+        handleConversationDeliveryFailure, handleControlDeliveryFailure,
+        waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+        markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
+        sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
+        getNextPendingForInstances: multi.getNextPendingForInstances,
+        getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
+        getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
+        markRejected: multi.markRejected,
+        markControlRejected: multi.markControlRejected,
+        notifyMessageDelivered,
+      });
+      if (!result?.legacy) return result;
+      // legacy mode (no instances.json): fall through to single-session
+    } catch (e) {
+      log(`Multi-session dispatch error: ${e.message}`);
+      return { delivered: false, state: 'multi_error' };
+    }
   }
 
   const agentState = getAgentState();
@@ -674,11 +828,12 @@ async function processNextMessage() {
   if (bypass) {
     const procState = readProcState();
     const confirmed = isAgentConfirmedActive();
-    if (shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive: confirmed })) {
+    const requireIdleWaiting = hasPendingRequireIdleControl();
+    if (shouldAutoAckHeartbeat({ item, agentState, procState, confirmedActive: confirmed, requireIdleWaiting })) {
       const phase = getHeartbeatPhase(item.content);
       const reason = confirmed
         ? `phase=${phase} /proc alive + active_tools>0 fresh (delta=${procState.lastDelta})`
-        : `phase=${phase} /proc alive + health=ok + idle_seconds=${agentState.idleSeconds}`;
+        : `phase=${phase} /proc alive + health=ok + idle_seconds=${agentState.idleSeconds}${requireIdleWaiting ? ' + require_idle_waiting' : ''}`;
       log(`Auto-acking heartbeat id=${item.id}: ${reason}`);
       ackControl(item.id);
       return { delivered: true, state: agentState.state };
@@ -743,28 +898,78 @@ async function processNextMessage() {
   return { delivered: false, state: agentState.state };
 }
 
+// Emit the periodic liveness line at most once per interval. Reads the last
+// tick's result for held/heldReasons/state; DB counts are cheap enough at ~1/min.
+// Defensive: a DB hiccup while counting must never crash the loop — lastHeartbeatMs
+// is advanced before the read so a persistent error can't spin the log every tick.
+function maybeEmitHeartbeat(result) {
+  const now = Date.now();
+  if (!shouldEmitHeartbeat(now, lastHeartbeatMs, HEARTBEAT_INTERVAL_MS)) return;
+  lastHeartbeatMs = now;
+  try {
+    log(formatHeartbeatLine({
+      pendingConv: getPendingCount(),
+      pendingControl: getPendingControlCount(),
+      held: result?.held ?? 0,
+      heldReasons: result?.heldReasons ?? {},
+      state: result?.state,
+    }));
+  } catch (err) {
+    log(`Heartbeat emit error: ${err.message}`);
+  }
+}
+
+/**
+ * One dispatcher iteration, extracted from the loop so the liveness invariant is
+ * unit-testable without driving the infinite loop. Refreshes the watchdog clock
+ * AND emits the heartbeat on BOTH the success and error paths — an alive-but-
+ * erroring loop must keep lastTickCompletedAt fresh so the watchdog does not
+ * falsely kill it, while a genuinely stuck tick (which never returns here) goes
+ * stale and trips it (review LOW-7). `processFn` and `now` are injectable for
+ * tests; dispatcherLoop calls it with the defaults.
+ *
+ * @returns {Promise<{ result: object, errored: boolean }>}
+ */
+export async function runDispatcherTick(processFn = processNextMessage, now = Date.now) {
+  try {
+    const result = await processFn();
+    lastTickCompletedAt = now();
+    maybeEmitHeartbeat(result);
+    return { result, errored: false };
+  } catch (err) {
+    log(`Dispatcher error: ${err.stack}`);
+    lastTickCompletedAt = now();
+    maybeEmitHeartbeat({ state: 'error' });
+    return { result: { delivered: false, state: 'error' }, errored: true };
+  }
+}
+
 async function dispatcherLoop() {
   while (!isShuttingDown) {
-    try {
-      const { delivered, state } = await processNextMessage();
+    const { result, errored } = await runDispatcherTick();
+    const { delivered, state } = result;
 
-      if (delivered) {
-        pollInterval = POLL_INTERVAL_BASE;
-        await sleep(POLL_INTERVAL_BASE);
-        continue;
-      }
-
-      if (state === 'idle') {
-        pollInterval = Math.min(POLL_INTERVAL_MAX, pollInterval + POLL_INTERVAL_BASE);
-      } else {
-        pollInterval = POLL_INTERVAL_BASE;
-      }
-
+    // On error keep the prior poll interval and back off by it — unchanged from
+    // the original catch-branch behavior (an erroring tick does not reset the
+    // adaptive interval).
+    if (errored) {
       await sleep(pollInterval);
-    } catch (err) {
-      log(`Dispatcher error: ${err.stack}`);
-      await sleep(pollInterval);
+      continue;
     }
+
+    if (delivered) {
+      pollInterval = POLL_INTERVAL_BASE;
+      await sleep(POLL_INTERVAL_BASE);
+      continue;
+    }
+
+    if (state === 'idle') {
+      pollInterval = Math.min(POLL_INTERVAL_MAX, pollInterval + POLL_INTERVAL_BASE);
+    } else {
+      pollInterval = POLL_INTERVAL_BASE;
+    }
+
+    await sleep(pollInterval);
   }
 }
 
@@ -777,10 +982,65 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
+/**
+ * Singleton guard. WAL + guarded-UPDATE claims make double-DELIVERY of one
+ * row impossible, but two dispatchers can still claim different rows for the
+ * same instance and interleave tmux keystrokes into one pane, and duplicate
+ * the in-memory lifecycle signals (wake/suspend/auto-start). PM2 fork-mode is
+ * the only thing preventing that today — this pidfile makes it a code
+ * guarantee. Stale pidfiles (dead pid) are reclaimed automatically.
+ */
+function acquireSingletonLock() {
+  const lockPath = path.join(path.dirname(DB_PATH), 'c4-dispatcher.pid');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fsOpenSync(lockPath, 'wx');
+      fsWriteSync(fd, String(process.pid));
+      fsCloseSync(fd);
+      const cleanup = () => { try { fsUnlinkSync(lockPath); } catch { /* best-effort */ } };
+      process.on('exit', cleanup);
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') { log(`Singleton lock error: ${err.message} — continuing without lock`); return true; }
+      let holderPid = 0;
+      try { holderPid = Number.parseInt(readFileSync(lockPath, 'utf8'), 10); } catch { }
+      let holderAlive = false;
+      if (Number.isInteger(holderPid) && holderPid > 0 && holderPid !== process.pid) {
+        try { process.kill(holderPid, 0); holderAlive = true; }
+        catch (e) { holderAlive = e?.code === 'EPERM'; }
+      }
+      if (holderAlive) {
+        log(`Another dispatcher is running (pid ${holderPid}) — exiting.`);
+        return false;
+      }
+      try { fsUnlinkSync(lockPath); } catch { }
+    }
+  }
+  log('Could not acquire singleton lock after stale-cleanup retry — exiting.');
+  return false;
+}
+
 async function main() {
+  if (!acquireSingletonLock()) {
+    close();
+    process.exit(1);
+  }
   log('=== C4 Dispatcher Started ===');
   log(`Tmux session: ${TMUX_SESSION}`);
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);
+
+  // Reclaim rows a previous dispatcher left in 'running' (killed mid-delivery).
+  // Safe here: the singleton lock is held, so no other dispatcher owns a claim.
+  // Without this, a message claimed right before a SIGKILL/pm2 kill_timeout is
+  // invisible to every pending query forever — silent loss.
+  try {
+    const orphaned = resetOrphanedRunning();
+    if (orphaned.conversations > 0 || orphaned.controls > 0) {
+      log(`Reclaimed orphaned in-flight rows from a prior dispatcher: ${orphaned.conversations} conversation(s), ${orphaned.controls} control(s)`);
+    }
+  } catch (err) {
+    log(`Warning: orphaned-running reclaim failed: ${err.message}`);
+  }
 
   const pendingControl = getPendingControlCount();
   const pendingConversation = getPendingCount();
@@ -791,10 +1051,31 @@ async function main() {
     log(`Found ${pendingConversation} pending conversation message(s)`);
   }
 
+  // Stuck-tick watchdog (defense-in-depth). pm2 can't detect a hung-but-online
+  // event loop, so a self-timer force-exits when no tick has completed in
+  // WATCHDOG_MAX_TICK_MS; pm2 (autorestart) then restarts and resetOrphanedRunning
+  // reclaims in-flight rows. .unref() so this timer never blocks the clean-shutdown
+  // process.exit(0) below.
+  lastTickCompletedAt = Date.now();
+  const watchdog = setInterval(() => {
+    if (isWatchdogExpired(Date.now(), lastTickCompletedAt, WATCHDOG_MAX_TICK_MS)) {
+      log(`WATCHDOG: no tick completed in >${WATCHDOG_MAX_TICK_MS}ms (last tick ${new Date(lastTickCompletedAt).toISOString()}) — exiting for pm2 restart`);
+      process.exit(1);
+    }
+  }, WATCHDOG_CHECK_INTERVAL_MS);
+  watchdog.unref();
+
   await dispatcherLoop();
   close();
   process.exit(0);
 }
+
+export {
+  getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
+  releaseItem, handleConversationDeliveryFailure, handleControlDeliveryFailure,
+  waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
+  markDelivered, ackControl, log, sleep, nowSeconds,
+};
 
 // PM2 sets argv[1] to its own ProcessContainerFork.js, so classic ESM
 // isMainModule checks are unreliable here. Keep the default auto-start

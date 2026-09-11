@@ -42,6 +42,8 @@ export const CORE_MANAGED_HOOKS = new Set([
   'skills/activity-monitor/scripts/context-monitor.js',
   'skills/activity-monitor/scripts/hook-activity.js',
   'skills/activity-monitor/scripts/hook-auth-prompt.js',
+  'skills/activity-monitor/scripts/memory-guard.js',
+  'skills/activity-monitor/scripts/src-egress-guard.js',
   'skills/activity-monitor/scripts/session-start-orchestrator.js',
   // Retired SessionStart hooks replaced by the orchestrator.
   'skills/zylos-memory/scripts/session-start-inject.js',
@@ -185,7 +187,14 @@ export function desiredClaudeHooks({
     PreToolUse: [
       {
         matcher: '',
-        hooks: [{ ...activityHook }],
+        hooks: [
+          // Fork guards (blocking) run before the async activity tracker:
+          // memory-guard scopes memory writes per instance; src-egress-guard
+          // blocks source-tier paths in send/upload commands (ISO belt-and-braces).
+          commandHook('skills/activity-monitor/scripts/memory-guard.js', { timeout: 5 }),
+          commandHook('skills/activity-monitor/scripts/src-egress-guard.js', { timeout: 5 }),
+          { ...activityHook },
+        ],
       },
     ],
     PermissionRequest: [
@@ -715,6 +724,9 @@ export function main(argv = process.argv.slice(2)) {
   enqueueRestartIfNeeded();
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+// realpathSync handles symlinked invocation (e.g. ~/.local/bin/zylos -> ~/zylos-core/cli/zylos.js,
+// or when the CLI is installed via npm symlinks). Node resolves import.meta.url to the realpath
+// but leaves argv[1] as-passed.
+if (process.argv[1] && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main();
 }

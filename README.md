@@ -192,6 +192,8 @@ This works from Windows, ChromeOS, or any platform that can run Claude Code loca
 3. Create the `~/zylos/` directory with memory, skills, and services
 4. Start all background services and launch your AI agent in a tmux session
 
+For fork-based deployments and post-deploy validation, see the [Deployment Guide](docs/deployment.md). It includes live smoke-test commands for routing, cold-start recovery, and real channel roundtrips.
+
 **Talk to your agent:**
 
 ```bash
@@ -285,7 +287,7 @@ Other frameworks charge per API token. Community reports show monthly bills of $
 
 ### Powered by Best-in-Class AI Runtimes
 
-Zylos supports Claude Code (Anthropic) and Codex (OpenAI) as interchangeable AI runtimes. Start with one, switch to the other anytime with `zylos runtime codex` — your memory, skills, and channels are preserved. When AI providers ship new capabilities, your agent benefits automatically. And because both runtimes can program, your AI writes new skills, integrates services, and evolves with your needs.
+Zylos supports Claude Code (Anthropic) and Codex (OpenAI) as first-class runtimes. You can still do a global switch with `zylos runtime codex`, while runtime profiles also support per-persona selection and subscription-to-API failover. The engine may change, but the persona keeps the same identity, memory, skills, workspace `.env`, messages, tasks, working directory, and stable tmux identity. Codex sees the Claude skill tree through `.agents/skills -> .claude/skills`; only runtime credentials, generated overlays, and the engine process are profile-specific. Usage cards include live subscription windows, while API profiles report tokens and a LiteLLM equivalent cost estimate. When AI providers ship new capabilities, your agent benefits automatically. And because both runtimes can program, your AI writes new skills, integrates services, and evolves with your needs.
 
 ---
 

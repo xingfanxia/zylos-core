@@ -20,6 +20,9 @@ async function runHook(payload, nowMs = 1000) {
   process.env.ZYLOS_DIR = tmpDir;
   process.env.CLAUDE_SESSION_ID = 'env-session';
   process.env.HOOK_ACTIVITY_DISABLE_MAIN = '1';
+  // Agent sessions export ZYLOS_INSTANCE_ID, which switches the hook to a
+  // per-instance monitor dir — clear it so results match every runner env.
+  delete process.env.ZYLOS_INSTANCE_ID;
   const modulePath = new URL('../hook-activity.js', import.meta.url);
   const { handleHookActivity } = await import(`${modulePath.href}?t=${Date.now()}-${Math.random()}`);
   handleHookActivity(payload, { nowMs, claudePid: 4242 });

@@ -272,6 +272,16 @@ describe('writeCodexConfig', () => {
     assert.match(projectContent, /user_added = "keep"/);
     assert.match(projectContent, /\[features\][\s\S]*fast_mode = false[\s\S]*multi_agent = true[\s\S]*hooks = true/);
   });
+
+  it('can write an instance overlay without generating a duplicate hooks file', () => {
+    const projectDir = path.join(fakeZylosDir, 'instances', 'user-pan');
+    fs.mkdirSync(projectDir, { recursive: true });
+
+    assert.equal(writeCodexConfig(projectDir, { installCoreHook: false }), true);
+
+    assert.ok(fs.existsSync(path.join(projectDir, '.codex', 'config.toml')));
+    assert.equal(fs.existsSync(path.join(projectDir, '.codex', 'hooks.json')), false);
+  });
 });
 
 describe('parseClaudeAuthStatus', () => {

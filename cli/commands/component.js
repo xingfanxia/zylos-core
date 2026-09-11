@@ -918,8 +918,8 @@ function detectCoreSkillChanges() {
  * Handle --self --check: check for zylos-core updates only (no lock needed).
  * Downloads new version to temp dir for file comparison by Claude.
  */
-function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
-  const check = checkForCoreUpdates({ branch, beta });
+async function handleSelfCheckOnly({ jsonOutput, branch, beta = false }) {
+  const check = await checkForCoreUpdates({ branch, beta });
 
   if (!check.success) {
     if (jsonOutput) {
@@ -1032,7 +1032,7 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
 
   try {
     // 2. Check for updates (compare against branch when --branch is specified)
-    const check = checkForCoreUpdates({ branch, beta });
+    const check = await checkForCoreUpdates({ branch, beta });
 
     if (!check.success && !branch) {
       if (jsonOutput) {
@@ -1045,7 +1045,7 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
       return false;
     }
 
-    if (!branch && check.success && !check.hasUpdate) {
+    if (!branch && check.success && !check.hasUpdate && !check.needsUpstreamCheck) {
       if (jsonOutput) {
         const output = { action: 'check', target: 'zylos-core', ...check };
         output.reply = formatC4Reply('self-check', check);
@@ -1123,10 +1123,11 @@ async function upgradeSelfCore({ branch, beta = false, mode = 'merge' } = {}) {
     }
 
     // 6. Execute self-upgrade — show progress in real time
-    const result = runSelfUpgrade({
+    const result = await runSelfUpgrade({
       tempDir,
       newVersion: check.latest,
       mode,
+      mergeUpstream: check.needsUpstreamCheck || false,
       onStep: !jsonOutput ? printStep : undefined,
     });
 
