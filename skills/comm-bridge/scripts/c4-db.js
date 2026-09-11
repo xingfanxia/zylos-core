@@ -97,7 +97,11 @@ function initSchema() {
 
 export function stripTrailingAckSuffix(content) {
   if (typeof content !== 'string') return content;
-  return content.replace(/\s---- ack via: node .+ ack --id \d+$/, '');
+  return content.replace(/\s---- ack via: (?!.*---- ack via: )[^\r\n]+ ack --id \d+$/, '');
+}
+
+function quoteShellArg(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function ensureControlQueueSchema(database) {
@@ -476,8 +480,11 @@ export function insertControl(content, options = {}) {
     if (appendAckSuffix) {
       // Control acknowledgements are stored with the queued control item so
       // the ack ID remains attached to the exact work item being delivered.
+      // Reuse the executable that successfully loaded this process and its
+      // native dependencies. A bare `node` can resolve to a different ABI in
+      // the recipient's interactive PATH and make every acknowledgement fail.
       const controlScriptPath = path.join(__dirname, 'c4-control.js');
-      const ackSuffix = ` ---- ack via: node ${controlScriptPath} ack --id ${id}`;
+      const ackSuffix = ` ---- ack via: ${quoteShellArg(process.execPath)} ${quoteShellArg(controlScriptPath)} ack --id ${id}`;
       finalContent = content + ackSuffix;
     }
 

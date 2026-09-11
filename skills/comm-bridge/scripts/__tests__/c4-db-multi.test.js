@@ -189,10 +189,34 @@ describe('getUnansweredDeliveredForInstance', () => {
     assert.equal(rows[0].id, id);
   });
 
-  it('excludes a message once a later outbound to the same chat exists', () => {
+  it('an own targeted outbound to the same chat clears the inbound', () => {
     conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
-    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'reply', status: 'delivered', target: null });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'reply', status: 'delivered', target: 'group' });
     assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0);
+  });
+
+  it('another instance\'s targeted outbound to the same chat does not clear the inbound', () => {
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'peer reply', status: 'delivered', target: 'user-elaine' });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
+  });
+
+  it('a legacy NULL-targeted outbound before the tagged cutover still clears the inbound', () => {
+    conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'legacy reply', status: 'delivered', target: null });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_cutover', content: 'first tagged reply', status: 'delivered', target: 'user-elaine' });
+    assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0);
+  });
+
+  it('a NULL-targeted outbound after the tagged cutover does not clear a later inbound', () => {
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_cutover', content: 'first tagged reply', status: 'delivered', target: 'group' });
+    const id = conv({ dir: 'in', channel: 'feishu', endpoint: 'oc_A|type:group|msg:om_1', content: 'q', status: 'delivered', target: 'group' });
+    conv({ dir: 'out', channel: 'feishu', endpoint: 'oc_A|type:group', content: 'regressed NULL reply', status: 'delivered', target: null });
+    const rows = multi.getUnansweredDeliveredForInstance('group');
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].id, id);
   });
 
   it('a reply to a DIFFERENT chat does not clear this one', () => {

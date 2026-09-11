@@ -332,12 +332,12 @@ async function opSend(p, caller) {
     }
   }
 
-  // Durable out-message audit row. target_instance = NULL (parity with c4-send):
-  // scoping out-rows to the caller would replay the agent's own replies into its
-  // SessionStart injection and inflate its unsummarized count (M3).
+  // Durable out-message audit row. Attribute it to the socket-authenticated
+  // caller so that instance-scoped SessionStart and Memory Sync history contains
+  // both sides of the conversation without exposing the reply to peer instances.
   let conversationId = null;
   try {
-    const row = insertConversation('out', channel, endpoint, content, null, 3, false, deliveryAction, null);
+    const row = insertConversation('out', channel, endpoint, content, null, 3, false, deliveryAction, caller);
     conversationId = row.id;
   } catch (e) {
     log(`WARN audit insert failed (${caller}): ${e.message}`);
@@ -447,9 +447,9 @@ async function opSend(p, caller) {
  * Record-only 'void' channel (#689) for isolated agents. The void endpoint is a
  * topic label (e.g. 'session-handoff'), never a real chat, so it deliberately
  * skips MESSAGING_CHANNELS / endpointAuthorized / egress-policy — none apply to
- * a message that is never dispatched. Unlike real out-rows (NULL target_instance
- * to avoid replaying replies), the void row is SCOPED TO THE CALLER: its whole
- * purpose is to be read back by that same instance's next session-init.
+ * a message that is never dispatched. Like real out-rows, the void row is
+ * SCOPED TO THE CALLER so it is read back only by that instance's next
+ * session-init.
  */
 function opVoid(p, caller) {
   const endpoint = p.endpoint ?? null;

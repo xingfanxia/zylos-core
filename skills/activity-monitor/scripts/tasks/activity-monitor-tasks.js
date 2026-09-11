@@ -59,7 +59,11 @@ export function createActivityMonitorTaskScheduler({
       id: 'health-check',
       type: 'interval',
       intervalSec: healthCheckInterval,
-      enabled: () => readHealthCheckEnabled(),
+      // PM2 and the shared health log are owner-only resources on OS-isolated
+      // installs. A per-instance monitor still runs for every user, so without
+      // this primary gate each user-tier agent receives a task it cannot
+      // execute. Keep one fleet-wide checker on the primary instance.
+      enabled: () => readHealthCheckEnabled() && usageMonitor.isPrimaryInstance(),
       gate: (snapshot) => snapshot.agentRunning === true && snapshot.health === 'ok',
       getLastRunAt: () => loadHealthCheckState()?.last_check_at ?? 0,
       execute: enqueueHealthCheck,
