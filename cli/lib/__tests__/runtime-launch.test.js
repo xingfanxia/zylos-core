@@ -174,6 +174,12 @@ function makeAdapter(Cls) {
   return adapter;
 }
 
+function readSpecArgs() {
+  const tmux = findTmuxNewSession();
+  const specMatch = tmux?.args[tmux.args.length - 1].match(/"([^"]+\.json)"/);
+  return specMatch ? JSON.parse(fs.readFileSync(specMatch[1], 'utf8')).args : null;
+}
+
 function readSpecEnv() {
   const tmux = findTmuxNewSession();
   if (!tmux) return null;
@@ -333,6 +339,24 @@ describe('Claude launch — new session', () => {
 
     assert.equal(readSpecEnv().CLAUDE_EFFORT, 'high');
   });
+
+  it('pins the Claude profile model and effort as CLI flags', async () => {
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = { id: 'claude-subscription', model: 'claude-opus-5-5[1m]', reasoningEffort: 'high' };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.deepEqual(readSpecArgs(), ['--model', 'claude-opus-5-5[1m]', '--effort', 'high']);
+  });
+
+  it('selects a profile Claude account with --settings, never the token itself', async () => {
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = { id: 'claude-ax-cl', claudeSettingsFile: '/home/zylos-shared/auth/claude-ax-cl.settings.json', model: 'claude-opus-5-5[1m]' };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.deepEqual(readSpecArgs(), ['--settings', '/home/zylos-shared/auth/claude-ax-cl.settings.json', '--model', 'claude-opus-5-5[1m]']);
+  });
 });
 
 describe('Claude launch — existing session', () => {
@@ -381,6 +405,18 @@ describe('Claude launch — existing session', () => {
     await adapter.launch({ bypassPermissions: false });
 
     assert.ok(sent.includes("export CLAUDE_EFFORT='high'"));
+  });
+
+  it('passes the Claude profile model and effort flags when reusing a session', async () => {
+    tmuxSessionExists = true;
+    let sent = '';
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = { id: 'claude-subscription', model: 'claude-opus-5-5[1m]', reasoningEffort: 'high' };
+    adapter.sendMessage = async (text) => { sent = text; };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.ok(sent.includes(" '--model' 'claude-opus-5-5[1m]' '--effort' 'high'"));
   });
 });
 

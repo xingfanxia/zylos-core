@@ -124,7 +124,13 @@ export function startContextMonitor(activeAdapter, {
       version: 1,
       runtime: activeAdapter.runtimeId,
       runtime_profile: profile.id || null,
-      model: profile.model || null,
+      model: profile.model || null, // legacy configured-model field
+      configured_model: profile.model || null,
+      configured_reasoning_effort: profile.reasoningEffort || null,
+      actual_model: valid ? sample.actualModel || null : null,
+      actual_reasoning_effort: valid ? sample.actualReasoningEffort || null : null,
+      actual_model_source: valid ? sample.actualModelSource || null : null,
+      actual_model_observed_at: valid ? sample.actualModelObservedAt || null : null,
       instance_id: instanceId,
       observed_at: new Date(nowMs()).toISOString(), // poll time, including idle sessions
       available: !!valid,

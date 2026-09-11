@@ -1,11 +1,16 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 
 const {
   fetchCodexNativeUsage,
   fetchClaudeNativeUsage,
+  fetchProviderUsage,
+  fetchClaudeAccountUsage,
   normalizeProviderPayload,
   normalizeNativeClaudeUsage,
   runProviderUsageOnce,
@@ -29,12 +34,26 @@ describe('fetchCodexNativeUsage', () => {
       },
     });
 
-    assert.equal(result.available, true);
+    assert.equal(result.available, false);
+    assert.equal(result.quota_authoritative, false);
+    assert.equal(result.fetched_at, null);
     assert.equal(result.source, 'zylos-native-rollout');
     assert.equal(result.primary, null);
     assert.equal(result.secondary.used_percent, 8);
     assert.equal(result.secondary.left_percent, 92);
     assert.equal(result.secondary.window_minutes, 10080);
+  });
+
+  it('preserves the original rollout observation and marks old data unavailable for policy', () => {
+    const result = fetchCodexNativeUsage({ now: '2026-09-07T13:19:23Z', readImpl: () => ({
+      observedAt: '2026-09-05T01:02:20Z', weeklyAllPercent: 98, weeklyAllResetsAt: 1788978510,
+    }) });
+    assert.equal(result.observed_at, '2026-09-05T01:02:20.000Z');
+    assert.equal(result.fetched_at, null);
+    assert.equal(result.freshness, 'stale');
+    assert.equal(result.available, false);
+    assert.equal(result.quota_authoritative, false);
+    assert.equal(result.secondary.used_percent, 98);
   });
 });
 
@@ -71,6 +90,59 @@ describe('normalizeProviderPayload', () => {
     assert.equal(normalized.available, false);
     assert.equal(normalized.error, 'not available');
     assert.equal(normalized.primary, null);
+  });
+});
+
+describe('fetchProviderUsage', () => {
+  const now = '2026-09-24T22:00:00.000Z';
+  it('marks a successful live CodexBar reading as a current authoritative observation', () => {
+    const exec = () => JSON.stringify([{ provider: 'claude', source: 'claude',
+      usage: { secondary: { usedPercent: 97, windowMinutes: 10080, resetsAt: '2026-09-26T02:00:00Z' } } }]);
+    const usage = fetchProviderUsage('claude', { execFileSyncImpl: exec, codexbarBin: 'codexbar', now });
+    assert.equal(usage.quota_authoritative, true);
+    assert.equal(usage.observed_at, now);
+    assert.equal(usage.secondary.used_percent, 97);
+  });
+
+  it('does not mark a failed or error probe authoritative', () => {
+    const errored = fetchProviderUsage('claude', { now, codexbarBin: 'codexbar',
+      execFileSyncImpl: () => JSON.stringify([{ provider: 'claude', error: { message: 'no auth' } }]) });
+    const thrown = fetchProviderUsage('claude', { now, codexbarBin: 'codexbar',
+      execFileSyncImpl: () => { throw new Error('timeout'); } });
+    for (const usage of [errored, thrown]) {
+      assert.equal(usage.available, false);
+      assert.notEqual(usage.quota_authoritative, true);
+    }
+  });
+});
+
+describe('fetchClaudeAccountUsage', () => {
+  const now = '2026-09-24T22:00:00.000Z';
+  it('probes one account through a private config dir and removes it', (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-usage-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const settings = path.join(dir, 'ax-cl.settings.json');
+    fs.writeFileSync(settings, JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-fixture' } }));
+    let configDir;
+    const exec = (_bin, args, opts) => {
+      configDir = opts.env.CLAUDE_CONFIG_DIR;
+      const creds = JSON.parse(fs.readFileSync(path.join(configDir, '.credentials.json'), 'utf8'));
+      assert.equal(creds.claudeAiOauth.accessToken, 'sk-ant-oat01-fixture');
+      assert.equal(creds.claudeAiOauth.refreshToken, '');
+      assert.ok(!args.join(' ').includes('sk-ant'), 'token must not reach argv');
+      return JSON.stringify([{ provider: 'claude', usage: { secondary: { usedPercent: 15, windowMinutes: 10080, resetsAt: '2026-10-01T17:00:00Z' } } }]);
+    };
+    const usage = fetchClaudeAccountUsage('claude-ax-cl', settings, { execFileSyncImpl: exec, codexbarBin: 'codexbar', now, homeDir: dir });
+    assert.equal(usage.provider, 'claude-ax-cl');
+    assert.equal(usage.quota_authoritative, true);
+    assert.equal(usage.secondary.used_percent, 15);
+    assert.equal(fs.existsSync(configDir), false);
+  });
+
+  it('reports an unreadable account as unavailable', () => {
+    const usage = fetchClaudeAccountUsage('claude-ax-cl', '/nonexistent/ax-cl.settings.json', { now });
+    assert.equal(usage.available, false);
+    assert.notEqual(usage.quota_authoritative, true);
   });
 });
 
@@ -173,8 +245,8 @@ describe('fetchClaudeNativeUsage', () => {
 });
 
 describe('runProviderUsageOnce', () => {
-  it('falls back to native Claude probe when CodexBar Claude probe fails', () => {
-    const payload = runProviderUsageOnce({
+  it('falls back to native Claude probe when CodexBar Claude probe fails', async () => {
+    const payload = await runProviderUsageOnce({
       log: () => {},
       execFileSyncImpl: (bin, args) => {
         if (String(args[1]) === '--provider' && String(args[2]) === 'claude') {
@@ -200,6 +272,7 @@ describe('runProviderUsageOnce', () => {
         secondary: { used_percent: 99, left_percent: 1, reset_description: 'Apr 3' },
         tertiary: { used_percent: 6, left_percent: 94, reset_description: 'Apr 6' },
       }),
+      fetchCodexAccountUsageImpl: async () => ({ provider: 'codex', available: true, quota_authoritative: true, source: 'codex-account-api' }),
       filePath: '/tmp/provider-usage-test.json',
     });
 
@@ -207,5 +280,34 @@ describe('runProviderUsageOnce', () => {
     assert.equal(payload.providers.claude.available, true);
     assert.equal(payload.providers.claude.source, 'zylos-native');
     assert.equal(payload.providers.claude.secondary.left_percent, 1);
+  });
+
+  it('prefers fresh official 39% over retained 98%, without a CodexBar quota read', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-quota-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const result = await runProviderUsageOnce({ filePath: path.join(dir, 'usage.json'), log: () => {},
+      execFileSyncImpl: (_bin, args) => { assert.equal(args[2], 'claude'); return JSON.stringify([{ usage: {} }]); },
+      fetchCodexAccountUsageImpl: async () => ({ available: true, quota_authoritative: true, source: 'codex-account-api',
+        observed_at: '2026-09-07T13:19:23Z', fetched_at: '2026-09-07T13:19:23Z', secondary: { used_percent: 39 } }),
+      fetchCodexNativeUsageImpl: () => { throw new Error('historical 98% must not override fresh official quota'); },
+    });
+    assert.equal(result.providers.codex.secondary.used_percent, 39);
+    assert.equal(result.providers.codex.quota_authoritative, true);
+  });
+
+  it('API failure leaves historical data non-authoritative even if a fallback claims availability', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-quota-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const result = await runProviderUsageOnce({ filePath: path.join(dir, 'usage.json'), log: () => {},
+      execFileSyncImpl: () => JSON.stringify([{ usage: {} }]),
+      fetchCodexAccountUsageImpl: async () => ({ available: false, error: 'quota_probe_timeout' }),
+      fetchCodexNativeUsageImpl: () => ({ available: true, fetched_at: '2026-09-07T13:19:23Z',
+        observed_at: '2026-09-05T01:02:20Z', source: 'zylos-native-rollout', secondary: { used_percent: 98 } }),
+    });
+    assert.equal(result.providers.codex.available, false);
+    assert.equal(result.providers.codex.quota_authoritative, false);
+    assert.equal(result.providers.codex.fetched_at, null);
+    assert.equal(result.providers.codex.observed_at, '2026-09-05T01:02:20Z');
+    assert.equal(result.providers.codex.api_error, 'quota_probe_timeout');
   });
 });

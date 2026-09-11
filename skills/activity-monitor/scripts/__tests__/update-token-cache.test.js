@@ -10,6 +10,7 @@ const originalDisableMain = process.env.UPDATE_TOKEN_CACHE_DISABLE_MAIN;
 process.env.UPDATE_TOKEN_CACHE_DISABLE_MAIN = '1';
 
 const {
+  buildClaudeUsageTargets,
   buildCodexProfileHomes,
   buildTokenCacheResult,
   classifyModelRuntime,
@@ -451,5 +452,77 @@ describe('runUpdateOnce', () => {
       '-n', '-u', 'zylos-pan', '-H', '--', '/usr/bin/env', `CODEX_HOME=${codexHome}`,
     ]);
     assert.ok(sudoArgs.includes('ccusage@20.0.17'));
+  });
+  it('runs Claude ccusage as each isolated persona OS user and keeps others on failure', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-token-cache-claude-os-user-'));
+    tmpDirs.push(tmpDir);
+    fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({
+      instances: {
+        admin: {},
+        'user-pan': { os_user: 'zylos-pan', claude_config_dir: '/home/zylos-pan/.claude' },
+        'user-elaine': { os_user: 'zylos-elaine' },
+      },
+    }));
+    const claudeDay = (tokens) => [{
+      date: '2026-04-01', inputTokens: tokens, outputTokens: 0, totalTokens: tokens, totalCost: 0,
+      modelBreakdowns: [{ modelName: 'claude-opus-4-6', inputTokens: tokens, outputTokens: 0, cacheCreationTokens: 0, cacheReadTokens: 0, cost: 0 }],
+    }];
+    const calls = [];
+
+    const result = runUpdateOnce({
+      cacheFile: path.join(tmpDir, 'token-cache.json'),
+      zylosDir: tmpDir,
+      codexProfileHomes: [],
+      now: new Date('2026-04-01T12:00:00.000Z'),
+      execFileSyncImpl: (cmd, args, opts) => {
+        calls.push({ cmd, args, configDir: opts.env.CLAUDE_CONFIG_DIR });
+        if (String(cmd).endsWith('ccusage')) {
+          return JSON.stringify({ projects: { '-home-svc-zylos-instances-admin': claudeDay(10) } });
+        }
+        if (cmd === 'sudo' && args[2] === 'zylos-pan') {
+          return JSON.stringify({ projects: { '-home-svc-zylos-instances-user-pan': claudeDay(20) } });
+        }
+        const err = new Error('EACCES');
+        err.stderr = Buffer.from('EACCES: permission denied');
+        throw err;
+      },
+      log: () => {},
+    });
+
+    const operatorCall = calls.find((c) => String(c.cmd).endsWith('ccusage'));
+    assert.doesNotMatch(operatorCall.configDir, /zylos-(pan|elaine)/);
+    const panCall = calls.find((c) => c.cmd === 'sudo' && c.args[2] === 'zylos-pan');
+    assert.deepEqual(panCall.args.slice(0, 7), [
+      '-n', '-u', 'zylos-pan', '-H', '--', '/usr/bin/env', 'CLAUDE_CONFIG_DIR=/home/zylos-pan/.claude',
+    ]);
+    assert.ok(panCall.args.includes('--instances'));
+    const elaineCall = calls.find((c) => c.cmd === 'sudo' && c.args[2] === 'zylos-elaine');
+    assert.equal(elaineCall.args[6], 'CLAUDE_CONFIG_DIR=/home/zylos-elaine/.claude');
+
+    assert.equal(result.instances.admin.runtimes.claude.totals.total_tokens, 10);
+    assert.equal(result.instances['user-pan'].runtimes.claude.totals.total_tokens, 20);
+    assert.equal(result.runtimes.claude.totals.total_tokens, 30);
+    assert.equal(result.warnings.length, 1);
+    assert.match(result.warnings[0], /^claude\[zylos-elaine\]: ccusage failed: EACCES/);
+  });
+
+  it('keeps non-isolated claude_config_dir homes on the service-user pass', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-token-cache-claude-targets-'));
+    tmpDirs.push(tmpDir);
+    const extraDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-claude-extra-'));
+    tmpDirs.push(extraDir);
+    fs.writeFileSync(path.join(tmpDir, 'instances.json'), JSON.stringify({
+      instances: {
+        scheduler: { claude_config_dir: extraDir },
+        group: { os_user: 'zylos-group', claude_config_dir: '/home/zylos-group/.claude' },
+      },
+    }));
+
+    const targets = buildClaudeUsageTargets(tmpDir);
+    assert.equal(targets[0].os_user, null);
+    assert.ok(targets[0].config_dirs.includes(extraDir));
+    assert.deepEqual(targets.slice(1), [
+      { os_user: 'zylos-group', config_dirs: ['/home/zylos-group/.claude'] },
+    ]);
   });
 });

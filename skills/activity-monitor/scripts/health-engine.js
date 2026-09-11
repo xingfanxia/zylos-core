@@ -112,6 +112,7 @@ export class HealthEngine {
     this.healthState = options.initialHealth ?? 'ok';
     this.healthReason = options.initialReason ?? '';
     this.restartFailureCount = 0;
+    this.lastFunctionalAckAt = 0;
     this.lastRecoveryAt = 0;
     this.lastDownCheckAt = 0;
     // If resuming in recovering state (e.g., PM2 restart mid-recovery),
@@ -134,6 +135,7 @@ export class HealthEngine {
 
     // API error detection throttle
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
+    this._lastStructuredQuotaScanAt = 0;
 
     // Flap escalation: kill-restart cycle timestamps (epoch sec) in the rolling
     // hour window. Incremented in triggerRecovery; reset ONLY by a functional
@@ -335,6 +337,19 @@ export class HealthEngine {
     // Fork: skip processing during cold-start grace period
     if (currentTime < this.warmupUntil) return;
 
+    // A verified terminal provider error does not need a second user message or
+    // a failed periodic heartbeat. Only runtimes with a structured detector use
+    // this path; quoted pane text keeps the existing behavioral checks.
+    if (agentRunning && this.healthState === 'ok' && this.deps.detectStructuredRateLimit
+        && currentTime - this._lastStructuredQuotaScanAt >= 5) {
+      this._lastStructuredQuotaScanAt = currentTime;
+      const limit = this.deps.detectStructuredRateLimit();
+      if (limit?.detected === true && limit.structured === true) {
+        this.enterRateLimited(limit.cooldownUntil || currentTime + this.rateLimitDefaultCooldown, limit.resetTime || '');
+        return;
+      }
+    }
+
     // Track agentRunning transitions for process signal acceleration
     this._trackAgentRunning(agentRunning, currentTime);
 
@@ -476,6 +491,7 @@ export class HealthEngine {
   }
 
   onHeartbeatSuccess(phase) {
+    this.lastFunctionalAckAt = this.now();
     this.deps.clearHeartbeatPending();
     this.restartFailureCount = 0;
     this.recoveringStartedAt = 0;

@@ -21,6 +21,15 @@ afterEach(() => {
 });
 
 describe('usage-codex-rollout-reader', () => {
+  it('retains the rate-limit event timestamp instead of inventing a fresh observation', () => {
+    const result = parseCodexUsageFromRolloutLines([JSON.stringify({
+      type: 'event_msg', timestamp: '2026-09-05T01:02:20Z', payload: {
+        type: 'token_count', rate_limits: { primary: { used_percent: 98, window_minutes: 10080, resets_at: 1788978510 } },
+      },
+    })]);
+    assert.equal(result.observedAt, '2026-09-05T01:02:20.000Z');
+    assert.equal(result.weeklyAllPercent, 98);
+  });
   it('parses primary and secondary rate limits from token_count events', () => {
     const lines = [
       JSON.stringify({
