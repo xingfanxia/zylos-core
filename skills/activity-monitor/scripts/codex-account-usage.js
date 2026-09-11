@@ -4,12 +4,16 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 
+export function rawCodexQuotaProbeBin() {
+  return process.env.CODEX_QUOTA_PROBE_BIN || path.join(path.dirname(process.execPath), 'codex');
+}
+
 export const CODEX_QUOTA_CACHE_MS = 120_000;
 const MAX_RPC_BYTES = 1_000_000;
 const fail = (code) => Object.assign(new Error(code), { code });
 
 // Hashes only leave this module. Never publish account identifiers or tokens.
-function profileIdentity(codexHome, uid) {
+export function profileIdentity(codexHome, uid = process.getuid?.()) {
   const dir = fs.statSync(codexHome);
   const authPath = path.join(codexHome, 'auth.json');
   const authStat = fs.statSync(authPath);
@@ -17,6 +21,18 @@ function profileIdentity(codexHome, uid) {
   if ((dir.mode & 0o077) || (authStat.mode & 0o077)) throw fail('profile_not_private');
   const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
   if (auth.auth_mode && auth.auth_mode !== 'chatgpt') throw fail('subscription_auth_required');
+  return accountIdentity(auth);
+}
+
+// Metadata-only read for an operator's already-authorized per-persona scope.
+// It does not grant permission to launch a canary inside a different UID home.
+export function readSubscriptionAccountKey(codexHome) {
+  const auth = JSON.parse(fs.readFileSync(path.join(codexHome, 'auth.json'), 'utf8'));
+  if (auth.auth_mode && auth.auth_mode !== 'chatgpt') throw fail('subscription_auth_required');
+  return accountIdentity(auth).accountKey;
+}
+
+function accountIdentity(auth) {
   const accountId = auth.tokens?.account_id || auth.account_id;
   let subject;
   try {
@@ -151,7 +167,7 @@ function freshCache(cache, accountKey, nowMs, maxAgeMs) {
 
 export async function fetchCodexAccountUsage({
   codexHome = process.env.CODEX_SUBSCRIPTION_HOME || path.join(os.homedir(), '.codex-subscription'),
-  codexBin = process.env.CODEX_BIN || (fs.existsSync(path.join(os.homedir(), '.local/bin/codex')) ? path.join(os.homedir(), '.local/bin/codex') : 'codex'),
+  codexBin = rawCodexQuotaProbeBin(),
   cacheFile = path.join(codexHome, 'zylos-rate-limits-cache.json'),
   cacheMaxAgeMs = CODEX_QUOTA_CACHE_MS,
   now = () => new Date().toISOString(),
