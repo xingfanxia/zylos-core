@@ -44,6 +44,14 @@ const CLAUDE_BYPASS_PERMISSIONS = readEnvValue('CLAUDE_BYPASS_PERMISSIONS', 'tru
 // Whether Codex should run with --dangerously-bypass-approvals-and-sandbox
 const CODEX_BYPASS_PERMISSIONS = readEnvValue('CODEX_BYPASS_PERMISSIONS', 'true');
 
+// Resolve once before sudo strips PATH during isolated hook trust. Otherwise
+// the daemon can approve hooks with /usr/bin/codex while launching a different
+// CLI from ~/.local/bin. An explicit operator binary selection still wins.
+const CODEX_BIN = readEnvValue('CODEX_BIN') || ENHANCED_PATH.split(':')
+  .map(dir => path.join(dir, 'codex'))
+  .find(file => { try { fs.accessSync(file, fs.constants.X_OK); return true; } catch { return false; } })
+  || 'codex';
+
 // Resolve the zylos package root so deployed skills can import CLI modules.
 // activity-monitor.js imports from cli/lib/runtime/, which is part of the
 // zylos npm package — not the skill's deployed directory.
@@ -97,6 +105,7 @@ function loadInstanceMonitors() {
           ZYLOS_TMUX_SESSION: def.tmux_session || `claude-${id}`,
           CLAUDE_BYPASS_PERMISSIONS,
           CODEX_BYPASS_PERMISSIONS,
+          CODEX_BIN,
           ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
         },
         autorestart: true,
@@ -313,6 +322,7 @@ module.exports = {
         ZYLOS_DIR,
         CLAUDE_BYPASS_PERMISSIONS,
         CODEX_BYPASS_PERMISSIONS,
+        CODEX_BIN,
         ...(ZYLOS_PACKAGE_ROOT ? { ZYLOS_PACKAGE_ROOT } : {}),
       },
         autorestart: true,

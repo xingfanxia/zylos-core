@@ -54,7 +54,8 @@ export class ContextMonitorBase {
    */
   async check() {
     const usage = await this.getUsage();
-    if (!usage || !usage.ceiling) return null;
+    if (!usage || !Number.isFinite(usage.used) || usage.used < 0 ||
+        !Number.isFinite(usage.ceiling) || usage.ceiling <= 0) return null;
     const { used, ceiling } = usage;
     return { ...usage, used, ceiling, ratio: used / ceiling };
   }
@@ -69,14 +70,14 @@ export class ContextMonitorBase {
    * @param {object} callbacks
    * @param {Function} [callbacks.onExceed]           Fired when session-switch threshold exceeded
    * @param {Function} [callbacks.onEarlyThreshold]   Fired when early threshold reached (but below session-switch)
-   * @param {Function} [callbacks.onSample]           Fired on every check with the usage result (multi-session monitoring)
+   * @param {Function} [callbacks.onSample]           Fired on every check, with null when usage is unavailable
    * @returns {Promise<void>}
    */
   async checkThreshold({ onExceed, onEarlyThreshold, onSample } = {}) {
-    const result = await this.check();
-    if (!result) return;
-
+    let result = null;
+    try { result = await this.check(); } catch { /* unavailable sample */ }
     if (onSample) await onSample(result);
+    if (!result) return;
 
     const { used, ceiling, ratio } = result;
     const now = Date.now();

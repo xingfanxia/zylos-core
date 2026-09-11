@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { afterEach, describe, it } from 'node:test';
 import {
   extractRolloutCwdFromLines,
@@ -146,13 +148,46 @@ describe('usage-codex-rollout-reader', () => {
       codexHome,
       instanceId: null,
       execFileSyncImpl: (_bin, args) => {
-        sqlitePath = args[0];
+        assert.equal(args[0], '-readonly');
+        assert.equal(new URL(args[1]).searchParams.get('immutable'), '1');
+        sqlitePath = fileURLToPath(args[1]);
         return '/tmp/profile-rollout.jsonl\n';
       },
     });
 
     assert.equal(sqlitePath, path.join(codexHome, 'state_5.sqlite'));
     assert.equal(chosen, '/tmp/profile-rollout.jsonl');
+  });
+
+  it('reads a WAL-mode profile index without creating operator-owned sidecars', () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-usage-wal-'));
+    tmpDirs.push(codexHome);
+    const day = path.join(codexHome, 'sessions/2026/09/06');
+    fs.mkdirSync(day, { recursive: true });
+    const file = path.join(day, 'rollout-active.jsonl');
+    fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { cwd: '/zylos/instances/group' } }) + '\n');
+    const db = path.join(codexHome, 'state_5.sqlite');
+    execFileSync('sqlite3', [db, `PRAGMA journal_mode=WAL;
+      CREATE TABLE threads (rollout_path TEXT, archived INTEGER, cwd TEXT, updated_at INTEGER);
+      INSERT INTO threads VALUES ('${file}',0,'/zylos/instances/group',100);`]);
+    const before = fs.readFileSync(db);
+    assert.equal(getActiveRolloutPath({ codexHome, instanceId: 'group' }), file);
+    assert.equal(fs.existsSync(`${db}-wal`), false);
+    assert.equal(fs.existsSync(`${db}-shm`), false);
+    assert.deepEqual(fs.readFileSync(db), before);
+  });
+
+  it('prefers a newer rollout over a stale immutable index result', () => {
+    const codexHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-usage-stale-index-'));
+    tmpDirs.push(codexHome);
+    const day = path.join(codexHome, 'sessions/2026/09/06');
+    fs.mkdirSync(day, { recursive: true });
+    const old = path.join(day, 'rollout-old.jsonl');
+    const current = path.join(day, 'rollout-current.jsonl');
+    for (const file of [old, current]) fs.writeFileSync(file, JSON.stringify({ type: 'session_meta', payload: { cwd: '/zylos/instances/group' } }) + '\n');
+    fs.utimesSync(old, 100, 100);
+    fs.utimesSync(current, 200, 200);
+    assert.equal(getActiveRolloutPath({ codexHome, instanceId: 'group', execFileSyncImpl: () => old + '\n' }), current);
   });
 
   it('skips a newer helper rollout without rate limits and finds the newest usable event', () => {

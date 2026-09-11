@@ -1,328 +1,219 @@
 /**
- * CodexContextMonitor — ContextMonitor implementation for OpenAI Codex CLI.
- *
- * Data sources (in priority order):
- *   1. Active JSONL rollout file — scan tail for last `event_msg:token_count` event.
- *      Fields: info.last_token_usage.input_tokens (current window fill) + info.model_context_window (ceiling).
- *      Note: last_token_usage.input_tokens = tokens sent in the last turn = current context fill.
- *      total_token_usage.input_tokens is cumulative session cost — do NOT use it for context monitoring.
- *      model_context_window in the event is already the effective ceiling
- *      (context_window × effective_context_window_percent / 100).
- *   2. SQLite state_5.sqlite fallback — threads.tokens_used + models_cache.json ceiling.
- *
- * Ceiling fallback chain:
- *   token_count event → ~/.codex/models_cache.json → DEFAULT_CEILING (128K)
+ * Current Codex context from the live parent rollout in its active CODEX_HOME.
+ * last_token_usage.input_tokens includes cached input; total_token_usage and
+ * SQLite threads.tokens_used are cumulative cost, never a context fallback.
+ * SQLite is only an index of rollout paths. Without a matching live session
+ * and a valid token_count event, return null rather than fabricate a sample.
  */
-
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { ContextMonitorBase } from './context-monitor-base.js';
+import { buildProcessTree } from './process-tree.js';
 
-const HOME = os.homedir();
-const CODEX_DIR = path.join(HOME, '.codex');
-const SQLITE_FILE = path.join(CODEX_DIR, 'state_5.sqlite');
-const MODELS_CACHE_FILE = path.join(CODEX_DIR, 'models_cache.json');
-const CODEX_CONFIG_FILE = path.join(CODEX_DIR, 'config.toml');
-const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
-
-// Bytes to read from the end of the JSONL file — large enough to capture
-// several turns including their token_count events.
-const TAIL_BYTES = 65_536; // 64 KB
-
-// Fallback ceiling when models_cache.json is unavailable
-const DEFAULT_CEILING = 128_000;
+const TAIL_BYTES = 65_536;
 
 export class CodexContextMonitor extends ContextMonitorBase {
-  /**
-   * @param {object} [opts]
-   * @param {string} [opts.model] - Model slug to look up in models_cache.json.
-   *   When omitted, uses the first model in the cache (most recently used).
-   */
   constructor(opts = {}) {
     super(opts);
     this._model = opts.model ?? null;
-    this._instanceId = opts.instanceId ?? INSTANCE_ID;
+    this._codexDir = opts.codexHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    this._cwd = canonical(opts.cwd || process.cwd());
+    this._tmuxSession = opts.tmuxSession || process.env.ZYLOS_TMUX_SESSION || 'codex-main';
+    this._execFileSync = opts.execFileSync || execFileSync;
+    this._buildProcessTree = opts.buildProcessTree || buildProcessTree;
+    this._cachedRollout = null;
   }
 
-  /**
-   * Read context usage from the active Codex session.
-   *
-   * @returns {Promise<{used: number, ceiling: number} | null>}
-   */
   async getUsage() {
-    // Primary: JSONL rollout tail (most accurate, includes live model_context_window)
-    const jsonlResult = this._readFromJsonl();
-    if (jsonlResult) return jsonlResult;
-
-    // Fallback: SQLite tokens_used + models_cache.json ceiling
-    return this._readFromSqlite();
+    return this._readFromJsonl();
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────────────
+  _liveSession() {
+    try {
+      const out = this._execFileSync('tmux', ['list-panes', '-t', this._tmuxSession, '-F', '#{pane_pid}'], {
+        encoding: 'utf8', stdio: 'pipe', timeout: 5_000,
+      });
+      const panes = String(out).trim().split('\n').map(Number);
+      if (panes.length !== 1 || !Number.isInteger(panes[0]) || panes[0] <= 0) return null;
+      const tree = this._buildProcessTree();
+      const roots = [];
+      const seen = new Set();
+      const visit = (pid) => {
+        if (seen.has(pid)) return;
+        seen.add(pid);
+        if (path.basename(tree.infoOf.get(pid)?.comm || '') === 'codex') {
+          roots.push(pid);
+          return; // Nested Codex workers do not replace their parent runtime.
+        }
+        for (const child of tree.childrenOf.get(pid) || []) visit(child);
+      };
+      visit(panes[0]);
+      if (roots.length !== 1) return null;
+      const pid = roots[0];
+      const date = this._execFileSync('ps', ['-p', String(pid), '-o', 'lstart='], {
+        encoding: 'utf8', stdio: 'pipe', timeout: 5_000,
+        env: { ...process.env, TZ: 'UTC', LC_ALL: 'C' },
+      });
+      const started = Date.parse(`${String(date).trim()} UTC`);
+      return Number.isFinite(started) ? { pid, started, key: `${pid}:${started}` } : null;
+    } catch { return null; }
+  }
 
-  /**
-   * Find the active JSONL rollout path via SQLite, then scan its tail for
-   * the most recent token_count event.
-   *
-   * @returns {{used: number, ceiling: number} | null}
-   */
   _readFromJsonl() {
     const rolloutPath = this._getActiveRolloutPath();
     if (!rolloutPath) return null;
-
     try {
       const stat = fs.statSync(rolloutPath);
       if (!stat.size) return null;
-
-      // Read only the tail to avoid loading large session files
       const readBytes = Math.min(TAIL_BYTES, stat.size);
-      const offset = stat.size - readBytes;
       const buf = Buffer.alloc(readBytes);
       const fd = fs.openSync(rolloutPath, 'r');
-      try {
-        fs.readSync(fd, buf, 0, readBytes, offset);
-      } finally {
-        fs.closeSync(fd);
-      }
-
+      try { fs.readSync(fd, buf, 0, readBytes, stat.size - readBytes); }
+      finally { fs.closeSync(fd); }
       const lines = buf.toString('utf8').split('\n');
-
-      // Scan from end for the most recent token_count event
       for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) continue;
         try {
-          const event = JSON.parse(line);
-          if (
-            event.type === 'event_msg' &&
-            event.payload?.type === 'token_count' &&
-            event.payload?.info?.last_token_usage?.input_tokens != null
-          ) {
-            // last_token_usage.input_tokens = tokens sent in the last turn =
-            // current context window fill. Do NOT use total_token_usage.input_tokens,
-            // which is cumulative session cost and grows unboundedly across turns.
-            const used = event.payload.info.last_token_usage.input_tokens;
-            // model_context_window is the effective ceiling (already multiplied by pct)
-            const ceiling = event.payload.info.model_context_window ?? this._getModelCeiling();
-            return {
-              used,
-              ceiling,
-              source: 'rollout_token_count',
-              rolloutPath,
-            };
-          }
-        } catch { /* skip malformed or partial line at read boundary */ }
+          const event = JSON.parse(lines[i]);
+          if (event.type !== 'event_msg' || event.payload?.type !== 'token_count') continue;
+          const info = event.payload.info;
+          const used = info?.last_token_usage?.input_tokens;
+          if (!Number.isFinite(used) || used < 0) continue;
+          const ceiling = info.model_context_window ?? this._getModelCeiling();
+          if (!Number.isFinite(ceiling) || ceiling <= 0) return null;
+          return { used, ceiling, source: 'rollout_token_count', rolloutPath };
+        } catch { /* partial tail boundary or incomplete JSONL write */ }
       }
-    } catch { /* file unreadable or stat failed */ }
-
+    } catch { /* missing/unreadable session is not a zero reading */ }
     return null;
   }
 
-  /**
-   * Read the active rollout path from SQLite threads table.
-   * Returns the most recently updated non-archived thread's rollout path.
-   *
-   * Falls back to filesystem scan when sqlite3 CLI is unavailable (e.g. Docker).
-   *
-   * @returns {string | null}
-   */
   _getActiveRolloutPath() {
-    // Primary: SQLite query (most accurate — respects archived flag)
+    const live = this._liveSession();
+    if (!live) {
+      this._cachedRollout = null;
+      return null;
+    }
+    // Open files tie resumed sessions (whose metadata predates this process)
+    // directly to the live engine. Other OS users may hide /proc fd entries;
+    // their fresh launches can still be matched by process start and metadata.
+    const open = this._openRollouts(live.pid).filter((p) => this._rolloutMatchesSession(p, null));
+    if (open.length > 1) return null;
+    if (open.length === 1) {
+      this._cachedRollout = { key: live.key, path: canonical(open[0]) };
+      return this._cachedRollout.path;
+    }
+    // Re-resolve rather than reusing a PID-only cache: /new or /resume may
+    // replace the active thread without replacing either tmux or the engine.
+    const { started } = live;
+    let candidates = [];
     try {
-      const sql = `SELECT rollout_path FROM threads
-                   WHERE archived = 0
-                     ${this._getThreadScopeSql()}
-                   ORDER BY updated_at DESC
-                   LIMIT 1;`;
-      const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
+      // Every condition is joined with AND. Validate metadata even if SQLite
+      // returns a path: old indexes and cloned child metadata can be stale.
+      const sql = `SELECT rollout_path FROM threads WHERE archived = 0
+        AND ${this._getThreadScopeSql()}
+        AND created_at >= ${Math.floor(started / 1000)}
+        ORDER BY created_at ASC;`;
+      // SQLITE_OPEN_READONLY can still create WAL/SHM sidecars as this monitor's
+      // OS user, breaking a persona's writable database. immutable=1 guarantees
+      // a zero-write index read. Uncheckpointed WAL rows may be absent; current
+      // rollout/PID metadata below remains authoritative in that case.
+      const uri = pathToFileURL(path.join(this._codexDir, 'state_5.sqlite'));
+      uri.search = '?mode=ro&immutable=1';
+      const out = this._execFileSync('sqlite3', ['-readonly', uri.href, sql], {
         encoding: 'utf8', stdio: 'pipe', timeout: 5_000,
-      }).trim();
-      if (out) return out;
-    } catch { /* sqlite3 CLI unavailable — fall through to filesystem scan */ }
-
-    // Fallback: scan ~/.codex/sessions/ for the most recently modified JSONL
-    // file that was updated after this monitor started. Used when sqlite3 is
-    // not installed (e.g. minimal Docker images).
-    return this._getActiveRolloutPathFromFilesystem();
+      });
+      candidates = String(out).trim().split('\n').filter((p) => p && this._rolloutMatchesSession(p, started));
+    } catch { /* CLI unavailable/schema drift: inspect rollout metadata */ }
+    if (!candidates.length) candidates = this._getRolloutsFromFilesystem(started);
+    const unique = [...new Set(candidates.map(canonical))];
+    if (unique.length !== 1) return null;
+    this._cachedRollout = { key: live.key, path: unique[0] };
+    return unique[0];
   }
 
-  /**
-   * Filesystem fallback: walk ~/.codex/sessions/YYYY/MM/DD/ and return the
-   * most recently modified rollout-*.jsonl file updated after _startTime.
-   *
-   * @returns {string | null}
-   */
-  _getActiveRolloutPathFromFilesystem() {
+  _openRollouts(pid) {
+    const paths = new Set();
     try {
-      const sessionsDir = path.join(CODEX_DIR, 'sessions');
-      let best = null;
-      let bestMtime = 0;
-
-      // Walk up to 3 directory levels: YYYY/MM/DD
-      for (const year of _readdirSafe(sessionsDir)) {
-        for (const month of _readdirSafe(path.join(sessionsDir, year))) {
-          for (const day of _readdirSafe(path.join(sessionsDir, year, month))) {
-            const dayDir = path.join(sessionsDir, year, month, day);
-            for (const file of _readdirSafe(dayDir)) {
-              if (!file.startsWith('rollout-') || !file.endsWith('.jsonl')) continue;
-              const fpath = path.join(dayDir, file);
-              try {
-                const { mtimeMs } = fs.statSync(fpath);
-                const mtimeSec = mtimeMs / 1000;
-                if (!this._rolloutMatchesInstance(fpath)) continue;
-                if (mtimeSec > bestMtime) {
-                  bestMtime = mtimeSec;
-                  best = fpath;
-                }
-              } catch { /* stat failed — skip */ }
-            }
-          }
-        }
+      for (const fd of fs.readdirSync(`/proc/${pid}/fd`)) {
+        try {
+          const file = fs.readlinkSync(`/proc/${pid}/fd/${fd}`);
+          if (path.basename(file).startsWith('rollout-') && file.endsWith('.jsonl')) paths.add(file);
+        } catch { /* descriptor closed or hidden */ }
       }
-      return best;
-    } catch {
-      return null;
-    }
+    } catch { /* non-Linux or isolated OS user: metadata fallback */ }
+    return [...paths];
   }
 
-  /**
-   * Fallback: read tokens_used from SQLite + ceiling from models_cache.json.
-   *
-   * @returns {{used: number, ceiling: number} | null}
-   */
-  _readFromSqlite() {
+  _getRolloutsFromFilesystem(started) {
+    const found = [];
+    const walk = (dir, depth) => {
+      for (const item of readdirSafe(dir)) {
+        const file = path.join(dir, item.name);
+        if (item.isDirectory() && depth > 0) walk(file, depth - 1);
+        else if (item.isFile() && item.name.startsWith('rollout-') && item.name.endsWith('.jsonl') && this._rolloutMatchesSession(file, started)) found.push(file);
+      }
+    };
+    walk(path.join(this._codexDir, 'sessions'), 3);
+    return found;
+  }
+
+  _getThreadScopeSql() {
+    return `cwd = '${this._cwd.replace(/'/g, "''")}'`;
+  }
+
+  _rolloutMatchesSession(rolloutPath, started) {
     try {
-      // Same start-time filter as _getActiveRolloutPath() — ignore stale threads.
-      const sql = `SELECT tokens_used FROM threads
-                   WHERE archived = 0
-                     ${this._getThreadScopeSql()}
-                   ORDER BY updated_at DESC
-                   LIMIT 1;`;
-      const out = execFileSync('sqlite3', [SQLITE_FILE, sql], {
-        encoding: 'utf8', stdio: 'pipe', timeout: 5_000,
-      }).trim();
-      if (!out) return null;
-      const tokensUsed = parseInt(out, 10);
-      if (isNaN(tokensUsed)) return null;
-      return {
-        used: tokensUsed,
-        ceiling: this._getModelCeiling(),
-        source: 'sqlite_fallback',
-      };
-    } catch {
-      return null;
-    }
+      const sessionsDir = canonical(path.join(this._codexDir, 'sessions'));
+      const relative = path.relative(sessionsDir, canonical(rolloutPath));
+      if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return false;
+      const fd = fs.openSync(rolloutPath, 'r');
+      let event;
+      try {
+        const buf = Buffer.alloc(65536);
+        const size = fs.readSync(fd, buf, 0, buf.length, 0);
+        // FIRST metadata only. Child rollouts may contain a cloned parent
+        // session_meta on line 2; that never makes the child the main session.
+        event = JSON.parse(buf.toString('utf8', 0, size).split('\n')[0]);
+      } finally { fs.closeSync(fd); }
+      const meta = event.payload;
+      if (event.type !== 'session_meta' || meta?.source !== 'cli' || typeof meta.cwd !== 'string') return false;
+      if (canonical(meta.cwd) !== this._cwd) return false;
+      if (!meta.id || !path.basename(rolloutPath).endsWith(`${meta.id}.jsonl`)) return false;
+      const created = Date.parse(meta.timestamp);
+      return Number.isFinite(created) && (started === null || created >= started);
+    } catch { return false; }
   }
 
-  /**
-   * Get effective context window ceiling.
-   *
-   * Fallback order:
-   *   1. ~/.codex/config.toml `model_context_window`
-   *   2. ~/.codex/models_cache.json effective ceiling
-   *   3. DEFAULT_CEILING
-   *
-   * config.toml takes precedence because operators may explicitly override the
-   * effective window there (for example GPT-5.4 set to 1,000,000 tokens), while
-   * models_cache.json can be stale or reflect a smaller default.
-   *
-   * @returns {number}
-   */
+  /** Event effective ceiling wins; otherwise read the active profile only. */
   _getModelCeiling() {
     try {
-      const config = fs.readFileSync(CODEX_CONFIG_FILE, 'utf8');
+      const config = fs.readFileSync(path.join(this._codexDir, 'config.toml'), 'utf8');
       const match = config.match(/^\s*model_context_window\s*=\s*(\d+)\s*$/m);
       if (match?.[1]) {
         const parsed = parseInt(match[1], 10);
         if (!Number.isNaN(parsed) && parsed > 0) return parsed;
       }
     } catch { /* config.toml missing or unreadable */ }
-
     try {
-      const cache = JSON.parse(fs.readFileSync(MODELS_CACHE_FILE, 'utf8'));
+      const cache = JSON.parse(fs.readFileSync(path.join(this._codexDir, 'models_cache.json'), 'utf8'));
       const models = cache.models ?? [];
-      const model = this._model
-        ? (models.find(m => m.slug === this._model) ?? models[0])
-        : models[0];
-
-      if (model?.context_window) {
+      const model = this._model ? models.find((m) => m.slug === this._model) : models[0];
+      if (Number.isFinite(model?.context_window) && model.context_window > 0) {
         const pct = model.effective_context_window_percent ?? 100;
-        return Math.round(model.context_window * (pct / 100));
+        if (Number.isFinite(pct) && pct > 0 && pct <= 100) return Math.round(model.context_window * (pct / 100));
       }
     } catch { /* models_cache.json missing or malformed */ }
-
-    return DEFAULT_CEILING;
-  }
-
-  /**
-   * Restrict thread lookup to the current instance in multi-session mode.
-   *
-   * Codex stores every runtime's threads in one shared ~/.codex/state_5.sqlite.
-   * In mixed multi-session deployments, selecting only by updated_at can pick
-   * another instance's thread and trigger false context-handoff loops.
-   *
-   * We scope by cwd suffix (`.../instances/<instanceId>`) instead of absolute
-   * path because older sessions may have been launched under a different $HOME
-   * prefix during migrations or manual restarts.
-   *
-   * @returns {string}
-   */
-  _getThreadScopeSql() {
-    if (!this._instanceId) return '1 = 1';
-    const suffix = _sqlEscape(`/instances/${this._instanceId}`);
-    return `cwd LIKE '%${suffix}'`;
-  }
-
-  _rolloutMatchesInstance(rolloutPath) {
-    if (!this._instanceId) return true;
-    try {
-      const stat = fs.statSync(rolloutPath);
-      if (!stat.size) return false;
-      const readBytes = Math.min(16_384, stat.size);
-      const buf = Buffer.alloc(readBytes);
-      const fd = fs.openSync(rolloutPath, 'r');
-      try {
-        fs.readSync(fd, buf, 0, readBytes, 0);
-      } finally {
-        fs.closeSync(fd);
-      }
-      const lines = buf.toString('utf8').split('\n');
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        try {
-          const event = JSON.parse(trimmed);
-          if (event.type === 'session_meta' && typeof event.payload?.cwd === 'string') {
-            return event.payload.cwd.endsWith(`/instances/${this._instanceId}`);
-          }
-        } catch {
-          // ignore malformed line
-        }
-      }
-    } catch {
-      return false;
-    }
-    return false;
+    return null;
   }
 }
 
-// ── Private helpers ────────────────────────────────────────────────────────
-
-/**
- * Safe readdir — returns empty array instead of throwing on missing/unreadable dirs.
- * @param {string} dir
- * @returns {string[]}
- */
-function _readdirSafe(dir) {
-  try {
-    return fs.readdirSync(dir);
-  } catch {
-    return [];
-  }
+function canonical(value) {
+  try { return fs.realpathSync(value); } catch { return path.resolve(value); }
 }
 
-function _sqlEscape(value) {
-  return String(value).replace(/'/g, "''");
+function readdirSafe(dir) {
+  try { return fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
 }
