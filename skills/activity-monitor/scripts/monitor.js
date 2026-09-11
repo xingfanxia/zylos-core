@@ -435,7 +435,17 @@ function writeStatusFile(statusObj) {
   // Stamp every status write with the instance id (multi-session: dashboard + downstream
   // consumers expect this field to disambiguate per-instance status files).
   const enriched = INSTANCE_ID ? { ...statusObj, instance_id: INSTANCE_ID } : statusObj;
-  writeStatus({ statusFile: STATUS_FILE, statusObj: enriched, healthEngine: engine });
+  writeStatus({
+    statusFile: STATUS_FILE,
+    statusObj: {
+      ...enriched,
+      // Loaded adapter identity, not a newer instances.json target. An ACK
+      // before this process launch cannot prove a pending switch is ready.
+      runtime_profile: adapter.config?.runtimeProfile?.id || null,
+      functional_ack_at: engine.lastFunctionalAckAt || 0,
+    },
+    healthEngine: engine,
+  });
 }
 
 function buildNotRunningStatus({
@@ -726,13 +736,13 @@ const ADMIN_CHAT_ID = resolveAdminChatId();
 
 // Degraded-transition admin alert (REL-3): direct feishu send that bypasses the
 // stuck instance entirely (its own queue can never forward while it flaps).
-function formatDegradedAdminAlert({ cycleCount, windowSec, ceiling, probeIntervalSec, reason }) {
+function formatDegradedAdminAlert({ cycleCount, windowSec, probeIntervalSec }) {
   const instance = INSTANCE_ID || 'primary';
   return [
-    `🔴 实例已降级（degraded）：${instance}`,
-    `过去 ${Math.round(windowSec / 60)} 分钟内 kill-restart 循环 ${cycleCount} 次（上限 ${ceiling}/小时），已停止重启循环（触发原因：${reason}）。`,
-    `降级 = 有界自恢复：每 ${Math.round(probeIntervalSec / 60)} 分钟自动重启并探测一次，恢复后自动回到 ok；期间该实例的消息会被暂存，不会丢失。`,
-    '如需立即恢复：检查该实例的 claude 登录/额度状态；给它发一条消息即可触发立刻探测。',
+    `🔴 ${instance.replace(/^user-/, '')} 暂时无法回复`,
+    `过去 ${Math.round(windowSec / 60)} 分钟已尝试恢复 ${cycleCount} 次，但还没有收到正常回应。为避免反复重启，系统已放慢重试。`,
+    `接下来每 ${Math.round(probeIntervalSec / 60)} 分钟自动检查一次，确认是否恢复。`,
+    '这条提醒表示恢复尚未成功，不需要重复发送原来的任务。',
   ].join('\n');
 }
 
