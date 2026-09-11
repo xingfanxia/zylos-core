@@ -108,7 +108,9 @@ async function handleEnqueue(args) {
     return;
   }
 
-  const targetInstance = parseStringArg(args, '--target-instance');
+  // Trusted admin/scheduler personas also retain their own target by default.
+  // Broker callers above remain forced to their authenticated instance.
+  const targetInstance = parseStringArg(args, '--target-instance') || process.env.ZYLOS_INSTANCE_ID || null;
   const record = insertControl(content, {
     priority: priority ?? 3,
     requireIdle,
