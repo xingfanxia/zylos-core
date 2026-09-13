@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 import { processSwitchNotices } from './runtime-switch-notices.js';
-import { verifiedQuotaRecoveries, readCurrentSubscriptionAccountKeys } from './codex-quota-recovery.js';
+import { verifiedQuotaRecoveries, readCurrentSubscriptionAccountKeys, readSubscriptionRotationMarkers } from './codex-quota-recovery.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -84,6 +84,7 @@ export function chooseRuntimeProfile({
   requiredReasoningEffort = null,
   usageMaxAgeMs = null,
   verifiedRecoveredProfiles = [],
+  usageFailoverNotBeforeMs = 0,
 } = {}) {
   if (requiredModel || requiredReasoningEffort) {
     chain = chain.filter(id => {
@@ -117,6 +118,10 @@ export function chooseRuntimeProfile({
   // race through every fallback tier in consecutive daemon polls.
   if (healthLimited && changedAtMs > 0 && nowMs - changedAtMs < minDwellMs) {
     return { profile: currentProfile, reason: 'no_change' };
+  }
+
+  if (usageLimited && !healthLimited && nowMs < usageFailoverNotBeforeMs) {
+    return { profile: currentProfile, reason: 'subscription_rotation_pending' };
   }
 
   if (healthLimited || usageLimited) {
@@ -178,11 +183,37 @@ export function chooseRuntimeProfile({
     ? 'fallback_chain_exhausted' : 'no_change' };
 }
 
+// A fresh host rotator gets a bounded first chance at the 95% handoff. The
+// deadline is persisted, so daemon restarts and fresh polls cannot extend it.
+// Actual health failures retain their existing immediate fallback semantics.
+function rotationDeadline(state, { policy, profiles, currentProfile, providerUsage, marker, nowMs }) {
+  const quota = providerUsageState(providerUsage, 'codex', nowMs,
+    Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null);
+  const checkedMs = typeof marker?.checked_at === 'number' ? marker.checked_at * 1000 : NaN;
+  const fresh = marker?.available === true && /^[a-f0-9]{64}$/.test(marker.generation || '') &&
+    Number.isFinite(checkedMs) && checkedMs <= nowMs + 30_000 && nowMs - checkedMs <= 90_000;
+  if (profiles[currentProfile]?.usage_provider !== 'codex' ||
+      (quota.available && quota.usedPercent < (Number(policy.switch_threshold) || 98))) {
+    delete state.runtime_usage_rotation_wait;
+    return 0;
+  }
+  // A missing quota observation cannot start a wait or erase one already in
+  // progress. A short monitoring gap must not re-arm the same deadline.
+  if (!fresh || !quota.available) return 0;
+  const prior = state.runtime_usage_rotation_wait;
+  const started = Date.parse(prior?.started_at || '');
+  if (prior?.profile !== currentProfile || !Number.isFinite(started) || started > nowMs) {
+    state.runtime_usage_rotation_wait = { profile: currentProfile, started_at: new Date(nowMs).toISOString() };
+  }
+  return Date.parse(state.runtime_usage_rotation_wait.started_at) + 120_000;
+}
+
 export function planRuntimeFailover({
   document,
   providerUsage,
   healthByInstance = {},
   currentSubscriptionAccountKeys = {},
+  rotationMarkers = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -206,7 +237,10 @@ export function planRuntimeFailover({
     const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys });
     const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !recovered.includes(id)));
     const currentHealth = healthByInstance[instanceId] || 'ok';
+    const usageFailoverNotBeforeMs = rotationDeadline(instance, { policy, profiles, currentProfile, providerUsage,
+      marker: rotationMarkers[instanceId]?.[currentProfile], nowMs });
     const decision = chooseRuntimeProfile({
+      usageFailoverNotBeforeMs,
       currentProfile,
       chain,
       profiles,
@@ -242,6 +276,7 @@ export function planRuntimeFailover({
         },
       };
     }
+    delete instance.runtime_usage_rotation_wait;
     instance.runtime_profile = decision.profile;
     instance.runtime = target.runtime;
     instance.runtime_profile_changed_at = new Date(nowMs).toISOString();
@@ -255,7 +290,7 @@ export function planRuntimeFailover({
       tmuxSession: instance.tmux_session || `${target.runtime}-${instanceId}`,
     });
   }
-  return { document: next, changes };
+  return { document: next, changes, stateChanged: JSON.stringify(next) !== JSON.stringify(document || {}) };
 }
 
 /**
@@ -268,6 +303,7 @@ export function planSingleSessionRuntimeFailover({
   providerUsage,
   currentHealth = 'ok',
   currentSubscriptionAccountKeys = {},
+  rotationMarkers = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -285,7 +321,10 @@ export function planSingleSessionRuntimeFailover({
     : {};
   const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys });
   const eligibleBlocks = Object.fromEntries(Object.entries(currentBlockedProfiles).filter(([id]) => !recovered.includes(id)));
+  const usageFailoverNotBeforeMs = rotationDeadline(next, { policy, profiles, currentProfile, providerUsage,
+    marker: rotationMarkers[currentProfile], nowMs });
   const decision = chooseRuntimeProfile({
+    usageFailoverNotBeforeMs,
     currentProfile,
     chain,
     profiles,
@@ -304,7 +343,7 @@ export function planSingleSessionRuntimeFailover({
     requiredReasoningEffort: policy.required_reasoning_effort,
     usageMaxAgeMs: Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null,
   });
-  if (decision.profile === currentProfile) return { document: next, changes };
+  if (decision.profile === currentProfile) return { document: next, changes, stateChanged: JSON.stringify(next) !== JSON.stringify(document || {}) };
 
   const target = profiles[decision.profile];
   if (recovered.length) next.runtime_failover_blocked_profiles = eligibleBlocks;
@@ -318,6 +357,7 @@ export function planSingleSessionRuntimeFailover({
       },
     };
   }
+  delete next.runtime_usage_rotation_wait;
   next.active_profile = decision.profile;
   next.active_runtime = target.runtime;
   next.runtime_profile_changed_at = new Date(nowMs).toISOString();
@@ -403,12 +443,13 @@ export function applyRuntimeFailover({
       const planned = planRuntimeFailover({
         document,
         currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
+        rotationMarkers: readSubscriptionRotationMarkers(document),
         providerUsage,
         healthByInstance: readHealthByInstance(document),
         nowMs,
       });
       changes = planned.changes;
-      if (changes.length > 0) writeInstancesAtomic(planned.document);
+      if (changes.length > 0 || planned.stateChanged) writeInstancesAtomic(planned.document);
     });
   } else if (fs.existsSync(SINGLE_PROFILE_FILE)) {
     withFileLock(`${SINGLE_PROFILE_FILE}.lock`, () => {
@@ -420,14 +461,15 @@ export function applyRuntimeFailover({
       const planned = planSingleSessionRuntimeFailover({
         document,
         currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
+        rotationMarkers: readSubscriptionRotationMarkers(document),
         providerUsage,
         currentHealth,
         nowMs,
       });
       changes = planned.changes;
-      if (changes.length > 0) {
+      if (changes.length > 0 || planned.stateChanged) {
         writeJsonAtomic(SINGLE_PROFILE_FILE, planned.document);
-        updateConfiguredRuntime(changes[0].runtime);
+        if (changes.length > 0) updateConfiguredRuntime(changes[0].runtime);
       }
     });
   }
