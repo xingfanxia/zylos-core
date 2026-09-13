@@ -11,3 +11,5 @@ test/integration/runtime/*.local.json
 
 # Agent worktrees (runtime artifact)
 .claude/worktrees/
+
+/scratch/
