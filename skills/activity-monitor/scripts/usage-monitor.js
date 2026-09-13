@@ -2,6 +2,7 @@ import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { formatBeijingReset } from './runtime-switch-notices.js';
+import { planUsageMilestones } from './usage-milestones.js';
 import { shouldStartUsageCheck } from './usage-check-engine.js';
 import {
   classifyCodexRateLimitWindows,
@@ -180,6 +181,8 @@ export class UsageMonitor {
       return true;
     }
 
+    if (this.usageProvider === 'codex') return this.runCodexMilestoneAlert(state, alertState, currentTime);
+
     const tier = state.tier || this.getUsageTier(weekly);
     if (tier === 'ok') {
       writeCheckedState({ lastObservedTier: tier });
@@ -216,6 +219,26 @@ export class UsageMonitor {
     return true;
   }
 
+  runCodexMilestoneAlert(state, previous, currentTime) {
+    const plan = planUsageMilestones(previous, {
+      accountKey: state.accountKey, weekly: state.weeklyAll?.percent, fiveHour: state.fiveHour?.percent,
+      weeklyAllResetsAt: state.weeklyAll?.resets, fiveHourResetsAt: state.fiveHour?.resets,
+    }, currentTime);
+    const checkedAt = new Date(currentTime * 1000).toISOString();
+    const next = { ...previous, version: 2, milestones: plan.ledger, lastCheckedAt: checkedAt, sourceRuntime: 'codex' };
+    if (!plan.changed.length) { this.writeUsageAlertState(next); return true; }
+    // Reserve before delivery: a monitor restart must not repeat this progress
+    // message while C4 is already handling the first attempt.
+    if (!this.writeUsageAlertState(next)) return true;
+    const usage = { weeklyAll: state.weeklyAll?.percent, weeklyAllResets: state.weeklyAll?.resets,
+      fiveHour: state.fiveHour?.percent, fiveHourResets: state.fiveHour?.resets, changedWindows: plan.changed };
+    const tier = maxRankTier(plan.changed.includes('weekly') ? this.getUsageTier(usage.weeklyAll) : 'ok',
+      plan.changed.includes('fiveHour') ? this.getFiveHourTier(usage.fiveHour) : 'ok');
+    this.sendNotification(formatUsageNotification(usage, tier, 'codex'));
+    this.writeUsageAlertState({ ...next, lastNotifiedTier: tier, lastNotifiedAt: checkedAt });
+    return true;
+  }
+
   /**
    * Fleet-level near-full alert. Runs ONLY on the primary (admin) instance —
    * the only non-isolated runner that can fan out to any chat_id via the legacy
@@ -238,12 +261,13 @@ export class UsageMonitor {
   // fire-and-forget; the .catch guarantees a rejected send-promise can never
   // surface as an unhandled rejection.
   runFleetAlert({ currentTime }) {
-    if (!this.usageProvider || !this.isPrimaryInstance()) return true;
+    if (!this.usageProvider || !this.isPrimaryInstance() || this._fleetAlertInFlight) return true;
+    this._fleetAlertInFlight = true;
     this.lastFleetAlertAt = currentTime;
     return this._runFleetAlertInner({ currentTime }).catch((err) => {
       this.options.log(`Usage fleet alert: unexpected error — ${err && err.message}`);
       return true;
-    });
+    }).finally(() => { this._fleetAlertInFlight = false; });
   }
 
   /**
@@ -308,7 +332,7 @@ export class UsageMonitor {
     const weeklyTier = reading ? this.getUsageTier(reading.weekly ?? 0) : 'unknown';
     const fiveHourTier = reading ? this.getFiveHourTier(reading.fiveHour ?? 0) : 'unknown';
     const state = {
-      available: provider.ok, quota_authoritative: provider.ok,
+      available: provider.ok, quota_authoritative: provider.ok, accountKey: reading?.accountKey ?? null,
       statusShape: 'codex-account-api', source: 'codex-account-api',
       checked_at: new Date(currentTime * 1000).toISOString(),
       // lastCheck is the observation time, not the time this diagnostic copy
@@ -464,7 +488,8 @@ export class UsageMonitor {
       quorum,
       sourceMode,
       usageProvider: this.usageProvider,
-      providerAgeMin: provider.ok ? Math.round(provider.reading.ageSec / 60) : null
+      providerAgeMin: provider.ok ? Math.round(provider.reading.ageSec / 60) : null,
+      accountKey: provider.ok ? provider.reading.accountKey : null
     };
 
     // Any usable reading clears a prior "monitoring blind" episode.
@@ -475,19 +500,37 @@ export class UsageMonitor {
       lastCheckedAt: nowIso
     };
 
-    if (tier === 'ok') {
+    const milestones = this.usageProvider === 'codex'
+      ? planUsageMilestones(fleetState, provider.reading, currentTime) : null;
+    if (milestones) {
+      carry.milestones = milestones.ledger;
+      if (!milestones.changed.length) {
+        this.options.log('Usage fleet alert: progress band already reported');
+        this.writeFleetAlertState({ ...carry, lastObservedTier: tier });
+        return true;
+      }
+      data.changedWindows = milestones.changed;
+    }
+
+    if (tier === 'ok' && !milestones) {
       this.writeFleetAlertState({ ...carry, lastObservedTier: 'ok' });
       return true;
     }
 
-    // Dedupe on the 5h window (keyed on the RAW resets_at epoch — review F6):
+    const notificationTier = milestones ? maxRankTier(
+      milestones.changed.includes('weekly') ? weeklyTier : 'ok',
+      milestones.changed.includes('fiveHour') ? fiveHourTier : 'ok') : tier;
+    if (milestones) data.hotWindow = milestones.changed.includes('fiveHour') &&
+      (!milestones.changed.includes('weekly') || tierRank(fiveHourTier) >= tierRank(weeklyTier)) ? '5h' : 'weekly';
+
+    // Legacy Claude alerts dedupe on the raw reset time:
     // fire once per threshold crossing per window, re-arm when the window resets,
     // re-fire on tier-rank escalation.
     const previousWindowKey = fleetState.lastAlertedWindowKey ?? fleetState.lastAlertedFiveHourResetsKey;
     const windowChanged = previousWindowKey !== alertWindowKey;
     const escalated = tierRank(tier) > tierRank(fleetState.lastAlertedTier || 'ok');
     const firstAlert = !fleetState.lastAlertedTier;
-    if (!windowChanged && !escalated && !firstAlert) {
+    if (!milestones && !windowChanged && !escalated && !firstAlert) {
       this.options.log(`Usage fleet alert: suppressing (tier=${tier}, window unchanged, source=${sourceMode}, sources=${usableCount})`);
       this.writeFleetAlertState({ ...carry, lastObservedTier: tier });
       return true;
@@ -498,23 +541,25 @@ export class UsageMonitor {
     const userRateLimitOk =
       (currentTime - (fleetState.lastUserAlertedAt || 0)) >= this.options.userAlertMinIntervalSec;
     const doUserFanout =
-      this.options.notifyUsers && quorum && tierRank(tier) >= tierRank('high') && userRateLimitOk;
-    if (this.options.notifyUsers && tierRank(tier) >= tierRank('high') && !doUserFanout) {
+      this.options.notifyUsers && quorum && tierRank(notificationTier) >= tierRank('high') && userRateLimitOk;
+    if (this.options.notifyUsers && tierRank(notificationTier) >= tierRank('high') && !doUserFanout) {
       const why = !quorum ? `below quorum (sources=${usableCount})` : 'user rate-limit active';
       this.options.log(`Usage fleet alert: user fan-out suppressed — ${why}`);
     }
 
-    const { userSends, adminSent, quotaSuppressed } = await this.deliverFleetAlert(tier, data, { doUserFanout, currentTime });
+    if (milestones && !this.writeFleetAlertState({ ...carry, version: 2, lastObservedTier: tier })) return true;
+    const { userSends, adminSent, quotaSuppressed } = await this.deliverFleetAlert(notificationTier, data, { doUserFanout, currentTime });
     if (quotaSuppressed && !userSends && !adminSent) {
-      this.writeFleetAlertState({ ...carry, lastObservedTier: 'unknown' });
+      this.writeFleetAlertState({ ...carry, milestones: fleetState.milestones, lastObservedTier: 'unknown' });
       return true;
     }
     this.options.log(
-      `Usage fleet alert: delivered tier=${tier} (users=${userSends}, admin=${adminSent}, ` +
+      `Usage fleet alert: delivery attempt tier=${notificationTier} (users=${userSends}, admin=${adminSent}, ` +
       `source=${sourceMode}, sources=${usableCount}, 5h=${fiveHour}% weekly=${weeklyAll}%)`
     );
     this.writeFleetAlertState({
-      version: 1,
+      version: milestones ? 2 : 1,
+      ...(milestones ? { milestones: milestones.ledger } : {}),
       lastAlertedTier: tier,
       lastAlertedWindowKey: alertWindowKey,
       // Backward-compatible state field for existing deployments/tests.
@@ -522,7 +567,7 @@ export class UsageMonitor {
       lastAlertedAt: nowIso,
       lastObservedTier: tier,
       lastCheckedAt: nowIso,
-      lastUserAlertedAt: doUserFanout ? currentTime : (fleetState.lastUserAlertedAt || 0),
+      lastUserAlertedAt: userSends ? currentTime : (fleetState.lastUserAlertedAt || 0),
       blindAlertedAt: null,
       // the blind re-alert cooldown survives recovery + tier alerts by design
       blindLastAlertAt: fleetState.blindLastAlertAt || 0,
@@ -548,7 +593,7 @@ export class UsageMonitor {
         const latest = this.readProviderUsage(now);
         // Native async fan-out can yield before sending. If the evidence has
         // changed or expired, wait for the next complete monitor cycle.
-        if (!latest.ok || latest.reading.weekly !== data.weeklyAll || latest.reading.fiveHour !== data.fiveHour ||
+        if (!latest.ok || latest.reading.accountKey !== data.accountKey || latest.reading.weekly !== data.weeklyAll || latest.reading.fiveHour !== data.fiveHour ||
             latest.reading.weeklyAllResets !== data.weeklyAllResets || latest.reading.fiveHourResets !== data.fiveHourResets) {
           quotaSuppressed = true;
           return { ok: false, output: 'Codex quota changed or became unavailable before send' };
@@ -572,7 +617,7 @@ export class UsageMonitor {
         }
       }
     }
-    // Admin always (caller guarantees tier >= warning here).
+    // Admin receives each crossed progress band, including normal usage.
     if (this.options.adminChatId) {
       pending.push(Promise.resolve()
         .then(() => send(this.options.adminChatId, formatAdminNotification(data, tier)))
@@ -646,8 +691,10 @@ export class UsageMonitor {
   writeFleetAlertState(data) {
     try {
       atomicWriteJson(this.options.fleetAlertStateFile, data);
+      return true;
     } catch (err) {
       this.options.log(`Usage fleet alert: failed to write state (${err.message})`);
+      return false;
     }
   }
 
@@ -683,9 +730,11 @@ export class UsageMonitor {
 
   writeUsageAlertState(data) {
     try {
-      fs.writeFileSync(this.options.usageAlertStateFile, JSON.stringify(data, null, 2));
+      atomicWriteJson(this.options.usageAlertStateFile, data);
+      return true;
     } catch (err) {
       this.options.log(`Usage alert: failed to write state (${err.message})`);
+      return false;
     }
   }
 
@@ -764,6 +813,7 @@ function readAuthoritativeCodex(provider, currentTime) {
   if (five === false || weekly === false) return { ok: false, reason: 'invalid_or_expired_window' };
   if (!five && !weekly) return { ok: false, reason: 'no_known_usage_window' };
   return { ok: true, reading: {
+    accountKey: /^[a-f0-9]{64}$/.test(provider.account_key || '') ? provider.account_key : null,
     fiveHour: five?.percent ?? null, weekly: weekly?.percent ?? null,
     fiveHourResetsAt: five?.resets ?? null, fiveHourResets: five?.resets ?? null,
     weeklyAllResetsAt: weekly?.resets ?? null, weeklyAllResets: weekly?.resets ?? null,
@@ -785,11 +835,11 @@ function remainingLabel(used) {
 
 function usageLines(data) {
   const lines = [];
-  for (const [label, value, reset] of [
-    ['本周额度', data.weeklyAll, data.weeklyAllResets],
-    ['最近 5 小时额度', data.fiveHour, data.fiveHourResets],
+  for (const [key, label, value, reset] of [
+    ['weekly', '本周额度', data.weeklyAll, data.weeklyAllResets],
+    ['fiveHour', '最近 5 小时额度', data.fiveHour, data.fiveHourResets],
   ]) {
-    if (value == null) continue;
+    if (value == null || (data.changedWindows && !data.changedWindows.includes(key))) continue;
     lines.push(`${label}已用 ${value}%，剩余 ${remainingPercent(value)}%。`);
     const resetLabel = formatBeijingReset(reset);
     if (resetLabel) lines.push(`${label}重置时间：${resetLabel}。`);
@@ -798,9 +848,9 @@ function usageLines(data) {
 }
 
 function formatUsageNotification(usage, tier, provider = 'claude') {
-  const labels = { warning: '⚠️ 用量提醒', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
+  const labels = { ok: '📊 额度使用进度', warning: '⚠️ 用量提醒', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
   return [labels[tier] || '用量提醒', `当前用量来自 ${providerLabel(provider)}。`,
-    ...usageLines(usage), '额度不足时可能影响回复；这条是用量提醒，不代表线路已切换。'].join('\n');
+    ...usageLines(usage), ...(tier === 'ok' ? [] : ['额度不足时可能影响回复；线路变更会单独通知。'])].join('\n');
 }
 
 function tierRank(tier) {
@@ -842,13 +892,13 @@ function formatUserNotification(data, tier) {
 // instances the reading came from (review S1/F2) + the standing tier-switch CTA
 // (AX 2026-07-10 note).
 function formatAdminNotification(data, tier) {
-  const labels = { warning: '⚠️ 用量提醒', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
+  const labels = { ok: '📊 额度使用进度', warning: '⚠️ 用量提醒', high: '🔶 额度偏高', critical: '🔴 额度接近上限' };
   const source = data.sourceMode === 'provider'
     ? `这是服务商 ${data.providerAgeMin ?? 0} 分钟前返回的用量。`
     : `服务商暂时没有返回新用量，以上来自 ${data.usableCount ?? 0} 个助手的最近记录，仅供参考。`;
   return [labels[tier] || '用量提醒', `当前用量来自 ${providerLabel(data.usageProvider)}。`,
     ...usageLines(data), source,
-    '额度不足时可能影响回复；这条是用量提醒，不代表线路已切换。'].join('\n');
+    ...(tier === 'ok' ? [] : ['额度不足时可能影响回复；线路变更会单独通知。'])].join('\n');
 }
 
 // Admin-only "monitoring blind" text — emitted only when BOTH channels are
