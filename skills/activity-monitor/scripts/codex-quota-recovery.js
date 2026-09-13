@@ -95,7 +95,7 @@ function userHome(user) {
   return home;
 }
 
-export function readCurrentSubscriptionAccountKeys(document, { homeForUser = userHome, readAccountKey = readSubscriptionAccountKey } = {}) {
+function readSubscriptionHomes(document, { homeForUser = userHome, readHome } = {}) {
   const profiles = document?.runtime_profiles || {};
   const states = document?.instances || { single: document };
   const result = {};
@@ -105,11 +105,20 @@ export function readCurrentSubscriptionAccountKeys(document, { homeForUser = use
       if (profile?.usage_provider !== 'codex' || !profile.codex_home) continue;
       try {
         const home = profile.codex_home.replace(/^~/, homeForUser(state?.os_user));
-        result[id][profileId] = readAccountKey(home);
+        result[id][profileId] = readHome(home);
       } catch { result[id][profileId] = null; }
     }
   }
   return document?.instances ? result : result.single;
+}
+
+export function readCurrentSubscriptionAccountKeys(document, { homeForUser = userHome, readAccountKey = readSubscriptionAccountKey } = {}) {
+  return readSubscriptionHomes(document, { homeForUser, readHome: readAccountKey });
+}
+
+export function readSubscriptionRotationMarkers(document, { homeForUser = userHome } = {}) {
+  return readSubscriptionHomes(document, { homeForUser,
+    readHome: home => readJson(path.join(home, 'rotation-generation.json'), null) });
 }
 
 export function collectQuotaHolds(document) {

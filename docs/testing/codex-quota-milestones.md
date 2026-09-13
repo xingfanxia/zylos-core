@@ -27,3 +27,20 @@ Validation on 2026-09-13: 45 focused quota tests passed. Full Jest suite passed
 failures reproduced at the deployed base e03037d on this Mac (two SQLite WAL
 sidecar assertions and the C4 startup spill assertion). They do not exercise
 the changed quota path.
+
+## Rotation before Azure
+
+A second live issue at 2026-09-13 01:57 UTC showed the ten-second fallback
+controller observing 95% before the minute-based account rotator selected the
+healthy next account. For managed subscription homes with a fresh (at most
+90 seconds old) available rotation marker, usage-only fallback now waits at
+most 120 seconds from its first observation. That deadline is persisted in the
+existing locked runtime document; restarts and monitoring gaps cannot renew it.
+Known healthy usage or leaving the subscription profile clears it. Unknown,
+stale or unavailable pool evidence never authorizes a hold. Native health
+failures retain the existing fallback behavior and recovery safeguards.
+
+Validation: 62 focused failover, account recovery and switch-notice tests,
+61 passed with one Linux-only ACL check skipped on Mac. The regression includes
+missing quota and marker observations followed by the same 95% reading, proving
+the original deadline still applies.
