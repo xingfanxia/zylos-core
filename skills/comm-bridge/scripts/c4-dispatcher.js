@@ -72,6 +72,7 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+let singleSessionSettlement = null;
 // Observability state (WS-A). lastHeartbeatMs=0 → the first tick emits a
 // heartbeat immediately (a positive "alive" signal at startup), then every
 // HEARTBEAT_INTERVAL_MS. lastTickCompletedAt drives the stuck-tick watchdog and
@@ -667,7 +668,7 @@ async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FIL
   log(`block_queue_until_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances, allowRequireIdle = true } = {}) {
+function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances, allowRequireIdle = true, conversationsOnly = false } = {}) {
   const current = nowSeconds();
 
   // When multi-session provides instance IDs, use instance-filtered queries.
@@ -692,7 +693,7 @@ function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, g
   // pending without preventing ordinary messages from reaching the session.
   // Control priority still applies among eligible items; post-send settlement
   // for block_queue_until_idle remains unchanged.
-  const control = getNextPendingControl(current, { allowRequireIdle });
+  const control = conversationsOnly ? null : getNextPendingControl(current, { allowRequireIdle });
   if (control) {
     if (claimControl(control.id)) {
       return { ...control, type: 'control' };
@@ -709,6 +710,37 @@ function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, g
   }
 
   return null;
+}
+
+export function beginSingleSessionSettlement(msgId, now = Date.now()) {
+  singleSessionSettlement = {
+    msgId,
+    holdUntil: now + REQUIRE_IDLE_POST_SEND_HOLD_MS,
+    deadline: now + REQUIRE_IDLE_POST_SEND_HOLD_MS + REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS,
+  };
+  log(`block_queue_until_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms, then allow ordinary conversations while background work settles`);
+}
+
+export function claimNextSingleSessionItem(agentState, now = Date.now()) {
+  if (singleSessionSettlement) {
+    // Preserve the short startup hold, including for lifecycle commands.
+    if (now < singleSessionSettlement.holdUntil) return null;
+
+    const settled = ['idle', 'offline', 'stopped'].includes(agentState.state);
+    const timedOut = now >= singleSessionSettlement.deadline;
+    if (settled || timedOut) {
+      log(`block_queue_until_idle item id=${singleSessionSettlement.msgId}: ${timedOut ? 'timeout' : `settled with agent state=${agentState.state}`}, continuing`);
+      singleSessionSettlement = null;
+    }
+  }
+
+  // Keep later controls and idle-only conversations serialized without
+  // blocking ordinary messages from reaching the existing busy session.
+  return claimNextItem(null, {
+    conversationsOnly: singleSessionSettlement !== null,
+    allowRequireIdle: singleSessionSettlement === null &&
+      agentState.state === 'idle' && agentState.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS,
+  });
 }
 
 function maybeCleanupControlQueue() {
@@ -797,9 +829,7 @@ async function processNextMessage() {
     tmuxMissingChecks = 0;
   }
 
-  const item = claimNextItem(null, {
-    allowRequireIdle: agentState.state === 'idle' && agentState.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS,
-  });
+  const item = claimNextSingleSessionItem(agentState);
   if (!item) {
     return { delivered: false, state: agentState.state };
   }
@@ -888,7 +918,7 @@ async function processNextMessage() {
     }
 
     if (item.require_idle === 1) {
-      await waitForRequireIdleSettlement(item.id);
+      beginSingleSessionSettlement(item.id);
     }
     return { delivered: true, state: agentState.state };
   }
