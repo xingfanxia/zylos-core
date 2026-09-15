@@ -1133,6 +1133,7 @@ function createHealthEngine(activeAdapter, initialStatus) {
     log,
     rateLimitDefaultCooldown: RATE_LIMIT_DEFAULT_COOLDOWN,
     userMessageRecoveryCooldown: USER_MESSAGE_RECOVERY_COOLDOWN,
+    heartbeatInterval: Math.min(86400, Math.max(600, readConfigInt('heartbeat_interval', 1800))),
     flapCeilingPerHour: FLAP_CEILING_PER_HOUR,
     degradedProbeInterval: DEGRADED_PROBE_INTERVAL,
     rateLimitProbeInterval: RATE_LIMIT_PROBE_INTERVAL,
