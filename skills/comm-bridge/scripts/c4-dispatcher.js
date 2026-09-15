@@ -667,7 +667,7 @@ async function waitForRequireIdleSettlement(msgId, statusFile = AGENT_STATUS_FIL
   log(`block_queue_until_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances } = {}) {
+function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, getNextPendingControlForInstances, allowRequireIdle = true } = {}) {
   const current = nowSeconds();
 
   // When multi-session provides instance IDs, use instance-filtered queries.
@@ -688,7 +688,11 @@ function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, g
     return null;
   }
 
-  const control = getNextPendingControl(current);
+  // An idle-gated item is not eligible while the agent is busy. Leave it
+  // pending without preventing ordinary messages from reaching the session.
+  // Control priority still applies among eligible items; post-send settlement
+  // for block_queue_until_idle remains unchanged.
+  const control = getNextPendingControl(current, { allowRequireIdle });
   if (control) {
     if (claimControl(control.id)) {
       return { ...control, type: 'control' };
@@ -699,7 +703,7 @@ function claimNextItem(onlineInstanceIds = null, { getNextPendingForInstances, g
     return null;
   }
 
-  const msg = getNextPending();
+  const msg = getNextPending({ allowRequireIdle });
   if (msg && claimConversation(msg.id)) {
     return { ...msg, type: 'conversation' };
   }
@@ -793,7 +797,9 @@ async function processNextMessage() {
     tmuxMissingChecks = 0;
   }
 
-  const item = claimNextItem();
+  const item = claimNextItem(null, {
+    allowRequireIdle: agentState.state === 'idle' && agentState.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS,
+  });
   if (!item) {
     return { delivered: false, state: agentState.state };
   }

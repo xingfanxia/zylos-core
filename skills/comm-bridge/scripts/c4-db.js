@@ -289,15 +289,16 @@ export function getStatusNoticeCooldowns() {
  * Get next pending message from queue (priority-based, then FIFO)
  * @returns {object|null} - highest priority pending message or null
  */
-export function getNextPending() {
+export function getNextPending({ allowRequireIdle = true } = {}) {
   const db = getDb();
   return db.prepare(`
     SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count, target_instance
     FROM conversations
     WHERE direction = 'in' AND status = 'pending'
+      AND (? OR COALESCE(require_idle, 0) = 0)
     ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
     LIMIT 1
-  `).get() || null;
+  `).get(allowRequireIdle ? 1 : 0) || null;
 }
 
 /**
@@ -544,7 +545,7 @@ export function getControlById(id) {
  * @param {number} current - unix seconds
  * @returns {object|null}
  */
-export function getNextPendingControl(current = nowSeconds()) {
+export function getNextPendingControl(current = nowSeconds(), { allowRequireIdle = true } = {}) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
@@ -552,9 +553,10 @@ export function getNextPendingControl(current = nowSeconds()) {
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
+      AND (? OR COALESCE(require_idle, 0) = 0)
     ORDER BY COALESCE(priority, 3) ASC, id ASC
     LIMIT 1
-  `).get(current) || null;
+  `).get(current, allowRequireIdle ? 1 : 0) || null;
 }
 
 /**
