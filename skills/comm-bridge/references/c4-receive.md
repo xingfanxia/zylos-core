@@ -20,7 +20,7 @@ Messages are written to DB with `status='pending'`. The c4-dispatcher daemon han
 | `--content <text>` | Message content (required) |
 | `--priority <1-3>` | Priority level (default: 3) |
 | `--no-reply` | Mark the message as having no reply target; defaults channel to `system` |
-| `--block-queue-until-idle` | Wait for sustained idle, then block later dispatch until execution settles |
+| `--block-queue-until-idle` | Wait for sustained idle, then serialize later background work; ordinary messages can arrive after the startup hold ([timing and scope](c4-control.md#enqueue)) |
 | `--json` | Output structured JSON instead of plain text |
 
 ## Priority Levels

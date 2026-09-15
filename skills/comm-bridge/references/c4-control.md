@@ -24,11 +24,21 @@ c4-control.js enqueue --content "<text>" [--priority 3] [--block-queue-until-idl
 |--------|-------------|
 | `--content <text>` | Instruction content (required) |
 | `--priority <n>` | Priority level (see Priority Levels below, default: 3 = normal) |
-| `--block-queue-until-idle` | Wait for sustained idle, then block later dispatch until execution settles |
+| `--block-queue-until-idle` | Wait for sustained idle, then serialize later background work until execution settles (ordinary messages can still arrive; see below) |
 | `--bypass-state` | Deliver regardless of current state |
 | `--ack-deadline <seconds>` | Seconds from now until the control times out if unacknowledged |
 | `--available-in <seconds>` | Delay before the control becomes eligible for delivery |
 | `--no-ack-suffix` | Do not append `ack via` suffix; dispatcher marks done right after successful submit |
+
+In a single session, an idle-only item requires at least three seconds of idle
+before delivery. After submission, all delivery pauses for five seconds so the
+command can start. Ordinary conversations that do not require idle can then
+reach the same session through normal delivery verification, while later
+controls and idle-only conversations remain queued. The background-work wait
+ends when the agent is idle, offline, or stopped, or after another 120 seconds.
+This does not cancel active tools or guarantee that the agent can answer before
+its current tool call finishes. Multi-session dispatch retains its existing
+post-submission wait.
 
 **Output:**
 
