@@ -185,6 +185,36 @@ export function ensureInstanceGhConfigDir(instanceCwd) {
 }
 
 /**
+ * Provision temporary storage as the runtime UID, after privilege drop. Tools
+ * such as gh use a fixed cache basename below TMPDIR; a shared /tmp makes the
+ * first user's cache unreadable to other personas. Keep both clean and compat
+ * launches private, independent of an inherited or dotenv-provided TMPDIR.
+ */
+export function ensureInstanceTmpDir(env) {
+  if (!env.ZYLOS_INSTANCE_ID) return env.TMPDIR;
+  if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(env.ZYLOS_INSTANCE_ID)) {
+    throw new Error('Invalid instance identity for runtime temp directory');
+  }
+  if (!env.HOME || !path.isAbsolute(env.HOME)) {
+    throw new Error('Runtime temp directory requires an absolute persona HOME');
+  }
+  const root = path.join(env.HOME, '.zylos-tmp');
+  const directory = path.join(root, env.ZYLOS_INSTANCE_ID);
+  for (const candidate of [root, directory]) {
+    try { fs.mkdirSync(candidate, { mode: 0o700 }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    const stat = fs.lstatSync(candidate);
+    if (!stat.isDirectory() || stat.isSymbolicLink()
+      || (process.getuid && stat.uid !== process.getuid())) {
+      throw new Error('Runtime temp directory must be owned by the runtime user and cannot be a symlink');
+    }
+    fs.chmodSync(candidate, 0o700);
+    fs.accessSync(candidate, fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK);
+  }
+  return directory;
+}
+
+/**
  * Parse a comma-separated manifest string into validated variable names.
  * Invalid names are skipped and recorded in warnings.
  */

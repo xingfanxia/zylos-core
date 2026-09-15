@@ -5,6 +5,29 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 
+/**
+ * Multi-instance receipts belong to the runtime's actual instance workspace,
+ * which is owned by that runtime UID. state_dir may be operator-owned, and a
+ * HOME/zylos farm can alias the shared activity-monitor directory.
+ *
+ * Readers holding the actual runtime cwd continue using the unchanged
+ * executionContextReceiptFile(cwd, sessionId) API. Readers starting from the
+ * shared installation root use this same resolver with its instance identity.
+ * Standalone installs retain their original installation-root receipt path.
+ */
+export function resolveExecutionContextRoot({ zylosDir, instanceId = null, cwd = null }) {
+  if (!path.isAbsolute(zylosDir)) throw new Error('Runtime root must be absolute');
+  if (!instanceId) return zylosDir;
+  if (typeof instanceId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(instanceId)) {
+    throw new Error('Runtime instance identity is invalid');
+  }
+  const instanceRoot = fs.realpathSync(path.join(zylosDir, 'instances', instanceId));
+  if (cwd !== null && (typeof cwd !== 'string' || !path.isAbsolute(cwd) || fs.realpathSync(cwd) !== instanceRoot)) {
+    throw new Error('Runtime cwd does not match its instance workspace');
+  }
+  return instanceRoot;
+}
+
 export function executionContextReceiptFile(zylosDir, sessionId) {
   if (typeof sessionId !== 'string' || !/^[A-Za-z0-9._-]{1,160}$/.test(sessionId)) throw new Error('Runtime session identity is missing or invalid');
   if (!path.isAbsolute(zylosDir)) throw new Error('Runtime root must be absolute');
@@ -23,6 +46,7 @@ export function writeExecutionContextReceipt({ zylosDir, payload, healthy, round
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) throw new Error('Execution context receipt directory must be private');
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) throw new Error('Execution context receipt directory must belong to the runtime user');
   const root = fs.realpathSync(zylosDir);
   if (!fs.realpathSync(directory).startsWith(`${root}${path.sep}`)) throw new Error('Execution context receipt directory escapes the runtime root');
   const record = {

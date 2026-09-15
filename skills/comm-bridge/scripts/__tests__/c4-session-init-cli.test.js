@@ -62,6 +62,8 @@ describe('c4-session-init', () => {
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
       assert.ok(stdout.includes('No new conversations since last checkpoint'));
+      assert.ok(stdout.includes('=== LAST CHECKPOINT SUMMARY ==='));
+      assert.ok(stdout.includes('No saved checkpoint exists for this instance.'));
     });
   });
 
@@ -90,10 +92,10 @@ describe('c4-session-init', () => {
       const { stdout, status } = cli([], env);
       assert.equal(status, 0);
       // The checkpoint block must still appear (not silently vanish).
-      assert.ok(stdout.includes('=== LAST CHECKPOINT ==='));
+      assert.ok(stdout.includes('=== LAST CHECKPOINT SUMMARY ==='));
       assert.ok(stdout.includes('no summary'));
-      // And it must NOT masquerade as a summary block.
-      assert.ok(!stdout.includes('=== LAST CHECKPOINT SUMMARY ==='));
+      // Stable framing must still explicitly distinguish an absent summary.
+      assert.ok(stdout.includes('checkpoint #'));
     });
   });
 

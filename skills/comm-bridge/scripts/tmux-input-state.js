@@ -17,6 +17,7 @@ const IN_PROGRESS_CAPTURE_PATTERNS = [
   /\bComposing(?:\.\.\.|…)\s*$/i,
   /\bReflecting(?:\.\.\.|…)\s*$/i,
   /\bRetrying(?:\.\.\.|…)\s*$/i,
+  /\besc to interrupt\b/i,
 ];
 
 export function findPromptY(capture) {
@@ -46,28 +47,23 @@ export function hasInProgressCapture(capture) {
   return recentLines.some((line) => IN_PROGRESS_CAPTURE_PATTERNS.some((pattern) => pattern.test(line)));
 }
 
-function readCursorCoord(sessionName, format, execFileSyncImpl) {
+function readPaneSnapshot(sessionName, execFileSyncImpl) {
   try {
-    const out = execFileSyncImpl('tmux', ['display-message', '-p', '-t', sessionName, format], {
+    // One tmux command queue captures matching geometry and text. Separate
+    // subprocesses can sample opposite sides of a TUI render.
+    const out = execFileSyncImpl('tmux', ['capture-pane', '-p', '-t', sessionName,
+      ';', 'display-message', '-p', '-t', sessionName,
+      '__ZYLOS_CURSOR__ #{cursor_x} #{cursor_y} #{session_id} #{session_created} #{pane_id} #{pane_pid}'], {
       encoding: 'utf8',
       stdio: 'pipe',
       timeout: 5000
     });
-    return Number.parseInt(String(out).trim(), 10);
+    const match = String(out).match(/\n__ZYLOS_CURSOR__ (\d+) (\d+) (\S+) (\d+) (\S+) (\d+)\s*$/);
+    if (!match) return { capture: null, cursorX: -1, cursorY: -1 };
+    return { capture: String(out).slice(0, match.index), cursorX: Number(match[1]), cursorY: Number(match[2]),
+      paneIdentity: match.slice(3, 7).join(':') };
   } catch {
-    return -1;
-  }
-}
-
-function readPaneCapture(sessionName, execFileSyncImpl) {
-  try {
-    return execFileSyncImpl('tmux', ['capture-pane', '-p', '-t', sessionName], {
-      encoding: 'utf8',
-      stdio: 'pipe',
-      timeout: 5000
-    });
-  } catch {
-    return null;
+    return { capture: null, cursorX: -1, cursorY: -1 };
   }
 }
 
@@ -87,9 +83,7 @@ export function readTmuxInputState({
     };
   }
 
-  const cursorX = readCursorCoord(sessionName, '#{cursor_x}', execFileSyncImpl);
-  const cursorY = readCursorCoord(sessionName, '#{cursor_y}', execFileSyncImpl);
-  const capture = readPaneCapture(sessionName, execFileSyncImpl);
+  const { cursorX, cursorY, capture, paneIdentity = null } = readPaneSnapshot(sessionName, execFileSyncImpl);
   const captureOk = typeof capture === 'string';
   const usageOverlay = isUsageOverlayCapture(capture);
   const inProgressCapture = captureOk ? hasInProgressCapture(capture) : false;
@@ -113,6 +107,7 @@ export function readTmuxInputState({
     captureOk,
     cursorX,
     cursorY,
+    paneIdentity,
     capture,
   };
 }

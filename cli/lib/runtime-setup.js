@@ -366,6 +366,16 @@ export function renderCodexProjectConfig(existingContent = '') {
   obj.check_for_update_on_startup = false;
   obj.model_availability_nux = 'gpt-5.4';
 
+  // The generated Zylos instructions plus persona/global context exceed
+  // Codex's 32 KiB default. Truncation kept intake gates but dropped the bug
+  // repair workflow, so full instruction loading is a runtime requirement.
+  // Preserve a larger explicit budget; do not silently reduce it on refresh.
+  const minimumInstructionBytes = 128 * 1024;
+  if (!Number.isSafeInteger(obj.project_doc_max_bytes)
+    || obj.project_doc_max_bytes < minimumInstructionBytes) {
+    obj.project_doc_max_bytes = minimumInstructionBytes;
+  }
+
   // Backfill: default only when the user has not configured a value.
   if (obj.model === undefined) obj.model = 'gpt-5.5';
   if (obj.model_reasoning_effort === undefined) obj.model_reasoning_effort = 'medium';

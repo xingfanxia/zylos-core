@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { executionContextReceiptFile, writeExecutionContextReceipt } from '../execution-context-receipt.js';
+import { executionContextReceiptFile, writeExecutionContextReceipt, resolveExecutionContextRoot } from '../execution-context-receipt.js';
 import { runSessionStartShard } from '../session-start-orchestrator.js';
 
 function fixture(t) {
@@ -64,4 +64,45 @@ test('receipt producer rejects path escapes and cannot mint healthy state withou
   assert.throws(() => executionContextReceiptFile(f.root, '../other'), /invalid/);
   assert.throws(() => writeExecutionContextReceipt({ zylosDir: f.root, payload: { session_id: 'a', source: 'startup' }, healthy: true }), /complete matching shard/);
   assert.throws(() => writeExecutionContextReceipt({ zylosDir: f.root, payload: { session_id: 'a', source: 'invented' }, healthy: false }), /Unknown runtime/);
+});
+
+test('instance workspace/farm resolution agrees with cwd readers and preserves standalone paths', t => {
+  const f = fixture(t);
+  const shared = path.join(f.root, 'shared');
+  const instance = path.join(shared, 'instances/group');
+  fs.mkdirSync(instance, { recursive: true });
+  const farm = path.join(f.root, 'farm');
+  fs.mkdirSync(farm);
+  fs.symlinkSync(path.join(shared, 'instances'), path.join(farm, 'instances'));
+  const root = resolveExecutionContextRoot({ zylosDir: farm, instanceId: 'group', cwd: instance });
+  assert.equal(root, fs.realpathSync(instance));
+  assert.equal(executionContextReceiptFile(root, 'session-c'), executionContextReceiptFile(fs.realpathSync(instance), 'session-c'));
+  writeExecutionContextReceipt({ zylosDir: root, payload: { session_id: 'session-c', source: 'startup' }, healthy: false });
+  assert.equal(fs.existsSync(executionContextReceiptFile(instance, 'session-c')), true);
+  assert.equal(fs.existsSync(path.join(shared, 'activity-monitor/execution-context')), false);
+  assert.equal(resolveExecutionContextRoot({ zylosDir: shared }), shared);
+  assert.ok(executionContextReceiptFile(shared, 'standalone').startsWith(path.join(shared, 'activity-monitor/execution-context')));
+  assert.throws(() => resolveExecutionContextRoot({ zylosDir: shared, instanceId: '../peer' }), /invalid/);
+  assert.throws(() => resolveExecutionContextRoot({ zylosDir: shared, instanceId: 'group', cwd: shared }), /does not match/);
+});
+
+test('optional receipt failure remains visible but cannot suppress healthy startup or a blocked notice', async t => {
+  for (const healthy of [true, false]) {
+    const f = fixture(t);
+    let prompted = 0;
+    await runSessionStartShard('start-prompt', { session_id: 'session-d', source: 'startup' }, {
+      requireHealthyContext: true, tmpdir: f.root, stdout: { fd: f.fd },
+      resolveShardImpl: () => ({ kind: 'side-effect', chain: [{ name: 'identity' }] }),
+      waitForFlagImpl: async () => ({ ok: true, waitedMs: 0 }),
+      readFlagStatusImpl: () => healthy ? { ok: true, roundId: 'fixture' } : { ok: false, reason: 'missing' },
+      recordContextReceipt: () => { throw new Error('fixture permission denied'); },
+      actions: { startupPrompt: async () => { prompted++; } },
+    });
+    const output = fs.readFileSync(path.join(f.root, 'stdout'), 'utf8');
+    assert.ok(output.includes('EXECUTION CONTEXT RECEIPT UNAVAILABLE'));
+    assert.ok(output.includes('No new receipt is available'));
+    assert.equal(output.includes('STARTUP CONTEXT BLOCKED'), !healthy);
+    assert.equal(prompted, healthy ? 1 : 0);
+    assert.equal(fs.existsSync(executionContextReceiptFile(f.root, 'session-d')), false);
+  }
 });
