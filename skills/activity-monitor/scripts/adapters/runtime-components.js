@@ -43,6 +43,7 @@ export function createToolPipeline(activeAdapter, config, {
 
 export function createHealthEngine(activeAdapter, initialStatus, {
   log,
+  heartbeatInterval,
   rateLimitDefaultCooldown,
   userMessageRecoveryCooldown,
   flapCeilingPerHour,
@@ -50,6 +51,13 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   rateLimitProbeInterval,
   notifyDegraded,
 }) {
+  // Per-instance primary-probe cadence, in seconds. Invalid configuration
+  // retains HealthEngine's default instead of causing a probe storm or outage.
+  if (heartbeatInterval != null && (!Number.isSafeInteger(heartbeatInterval) || heartbeatInterval <= 0)) {
+    log('Invalid heartbeat_interval; using the default 1800 seconds');
+    heartbeatInterval = undefined;
+  }
+  log(`Primary heartbeat interval: ${heartbeatInterval ?? 1800}s`);
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
     killTmuxSession: () => activeAdapter.stop(),
@@ -61,6 +69,7 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   }, {
     initialHealth: initialStatus.health,
     initialReason: initialStatus.unavailable_reason || '',
+    heartbeatInterval,
     rateLimitDefaultCooldown,
     userMessageRecoveryCooldown,
     flapCeilingPerHour,
