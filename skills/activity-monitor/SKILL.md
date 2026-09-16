@@ -89,6 +89,16 @@ pm2 list
 
 The heartbeat engine runs inside the activity monitor and uses the C4 control queue to verify Claude is actually responsive (not just process-alive).
 
+The primary probe interval defaults to 1800 seconds. In multi-instance installs,
+set `instances.<id>.heartbeat_interval` in `~/zylos/instances.json` to a positive
+integer number of seconds to override only that instance. For example,
+`instances.scheduler.heartbeat_interval = 7200` makes the scheduler's primary
+probe run every two hours; personas without the key retain the 30-minute default.
+Invalid values fall back to the default. Restart only that instance's activity
+monitor after changing the setting. Recovery probes, degraded/rate-limit retry
+intervals, startup verification, process monitoring and model settings are
+unchanged.
+
 ### State Machine
 
 ```

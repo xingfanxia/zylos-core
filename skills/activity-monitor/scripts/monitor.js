@@ -1143,6 +1143,7 @@ function createToolPipeline(activeAdapter, config) {
 function createHealthEngine(activeAdapter, initialStatus) {
   return createRuntimeHealthEngine(activeAdapter, initialStatus, {
     log,
+    heartbeatInterval: _getInstanceDef?.(INSTANCE_ID)?.heartbeat_interval,
     rateLimitDefaultCooldown: RATE_LIMIT_DEFAULT_COOLDOWN,
     userMessageRecoveryCooldown: USER_MESSAGE_RECOVERY_COOLDOWN,
     flapCeilingPerHour: FLAP_CEILING_PER_HOUR,
