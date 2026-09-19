@@ -1,6 +1,14 @@
-# CLAUDE.md
+# zylos-core — agent guide
 
-This file provides guidance to Claude Code when working with code in this repository.
+## Project scale and verification
+
+**Profile: personal agent runtime.** Persistent agents, scheduled jobs and messaging services. Check the changed scheduler/session path with synthetic jobs; command execution, credentials and external message dispatch need focused boundary tests. Preserve service ownership and release rules. Do not send live messages or restart unrelated services for verification.
+
+- The requested behavior/questions define completion. Reviews are read-only unless fixes are requested; report unrelated findings briefly without adding tasks or test backfill.
+- Use the smallest existing check that proves the change. Add tests for a concrete regression or consequential boundary; do not impose blanket TDD, new coverage targets, full suites, plans or reviewers. Preserve configured CI and actual release gates; reuse still-valid results.
+- Keep the existing structure. Internal contract errors should be clear; add retries, fallbacks or compatibility layers only for an observed external failure or supported contract. Keep secrets private and inspect security only at boundaries changed by this task.
+
+This file provides shared guidance to coding agents working in this repository.
 
 ## Project Standards
 
@@ -103,7 +111,7 @@ This file:
 When adding a new service:
 
 1. **Update ecosystem.config.cjs** - Add the new service to the apps array
-2. **Restart all services** - `pm2 delete all && pm2 start ~/zylos/pm2/ecosystem.config.cjs`
+2. **Start or reload only the target service** - For a new service, run `pm2 start ~/zylos/pm2/ecosystem.config.cjs --only my-service`. For a changed existing service, run `pm2 reload ~/zylos/pm2/ecosystem.config.cjs --only my-service --update-env`. Replace `my-service` with the exact ecosystem `name`; leave every other service running.
 3. **Save configuration** - `pm2 save` (critical for reboot persistence)
 4. **Update template** - Sync changes back to `templates/pm2/ecosystem.config.cjs`
 
@@ -162,12 +170,19 @@ argument-hint: [args]         # Optional, hint for expected arguments
 disable-model-invocation: true  # Prevents Claude from auto-invoking (user only)
 user-invocable: false         # Hides from /menu (Claude only, background knowledge)
 allowed-tools: Read, Grep     # Tools Claude can use without permission
-model: sonnet                 # Model to use when skill is active
+# Omit model to inherit the active runtime's configured model
 context: fork                 # Run in subagent (isolated context)
 agent: Explore                # Agent type when context: fork
 hooks: ...                    # Skill lifecycle hooks
 ---
 ```
+
+Coding-agent work uses Codex with `gpt-6-astra` and `high` reasoning,
+explicitly selected or inherited from an enforced runtime configuration.
+Roles define responsibilities, not model or reasoning tiers. Claude-specific
+frontmatter cannot select an OpenAI model: omit its model override rather than
+putting an unsupported identifier there. Do not claim a Claude launch satisfies
+the Astra route; report a runtime limitation if the required route is unavailable.
 
 #### Invocation Control
 
