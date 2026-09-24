@@ -8,6 +8,11 @@ const VALID_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // Optional Claude Code context suffix, e.g. claude-opus-5-5[1m].
 const VALID_MODEL = /^[A-Za-z0-9._:-]+(?:\[1m\])?$/;
 const VALID_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']);
+// Extra Claude subscription accounts publish usage as claude-<account>.
+const VALID_USAGE_PROVIDER = /^(?:codex|claude(?:-[a-z0-9][a-z0-9-]{0,30})?)$/;
+// Absolute, shell-safe path to a Claude --settings file carrying one account's
+// setup-token; the path (never the token) reaches the launch command.
+const VALID_SETTINGS_FILE = /^\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.json$/;
 
 function readJsonSafe(filePath, readFileSync = fs.readFileSync) {
   try {
@@ -108,10 +113,16 @@ export function resolveRuntimeProfile({
     : null;
   if (raw?.reasoning_effort != null && !reasoningEffort) errors.push('invalid_reasoning_effort');
 
-  const usageProvider = raw?.usage_provider === 'claude' || raw?.usage_provider === 'codex'
+  const usageProvider = typeof raw?.usage_provider === 'string' && VALID_USAGE_PROVIDER.test(raw.usage_provider)
     ? raw.usage_provider
     : null;
   if (raw?.usage_provider != null && !usageProvider) errors.push('invalid_usage_provider');
+
+  const claudeSettingsFile = runtime === 'claude' && typeof raw?.claude_settings_file === 'string'
+    && VALID_SETTINGS_FILE.test(raw.claude_settings_file) && !raw.claude_settings_file.split('/').includes('..')
+    ? raw.claude_settings_file
+    : null;
+  if (raw?.claude_settings_file != null && !claudeSettingsFile) errors.push('invalid_claude_settings_file');
 
   if (profileId && !raw) errors.push('unknown_runtime_profile');
 
@@ -125,6 +136,7 @@ export function resolveRuntimeProfile({
     model,
     reasoningEffort,
     providerEnvKey,
+    claudeSettingsFile,
     errors: [...new Set(errors)],
   };
 }

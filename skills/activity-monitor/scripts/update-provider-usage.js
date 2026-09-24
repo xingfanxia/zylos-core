@@ -148,6 +148,54 @@ export function fetchProviderUsage(provider, {
   }
 }
 
+/**
+ * Probe one extra Claude subscription account (profile usage_provider
+ * claude-<account>) through CodexBar with a private CLAUDE_CONFIG_DIR holding
+ * only that account's setup-token plus the operator's onboarding state.
+ */
+export function fetchClaudeAccountUsage(provider, settingsFile, {
+  execFileSyncImpl = execFileSync,
+  codexbarBin = resolveCodexBarBin(),
+  now = new Date().toISOString(),
+  homeDir = os.homedir(),
+  cwd = ZYLOS_DIR,
+} = {}) {
+  let configDir = null;
+  try {
+    const token = JSON.parse(fs.readFileSync(settingsFile, 'utf8'))?.env?.CLAUDE_CODE_OAUTH_TOKEN;
+    if (typeof token !== 'string' || !token.startsWith('sk-ant-')) throw new Error('settings file has no setup-token');
+    configDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-claude-usage-'));
+    fs.writeFileSync(path.join(configDir, '.credentials.json'), JSON.stringify({ claudeAiOauth: {
+      accessToken: token, refreshToken: '', expiresAt: Date.parse(now) + 300 * 86_400_000,
+      scopes: ['user:inference', 'user:sessions:claude_code'],
+    } }), { mode: 0o600 });
+    const state = path.join(homeDir, '.claude.json');
+    if (fs.existsSync(state)) fs.copyFileSync(state, path.join(configDir, '.claude.json'));
+    const raw = execFileSyncImpl(codexbarBin, ['usage', '--provider', 'claude', '--source', 'cli', '--json-only'], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 90_000, cwd,
+      env: { ...process.env, CLAUDE_CONFIG_DIR: configDir },
+    });
+    const usage = { ...normalizeProviderPayload('claude', JSON.parse(raw), now), provider };
+    return usage.available ? { ...usage, quota_authoritative: true, observed_at: now } : usage;
+  } catch (err) {
+    return { provider, available: false, fetched_at: now, source: 'cli', error: err.message,
+      primary: null, secondary: null, tertiary: null, account_email: null, version: null };
+  } finally {
+    if (configDir) fs.rmSync(configDir, { recursive: true, force: true });
+  }
+}
+
+function extraClaudeAccounts(document) {
+  const accounts = new Map();
+  for (const profile of Object.values(document?.runtime_profiles || {})) {
+    if (profile?.runtime === 'claude' && /^claude-[a-z0-9-]+$/.test(profile.usage_provider || '')
+        && typeof profile.claude_settings_file === 'string') {
+      accounts.set(profile.usage_provider, profile.claude_settings_file);
+    }
+  }
+  return accounts;
+}
+
 export function fetchClaudeNativeUsage({
   zylosDir = ZYLOS_DIR,
   now = new Date().toISOString(),
@@ -259,6 +307,7 @@ export async function runProviderUsageOnce({
   fetchCodexNativeUsageImpl = fetchCodexNativeUsage,
   fetchCodexAccountUsageImpl = fetchCodexAccountUsage,
   refreshQuotaRecoveryProofsImpl = refreshQuotaRecoveryProofs,
+  fetchClaudeAccountUsageImpl = fetchClaudeAccountUsage,
   zylosDir = ZYLOS_DIR,
   log = console.log,
 } = {}) {
@@ -287,6 +336,10 @@ export async function runProviderUsageOnce({
   for (const file of [path.join(zylosDir, 'instances.json'), path.join(zylosDir, '.zylos', 'runtime-profiles.json')]) {
     try { document = JSON.parse(fs.readFileSync(file, 'utf8')); break; } catch { /* next supported layout */ }
   }
+  const accounts = {};
+  for (const [provider, settingsFile] of extraClaudeAccounts(document)) {
+    accounts[provider] = fetchClaudeAccountUsageImpl(provider, settingsFile, { execFileSyncImpl, codexbarBin, now: fetchedAt });
+  }
   const quotaRecovery = await refreshQuotaRecoveryProofsImpl({ zylosDir, document });
   const payload = {
     updated_at: fetchedAt,
@@ -295,6 +348,7 @@ export async function runProviderUsageOnce({
     providers: {
       claude,
       codex,
+      ...accounts,
     },
   };
   writeProviderUsage(payload, filePath);

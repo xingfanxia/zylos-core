@@ -10,6 +10,7 @@ const {
   fetchCodexNativeUsage,
   fetchClaudeNativeUsage,
   fetchProviderUsage,
+  fetchClaudeAccountUsage,
   normalizeProviderPayload,
   normalizeNativeClaudeUsage,
   runProviderUsageOnce,
@@ -112,6 +113,36 @@ describe('fetchProviderUsage', () => {
       assert.equal(usage.available, false);
       assert.notEqual(usage.quota_authoritative, true);
     }
+  });
+});
+
+describe('fetchClaudeAccountUsage', () => {
+  const now = '2026-09-24T22:00:00.000Z';
+  it('probes one account through a private config dir and removes it', (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'acct-usage-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const settings = path.join(dir, 'ax-cl.settings.json');
+    fs.writeFileSync(settings, JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-fixture' } }));
+    let configDir;
+    const exec = (_bin, args, opts) => {
+      configDir = opts.env.CLAUDE_CONFIG_DIR;
+      const creds = JSON.parse(fs.readFileSync(path.join(configDir, '.credentials.json'), 'utf8'));
+      assert.equal(creds.claudeAiOauth.accessToken, 'sk-ant-oat01-fixture');
+      assert.equal(creds.claudeAiOauth.refreshToken, '');
+      assert.ok(!args.join(' ').includes('sk-ant'), 'token must not reach argv');
+      return JSON.stringify([{ provider: 'claude', usage: { secondary: { usedPercent: 15, windowMinutes: 10080, resetsAt: '2026-10-01T17:00:00Z' } } }]);
+    };
+    const usage = fetchClaudeAccountUsage('claude-ax-cl', settings, { execFileSyncImpl: exec, codexbarBin: 'codexbar', now, homeDir: dir });
+    assert.equal(usage.provider, 'claude-ax-cl');
+    assert.equal(usage.quota_authoritative, true);
+    assert.equal(usage.secondary.used_percent, 15);
+    assert.equal(fs.existsSync(configDir), false);
+  });
+
+  it('reports an unreadable account as unavailable', () => {
+    const usage = fetchClaudeAccountUsage('claude-ax-cl', '/nonexistent/ax-cl.settings.json', { now });
+    assert.equal(usage.available, false);
+    assert.notEqual(usage.quota_authoritative, true);
   });
 });
 
