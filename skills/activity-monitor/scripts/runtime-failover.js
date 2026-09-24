@@ -211,6 +211,18 @@ function rotationDeadline(state, { policy, profiles, currentProfile, providerUsa
   return Date.parse(state.runtime_usage_rotation_wait.started_at) + 120_000;
 }
 
+// runtime_failover.hold_profiles: tiers an external owner (the Codex account
+// rotation service) has marked unusable. A held tier is skipped for forward
+// switches and recovery alike, unlike auto_recover=false, which would also stop
+// recovery into every other tier of a mixed chain.
+function heldProfiles(policy) {
+  return new Set(Array.isArray(policy.hold_profiles) ? policy.hold_profiles.filter(id => typeof id === 'string') : []);
+}
+
+function withHeld(blocked, held) {
+  return held.size ? { ...blocked, ...Object.fromEntries([...held].map(id => [id, { hold: 'policy' }])) } : blocked;
+}
+
 export function planRuntimeFailover({
   document,
   providerUsage,
@@ -225,6 +237,7 @@ export function planRuntimeFailover({
   const chain = Array.isArray(policy.chain) ? policy.chain.filter(id => profiles[id]) : [];
   const changes = [];
   if (!policy.enabled || chain.length < 2) return { document: next, changes };
+  const held = heldProfiles(policy);
 
   for (const [instanceId, instance] of Object.entries(next.instances || {})) {
     if (instance.enabled === false || instance.runtime_failover_enabled !== true) continue;
@@ -237,7 +250,8 @@ export function planRuntimeFailover({
       ? instance.runtime_failover_blocked_profiles
       : {};
     const currentAccountKeys = currentSubscriptionAccountKeys[instanceId] || {};
-    const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys });
+    const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys })
+      .filter(id => !held.has(id));
     const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !recovered.includes(id)));
     const currentHealth = healthByInstance[instanceId] || 'ok';
     const usageFailoverNotBeforeMs = rotationDeadline(instance, { policy, profiles, currentProfile, providerUsage,
@@ -256,7 +270,7 @@ export function planRuntimeFailover({
       nowMs,
       autoRecover: policy.auto_recover !== false,
       wrapOnExhausted: policy.wrap_on_exhausted === true,
-      blockedProfiles: eligibleBlocks,
+      blockedProfiles: withHeld(eligibleBlocks, held),
       verifiedRecoveredProfiles: recovered,
       requiredModel: policy.required_model,
       requiredReasoningEffort: policy.required_reasoning_effort,
@@ -322,7 +336,9 @@ export function planSingleSessionRuntimeFailover({
     && !Array.isArray(next.runtime_failover_blocked_profiles)
     ? next.runtime_failover_blocked_profiles
     : {};
-  const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys });
+  const held = heldProfiles(policy);
+  const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys })
+    .filter(id => !held.has(id));
   const eligibleBlocks = Object.fromEntries(Object.entries(currentBlockedProfiles).filter(([id]) => !recovered.includes(id)));
   const usageFailoverNotBeforeMs = rotationDeadline(next, { policy, profiles, currentProfile, providerUsage,
     marker: rotationMarkers[currentProfile], nowMs });
@@ -340,7 +356,7 @@ export function planSingleSessionRuntimeFailover({
     nowMs,
     autoRecover: policy.auto_recover !== false,
     wrapOnExhausted: policy.wrap_on_exhausted === true,
-    blockedProfiles: eligibleBlocks,
+    blockedProfiles: withHeld(eligibleBlocks, held),
     verifiedRecoveredProfiles: recovered,
     requiredModel: policy.required_model,
     requiredReasoningEffort: policy.required_reasoning_effort,
