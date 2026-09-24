@@ -211,6 +211,43 @@ describe('Claude account pool ahead of Azure', () => {
   });
 });
 
+describe('policy hold_profiles for a Claude -> Codex subscription -> Azure chain', () => {
+  const nowMs = Date.parse('2026-09-24T23:00:00Z');
+  const profiles3 = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const plan = (profile, { claude, codex, hold }) => planRuntimeFailover({
+    document: {
+      runtime_profiles: profiles3,
+      runtime_failover: { enabled: true, chain: Object.keys(profiles3), switch_threshold: 95, recover_threshold: 90,
+        min_dwell_sec: 0, auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium',
+        usage_max_age_sec: 180, ...(hold ? { hold_profiles: hold } : {}) },
+      instances: { pan: { runtime_profile: profile, runtime_failover_enabled: true, tmux_session: 'claude-user-pan' } },
+    },
+    providerUsage: { providers: { claude: seen(claude), codex: codex == null ? { available: false } : seen(codex) } },
+    nowMs,
+  }).document.instances.pan.runtime_profile;
+
+  it('uses the Codex subscription between Claude and Azure', () => {
+    assert.equal(plan('claude-subscription', { claude: 97, codex: 40 }), 'codex-subscription');
+    assert.equal(plan('codex-subscription', { claude: 97, codex: 96 }), 'codex-azure');
+  });
+
+  it('skips a held Codex subscription forward even when its usage is unknown', () => {
+    assert.equal(plan('claude-subscription', { claude: 97, codex: null, hold: ['codex-subscription'] }), 'codex-azure');
+  });
+
+  it('keeps recovery to Claude while only the Codex tier is held', () => {
+    assert.equal(plan('codex-azure', { claude: 40, codex: 10, hold: ['codex-subscription'] }), 'claude-subscription');
+    assert.equal(plan('codex-azure', { claude: 97, codex: 10, hold: ['codex-subscription'] }), 'codex-azure');
+    assert.equal(plan('codex-azure', { claude: 97, codex: 10 }), 'codex-subscription');
+  });
+});
+
 describe('degraded last-tier recovery', () => {
   const nowMs = Date.parse('2026-09-09T02:00:00Z');
   const pinned = Object.fromEntries(['codex-subscription', 'codex-azure'].map(id => [id, {
