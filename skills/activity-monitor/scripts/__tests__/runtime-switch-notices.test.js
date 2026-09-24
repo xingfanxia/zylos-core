@@ -76,6 +76,11 @@ it('reports the Claude subscription quota for a Claude to Azure switch', () => {
   const text = formatSwitchNotice(event, 'started', usage, null, now);
   assert.match(text, /Claude 订阅 → Azure/); assert.match(text, /Claude 本周额度已用 97%/); assert.doesNotMatch(text, /Codex/);
 });
+it('describes an operator primary-route change as configured, not as a failure', () => {
+  const event = { changes: [{ instanceId: 'user-pan', fromProfile: 'codex-subscription', toProfile: 'claude-subscription', reason: 'configured_primary:claude-subscription' }] };
+  const text = formatSwitchNotice(event, 'started', {}, null, now);
+  assert.match(text, /管理员调整了助手的主线路/); assert.doesNotMatch(text, /没有正常回应/);
+});
 it('budget reader only uses existing loopback observer and never exposes auth on failures', async t => {
   const f = fixture(t); const token = path.join(f.dir, 'token'); fs.writeFileSync(token, 'private\n');
   let calls = 0;
