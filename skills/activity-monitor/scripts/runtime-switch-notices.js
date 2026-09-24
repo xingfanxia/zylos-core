@@ -5,7 +5,9 @@ import { execFileSync } from 'node:child_process';
 
 const read = (file, fallback = {}) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; } };
 const label = id => ({ admin: '管理员助手', group: '群助手', scheduler: '定时任务助手' }[id] || id.replace(/^user-/, '').replace(/^./, c => c.toUpperCase()));
-const profile = id => id === 'codex-azure' ? 'Azure' : id === 'codex-subscription' ? 'Codex 订阅' : id === 'claude-subscription' ? 'Claude 订阅' : '备用线路';
+const PROFILE_NAMES = { 'codex-azure': 'Azure', 'codex-subscription': 'Codex 订阅', 'claude-subscription': 'Claude 订阅' };
+// A profile may carry its own reader-facing label (e.g. a second Claude account).
+const profileName = (id, profiles = {}) => profiles[id]?.label || PROFILE_NAMES[id] || '备用线路';
 const money = value => `$${(value / 1e6).toFixed(2)}`;
 
 export function formatBeijingReset(value) {
@@ -26,14 +28,14 @@ function save(file, state) {
 }
 
 const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex' };
-const subscriptionProvider = id => id === 'claude-subscription' ? 'claude' : id === 'codex-subscription' ? 'codex' : null;
+const subscriptionProvider = (id, profiles = {}) => profiles[id] ? profiles[id].usage_provider || null
+  : id === 'claude-subscription' ? 'claude' : id === 'codex-subscription' ? 'codex' : null;
 
-export function subscriptionLines(usage, nowMs, provider = 'codex') {
-  const name = PROVIDER_NAMES[provider] || provider;
+export function subscriptionLines(usage, nowMs, provider = 'codex', name = PROVIDER_NAMES[provider] || provider) {
   const data = usage?.providers?.[provider];
   const observed = Date.parse(data?.observed_at || data?.fetched_at || '');
   if (!data?.available || data.quota_authoritative !== true || !Number.isFinite(observed)
-      || nowMs - observed > 180_000 || observed > nowMs + 30_000) return [`${name} 订阅的最新用量暂时取不到。`];
+      || nowMs - observed > 180_000 || observed > nowMs + 30_000) return [`${name} 的最新用量暂时取不到。`];
   const lines = [];
   for (const window of [data.primary, data.secondary, data.tertiary]) {
     if (!window || !Number.isFinite(window.used_percent)) continue;
@@ -43,7 +45,7 @@ export function subscriptionLines(usage, nowMs, provider = 'codex') {
     lines.push(`${name} ${windowName}已用 ${window.used_percent}%，剩余 ${Math.max(0, 100 - window.used_percent)}%。`);
     if (Number.isFinite(reset)) lines.push(`重置时间：${formatBeijingReset(new Date(reset).toISOString())}。`);
   }
-  return lines.length ? lines : [`${name} 订阅的最新用量暂时取不到。`];
+  return lines.length ? lines : [`${name} 的最新用量暂时取不到。`];
 }
 
 export function budgetLines(budget, nowMs) {
@@ -75,9 +77,9 @@ export async function readSwitchBudget(config, { fetchImpl = fetch } = {}) {
   } catch { return null; }
 }
 
-export function formatSwitchNotice(event, phase, usage, budget, nowMs) {
+export function formatSwitchNotice(event, phase, usage, budget, nowMs, profiles = {}) {
   const names = event.changes.map(change => label(change.instanceId)).join('、');
-  const routes = [...new Set(event.changes.map(change => `${profile(change.fromProfile)} → ${profile(change.toProfile)}`))].join('；');
+  const routes = [...new Set(event.changes.map(change => `${profileName(change.fromProfile, profiles)} → ${profileName(change.toProfile, profiles)}`))].join('；');
   const reason = event.changes.some(change => change.reason.startsWith('usage_exhausted'))
     ? '订阅额度接近上限，为了让任务继续进行，系统开始切换线路。'
     : event.changes.every(change => change.reason.startsWith('preferred_provider_recovered'))
@@ -89,10 +91,16 @@ export function formatSwitchNotice(event, phase, usage, budget, nowMs) {
     : phase === 'ready' ? ['✅ 助手线路切换完成', '新线路已经实际回应了检查，可以继续接收任务。']
       : phase === 'superseded' ? ['⚠️ 上一次线路切换已被后续切换替代', '原目标未完成全部恢复确认，请以后续线路检查结果为准。']
         : ['⚠️ 线路切换尚未恢复正常', '切换后仍未收到所有助手的正常回应，不能算恢复成功。系统会继续检查，确认恢复后再通知。'];
-  const providers = [...new Set(event.changes.flatMap(change => [change.fromProfile, change.toProfile])
-    .map(subscriptionProvider).filter(Boolean))];
+  const subscriptions = new Map();
+  for (const id of event.changes.flatMap(change => [change.fromProfile, change.toProfile])) {
+    const provider = subscriptionProvider(id, profiles);
+    if (provider && !subscriptions.has(provider)) {
+      subscriptions.set(provider, profiles[id]?.label || PROVIDER_NAMES[provider] || provider);
+    }
+  }
+  if (!subscriptions.size) subscriptions.set('codex', PROVIDER_NAMES.codex);
   return [...outcome, `涉及助手：${names}。`, `线路：${routes}。`,
-    ...(providers.length ? providers : ['codex']).flatMap(provider => subscriptionLines(usage, nowMs, provider)),
+    ...[...subscriptions].flatMap(([provider, name]) => subscriptionLines(usage, nowMs, provider, name)),
     ...budgetLines(budget, nowMs)].join('\n');
 }
 
@@ -172,7 +180,7 @@ export async function processSwitchNotices({ zylosDir, nowMs = Date.now(), send 
     if (budget === undefined) budget = await getBudget(config);
     try {
       const usage = read(path.join(zylosDir, 'activity-monitor/provider-usage.json'));
-      await send({ zylosDir, endpoint, eventId: event.id, phase, message: formatSwitchNotice(event, phase, usage, budget, nowMs) });
+      await send({ zylosDir, endpoint, eventId: event.id, phase, message: formatSwitchNotice(event, phase, usage, budget, nowMs, document.runtime_profiles || {}) });
       event.sent[phase] = new Date(nowMs).toISOString();
       if (phase === 'ready' || phase === 'superseded') event.complete = true;
     } catch { log(`[runtime-switch-notices] delivery failed; retry scheduled (${phase})`); }

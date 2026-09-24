@@ -89,6 +89,26 @@ describe('runtime profile resolution', () => {
     assert.deepEqual(result.errors, []);
   });
 
+  it('accepts an extra Claude account settings file and usage provider', () => {
+    const resolve = profile => getInstanceRuntimeProfile({
+      zylosDir: '/srv/zylos', homeDir: '/home/bohe',
+      readFileSync: (filePath) => {
+        if (filePath === '/srv/zylos/.zylos/runtime-profiles.json') {
+          return JSON.stringify({ active_profile: 'claude-ax-cl', runtime_profiles: { 'claude-ax-cl': { runtime: 'claude', ...profile } } });
+        }
+        throw new Error('ENOENT');
+      },
+    });
+    const ok = resolve({ usage_provider: 'claude-ax-cl', claude_settings_file: '/home/zylos-shared/auth/claude-ax-cl.settings.json' });
+    assert.deepEqual(ok.errors, []);
+    assert.equal(ok.claudeSettingsFile, '/home/zylos-shared/auth/claude-ax-cl.settings.json');
+    assert.equal(ok.usageProvider, 'claude-ax-cl');
+    for (const file of ['relative.json', '/tmp/../etc/x.json', "/tmp/a b.json", "/tmp/x';id;'.json", '/tmp/x.toml']) {
+      assert.ok(resolve({ claude_settings_file: file }).errors.includes('invalid_claude_settings_file'), file);
+    }
+    assert.ok(resolve({ usage_provider: 'claude-AX' }).errors.includes('invalid_usage_provider'));
+  });
+
   it('accepts a Claude 1M-context model id and rejects shell metacharacters', () => {
     const resolve = model => getInstanceRuntimeProfile({
       zylosDir: '/srv/zylos', homeDir: '/home/bohe',
@@ -102,6 +122,7 @@ describe('runtime profile resolution', () => {
       },
     });
     assert.equal(resolve('claude-opus-5-5[1m]').model, 'claude-opus-5-5[1m]');
+    assert.deepEqual(resolve('claude-opus-5-5[1m]').errors, []);
     for (const model of ["opus'; id #", 'opus[2m]', 'opus [1m]']) {
       assert.ok(resolve(model).errors.includes('invalid_model'), model);
     }

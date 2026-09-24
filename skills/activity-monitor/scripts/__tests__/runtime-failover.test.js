@@ -183,6 +183,34 @@ describe('Claude-primary chain with a pinned Codex Azure fallback', () => {
   });
 });
 
+describe('Claude account pool ahead of Azure', () => {
+  const nowMs = Date.parse('2026-09-24T22:00:00Z');
+  const pool = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'claude-ax-cl': { runtime: 'claude', usage_provider: 'claude-ax-cl', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const chain = Object.keys(pool);
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const choose = (currentProfile, main, cl) => chooseRuntimeProfile({
+    currentProfile, chain, profiles: pool, providerUsage: { providers: { claude: seen(main), 'claude-ax-cl': seen(cl) } },
+    requiredModel: 'gpt-6-astra', requiredReasoningEffort: 'medium', usageMaxAgeMs: 180_000,
+    switchThreshold: 95, recoverThreshold: 90, nowMs, minDwellMs: 0,
+  }).profile;
+
+  it('moves to the second account before Azure and to Azure only when both are full', () => {
+    assert.equal(choose('claude-subscription', 97, 15), 'claude-ax-cl');
+    assert.equal(choose('claude-subscription', 97, 96), 'codex-azure');
+    assert.equal(choose('claude-ax-cl', 97, 96), 'codex-azure');
+  });
+
+  it('returns to the first account once it recovers', () => {
+    assert.equal(choose('codex-azure', 97, 40), 'claude-ax-cl');
+    assert.equal(choose('claude-ax-cl', 20, 40), 'claude-subscription');
+  });
+});
+
 describe('degraded last-tier recovery', () => {
   const nowMs = Date.parse('2026-09-09T02:00:00Z');
   const pinned = Object.fromEntries(['codex-subscription', 'codex-azure'].map(id => [id, {

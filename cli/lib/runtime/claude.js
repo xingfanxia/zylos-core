@@ -397,7 +397,10 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // Profile model/effort are validated by runtime-files.js (shell-safe
     // characters only). Flags pin the session even when settings.json differs.
     const model = profile.model || null;
+    // A profile-selected subscription account: --settings outranks the shared
+    // project token and the credentials file (verified on Claude Code 2.1.281).
     const profileFlags = [
+      ...(profile.claudeSettingsFile ? ['--settings', profile.claudeSettingsFile] : []),
       ...(model ? ['--model', model] : []),
       ...(reasoningEffort ? ['--effort', reasoningEffort] : []),
     ];

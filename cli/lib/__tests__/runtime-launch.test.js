@@ -337,6 +337,15 @@ describe('Claude launch — new session', () => {
 
     assert.deepEqual(readSpecArgs(), ['--model', 'claude-opus-5-5[1m]', '--effort', 'high']);
   });
+
+  it('selects a profile Claude account with --settings, never the token itself', async () => {
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = { id: 'claude-ax-cl', claudeSettingsFile: '/home/zylos-shared/auth/claude-ax-cl.settings.json', model: 'claude-opus-5-5[1m]' };
+
+    await adapter.launch({ bypassPermissions: false });
+
+    assert.deepEqual(readSpecArgs(), ['--settings', '/home/zylos-shared/auth/claude-ax-cl.settings.json', '--model', 'claude-opus-5-5[1m]']);
+  });
 });
 
 describe('Claude launch — existing session', () => {

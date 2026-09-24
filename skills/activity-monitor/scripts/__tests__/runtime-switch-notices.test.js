@@ -76,6 +76,18 @@ it('reports the Claude subscription quota for a Claude to Azure switch', () => {
   const text = formatSwitchNotice(event, 'started', usage, null, now);
   assert.match(text, /Claude 订阅 → Azure/); assert.match(text, /Claude 本周额度已用 97%/); assert.doesNotMatch(text, /Codex/);
 });
+it('names each Claude account and its own quota in a pool switch', () => {
+  const profiles = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', label: 'Claude 主订阅' },
+    'claude-ax-cl': { runtime: 'claude', usage_provider: 'claude-ax-cl', label: 'Claude 备用订阅' },
+  };
+  const window = used => ({ available: true, quota_authoritative: true, observed_at: new Date(now).toISOString(), secondary: { window_minutes: 10080, used_percent: used, resets_at: new Date(now + 100000).toISOString() } });
+  const usage = { providers: { claude: window(96), 'claude-ax-cl': window(15) } };
+  const event = { changes: [{ instanceId: 'group', fromProfile: 'claude-subscription', toProfile: 'claude-ax-cl', reason: 'usage_exhausted:claude' }] };
+  const text = formatSwitchNotice(event, 'started', usage, null, now, profiles);
+  assert.match(text, /Claude 主订阅 → Claude 备用订阅/);
+  assert.match(text, /Claude 主订阅 本周额度已用 96%/); assert.match(text, /Claude 备用订阅 本周额度已用 15%/);
+});
 it('describes an operator primary-route change as configured, not as a failure', () => {
   const event = { changes: [{ instanceId: 'user-pan', fromProfile: 'codex-subscription', toProfile: 'claude-subscription', reason: 'configured_primary:claude-subscription' }] };
   const text = formatSwitchNotice(event, 'started', {}, null, now);

@@ -1039,7 +1039,9 @@ function createUsageMonitor(activeAdapter) {
     // Named profiles explicitly declare which subscription quota they use.
     // `null` means an API-backed profile (for example Azure) and disables
     // subscription reminders instead of misreporting Codex subscription usage.
-    ...(runtimeProfile?.id ? { usageProvider: runtimeProfile.usageProvider } : {}),
+    // Extra Claude accounts (claude-<account>) read the same local statusline.
+    ...(runtimeProfile?.id ? { usageProvider: runtimeProfile.usageProvider?.startsWith('claude-')
+      ? 'claude' : runtimeProfile.usageProvider } : {}),
     codexHome: runtimeProfile?.codexHome,
     statuslineFile: STATUSLINE_FILE,
     usageStateFile: USAGE_STATE_FILE,
