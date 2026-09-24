@@ -82,7 +82,9 @@ export function formatSwitchNotice(event, phase, usage, budget, nowMs) {
     ? '订阅额度接近上限，为了让任务继续进行，系统开始切换线路。'
     : event.changes.every(change => change.reason.startsWith('preferred_provider_recovered'))
       ? '订阅额度已经恢复，系统开始切回订阅，减少 Azure 花费。'
-      : '原来的线路没有正常回应，系统开始尝试另一条可用线路。';
+      : event.changes.every(change => change.reason.startsWith('configured_primary'))
+        ? '管理员调整了助手的主线路，系统开始切换到新的主线路。'
+        : '原来的线路没有正常回应，系统开始尝试另一条可用线路。';
   const outcome = phase === 'started' ? ['🔄 正在切换助手线路', reason, '正在启动并检查新线路；还没有确认恢复。']
     : phase === 'ready' ? ['✅ 助手线路切换完成', '新线路已经实际回应了检查，可以继续接收任务。']
       : phase === 'superseded' ? ['⚠️ 上一次线路切换已被后续切换替代', '原目标未完成全部恢复确认，请以后续线路检查结果为准。']
