@@ -9,6 +9,7 @@ process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 const {
   fetchCodexNativeUsage,
   fetchClaudeNativeUsage,
+  fetchProviderUsage,
   normalizeProviderPayload,
   normalizeNativeClaudeUsage,
   runProviderUsageOnce,
@@ -88,6 +89,29 @@ describe('normalizeProviderPayload', () => {
     assert.equal(normalized.available, false);
     assert.equal(normalized.error, 'not available');
     assert.equal(normalized.primary, null);
+  });
+});
+
+describe('fetchProviderUsage', () => {
+  const now = '2026-09-24T22:00:00.000Z';
+  it('marks a successful live CodexBar reading as a current authoritative observation', () => {
+    const exec = () => JSON.stringify([{ provider: 'claude', source: 'claude',
+      usage: { secondary: { usedPercent: 97, windowMinutes: 10080, resetsAt: '2026-09-26T02:00:00Z' } } }]);
+    const usage = fetchProviderUsage('claude', { execFileSyncImpl: exec, codexbarBin: 'codexbar', now });
+    assert.equal(usage.quota_authoritative, true);
+    assert.equal(usage.observed_at, now);
+    assert.equal(usage.secondary.used_percent, 97);
+  });
+
+  it('does not mark a failed or error probe authoritative', () => {
+    const errored = fetchProviderUsage('claude', { now, codexbarBin: 'codexbar',
+      execFileSyncImpl: () => JSON.stringify([{ provider: 'claude', error: { message: 'no auth' } }]) });
+    const thrown = fetchProviderUsage('claude', { now, codexbarBin: 'codexbar',
+      execFileSyncImpl: () => { throw new Error('timeout'); } });
+    for (const usage of [errored, thrown]) {
+      assert.equal(usage.available, false);
+      assert.notEqual(usage.quota_authoritative, true);
+    }
   });
 });
 

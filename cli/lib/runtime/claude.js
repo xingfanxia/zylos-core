@@ -394,6 +394,13 @@ export class ClaudeAdapter extends RuntimeAdapter {
     assertInstructionReady('claude');
     const profile = this.config.runtimeProfile || {};
     const reasoningEffort = profile.reasoningEffort || null;
+    // Profile model/effort are validated by runtime-files.js (shell-safe
+    // characters only). Flags pin the session even when settings.json differs.
+    const model = profile.model || null;
+    const profileFlags = [
+      ...(model ? ['--model', model] : []),
+      ...(reasoningEffort ? ['--effort', reasoningEffort] : []),
+    ];
 
     // Guardian has already built and validated the split instruction files.
     // Resolve the per-instance working directory for memory, token, and GitHub
@@ -469,7 +476,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     // No --continue: CC's resume locks model to original session and double-injects
     // context (zylos's c4-session-init hook already restores conversation history).
-    const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}`;
+    const profileFlagText = profileFlags.map(arg => ` '${arg}'`).join('');
+    const claudeCmd = `${ENV_CLEAN_PREFIX}${envStripFlags} ${CLAUDE_BIN}${bypassFlag}${profileFlagText}`;
 
     const monitorDir = path.join(ZYLOS_DIR, 'activity-monitor');
     const exitLogFile = path.join(monitorDir, 'claude-exit.log');
@@ -538,6 +546,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       // Build launch spec
       const args = [];
       if (bypassPermissions) args.push('--dangerously-skip-permissions');
+      args.push(...profileFlags);
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
       const specPath = writeLaunchSpec({

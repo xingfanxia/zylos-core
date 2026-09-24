@@ -125,7 +125,10 @@ export function fetchProviderUsage(provider, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: provider === 'claude' ? 45_000 : 20_000,
     });
-    return normalizeProviderPayload(provider, JSON.parse(raw), now);
+    const usage = normalizeProviderPayload(provider, JSON.parse(raw), now);
+    // A successful live CLI probe is a current account observation. Native
+    // monitor-file fallbacks stay non-authoritative: they freeze on switch.
+    return usage.available ? { ...usage, quota_authoritative: true, observed_at: now } : usage;
   } catch (err) {
     const stderr = err.stderr ? String(err.stderr).trim() : '';
     const stdout = err.stdout ? String(err.stdout).trim() : '';

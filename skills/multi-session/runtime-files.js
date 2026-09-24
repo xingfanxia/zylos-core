@@ -5,7 +5,8 @@ import os from 'os';
 const DEFAULT_ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const VALID_OS_USER = /^[a-z_][a-z0-9_-]{0,31}$/;
 const VALID_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const VALID_MODEL = /^[A-Za-z0-9._:-]+$/;
+// Optional Claude Code context suffix, e.g. claude-opus-5-5[1m].
+const VALID_MODEL = /^[A-Za-z0-9._:-]+(?:\[1m\])?$/;
 const VALID_REASONING = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']);
 
 function readJsonSafe(filePath, readFileSync = fs.readFileSync) {

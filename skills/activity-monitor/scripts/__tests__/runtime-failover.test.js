@@ -136,6 +136,53 @@ describe('model and authoritative quota policy', () => {
   });
 });
 
+describe('Claude-primary chain with a pinned Codex Azure fallback', () => {
+  const nowMs = Date.parse('2026-09-24T22:00:00Z');
+  const mixedProfiles = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const chain = Object.keys(mixedProfiles);
+  function claudeUsage(used) {
+    const value = usage({ claude: used });
+    Object.assign(value.providers.claude, {
+      quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    });
+    return value;
+  }
+  function choose(extra = {}) {
+    return chooseRuntimeProfile({
+      currentProfile: 'claude-subscription', chain, profiles: mixedProfiles,
+      providerUsage: claudeUsage(10), requiredModel: 'gpt-6-astra', requiredReasoningEffort: 'medium',
+      usageMaxAgeMs: 180_000, switchThreshold: 95, recoverThreshold: 90, nowMs, minDwellMs: 0, ...extra,
+    });
+  }
+
+  it('keeps the Claude tier eligible under the Codex model policy', () => {
+    assert.deepEqual(choose(), { profile: 'claude-subscription', reason: 'no_change' });
+    assert.equal(choose({ currentProfile: 'codex-subscription' }).profile, 'claude-subscription');
+  });
+
+  it('falls back to Azure on Claude quota or health failure', () => {
+    assert.equal(choose({ providerUsage: claudeUsage(95) }).profile, 'codex-azure');
+    assert.equal(choose({ currentHealth: 'rate_limited' }).profile, 'codex-azure');
+  });
+
+  it('returns to Claude only on a current authoritative reading below recovery', () => {
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: claudeUsage(89) }).profile, 'claude-subscription');
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: claudeUsage(92) }).profile, 'codex-azure');
+    const frozen = claudeUsage(10);
+    frozen.providers.claude.quota_authoritative = false;
+    assert.equal(choose({ currentProfile: 'codex-azure', providerUsage: frozen }).profile, 'codex-azure');
+  });
+
+  it('still pins the Codex fallback model and effort', () => {
+    const drifted = { ...mixedProfiles, 'codex-azure': { ...mixedProfiles['codex-azure'], model: 'gpt-5.6-sol' } };
+    assert.deepEqual(choose({ profiles: drifted, providerUsage: claudeUsage(99) }),
+      { profile: 'claude-subscription', reason: 'fallback_chain_exhausted' });
+  });
+});
+
 describe('degraded last-tier recovery', () => {
   const nowMs = Date.parse('2026-09-09T02:00:00Z');
   const pinned = Object.fromEntries(['codex-subscription', 'codex-azure'].map(id => [id, {
