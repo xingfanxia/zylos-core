@@ -88,4 +88,22 @@ describe('runtime profile resolution', () => {
     assert.equal(result.reasoningEffort, 'high');
     assert.deepEqual(result.errors, []);
   });
+
+  it('accepts a Claude 1M-context model id and rejects shell metacharacters', () => {
+    const resolve = model => getInstanceRuntimeProfile({
+      zylosDir: '/srv/zylos', homeDir: '/home/bohe',
+      readFileSync: (filePath) => {
+        if (filePath === '/srv/zylos/.zylos/runtime-profiles.json') {
+          return JSON.stringify({ active_profile: 'claude-subscription', runtime_profiles: {
+            'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model, reasoning_effort: 'high' },
+          } });
+        }
+        throw new Error('ENOENT');
+      },
+    });
+    assert.equal(resolve('claude-opus-5-5[1m]').model, 'claude-opus-5-5[1m]');
+    for (const model of ["opus'; id #", 'opus[2m]', 'opus [1m]']) {
+      assert.ok(resolve(model).errors.includes('invalid_model'), model);
+    }
+  });
 });

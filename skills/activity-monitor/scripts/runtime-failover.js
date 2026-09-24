@@ -87,8 +87,11 @@ export function chooseRuntimeProfile({
   usageFailoverNotBeforeMs = 0,
 } = {}) {
   if (requiredModel || requiredReasoningEffort) {
+    // The model policy pins Codex tiers only; a Claude tier carries its own
+    // model/effort and stays eligible in a mixed Claude -> Codex chain.
     chain = chain.filter(id => {
       const profile = profiles[id];
+      if (profile && profile.runtime !== 'codex') return true;
       return profile && (!requiredModel || profile.model === requiredModel)
         && (!requiredReasoningEffort || profile.reasoning_effort === requiredReasoningEffort);
     });

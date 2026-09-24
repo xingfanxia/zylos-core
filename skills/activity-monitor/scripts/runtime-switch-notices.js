@@ -25,21 +25,25 @@ function save(file, state) {
   fs.renameSync(tmp, file);
 }
 
-export function subscriptionLines(usage, nowMs) {
-  const data = usage?.providers?.codex;
+const PROVIDER_NAMES = { claude: 'Claude', codex: 'Codex' };
+const subscriptionProvider = id => id === 'claude-subscription' ? 'claude' : id === 'codex-subscription' ? 'codex' : null;
+
+export function subscriptionLines(usage, nowMs, provider = 'codex') {
+  const name = PROVIDER_NAMES[provider] || provider;
+  const data = usage?.providers?.[provider];
   const observed = Date.parse(data?.observed_at || data?.fetched_at || '');
   if (!data?.available || data.quota_authoritative !== true || !Number.isFinite(observed)
-      || nowMs - observed > 180_000 || observed > nowMs + 30_000) return ['Codex 订阅的最新用量暂时取不到。'];
+      || nowMs - observed > 180_000 || observed > nowMs + 30_000) return [`${name} 订阅的最新用量暂时取不到。`];
   const lines = [];
   for (const window of [data.primary, data.secondary, data.tertiary]) {
     if (!window || !Number.isFinite(window.used_percent)) continue;
     const reset = Date.parse(window.resets_at || '');
     if (Number.isFinite(reset) && reset <= nowMs) continue;
-    const name = window.window_minutes >= 10080 ? '本周额度' : window.window_minutes === 300 ? '最近 5 小时额度' : '订阅额度';
-    lines.push(`Codex ${name}已用 ${window.used_percent}%，剩余 ${Math.max(0, 100 - window.used_percent)}%。`);
+    const windowName = window.window_minutes >= 10080 ? '本周额度' : window.window_minutes === 300 ? '最近 5 小时额度' : '订阅额度';
+    lines.push(`${name} ${windowName}已用 ${window.used_percent}%，剩余 ${Math.max(0, 100 - window.used_percent)}%。`);
     if (Number.isFinite(reset)) lines.push(`重置时间：${formatBeijingReset(new Date(reset).toISOString())}。`);
   }
-  return lines.length ? lines : ['Codex 订阅的最新用量暂时取不到。'];
+  return lines.length ? lines : [`${name} 订阅的最新用量暂时取不到。`];
 }
 
 export function budgetLines(budget, nowMs) {
@@ -83,8 +87,11 @@ export function formatSwitchNotice(event, phase, usage, budget, nowMs) {
     : phase === 'ready' ? ['✅ 助手线路切换完成', '新线路已经实际回应了检查，可以继续接收任务。']
       : phase === 'superseded' ? ['⚠️ 上一次线路切换已被后续切换替代', '原目标未完成全部恢复确认，请以后续线路检查结果为准。']
         : ['⚠️ 线路切换尚未恢复正常', '切换后仍未收到所有助手的正常回应，不能算恢复成功。系统会继续检查，确认恢复后再通知。'];
+  const providers = [...new Set(event.changes.flatMap(change => [change.fromProfile, change.toProfile])
+    .map(subscriptionProvider).filter(Boolean))];
   return [...outcome, `涉及助手：${names}。`, `线路：${routes}。`,
-    ...subscriptionLines(usage, nowMs), ...budgetLines(budget, nowMs)].join('\n');
+    ...(providers.length ? providers : ['codex']).flatMap(provider => subscriptionLines(usage, nowMs, provider)),
+    ...budgetLines(budget, nowMs)].join('\n');
 }
 
 export function switchReady(change, status, instance, nowMs) {

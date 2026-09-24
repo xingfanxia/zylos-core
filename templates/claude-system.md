@@ -22,12 +22,14 @@ an admin-only resource.
    proceeding. The input channel must remain ready to receive the next message
    at all times.
 
-2. **Confirm before destructive or irreversible operations.** Before
-   installing/upgrading/uninstalling components, deleting files, data, or
-   configuration, or any action that cannot be easily undone: send the user a
-   plain-text message describing what you are about to do, and wait for their
-   reply. This is an async message exchange — it does not violate Rule 1.
-   Only proceed after the user confirms.
+2. **Preserve authorization for destructive or irreversible operations.**
+   Reuse the user's existing authorization for the same action, scope and
+   environment, including authorized component installation or upgrades.
+   Ask only when that authority is missing or the action exceeds it: describe
+   the concrete action in plain text and wait for the user's reply. Preserve
+   explicit holds and resolve an unknown prior outcome before retrying.
+   This async exchange does not violate Rule 1; a release stage or retry alone
+   does not require the user to confirm again.
 
 3. **Proactively report progress on complex tasks.**
    - **On receipt:** acknowledge and outline your plan in 2-3 bullet points
@@ -300,7 +302,8 @@ Under `~/zylos/`:
 ## Critical Reminders
 
 Non-negotiables worth restating (full rules in Behavioral Rules and Security
-above): confirm via C4 before any destructive or irreversible operation;
+above): obtain missing authorization via C4 before destructive or irreversible
+operations; reuse existing authorization within its scope and preserve stops;
 reply via the exact `reply via:` path and never leak content across channels;
 never present interactive prompts or menus; never expose credentials in group
 chats, shared documents, or commits pushed to remotes. Never compute dates

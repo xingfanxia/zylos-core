@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { it } from 'node:test';
-import { processSwitchNotices, switchReady, budgetLines, subscriptionLines, readSwitchBudget, sendToAdmin, formatBeijingReset } from '../runtime-switch-notices.js';
+import { processSwitchNotices, switchReady, budgetLines, subscriptionLines, formatSwitchNotice, readSwitchBudget, sendToAdmin, formatBeijingReset } from '../runtime-switch-notices.js';
 
 const now = Date.parse('2026-09-09T04:00:00Z');
 function fixture(t) {
@@ -69,6 +69,12 @@ it('reports one shared capped pool, reservations, exempt helpers, and unknown/st
   assert.match(subscriptionLines({}, now).join(''), /暂时取不到/);
   const usage = { providers: { codex: { available: true, quota_authoritative: true, observed_at: new Date(now).toISOString(), secondary: { window_minutes: 10080, used_percent: 98, resets_at: new Date(now + 100000).toISOString() } } } };
   const sub = subscriptionLines(usage, now).join('\n'); assert.match(sub, /剩余 2%/); assert.doesNotMatch(sub, /unknown|5 小时/);
+});
+it('reports the Claude subscription quota for a Claude to Azure switch', () => {
+  const usage = { providers: { claude: { available: true, quota_authoritative: true, observed_at: new Date(now).toISOString(), secondary: { window_minutes: 10080, used_percent: 97, resets_at: new Date(now + 100000).toISOString() } } } };
+  const event = { changes: [{ instanceId: 'group', fromProfile: 'claude-subscription', toProfile: 'codex-azure', reason: 'usage_exhausted:claude' }] };
+  const text = formatSwitchNotice(event, 'started', usage, null, now);
+  assert.match(text, /Claude 订阅 → Azure/); assert.match(text, /Claude 本周额度已用 97%/); assert.doesNotMatch(text, /Codex/);
 });
 it('budget reader only uses existing loopback observer and never exposes auth on failures', async t => {
   const f = fixture(t); const token = path.join(f.dir, 'token'); fs.writeFileSync(token, 'private\n');
