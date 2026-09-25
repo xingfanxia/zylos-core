@@ -71,6 +71,10 @@ export class HealthEngine {
    * @param {number} [options.postRestartProbeDelayMs=5000]
    * @param {number} [options.userMessageCheckDelayMs=5000]
    * @param {() => number} [options.now]
+   * @param {boolean} [options.authFailureHold=false] - Park a pane-detected auth
+   *   failure in auth_failed without restarting, and leave auth_failed only
+   *   after checkAuth and a heartbeat both succeed (per-instance config
+   *   `auth_failure_hold`). Off keeps the upstream verify-then-restart flow.
    */
   constructor(deps, options = {}) {
     this.deps = deps;
@@ -81,6 +85,7 @@ export class HealthEngine {
     this.rateLimitDefaultCooldown = options.rateLimitDefaultCooldown ?? 3600; // 1 hour
     this.userMessageRecoveryCooldown = options.userMessageRecoveryCooldown ?? 60; // 1 min
     this.heartbeatEnabled = options.heartbeatEnabled ?? true;
+    this.authFailureHold = options.authFailureHold === true;
     this.userMessageCheckDelayMs = options.userMessageCheckDelayMs ?? USER_MESSAGE_CHECK_DELAY_MS;
     this.maintenanceIntervalMs = options.maintenanceIntervalMs ?? 1000;
     this.postRestartProbeDelayMs = options.postRestartProbeDelayMs ?? USER_MESSAGE_CHECK_DELAY_MS;
@@ -367,7 +372,7 @@ export class HealthEngine {
       return;
     }
 
-    if (isPostRestartProbeState(this.healthState) && this.deps.detectAuthFailure) {
+    if (this.authFailureHold && isPostRestartProbeState(this.healthState) && this.deps.detectAuthFailure) {
       const authFailure = this.deps.detectAuthFailure();
       if (authFailure.detected) {
         this.restartFailureCount = 0;
@@ -491,7 +496,7 @@ export class HealthEngine {
     // a rate limit. This is the "behavioral + text" dual-signal approach:
     // heartbeat failed (behavioral) AND tmux shows rate limit text (text signal).
     // Only checked in states where a heartbeat failure may otherwise change health.
-    if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState) || this.healthState === 'rate_limited') && this.deps.detectAuthFailure) {
+    if (this.authFailureHold && (this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState) || this.healthState === 'rate_limited') && this.deps.detectAuthFailure) {
       const authFailure = this.deps.detectAuthFailure();
       if (authFailure.detected) {
         this.restartFailureCount = 0;
@@ -621,7 +626,7 @@ export class HealthEngine {
 
     this.lastRecoveryAt = Math.floor(Date.now() / 1000);
 
-    if (this.healthState === 'auth_failed') {
+    if (this.healthState === 'auth_failed' && this.authFailureHold) {
       const authFailure = this.deps.detectAuthFailure ? this.deps.detectAuthFailure() : { detected: false };
       if (authFailure.detected) {
         const reason = authFailure.pattern || this.healthReason || 'auth_still_failed';
@@ -637,6 +642,21 @@ export class HealthEngine {
       }
 
       this.deps.log('Auth probe passed; verifying runtime with heartbeat before marking healthy');
+    } else if (this.healthState === 'auth_failed') {
+      const authResult = await this._checkAuth();
+      if (getAuthCheckStatus(authResult) === 'success') {
+        const now = Math.floor(Date.now() / 1000);
+        this.deps.log('Auth probe recovered; restarting session before marking healthy');
+        this.restartFailureCount = 0;
+        this.lastRecoveryAt = now;
+        this.recoveringStartedAt = now;
+        this.setHealth('unavailable', 'auth_recovered_restart');
+        this.deps.killTmuxSession();
+        return { recovered: false, health: 'unavailable', restartTriggered: true };
+      }
+      const reason = authResult.reason || 'auth_still_failed';
+      this.setHealth('auth_failed', reason);
+      return { recovered: false, health: 'auth_failed', reason };
     }
 
     let pending = this.deps.readHeartbeatPending();

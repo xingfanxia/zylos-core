@@ -99,6 +99,53 @@ describe('MessageRouter route', () => {
     assert.match(decision.userMessage, /rate-limited/i);
   });
 
+  it('answers auth_failed at once without probing when the engine holds auth failures', async () => {
+    let notifyCalls = 0;
+    let probeCalls = 0;
+    const router = new MessageRouter({
+      healthEngine: createHealthEngine({
+        health: 'auth_failed',
+        healthReason: 'token_expired',
+        authFailureHold: true,
+        notifyUserMessage: () => {
+          notifyCalls++;
+          return true;
+        },
+        runRecoveryProbe: async () => {
+          probeCalls++;
+          return { recovered: true };
+        },
+      }),
+    });
+
+    const decision = await router.route(routeRequest());
+
+    assert.equal(notifyCalls, 0);
+    assert.equal(probeCalls, 0);
+    assert.equal(decision.recovered, false);
+    assert.equal(decision.health, 'auth_failed');
+    assert.match(decision.userMessage, /Authentication is currently unavailable/);
+  });
+
+  it('keeps the upstream user-message recovery probe for auth_failed without the hold', async () => {
+    let probeCalls = 0;
+    const router = new MessageRouter({
+      healthEngine: createHealthEngine({
+        health: 'auth_failed',
+        healthReason: 'token_expired',
+        notifyUserMessage: () => true,
+        runRecoveryProbe: async () => {
+          probeCalls++;
+          return { recovered: true, health: 'ok' };
+        },
+      }),
+    });
+
+    await router.route(routeRequest());
+
+    assert.equal(probeCalls, 1);
+  });
+
   it('returns cached negative decisions without probing', async () => {
     await withTmpDir(async (tmpDir) => {
       let probeCalls = 0;
