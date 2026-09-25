@@ -248,6 +248,57 @@ describe('policy hold_profiles for a Claude -> Codex subscription -> Azure chain
   });
 });
 
+describe('Codex reserve-model downshift guard', () => {
+  const nowMs = Date.parse('2026-09-24T23:00:00Z');
+  const pinned = {
+    'claude-ax-backup': { runtime: 'claude', usage_provider: 'claude-ax-backup', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const snapshot = (patch = {}) => ({ runtime_profile: 'codex-subscription', actual_model: 'gpt-reserve',
+    actual_model_source: 'rollout_thread_settings', actual_model_observed_at: new Date(nowMs - 20_000).toISOString(),
+    observed_at: new Date(nowMs - 5_000).toISOString(), ...patch });
+  const doc = (instance = {}, extraPolicy = {}) => ({
+    runtime_profiles: pinned,
+    runtime_failover: { enabled: true, chain: Object.keys(pinned), switch_threshold: 95, recover_threshold: 90, min_dwell_sec: 300,
+      auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium', usage_max_age_sec: 180, ...extraPolicy },
+    instances: { pan: { runtime: 'codex', runtime_profile: 'codex-subscription', runtime_failover_enabled: true, tmux_session: 'claude-user-pan',
+      runtime_profile_changed_at: new Date(nowMs - 60_000).toISOString(), ...instance } },
+  });
+  const usageAll = (claude, codex) => ({ providers: { 'claude-ax-backup': seen(claude), codex: seen(codex) } });
+
+  it('moves off the reserve model immediately and quarantines the Codex tier', () => {
+    const { document, changes } = planRuntimeFailover({ document: doc(), providerUsage: usageAll(97, 40),
+      modelSnapshots: { pan: snapshot() }, nowMs });
+    assert.equal(changes[0].toProfile, 'codex-azure');
+    assert.equal(changes[0].reason, 'model_downshift:gpt-reserve');
+    assert.equal(document.instances.pan.runtime_failover_blocked_profiles['codex-subscription'].health, 'rate_limited');
+  });
+
+  it('ignores records from another profile, older than the switch, or stale polls', () => {
+    for (const patch of [{ runtime_profile: 'codex-azure' }, { actual_model: 'gpt-6-astra' },
+      { actual_model_observed_at: new Date(nowMs - 120_000).toISOString() }, { observed_at: new Date(nowMs - 600_000).toISOString() }]) {
+      assert.equal(planRuntimeFailover({ document: doc(), providerUsage: usageAll(97, 40),
+        modelSnapshots: { pan: snapshot(patch) }, nowMs }).changes.length, 0);
+    }
+  });
+
+  it('suspends instead of running on the reserve model when no tier is usable, then resumes', () => {
+    const exhausted = doc({ runtime_failover_blocked_profiles: { 'codex-azure': { health: 'degraded' } } });
+    const first = planRuntimeFailover({ document: exhausted, providerUsage: usageAll(97, 40), modelSnapshots: { pan: snapshot() }, nowMs });
+    assert.equal(first.changes[0].suspend, true);
+    assert.equal(first.document.instances.pan.runtime_failover_suspended.reason, 'model_downshift:gpt-reserve');
+    assert.equal(first.document.instances.pan.runtime_profile, 'codex-subscription');
+    const still = planRuntimeFailover({ document: first.document, providerUsage: usageAll(97, 40), nowMs: nowMs + 60_000 });
+    assert.equal(still.changes.length, 0);
+    const resumed = planRuntimeFailover({ document: first.document, providerUsage: usageAll(10, 40), nowMs: nowMs + 120_000 });
+    assert.equal(resumed.changes[0].toProfile, 'claude-ax-backup');
+    assert.equal(resumed.document.instances.pan.runtime_failover_suspended, undefined);
+  });
+});
+
 describe('degraded last-tier recovery', () => {
   const nowMs = Date.parse('2026-09-09T02:00:00Z');
   const pinned = Object.fromEntries(['codex-subscription', 'codex-azure'].map(id => [id, {

@@ -84,6 +84,8 @@ export function formatSwitchNotice(event, phase, usage, budget, nowMs, profiles 
     ? '订阅额度接近上限，为了让任务继续进行，系统开始切换线路。'
     : event.changes.every(change => change.reason.startsWith('preferred_provider_recovered'))
       ? '订阅额度已经恢复，系统开始切回订阅，减少 Azure 花费。'
+      : event.changes.some(change => change.reason.startsWith('model_downshift'))
+        ? 'Codex 订阅额度用完后自动换成了备用模型；备用模型不允许使用，系统已切换线路。'
       : event.changes.every(change => change.reason.startsWith('configured_primary'))
         ? '管理员调整了助手的主线路，系统开始切换到新的主线路。'
         : '原来的线路没有正常回应，系统开始尝试另一条可用线路。';

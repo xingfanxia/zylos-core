@@ -232,6 +232,19 @@ test('missing effective event ceiling and unknown profile window yield no sample
 });
 
 
+test('a reserve-model thread settings switch is published before the next turn', async (t) => {
+  const f = fixture(t);
+  const context = { type: 'turn_context', timestamp: '2026-09-21T11:30:00Z', payload: { model: 'gpt-6-astra', effort: 'medium' } };
+  const settings = { type: 'event_msg', timestamp: '2026-09-21T11:47:06Z', payload: { type: 'thread_settings_applied',
+    thread_settings: { model: 'gpt-reserve', reasoning_effort: 'medium', cwd: 'PRIVATE_PATH' } } };
+  f.rollout({ rows: [context, f.count(50000), settings] });
+  const usage = await f.monitor.getUsage();
+  assert.equal(usage.actualModel, 'gpt-reserve');
+  assert.equal(usage.actualModelSource, 'rollout_thread_settings');
+  assert.equal(usage.actualModelObservedAt, '2026-09-21T11:47:06.000Z');
+  assert.ok(!JSON.stringify(usage).includes('PRIVATE_PATH'));
+});
+
 test('publishes only actual root turn model/effort and preserves old idle turn timestamps', async (t) => {
   const f = fixture(t);
   const context = (model, effort) => ({ type: 'turn_context', timestamp: '2026-09-06T12:00:01Z',
