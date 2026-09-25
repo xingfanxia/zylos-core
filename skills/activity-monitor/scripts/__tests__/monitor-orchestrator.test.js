@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { MonitorOrchestrator } from '../monitor-orchestrator.js';
+import { MonitorOrchestrator, startupRuntimeProfile } from '../monitor-orchestrator.js';
+import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 
 describe('MonitorOrchestrator', () => {
   function createHarness(overrides = {}) {
@@ -12,7 +13,8 @@ describe('MonitorOrchestrator', () => {
     fs.rmSync(monitorDir, { recursive: true, force: true });
 
     const calls = [];
-    const env = { TMUX: '/tmp/stale-tmux' };
+    // Production always provides ZYLOS_DIR; the runtime-switch signal is read from it.
+    const env = { TMUX: '/tmp/stale-tmux', ZYLOS_DIR: overrides.zylosDir ?? path.join(monitorDir, 'zylos') };
     const adapter = overrides.adapter ?? { runtimeId: 'codex', displayName: 'Codex', sessionName: 'codex-main' };
     const config = { runtime: 'codex' };
     const toolPipeline = overrides.toolPipeline ?? { id: 'toolPipeline' };
@@ -1380,5 +1382,88 @@ describe('MonitorOrchestrator', () => {
         apiActivity: null,
       }],
     ]);
+  });
+});
+
+describe('MonitorOrchestrator single-session runtime switch and tmux hold', () => {
+  function profileDir(profile) {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-single-switch-'));
+    fs.mkdirSync(path.join(zylosDir, '.zylos'), { recursive: true });
+    fs.writeFileSync(path.join(zylosDir, '.zylos', 'runtime-profiles.json'), JSON.stringify(profile));
+    return zylosDir;
+  }
+  const profiles = {
+    'codex-subscription': { runtime: 'codex' },
+    'codex-azure': { runtime: 'codex' },
+    'claude-subscription': { runtime: 'claude' },
+  };
+
+  it('binds the switch signal to the active profile only for the matching engine and pane', () => {
+    const codexMain = { runtimeId: 'codex', sessionName: 'codex-main' };
+    const bohe = { runtimeId: 'codex', sessionName: 'claude-main' };
+    const cl = profileDir({ active_profile: 'codex-azure', active_runtime: 'codex', tmux_session: 'codex-main', runtime_profiles: profiles });
+    const herdr = profileDir({ active_profile: 'codex-subscription', active_runtime: 'codex', tmux_session: 'claude-main', runtime_profiles: profiles });
+    try {
+      assert.equal(startupRuntimeProfile(codexMain, { ZYLOS_DIR: cl }), 'codex-azure');
+      assert.equal(startupRuntimeProfile(bohe, { ZYLOS_DIR: herdr }), 'codex-subscription');
+      assert.equal(startupRuntimeProfile(codexMain, { ZYLOS_DIR: herdr }), null, 'pane mismatch');
+      assert.equal(startupRuntimeProfile({ runtimeId: 'claude', sessionName: 'claude-main' }, { ZYLOS_DIR: herdr }), null, 'engine mismatch');
+      assert.equal(startupRuntimeProfile(codexMain, { ZYLOS_DIR: cl, ZYLOS_INSTANCE_ID: 'x' }), null, 'multi-session instance');
+    } finally {
+      fs.rmSync(cl, { recursive: true, force: true });
+      fs.rmSync(herdr, { recursive: true, force: true });
+    }
+  });
+
+  it('consumes a matching single-session switch signal: cold start, no inherited quota cooldown', () => {
+    const zylosDir = profileDir({ active_profile: 'codex-azure', active_runtime: 'codex', tmux_session: 'codex-main', runtime_profiles: profiles });
+    const calls = [];
+    const now = Date.now();
+    try {
+      writeRuntimeSwitchSignal({ zylosDir, change: { instanceId: 'single', fromProfile: 'codex-subscription', toProfile: 'codex-azure', reason: 'quota' }, nowMs: now, graceSec: 30 });
+      const monitorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-single-switch-monitor-'));
+      const adapter = { runtimeId: 'codex', displayName: 'Codex', sessionName: 'codex-main',
+        getHeartbeatDeps: () => ({ clearHeartbeatPending: () => calls.push('clearHeartbeatPending') }) };
+      const engine = { start: () => calls.push('start'), notifyColdStart: sec => calls.push(`cold:${sec}`),
+        enterRateLimited: () => calls.push('enterRateLimited') };
+      const noop = () => ({});
+      const orchestrator = new MonitorOrchestrator({
+        env: { ZYLOS_DIR: zylosDir }, monitorDir, getActiveAdapter: () => adapter, readConfigObject: () => ({}),
+        createToolPipeline: () => ({ pipeline: {}, toolRules: [] }), readWatchdogState: noop, createProcSampler: noop,
+        loadInitialHealth: () => ({ health: 'rate_limited', cooldown_until: Math.floor(now / 1000) + 3600, runtime_launch_at: now }),
+        createHealthEngine: () => engine, createGuardian: noop, startMessageRouterServer: () => {}, readDailyUpgradeEnabled: () => false,
+        createUsageMonitor: noop, createTaskScheduler: noop, initializeUsageMonitor: () => {}, startContextMonitor: noop,
+        scheduleStaleRuntimeCleanup: () => {}, log: () => {}, nowMs: () => now,
+      });
+      orchestrator.start();
+      assert.deepEqual(calls, ['clearHeartbeatPending', 'cold:30', 'start']);
+      fs.rmSync(monitorDir, { recursive: true, force: true });
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  it('holds last-known liveness while tmux is unresponsive instead of reporting the agent stopped', async () => {
+    const calls = [];
+    const now = Date.now();
+    const monitorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-single-hold-'));
+    const engine = { start() {}, setAgentRunning: (running) => calls.push(`running:${running}`), onProcessRestarted: () => calls.push('restarted') };
+    const guardian = { tick: async () => ({ state: 'indeterminate', skippedForIndeterminateProbe: true, attempted_restart: false, runtimeLaunchAtMs: 7 }) };
+    const noop = () => ({});
+    const orchestrator = new MonitorOrchestrator({
+      env: { ZYLOS_DIR: path.join(monitorDir, 'zylos') }, monitorDir,
+      getActiveAdapter: () => ({ runtimeId: 'codex', displayName: 'Codex', sessionName: 'codex-main' }), readConfigObject: () => ({}),
+      createToolPipeline: () => ({ pipeline: {}, toolRules: [] }), readWatchdogState: noop, createProcSampler: noop,
+      loadInitialHealth: () => ({ health: 'ok', runtime_launch_at: now }), createHealthEngine: () => engine, createGuardian: () => guardian,
+      startMessageRouterServer: () => {}, readDailyUpgradeEnabled: () => false, createUsageMonitor: noop, createTaskScheduler: noop,
+      initializeUsageMonitor: () => {}, startContextMonitor: noop, scheduleStaleRuntimeCleanup: () => {}, log: () => {}, nowMs: () => now,
+    });
+    try {
+      orchestrator.start();
+      await orchestrator.tickRuntimeLiveness({ currentTime: 100, checkDailyTruncate: () => {} });
+      assert.deepEqual(calls, []);
+    } finally {
+      fs.rmSync(monitorDir, { recursive: true, force: true });
+    }
   });
 });

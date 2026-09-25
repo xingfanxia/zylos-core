@@ -78,7 +78,9 @@ export class MessageRouter {
       return this._decision(request, { recovered: true, health: 'ok' });
     }
 
-    if (health === 'auth_failed') {
+    // auth_failure_hold instances answer at once instead of spending a probe
+    // on a user message while the credential is known to be broken.
+    if (health === 'auth_failed' && this.healthEngine.authFailureHold === true) {
       const userMessage = messageForRoute({ health, reason });
       this._writeNegativeCache(health, reason, userMessage, undefined);
       return this._decision(request, {
