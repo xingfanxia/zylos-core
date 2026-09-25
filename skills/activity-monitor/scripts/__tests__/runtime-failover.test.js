@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 
 import {
   chooseRuntimeProfile,
+  codexReserveObservation,
   planRuntimeFailover,
   planSingleSessionRuntimeFailover,
 } from '../runtime-failover.js';
@@ -399,6 +400,67 @@ describe('runtime failover selection', () => {
         blocked_at: '1970-01-01T00:00:10.000Z',
       },
     });
+  });
+});
+
+describe('Codex reserve-model guard (single session)', () => {
+  const nowMs = Date.parse('2026-09-25T02:00:00Z');
+  const writeRollout = (home, name, events, mtimeMs = nowMs - 60_000) => {
+    const dir = path.join(home, 'sessions', '2026', '09', '25');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-${name}.jsonl`);
+    fs.writeFileSync(file, events.map(e => JSON.stringify(e)).join('\n') + '\n');
+    fs.utimesSync(file, new Date(mtimeMs), new Date(mtimeMs));
+  };
+  const turn = (model, at) => ({ type: 'turn_context', timestamp: new Date(at).toISOString(), payload: { model, effort: 'high' } });
+  const reserve = at => ({ type: 'event_msg', timestamp: new Date(at).toISOString(),
+    payload: { type: 'thread_settings_applied', thread_settings: { model: 'gpt-reserve' } } });
+
+  it('finds a rollout whose latest model event is the reserve model, and nothing else', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'reserve-'));
+    try {
+      writeRollout(home, 'sub', [turn('gpt-5.6-sol', nowMs - 90_000)]);
+      assert.equal(codexReserveObservation(home, { sinceMs: nowMs - 600_000, nowMs }), null);
+      writeRollout(home, 'root', [turn('gpt-6-astra', nowMs - 120_000), reserve(nowMs - 70_000)]);
+      assert.equal(codexReserveObservation(home, { sinceMs: nowMs - 600_000, nowMs })?.model, 'gpt-reserve');
+      assert.equal(codexReserveObservation(home, { sinceMs: nowMs - 30_000, nowMs }), null);
+      writeRollout(home, 'root', [reserve(nowMs - 70_000), turn('gpt-6-astra', nowMs - 50_000)], nowMs - 40_000);
+      assert.equal(codexReserveObservation(home, { sinceMs: nowMs - 600_000, nowMs }), null);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  });
+
+  const single = (extra = {}) => ({
+    persona_id: 'swe', tmux_session: 'codex-main', monitor_name: 'activity-monitor', active_profile: 'codex-subscription',
+    runtime_profile_changed_at: new Date(nowMs - 3_600_000).toISOString(),
+    runtime_profiles: { 'codex-subscription': { runtime: 'codex', usage_provider: 'codex', codex_home: '~/.codex-subscription', model: 'gpt-6-astra' },
+      'codex-azure': { runtime: 'codex', usage_provider: null, codex_home: '~/.codex-azure', model: 'gpt-6-astra' } },
+    runtime_failover: { enabled: true, chain: ['codex-subscription', 'codex-azure'], switch_threshold: 95, recover_threshold: 90, min_dwell_sec: 300 },
+    ...extra,
+  });
+  const seen = value => ({ providers: { codex: { available: true, primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } } } });
+  const observed = { model: 'gpt-reserve', observedAtMs: nowMs - 30_000 };
+
+  it('fails over immediately from the reserve model', () => {
+    const { document, changes } = planSingleSessionRuntimeFailover({ document: single(), providerUsage: seen(99),
+      reserveObservation: observed, nowMs });
+    assert.equal(changes[0].toProfile, 'codex-azure');
+    assert.equal(changes[0].reason, 'model_downshift:gpt-reserve');
+    assert.equal(document.runtime_failover_blocked_profiles['codex-subscription'].health, 'rate_limited');
+  });
+
+  it('ignores an observation older than the last switch', () => {
+    const { changes } = planSingleSessionRuntimeFailover({ document: single(), providerUsage: seen(40),
+      reserveObservation: { model: 'gpt-reserve', observedAtMs: nowMs - 7_200_000 }, nowMs });
+    assert.equal(changes.length, 0);
+  });
+
+  it('suspends when no tier is usable and resumes when one recovers', () => {
+    const blocked = single({ runtime_failover_blocked_profiles: { 'codex-azure': { health: 'degraded' } } });
+    const first = planSingleSessionRuntimeFailover({ document: blocked, providerUsage: seen(99), reserveObservation: observed, nowMs });
+    assert.equal(first.changes[0].suspend, true);
+    assert.equal(first.changes[0].monitorName, 'activity-monitor');
+    assert.equal(first.document.runtime_failover_suspended.reason, 'model_downshift:gpt-reserve');
+    assert.equal(planSingleSessionRuntimeFailover({ document: first.document, providerUsage: seen(99), nowMs }).changes.length, 0);
   });
 });
 
