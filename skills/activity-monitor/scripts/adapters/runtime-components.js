@@ -45,6 +45,7 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   log,
   rateLimitDefaultCooldown,
   userMessageRecoveryCooldown,
+  heartbeatInterval,
 }) {
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
@@ -56,6 +57,7 @@ export function createHealthEngine(activeAdapter, initialStatus, {
     initialReason: initialStatus.unavailable_reason || '',
     rateLimitDefaultCooldown,
     userMessageRecoveryCooldown,
+    heartbeatInterval,
   });
 }
 
@@ -156,6 +158,7 @@ export function scheduleStaleRuntimeCleanup(activeAdapter, { log }) {
   // absent, the kill fails silently. The delay gives a running agent time to
   // finish its current response before being terminated.
   const otherSession = activeAdapter.runtimeId === 'codex' ? 'claude-main' : 'codex-main';
+  if (otherSession === activeAdapter.sessionName) return;
   setTimeout(() => {
     try {
       execSync(`tmux kill-session -t "${otherSession}" 2>/dev/null`, { stdio: 'pipe', timeout: 3000 });

@@ -36,6 +36,27 @@ export function isUsageOverlayCapture(capture) {
   return hasUsageHeader && hasEscHint;
 }
 
+// Only these informational/settings overlays may be cancelled automatically.
+// Approval dialogs take precedence, even if a settings title remains visible.
+export function getModalCapture(capture) {
+  const text = String(capture || '');
+  const tail = text.split('\n').slice(-24).join('\n');
+  // A footer above the last composer belongs to transcript/history. Only a
+  // modal's current footer (after its selected row) is evidence of blocked UI.
+  const lines = tail.split('\n');
+  const promptY = findPromptY(tail);
+  const footer = lines.slice(promptY >= 0 ? promptY : 0).join('\n');
+  const cancelHint = /esc(?:ape)?(?: to)? (?:cancel|close|go back|back|dismiss)/i.test(footer);
+  const selection = /(?:enter to (?:select|confirm)|[↑↓].*(?:navigate|select)|use (?:the )?arrow keys|^\s*[›❯]\s*\d+\.\s*(?:Yes|No|Allow|Approve)\b)/im.test(footer);
+  if (!cancelHint && !selection) return { modal: false, dismissibleOverlay: null };
+  const permission = /(?:would you like to (?:run|allow|proceed)|do you (?:want to|trust)|allow (?:once|always)|approval required|permission required)/i.test(tail);
+  if (permission) return { modal: true, dismissibleOverlay: null };
+  if (isUsageOverlayCapture(tail)) return { modal: true, dismissibleOverlay: 'usage' };
+  const hooks = /^\s*(?:[│┃]\s*)?(?:Hooks|Hooks settings|Settings:?[^\n]*\bHooks)\s*(?:[│┃])?$/im.test(tail);
+  if (hooks && cancelHint) return { modal: true, dismissibleOverlay: 'hooks' };
+  return { modal: true, dismissibleOverlay: null };
+}
+
 export function hasInProgressCapture(capture) {
   if (!capture) return false;
   const recentLines = String(capture)
@@ -43,7 +64,7 @@ export function hasInProgressCapture(capture) {
     .slice(-12)
     .map((line) => line.trim())
     .filter(Boolean);
-  return recentLines.some((line) => IN_PROGRESS_CAPTURE_PATTERNS.some((pattern) => pattern.test(line)));
+  return recentLines.some((line) => /esc to interrupt/i.test(line) || IN_PROGRESS_CAPTURE_PATTERNS.some((pattern) => pattern.test(line)));
 }
 
 function readCursorCoord(sessionName, format, execFileSyncImpl) {
@@ -73,6 +94,7 @@ function readPaneCapture(sessionName, execFileSyncImpl) {
 
 export function readTmuxInputState({
   sessionName,
+  runtime,
   execFileSyncImpl = execFileSync
 } = {}) {
   if (!sessionName) {
@@ -92,13 +114,19 @@ export function readTmuxInputState({
   const capture = readPaneCapture(sessionName, execFileSyncImpl);
   const captureOk = typeof capture === 'string';
   const usageOverlay = isUsageOverlayCapture(capture);
+  const { modal, dismissibleOverlay } = getModalCapture(capture);
   const inProgressCapture = captureOk ? hasInProgressCapture(capture) : false;
   const promptY = captureOk ? findPromptY(capture) : -1;
-  const promptVisible = promptY >= 0;
+  const promptVisible = promptY >= 0 && !modal;
+  const promptLine = captureOk && promptY >= 0 ? capture.split('\n')[promptY] : '';
+  const promptColumn = promptLine.search(/[›❯]/);
+  // Codex may indent its composer; the insertion position follows its chevron.
+  const emptyThreshold = (runtime === 'codex' || promptLine.includes('›'))
+    ? promptColumn + 2 : CURSOR_EMPTY_THRESHOLD;
 
   let inputState = 'indeterminate';
   if (cursorX >= 0 && cursorY >= 0 && promptVisible) {
-    if (cursorX > CURSOR_EMPTY_THRESHOLD) {
+    if (cursorX > emptyThreshold) {
       inputState = 'has_content';
     } else {
       inputState = cursorY === promptY ? 'empty' : 'has_content';
@@ -109,6 +137,8 @@ export function readTmuxInputState({
     promptVisible,
     inputState,
     usageOverlay,
+    modal,
+    dismissibleOverlay,
     inProgressCapture,
     captureOk,
     cursorX,
