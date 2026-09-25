@@ -55,6 +55,27 @@ export function startupContextRequired(env = process.env) {
   return /^(?:1|true|yes|on)$/i.test(String(env.ZYLOS_REQUIRE_STARTUP_CONTEXT || ''));
 }
 
+export function runtimeRoot(env = process.env) {
+  return env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+}
+
+// Execution-context receipts are consumed by the CL workflow platform on the
+// SWE/auto-reviewer agents only. Other agents opt in with config.json
+// `execution_context_receipts: true`; absent or unreadable config means off.
+export function executionContextReceiptsEnabled(zylosDir, { readFileSync = fs.readFileSync } = {}) {
+  try {
+    const config = JSON.parse(readFileSync(path.join(zylosDir, '.zylos', 'config.json'), 'utf8'));
+    return config.execution_context_receipts === true || config.execution_context_receipts === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function contextReceiptRecorder(zylosDir, options) {
+  if (!executionContextReceiptsEnabled(zylosDir, options)) return undefined;
+  return input => writeExecutionContextReceipt({ ...input, zylosDir });
+}
+
 export function installProcessBackstop({
   totalBudgetMs = DEFAULT_TOTAL_BUDGET_MS,
   exit = process.exit,
@@ -625,8 +646,7 @@ async function main() {
   try {
     if (shardName) {
       await runSessionStartShard(shardName, payload, {
-        recordContextReceipt: input => writeExecutionContextReceipt({ ...input,
-          zylosDir: process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos') }),
+        recordContextReceipt: contextReceiptRecorder(runtimeRoot()),
       });
     } else {
       await runSessionStartOrchestrator(payload, {
