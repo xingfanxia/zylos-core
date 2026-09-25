@@ -380,6 +380,13 @@ async function runShardSideEffect(name, payload, {
   // injection chain has finished, or the agent starts acting with no memory
   // in context. Wait on the last in-chain shard's flag; fail open past the
   // chain-tail deadline so the prompt is never permanently withheld.
+  // Without a receipt recorder a compaction has nothing to validate or record,
+  // so it skips at once (no chain-tail wait). With one, a compaction still
+  // validates the round and records a "continued" receipt before skipping.
+  if (source === 'compact' && !recordContextReceipt) {
+    await logStep({ name: 'session-start-prompt', source, status: 'skipped', durationMs: 0 });
+    return;
+  }
 
   let waitExtra = '';
   const tail = chain.at(-1);
