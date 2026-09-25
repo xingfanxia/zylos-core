@@ -100,7 +100,47 @@ and do not start another sync writer while one is in flight.
    under.
 8. Create checkpoint (only if conversations were fetched in step 2):
    `node ~/zylos/.claude/skills/comm-bridge/scripts/c4-checkpoint.js create <end_id> --summary "SUMMARY"`
-9. Confirm completion.
+9. Run the provenance audit on your own edits and fix anything it flags:
+   `node ~/zylos/.claude/skills/zylos-memory/scripts/provenance-audit.js`
+   Every flagged line is a fact you added without a citable source — either
+   add a `[src: ...]` tag, mark it `(unverified)`, or delete it. Do not finish
+   with unresolved flags.
+10. Snapshot memory to git so this cycle leaves an audit trail:
+    `node ~/zylos/.claude/skills/zylos-memory/scripts/daily-commit.js`
+11. Confirm completion.
+
+## Provenance & Anti-Confabulation (CRITICAL)
+
+This is the single most important rule for any process that WRITES memory
+(Memory Sync and Memory Dream both do). It exists because an unconstrained
+"consolidate / tidy up memory" pass is an LLM smoothing gaps with plausible
+inventions. A past dream cycle fabricated an appointment from unrelated real
+details, then propagated the invention across later cycles.
+
+**Memory records what was observed, never what is plausible.** Apply on every write:
+
+1. **Grounding rule.** Every NEW or CHANGED concrete datum — date, time,
+   appointment, deadline, money amount, account/card number, phone, name, ID,
+   address — MUST trace to an explicit source you can point at *this cycle*:
+   a specific C4 message, an email/calendar/API read you actually performed
+   this cycle, or an existing grounded memory entry you are copying verbatim.
+   No citable source means you may not write it as fact.
+2. **No synthesis to look complete.** Never invent or fill in a specific to
+   make an entry whole. A partially-known fact stays partial. Unknown time
+   stays unknown; an empty section stays empty.
+3. **Convert-dates rule, tightened.** Relative-to-absolute date conversion
+   applies only when the reference point is itself grounded. Show the basis.
+4. **Copy, don't regenerate.** Copy concrete facts forward character-for-
+   character. Rewriting prose is fine; changing a number, date, time, or
+   amount is forbidden unless a new source updates it.
+5. **Uncertainty is first-class.** Mark uncertain content `(unverified — basis:
+   ...)` or add a Needs Human Review note. Never launder a guess into fact.
+6. **Provenance tags on high-risk entries.** New appointment, deadline,
+   financial, or security entries carry an inline source tag such as
+   `[src: TG 2026-04-14 msg441]` or `[src: calendar 2026-06-22]`.
+
+When in doubt, write less. A missing fact costs a follow-up question; a
+confabulated fact costs trust and compounds silently.
 
 ## Classification Rules
 
@@ -145,6 +185,10 @@ worked example in `examples/`:
 - `memory-status.js`: quick health summary.
   Use when you need a fast manual check of core file sizes and budget status.
   If it reports `OVER`, run `consolidate.js` and perform the needed cleanup.
+- `provenance-audit.js`: anti-confabulation guard. Diffs `memory/` against the
+  last git snapshot and flags newly-added high-risk facts lacking a source or
+  uncertainty marker. Run it at the end of every Sync/Dream cycle and resolve
+  every flag before committing.
 
 C4 scripts used by sync flow (provided by comm-bridge skill):
 - `c4-fetch.js --unsummarized`: fetch unsummarized conversations and range.
