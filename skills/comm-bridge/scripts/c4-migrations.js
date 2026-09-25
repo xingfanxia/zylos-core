@@ -11,7 +11,7 @@ export function migrateSchema(database, { isNew }) {
 
 export function stripTrailingAckSuffix(content) {
   if (typeof content !== 'string') return content;
-  return content.replace(/\s---- ack via: node .+ ack --id \d+$/, '');
+  return content.replace(/\s---- ack via: (?!.*---- ack via: )[^\r\n]+ ack --id \d+$/, '');
 }
 
 function ensureControlQueueSchema(database) {

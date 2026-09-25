@@ -40,6 +40,25 @@ function hasMemoryChanges() {
   return output.trim().length > 0;
 }
 
+// Deterministic anti-confabulation check on every snapshot. Surfaces (never
+// blocks — losing a memory write is worse than an unsourced fact) any new
+// high-risk datum that lacks a source. Runs against the working tree vs HEAD,
+// so it must fire BEFORE `git add`. See provenance-audit.js + SKILL.md.
+function runProvenanceAudit() {
+  const audit = path.join(path.dirname(fileURLToPath(import.meta.url)), 'provenance-audit.js');
+  try {
+    const out = execFileSync('node', [audit], {
+      cwd: MEMORY_DIR,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    if (out.trim()) process.stdout.write(out.endsWith('\n') ? out : out + '\n');
+  } catch (err) {
+    // Advisory only — never let an audit hiccup block the snapshot.
+    console.error(`provenance-audit skipped: ${err?.message || err}`);
+  }
+}
+
 function main() {
   try {
     ensureGitRepo();
@@ -48,6 +67,8 @@ function main() {
       console.log('No memory changes to commit.');
       return;
     }
+
+    runProvenanceAudit();
 
     const tz = loadTimezoneFromEnv();
     const dateStr = dateInTimeZone(new Date(), tz);

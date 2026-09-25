@@ -1,13 +1,30 @@
+import { consumeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import path from 'node:path';
 import fs from 'fs';
 import {
   WATCHDOG_INTERRUPT_AVAILABLE_IN_SEC,
   evaluateToolWatchdogTransition,
 } from './tool-watchdog.js';
 
+// Older single-session adapters predate runtimeProfile metadata. Bind the
+// switch signal to the actual runtime and pane in the existing profile file.
+export function startupRuntimeProfile(adapter, env) {
+  if (adapter?.config?.runtimeProfile?.id) return adapter.config.runtimeProfile.id;
+  if (env.ZYLOS_INSTANCE_ID || !env.ZYLOS_DIR) return null;
+  try {
+    const p = JSON.parse(fs.readFileSync(path.join(env.ZYLOS_DIR, '.zylos', 'runtime-profiles.json'), 'utf8'));
+    const selected = p.runtime_profiles?.[p.active_profile];
+    if (p.active_runtime !== adapter.runtimeId || selected?.runtime !== adapter.runtimeId
+        || (p.tmux_session && p.tmux_session !== adapter.sessionName)) return null;
+    return p.active_profile;
+  } catch { return null; }
+}
+
 export class MonitorOrchestrator {
   constructor(deps) {
     this.deps = deps;
     this.components = null;
+    this._lastIndeterminateLogAt = 0;
   }
 
   start() {
@@ -51,9 +68,22 @@ export class MonitorOrchestrator {
     const runtimeLaunchAtMs = Number(initialStatus.runtime_launch_at) || nowMs();
 
     const engine = createHealthEngine(adapter, initialStatus);
+    const activeProfile = startupRuntimeProfile(adapter, env);
+    const runtimeSwitchSignal = consumeRuntimeSwitchSignal({
+      zylosDir: env.ZYLOS_DIR,
+      instanceId: env.ZYLOS_INSTANCE_ID || 'single',
+      activeProfile,
+      nowMs: nowMs(),
+    });
+    if (runtimeSwitchSignal) {
+      adapter.getHeartbeatDeps?.()?.clearHeartbeatPending?.();
+      engine.notifyColdStart(runtimeSwitchSignal.grace_sec);
+      log(`Runtime switch to ${activeProfile}: cold-start grace ${runtimeSwitchSignal.grace_sec}s`);
+    }
+
     const guardian = createGuardian(adapter, toolPipeline, runtimeLaunchAtMs);
 
-    if (initialHealth === 'rate_limited' && initialStatus.cooldown_until) {
+    if (!runtimeSwitchSignal && initialHealth === 'rate_limited' && initialStatus.cooldown_until) {
       engine.enterRateLimited(initialStatus.cooldown_until, initialStatus.rate_limit_reset || '');
     }
     engine.start();
@@ -70,7 +100,7 @@ export class MonitorOrchestrator {
 
     const contextMonitor = startContextMonitor(adapter);
 
-    if (initialHealth !== 'ok') {
+    if (!runtimeSwitchSignal && initialHealth !== 'ok') {
       log(`Startup with health=${initialHealth}; will verify immediately when ${adapter.displayName} is running`);
     }
 
@@ -102,7 +132,11 @@ export class MonitorOrchestrator {
     const { engine, guardian } = this.components;
     const guardianResult = await guardian.tick({ currentTime });
     this.components.runtimeLaunchAtMs = guardianResult.runtimeLaunchAtMs;
-    engine.setAgentRunning(guardianResult.state === 'running', currentTime);
+    // On an indeterminate probe (tmux unresponsive) the guardian holds; retain
+    // the last-known liveness rather than flipping the agent to "not running".
+    if (!guardianResult.skippedForIndeterminateProbe) {
+      engine.setAgentRunning(guardianResult.state === 'running', currentTime);
+    }
     if (guardianResult.attempted_restart) {
       engine.onProcessRestarted(currentTime);
     }
@@ -274,6 +308,21 @@ export class MonitorOrchestrator {
       runtimeLaunchAtMs: livenessTick.runtimeLaunchAtMs,
     };
     const guardianResult = livenessTick.guardianResult;
+
+    if (guardianResult.skippedForIndeterminateProbe) {
+      // tmux is unresponsive — hold last-known state, never restart. Retain the
+      // prior status file (a sustained hang lets it go stale naturally within
+      // ~5s, which the c4-dispatcher already degrades to offline); just emit a
+      // throttled warning. Note: taskScheduler.tick is intentionally skipped here
+      // (both the running and not-running paths call it) — the agent is
+      // unreachable while tmux hangs, so firing scheduled work is pointless;
+      // the scheduler resumes on the next determinate tick.
+      if (currentTime - this._lastIndeterminateLogAt >= 30) {
+        this.deps.log(`State: INDETERMINATE (holding, not restarting) — ${guardianResult.message}`);
+        this._lastIndeterminateLogAt = currentTime;
+      }
+      return { ...nextState };
+    }
 
     if (guardianResult.skippedForStartupGrace) {
       return {

@@ -78,6 +78,17 @@ export class MessageRouter {
       return this._decision(request, { recovered: true, health: 'ok' });
     }
 
+    if (health === 'auth_failed') {
+      const userMessage = messageForRoute({ health, reason });
+      this._writeNegativeCache(health, reason, userMessage, undefined);
+      return this._decision(request, {
+        recovered: false,
+        health,
+        reason,
+        userMessage: request.noReply ? undefined : userMessage,
+      });
+    }
+
     let forceProbe = false;
     if (!request.noReply && typeof this.healthEngine.notifyUserMessage === 'function') {
       forceProbe = this.healthEngine.notifyUserMessage(Math.floor(this.now() / 1000));

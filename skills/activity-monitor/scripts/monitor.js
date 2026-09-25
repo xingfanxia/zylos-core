@@ -987,6 +987,7 @@ function createHealthEngine(activeAdapter, initialStatus) {
     log,
     rateLimitDefaultCooldown: RATE_LIMIT_DEFAULT_COOLDOWN,
     userMessageRecoveryCooldown: USER_MESSAGE_RECOVERY_COOLDOWN,
+    heartbeatInterval: Math.min(86400, Math.max(600, readConfigInt('heartbeat_interval', 1800))),
   });
 }
 
