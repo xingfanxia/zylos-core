@@ -112,6 +112,8 @@ export class HealthEngine {
     this.maintenanceTimer = null;
 
     // API error detection throttle
+    this._lastStructuredQuotaScanAt = 0;
+    this.warmupUntil = 0;
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
 
     // OK-path detection debounce counters, advanced by dispatcher delivery notifications.
@@ -189,6 +191,19 @@ export class HealthEngine {
    * Formula: min(3600, 60 × 5^(n-1)) where n = restartFailureCount
    * Sequence: 60s, 300s, 1500s, 3600s, 3600s, ...
    */
+  notifyColdStart(seconds) {
+    const nowSec = Math.floor(this.now() / 1000);
+    this.warmupUntil = nowSec + seconds;
+    // Make the first functional probe due exactly when warmup ends. Carrying
+    // the previous profile's degraded health into a fresh adapter caused a
+    // five-second post-restart probe to race Codex startup and quarantine a
+    // healthy fallback before it could consume the heartbeat.
+    this.lastHeartbeatAt = nowSec - this.heartbeatInterval + seconds;
+    this.setHealth('ok', `cold_start_grace_${seconds}s`);
+    this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
+  }
+
+
   getBackoffDelay() {
     if (this.restartFailureCount <= 0) return 0;
     return Math.min(3600, 60 * Math.pow(5, this.restartFailureCount - 1));
@@ -272,7 +287,21 @@ export class HealthEngine {
   }
 
   runMaintenanceCycle(agentRunning, currentTime) {
+    if (currentTime < this.warmupUntil) return;
     // Track agentRunning transitions for process signal acceleration
+    // A verified terminal provider error does not need a second user message or
+    // a failed periodic heartbeat. Only runtimes with a structured detector use
+    // this path; quoted pane text keeps the existing behavioral checks.
+    if (agentRunning && this.healthState === 'ok' && this.deps.detectStructuredRateLimit
+        && currentTime - this._lastStructuredQuotaScanAt >= 5) {
+      this._lastStructuredQuotaScanAt = currentTime;
+      const limit = this.deps.detectStructuredRateLimit();
+      if (limit?.detected === true && limit.structured === true) {
+        this.enterRateLimited(limit.cooldownUntil || currentTime + this.rateLimitDefaultCooldown, limit.resetTime || '');
+        return;
+      }
+    }
+
     this._trackAgentRunning(agentRunning, currentTime);
 
     const pending = this.deps.readHeartbeatPending();

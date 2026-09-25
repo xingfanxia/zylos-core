@@ -44,7 +44,7 @@ import { buildKickPrompt } from './kick-prompt.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const SESSION = 'codex-main';
+const SESSION = process.env.ZYLOS_TMUX_SESSION || 'codex-main';
 const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 
 // When CODEX_BYPASS_PERMISSIONS=false, skip --dangerously-bypass-approvals-and-sandbox.
@@ -73,7 +73,7 @@ function getCodexApiBaseUrl() {
 export class CodexAdapter extends RuntimeAdapter {
   get displayName() { return 'Codex'; }
   get runtimeId() { return 'codex'; }
-  get sessionName()  { return 'codex-main'; }
+  get sessionName()  { return SESSION; }
 
   // ── Instruction file ───────────────────────────────────────────────────────
 
