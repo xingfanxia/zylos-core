@@ -112,6 +112,8 @@ export class HealthEngine {
     this.maintenanceTimer = null;
 
     // API error detection throttle
+    this._lastStructuredQuotaScanAt = 0;
+    this.warmupUntil = 0;
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
 
     // OK-path detection debounce counters, advanced by dispatcher delivery notifications.
@@ -189,6 +191,19 @@ export class HealthEngine {
    * Formula: min(3600, 60 × 5^(n-1)) where n = restartFailureCount
    * Sequence: 60s, 300s, 1500s, 3600s, 3600s, ...
    */
+  notifyColdStart(seconds) {
+    const nowSec = Math.floor(this.now() / 1000);
+    this.warmupUntil = nowSec + seconds;
+    // Make the first functional probe due exactly when warmup ends. Carrying
+    // the previous profile's degraded health into a fresh adapter caused a
+    // five-second post-restart probe to race Codex startup and quarantine a
+    // healthy fallback before it could consume the heartbeat.
+    this.lastHeartbeatAt = nowSec - this.heartbeatInterval + seconds;
+    this.setHealth('ok', `cold_start_grace_${seconds}s`);
+    this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
+  }
+
+
   getBackoffDelay() {
     if (this.restartFailureCount <= 0) return 0;
     return Math.min(3600, 60 * Math.pow(5, this.restartFailureCount - 1));
@@ -272,7 +287,21 @@ export class HealthEngine {
   }
 
   runMaintenanceCycle(agentRunning, currentTime) {
+    if (currentTime < this.warmupUntil) return;
     // Track agentRunning transitions for process signal acceleration
+    // A verified terminal provider error does not need a second user message or
+    // a failed periodic heartbeat. Only runtimes with a structured detector use
+    // this path; quoted pane text keeps the existing behavioral checks.
+    if (agentRunning && this.healthState === 'ok' && this.deps.detectStructuredRateLimit
+        && currentTime - this._lastStructuredQuotaScanAt >= 5) {
+      this._lastStructuredQuotaScanAt = currentTime;
+      const limit = this.deps.detectStructuredRateLimit();
+      if (limit?.detected === true && limit.structured === true) {
+        this.enterRateLimited(limit.cooldownUntil || currentTime + this.rateLimitDefaultCooldown, limit.resetTime || '');
+        return;
+      }
+    }
+
     this._trackAgentRunning(agentRunning, currentTime);
 
     const pending = this.deps.readHeartbeatPending();
@@ -336,6 +365,16 @@ export class HealthEngine {
 
     if (!agentRunning) {
       return;
+    }
+
+    if (isPostRestartProbeState(this.healthState) && this.deps.detectAuthFailure) {
+      const authFailure = this.deps.detectAuthFailure();
+      if (authFailure.detected) {
+        this.restartFailureCount = 0;
+        this.signalDetectedAt = 0;
+        this.setHealth('auth_failed', authFailure.pattern || 'auth_failure_detected');
+        return;
+      }
     }
 
     // Process signal acceleration: agentRunning just transitioned false→true,
@@ -452,6 +491,17 @@ export class HealthEngine {
     // a rate limit. This is the "behavioral + text" dual-signal approach:
     // heartbeat failed (behavioral) AND tmux shows rate limit text (text signal).
     // Only checked in states where a heartbeat failure may otherwise change health.
+    if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState) || this.healthState === 'rate_limited') && this.deps.detectAuthFailure) {
+      const authFailure = this.deps.detectAuthFailure();
+      if (authFailure.detected) {
+        this.restartFailureCount = 0;
+        this.lastRecoveryAt = now;
+        this.deps.log(`Auth failure detected after heartbeat ${status}: ${authFailure.pattern || 'unknown'}; suppressing restart`);
+        this.setHealth('auth_failed', authFailure.pattern || 'auth_failure_detected');
+        return;
+      }
+    }
+
     if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState) || this.healthState === 'rate_limited') && this.deps.detectRateLimit) {
       const rateLimit = this.deps.detectRateLimit();
       if (rateLimit.detected) {
@@ -517,7 +567,7 @@ export class HealthEngine {
     const authFailure = this.deps.detectAuthFailure ? this.deps.detectAuthFailure() : { detected: false };
     if (authFailure.detected) {
       const authResult = await this._checkAuth();
-      if (authResult && authResult.status === 'failure') {
+      if (getAuthCheckStatus(authResult) === 'failure') {
         this.rateLimitConsecutiveHits = 0;
         this.stickyErrorConsecutiveHits = 0;
         this.lastStickyErrorHitAt = 0;
@@ -572,20 +622,21 @@ export class HealthEngine {
     this.lastRecoveryAt = Math.floor(Date.now() / 1000);
 
     if (this.healthState === 'auth_failed') {
-      const authResult = await this._checkAuth();
-      if (authResult.status === 'success') {
-        const now = Math.floor(Date.now() / 1000);
-        this.deps.log('Auth probe recovered; restarting session before marking healthy');
-        this.restartFailureCount = 0;
-        this.lastRecoveryAt = now;
-        this.recoveringStartedAt = now;
-        this.setHealth('unavailable', 'auth_recovered_restart');
-        this.deps.killTmuxSession();
-        return { recovered: false, health: 'unavailable', restartTriggered: true };
+      const authFailure = this.deps.detectAuthFailure ? this.deps.detectAuthFailure() : { detected: false };
+      if (authFailure.detected) {
+        const reason = authFailure.pattern || this.healthReason || 'auth_still_failed';
+        this.setHealth('auth_failed', reason);
+        return { recovered: false, health: 'auth_failed', reason };
       }
-      const reason = authResult.reason || 'auth_still_failed';
-      this.setHealth('auth_failed', reason);
-      return { recovered: false, health: 'auth_failed', reason };
+
+      const authResult = await this._checkAuth();
+      if (getAuthCheckStatus(authResult) !== 'success') {
+        const reason = authResult.reason || 'auth_still_failed';
+        this.setHealth('auth_failed', reason);
+        return { recovered: false, health: 'auth_failed', reason };
+      }
+
+      this.deps.log('Auth probe passed; verifying runtime with heartbeat before marking healthy');
     }
 
     let pending = this.deps.readHeartbeatPending();
@@ -721,3 +772,13 @@ export class HealthEngine {
 }
 
 export { HealthEngine as HeartbeatEngine };
+
+function getAuthCheckStatus(authResult) {
+  if (!authResult) return 'uncertain';
+  if (authResult.status === 'success' || authResult.status === 'failure' || authResult.status === 'uncertain') {
+    return authResult.status;
+  }
+  if (authResult.ok === true) return 'success';
+  if (authResult.ok === false) return 'failure';
+  return 'uncertain';
+}

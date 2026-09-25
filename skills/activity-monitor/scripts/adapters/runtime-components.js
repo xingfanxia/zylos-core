@@ -43,6 +43,7 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   log,
   rateLimitDefaultCooldown,
   userMessageRecoveryCooldown,
+  heartbeatInterval,
 }) {
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
@@ -54,6 +55,7 @@ export function createHealthEngine(activeAdapter, initialStatus, {
     initialReason: initialStatus.unavailable_reason || '',
     rateLimitDefaultCooldown,
     userMessageRecoveryCooldown,
+    heartbeatInterval,
   });
 }
 
