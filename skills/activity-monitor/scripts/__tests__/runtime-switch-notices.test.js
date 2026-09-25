@@ -88,6 +88,10 @@ it('names each Claude account and its own quota in a pool switch', () => {
   assert.match(text, /Claude 主订阅 → Claude 备用订阅/);
   assert.match(text, /Claude 主订阅 本周额度已用 96%/); assert.match(text, /Claude 备用订阅 本周额度已用 15%/);
 });
+it('explains a reserve-model downshift switch', () => {
+  const event = { changes: [{ instanceId: 'user-pan', fromProfile: 'codex-subscription', toProfile: 'codex-azure', reason: 'model_downshift:gpt-reserve' }] };
+  assert.match(formatSwitchNotice(event, 'started', {}, null, now), /备用模型不允许使用/);
+});
 it('describes an operator primary-route change as configured, not as a failure', () => {
   const event = { changes: [{ instanceId: 'user-pan', fromProfile: 'codex-subscription', toProfile: 'claude-subscription', reason: 'configured_primary:claude-subscription' }] };
   const text = formatSwitchNotice(event, 'started', {}, null, now);

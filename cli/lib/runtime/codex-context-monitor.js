@@ -112,6 +112,22 @@ export class CodexContextMonitor extends ContextMonitorBase {
       let lines = complete.split('\n');
       if (start > 0 && !(same && start === cached.offset)) lines = lines.slice(1);
       for (const line of lines) {
+        // The TUI records a reserve-model switch as thread settings before the
+        // next turn runs; report it immediately so failover can act.
+        if (line.includes('"thread_settings_applied"')) {
+          let event;
+          try { event = JSON.parse(line); } catch { continue; }
+          const settings = event.type === 'event_msg' && event.payload?.type === 'thread_settings_applied'
+            ? event.payload.thread_settings : null;
+          const observed = Date.parse(event.timestamp);
+          if (!settings || typeof settings.model !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,79}$/.test(settings.model)
+            || !Number.isFinite(observed)) continue;
+          const effort = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(settings.reasoning_effort)
+            ? settings.reasoning_effort : null;
+          metadata = { actualModel: settings.model, actualReasoningEffort: effort,
+            actualModelSource: 'rollout_thread_settings', actualModelObservedAt: new Date(observed).toISOString() };
+          continue;
+        }
         if (!line.includes('"turn_context"')) continue;
         let event;
         try { event = JSON.parse(line); } catch { continue; }
@@ -129,7 +145,7 @@ export class CodexContextMonitor extends ContextMonitorBase {
         offset: start + end + 1, metadata };
       // A partially written new turn must not appear to use the previous model.
       const partial = buf.subarray(end + 1).toString('utf8');
-      return partial.includes('"turn_context"') ? {} : metadata || {};
+      return partial.includes('"turn_context"') || partial.includes('"thread_settings_applied"') ? {} : metadata || {};
     } catch { return {}; }
   }
 
