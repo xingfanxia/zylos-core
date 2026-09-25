@@ -24,6 +24,7 @@ export class MonitorOrchestrator {
   constructor(deps) {
     this.deps = deps;
     this.components = null;
+    this._lastIndeterminateLogAt = 0;
   }
 
   start() {
@@ -131,7 +132,11 @@ export class MonitorOrchestrator {
     const { engine, guardian } = this.components;
     const guardianResult = await guardian.tick({ currentTime });
     this.components.runtimeLaunchAtMs = guardianResult.runtimeLaunchAtMs;
-    engine.setAgentRunning(guardianResult.state === 'running', currentTime);
+    // On an indeterminate probe (tmux unresponsive) the guardian holds; retain
+    // the last-known liveness rather than flipping the agent to "not running".
+    if (!guardianResult.skippedForIndeterminateProbe) {
+      engine.setAgentRunning(guardianResult.state === 'running', currentTime);
+    }
     if (guardianResult.attempted_restart) {
       engine.onProcessRestarted(currentTime);
     }
@@ -303,6 +308,21 @@ export class MonitorOrchestrator {
       runtimeLaunchAtMs: livenessTick.runtimeLaunchAtMs,
     };
     const guardianResult = livenessTick.guardianResult;
+
+    if (guardianResult.skippedForIndeterminateProbe) {
+      // tmux is unresponsive — hold last-known state, never restart. Retain the
+      // prior status file (a sustained hang lets it go stale naturally within
+      // ~5s, which the c4-dispatcher already degrades to offline); just emit a
+      // throttled warning. Note: taskScheduler.tick is intentionally skipped here
+      // (both the running and not-running paths call it) — the agent is
+      // unreachable while tmux hangs, so firing scheduled work is pointless;
+      // the scheduler resumes on the next determinate tick.
+      if (currentTime - this._lastIndeterminateLogAt >= 30) {
+        this.deps.log(`State: INDETERMINATE (holding, not restarting) — ${guardianResult.message}`);
+        this._lastIndeterminateLogAt = currentTime;
+      }
+      return { ...nextState };
+    }
 
     if (guardianResult.skippedForStartupGrace) {
       return {
