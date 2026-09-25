@@ -63,6 +63,7 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
+let singleSessionSettlement = null;
 
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const NOTIFY_DELIVERED_TIMEOUT_MS = 5000;
@@ -587,9 +588,9 @@ async function waitForRequireIdleSettlement(msgId) {
   log(`block_queue_until_idle item id=${msgId}: timeout after ${REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS}ms, continuing`);
 }
 
-function claimNextItem() {
+function claimNextItem({ allowRequireIdle = true, conversationsOnly = false } = {}) {
   const current = nowSeconds();
-  const control = getNextPendingControl(current);
+  const control = conversationsOnly ? null : getNextPendingControl(current, { allowRequireIdle });
   if (control) {
     if (claimControl(control.id)) {
       return { ...control, type: 'control' };
@@ -600,12 +601,43 @@ function claimNextItem() {
     return null;
   }
 
-  const msg = getNextPending();
+  const msg = getNextPending({ allowRequireIdle });
   if (msg && claimConversation(msg.id)) {
     return { ...msg, type: 'conversation' };
   }
 
   return null;
+}
+
+export function beginSingleSessionSettlement(msgId, now = Date.now()) {
+  singleSessionSettlement = {
+    msgId,
+    holdUntil: now + REQUIRE_IDLE_POST_SEND_HOLD_MS,
+    deadline: now + REQUIRE_IDLE_POST_SEND_HOLD_MS + REQUIRE_IDLE_EXECUTION_MAX_WAIT_MS,
+  };
+  log(`block_queue_until_idle item id=${msgId}: hold ${REQUIRE_IDLE_POST_SEND_HOLD_MS}ms, then allow ordinary conversations while background work settles`);
+}
+
+export function claimNextSingleSessionItem(agentState, now = Date.now()) {
+  if (singleSessionSettlement) {
+    // Preserve the short startup hold, including for lifecycle commands.
+    if (now < singleSessionSettlement.holdUntil) return null;
+
+    const settled = ['idle', 'offline', 'stopped'].includes(agentState.state);
+    const timedOut = now >= singleSessionSettlement.deadline;
+    if (settled || timedOut) {
+      log(`block_queue_until_idle item id=${singleSessionSettlement.msgId}: ${timedOut ? 'timeout' : `settled with agent state=${agentState.state}`}, continuing`);
+      singleSessionSettlement = null;
+    }
+  }
+
+  // Keep later controls and idle-only conversations serialized without
+  // blocking ordinary messages from reaching the existing busy session.
+  return claimNextItem({
+    conversationsOnly: singleSessionSettlement !== null,
+    allowRequireIdle: singleSessionSettlement === null &&
+      agentState.state === 'idle' && agentState.idleSeconds >= REQUIRE_IDLE_MIN_SECONDS,
+  });
 }
 
 function maybeCleanupControlQueue() {
@@ -639,7 +671,7 @@ async function processNextMessage() {
     tmuxMissingChecks = 0;
   }
 
-  const item = claimNextItem();
+  const item = claimNextSingleSessionItem(agentState);
   if (!item) {
     return { delivered: false, state: agentState.state };
   }
@@ -727,7 +759,7 @@ async function processNextMessage() {
     }
 
     if (item.require_idle === 1) {
-      await waitForRequireIdleSettlement(item.id);
+      beginSingleSessionSettlement(item.id);
     }
     return { delivered: true, state: agentState.state };
   }

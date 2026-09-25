@@ -57,7 +57,11 @@ function initSchema() {
 
 export function stripTrailingAckSuffix(content) {
   if (typeof content !== 'string') return content;
-  return content.replace(/\s---- ack via: node .+ ack --id \d+$/, '');
+  return content.replace(/\s---- ack via: (?!.*---- ack via: )[^\r\n]+ ack --id \d+$/, '');
+}
+
+function quoteShellArg(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function ensureControlQueueSchema(database) {
@@ -244,15 +248,16 @@ export function getStatusNoticeCooldowns() {
  * Get next pending message from queue (priority-based, then FIFO)
  * @returns {object|null} - highest priority pending message or null
  */
-export function getNextPending() {
+export function getNextPending({ allowRequireIdle = true } = {}) {
   const db = getDb();
   return db.prepare(`
     SELECT id, direction, channel, endpoint_id, content, timestamp, priority, require_idle, retry_count
     FROM conversations
     WHERE direction = 'in' AND status = 'pending'
+      AND (? OR COALESCE(require_idle, 0) = 0)
     ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
     LIMIT 1
-  `).get() || null;
+  `).get(allowRequireIdle ? 1 : 0) || null;
 }
 
 /**
@@ -385,8 +390,11 @@ export function insertControl(content, options = {}) {
     if (appendAckSuffix) {
       // Control acknowledgements are stored with the queued control item so
       // the ack ID remains attached to the exact work item being delivered.
+      // Reuse the executable that successfully loaded this process and its
+      // native dependencies. A bare `node` can resolve to a different ABI in
+      // the recipient's interactive PATH and make every acknowledgement fail.
       const controlScriptPath = path.join(__dirname, 'c4-control.js');
-      const ackSuffix = ` ---- ack via: node ${controlScriptPath} ack --id ${id}`;
+      const ackSuffix = ` ---- ack via: ${quoteShellArg(process.execPath)} ${quoteShellArg(controlScriptPath)} ack --id ${id}`;
       finalContent = content + ackSuffix;
     }
 
@@ -444,7 +452,7 @@ export function getControlById(id) {
  * @param {number} current - unix seconds
  * @returns {object|null}
  */
-export function getNextPendingControl(current = nowSeconds()) {
+export function getNextPendingControl(current = nowSeconds(), { allowRequireIdle = true } = {}) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
@@ -452,9 +460,10 @@ export function getNextPendingControl(current = nowSeconds()) {
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
+      AND (? OR COALESCE(require_idle, 0) = 0)
     ORDER BY COALESCE(priority, 3) ASC, id ASC
     LIMIT 1
-  `).get(current) || null;
+  `).get(current, allowRequireIdle ? 1 : 0) || null;
 }
 
 /**
