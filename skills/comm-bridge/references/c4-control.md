@@ -94,10 +94,13 @@ By default, when a control message is enqueued, the C4 layer automatically appen
 The stored content will include a suffix like:
 
 ```
----- ack via: node /path/to/c4-control.js ack --id 42
+---- ack via: '/absolute/path/to/node' '/path/to/c4-control.js' ack --id 42
 ```
 
 Callers do **not** need to include ack instructions in `--content`. The recipient uses the appended suffix to acknowledge the control after processing.
+The executable is the same absolute Node runtime that enqueued the control, so
+an interactive shell cannot silently switch the acknowledgement to an
+ABI-incompatible system Node.
 
 For slash-style controls that must stay as a clean command (for example `/clear` in Codex), use `--no-ack-suffix`. In that mode, dispatcher marks the control as `done` immediately after successful submit.
 
