@@ -594,6 +594,26 @@ describe('HealthEngine', () => {
       assert.deepStrictEqual(calls.enqueueHeartbeat, []);
     });
 
+    // Fork rebase onto 0.9.5: the non-hold auth branch keeps upstream's fence, so
+    // a heartbeat ACK that lands during the credential check is not undone.
+    for (const status of ['success', 'failure']) {
+      it(`a stale auth ${status} after an intervening heartbeat ACK changes nothing`, async () => {
+        const { deps, calls } = createMockDeps();
+        let resolveAuth;
+        deps.checkAuth = () => new Promise(resolve => { resolveAuth = resolve; });
+        const engine = new HeartbeatEngine(deps, { initialHealth: 'auth_failed' });
+        const probe = engine.runRecoveryProbe({ timeoutMs: 100, pollIntervalMs: 1 });
+        await new Promise(resolve => setImmediate(resolve));
+        engine.onHeartbeatSuccess('post_restart', null);
+        assert.equal(engine.health, 'ok');
+        resolveAuth({ status, reason: 'auth_still_failed' });
+        const result = await probe;
+        assert.equal(result.reason, 'stale_probe');
+        assert.equal(engine.health, 'ok');
+        assert.equal(calls.killTmuxSession, 0);
+      });
+    }
+
     it('keeps auth_failed when direct auth check still fails', async () => {
       const { deps, calls } = createMockDeps();
       deps.checkAuth = async () => ({ status: 'failure', reason: 'auth_still_failed' });
@@ -1298,6 +1318,94 @@ describe('HealthEngine', () => {
 
       assert.equal(calls.killTmuxSession, 0);
       assert.equal(engine.health, 'ok');
+    });
+  });
+
+  // CL SWE/auto-reviewer run with config `auth_failure_hold: true`; every other
+  // single-session agent keeps the upstream flow (option absent).
+  describe('auth_failure_hold (per-instance config)', () => {
+    it('requires heartbeat success before recovering from auth_failed after checkAuth succeeds', async () => {
+      const { deps, calls } = createMockDeps();
+      deps.checkAuth = async () => ({ status: 'success' });
+      deps._pending = { control_id: 7, phase: 'post_restart', created_at: 1000 };
+      deps._heartbeatStatus = 'done';
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'auth_failed', authFailureHold: true });
+
+      const result = await engine.runRecoveryProbe({ timeoutMs: 100, pollIntervalMs: 1 });
+
+      assert.equal(result.recovered, true);
+      assert.equal(engine.health, 'ok');
+      assert.equal(calls.killTmuxSession, 0);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, []);
+    });
+
+    it('keeps auth_failed when the pane still shows an auth failure even if checkAuth would pass', async () => {
+      const { deps, calls } = createMockDeps();
+      let checkAuthCalls = 0;
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'token_expired' });
+      deps.checkAuth = async () => { checkAuthCalls++; return { status: 'success' }; };
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'auth_failed', authFailureHold: true });
+
+      const result = await engine.runRecoveryProbe({ timeoutMs: 100, pollIntervalMs: 1 });
+
+      assert.equal(result.recovered, false);
+      assert.equal(result.health, 'auth_failed');
+      assert.equal(result.reason, 'token_expired');
+      assert.equal(checkAuthCalls, 0);
+      assert.equal(calls.killTmuxSession, 0);
+      assert.deepStrictEqual(calls.enqueueHeartbeat, []);
+    });
+
+    it('enters auth_failed without restart when a running unavailable pane shows auth failure', () => {
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'token_expired' });
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'unavailable', authFailureHold: true });
+
+      engine.processHeartbeat(true, Math.floor(Date.now() / 1000));
+
+      assert.equal(engine.health, 'auth_failed');
+      assert.equal(engine.healthReason, 'token_expired');
+      assert.deepStrictEqual(calls.enqueueHeartbeat, []);
+      assert.equal(calls.killTmuxSession, 0);
+    });
+
+    it('enters auth_failed and does not restart when heartbeat fails on an auth error pane', () => {
+      const { deps, calls } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'token_expired' });
+      deps.detectRateLimit = () => ({ detected: false });
+      deps._pending = { control_id: 1, phase: 'primary', created_at: 1000 };
+      deps._heartbeatStatus = 'timeout';
+      const engine = new HeartbeatEngine(deps, { authFailureHold: true });
+
+      engine.processHeartbeat(true, 1500);
+
+      assert.equal(engine.health, 'auth_failed');
+      assert.equal(engine.healthReason, 'token_expired');
+      assert.equal(calls.killTmuxSession, 0);
+      assert.equal(calls.clearHeartbeatPending, 1);
+    });
+
+    it('without the option, a pane auth match on a running unavailable agent keeps upstream recovery', () => {
+      const { deps } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'token_expired' });
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'unavailable' });
+
+      engine.processHeartbeat(true, Math.floor(Date.now() / 1000));
+
+      assert.notEqual(engine.health, 'auth_failed');
+    });
+
+    it('without the option, a heartbeat failure on an auth pane never parks in auth_failed unverified', () => {
+      const { deps } = createMockDeps();
+      deps.detectAuthFailure = () => ({ detected: true, pattern: 'token_expired' });
+      deps.detectRateLimit = () => ({ detected: false });
+      deps._pending = { control_id: 1, phase: 'primary', created_at: 1000 };
+      deps._heartbeatStatus = 'timeout';
+      const engine = new HeartbeatEngine(deps);
+
+      engine.processHeartbeat(true, 1500);
+
+      assert.notEqual(engine.health, 'auth_failed');
     });
   });
 });
