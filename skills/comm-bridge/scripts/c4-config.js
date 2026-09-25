@@ -44,6 +44,10 @@ function _readConfig() {
 const _cfg = _readConfig();
 export const ACTIVE_RUNTIME = _cfg.runtime === 'codex' ? 'codex' : 'claude';
 export const TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION || _cfg.tmux_session || (ACTIVE_RUNTIME === 'codex' ? 'codex-main' : 'claude-main');
+// Per-instance opt-in (config.json `verified_terminal_delivery`, herdr Bohe):
+// paste and heartbeat auto-ack only into an observed empty, dialog-free
+// composer. Absent keeps the upstream paste-then-verify delivery.
+export const VERIFIED_TERMINAL_DELIVERY = _cfg.verified_terminal_delivery === true || _cfg.verified_terminal_delivery === 'true';
 export const DATA_DIR = path.join(ZYLOS_DIR, 'comm-bridge');
 export const DB_PATH = path.join(DATA_DIR, 'c4.db');
 export const ACTIVITY_MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
