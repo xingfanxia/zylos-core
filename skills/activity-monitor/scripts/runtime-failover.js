@@ -316,6 +316,25 @@ export function codexReserveObservation(codexHome, { sinceMs = 0, nowMs = Date.n
   return null;
 }
 
+// runtime_failover.hold_profiles: tiers an external owner (the Codex account
+// rotation service) has marked unusable; skipped for forward switches and
+// recovery alike, unlike auto_recover=false, which would also stop recovery
+// into every other tier of a mixed chain.
+// runtime_failover.ineligible_profiles: tiers whose subscription is on a free
+// or canceled plan. Held the same way, and an engine already on one leaves it
+// at once. Removal (resubscription) restores ordinary recovery.
+function profileList(value) {
+  return Array.isArray(value) ? value.filter(id => typeof id === 'string') : [];
+}
+
+function heldProfiles(policy) {
+  return new Set([...profileList(policy.hold_profiles), ...profileList(policy.ineligible_profiles)]);
+}
+
+function withHeld(blocked, held) {
+  return held.size ? { ...blocked, ...Object.fromEntries([...held].map(id => [id, { hold: 'policy' }])) } : blocked;
+}
+
 function firstUsableTier({ chain, profiles, blocked, providerUsage, policy, nowMs }) {
   const threshold = Number(policy.switch_threshold) || 98;
   return chain.find(id => {
@@ -352,11 +371,14 @@ export function planSingleSessionRuntimeFailover({
     && !Array.isArray(next.runtime_failover_blocked_profiles)
     ? next.runtime_failover_blocked_profiles
     : {};
-  const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys });
+  const held = heldProfiles(policy);
+  const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys })
+    .filter(id => !held.has(id));
   const eligibleBlocks = Object.fromEntries(Object.entries(currentBlockedProfiles).filter(([id]) => !recovered.includes(id)));
+  const blockedWithHeld = new Set(Object.keys(withHeld(eligibleBlocks, held)));
   if (next.runtime_failover_suspended) {
     // Stopped rather than run on the reserve model; resume on the first usable tier.
-    const resume = firstUsableTier({ chain, profiles, blocked: new Set(Object.keys(eligibleBlocks)), providerUsage, policy, nowMs });
+    const resume = firstUsableTier({ chain, profiles, blocked: blockedWithHeld, providerUsage, policy, nowMs });
     if (!resume) return { document: next, changes };
     if (recovered.length) next.runtime_failover_blocked_profiles = eligibleBlocks;
     delete next.runtime_failover_suspended;
@@ -366,6 +388,19 @@ export function planSingleSessionRuntimeFailover({
     next.runtime_profile_change_reason = 'resumed_after_model_downshift';
     changes.push({ ...single, fromProfile: currentProfile, toProfile: resume, runtime: profiles[resume].runtime,
       reason: 'resumed_after_model_downshift' });
+    return { document: next, changes };
+  }
+  const leave = profileList(policy.ineligible_profiles).includes(currentProfile)
+    && firstUsableTier({ chain, profiles, blocked: blockedWithHeld, providerUsage, policy, nowMs });
+  if (leave) {
+    const reason = `plan_ineligible:${currentProfile}`;
+    if (recovered.length) next.runtime_failover_blocked_profiles = eligibleBlocks;
+    delete next.runtime_usage_rotation_wait;
+    next.active_profile = leave;
+    next.active_runtime = profiles[leave].runtime;
+    next.runtime_profile_changed_at = new Date(nowMs).toISOString();
+    next.runtime_profile_change_reason = reason;
+    changes.push({ ...single, fromProfile: currentProfile, toProfile: leave, runtime: profiles[leave].runtime, reason });
     return { document: next, changes };
   }
   const downshift = profiles[currentProfile]?.runtime === 'codex' && reserveObservation?.model === CODEX_RESERVE_MODEL
@@ -390,7 +425,7 @@ export function planSingleSessionRuntimeFailover({
     nowMs,
     autoRecover: policy.auto_recover !== false,
     wrapOnExhausted: policy.wrap_on_exhausted === true,
-    blockedProfiles: eligibleBlocks,
+    blockedProfiles: withHeld(eligibleBlocks, held),
     verifiedRecoveredProfiles: recovered,
   });
   if (downshift) decision.reason = `model_downshift:${downshift}`;
