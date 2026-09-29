@@ -248,6 +248,47 @@ describe('policy hold_profiles for a Claude -> Codex subscription -> Azure chain
   });
 });
 
+describe('policy ineligible_profiles for lapsed Claude subscriptions', () => {
+  const nowMs = Date.parse('2026-09-29T12:00:00Z');
+  const chain = {
+    'claude-ax-backup': { runtime: 'claude', usage_provider: 'claude-ax-backup', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'claude-ax-cl': { runtime: 'claude', usage_provider: 'claude-ax-cl', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = value => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    primary: { used_percent: value, resets_at: '2099-01-01T00:00:00Z' } });
+  const run = (profile, ineligible, { changedAgoMs = 10_000 } = {}) => planRuntimeFailover({
+    document: {
+      runtime_profiles: chain,
+      runtime_failover: { enabled: true, chain: Object.keys(chain), switch_threshold: 95, recover_threshold: 90,
+        min_dwell_sec: 300, auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium',
+        usage_max_age_sec: 180, ...(ineligible ? { ineligible_profiles: ineligible } : {}) },
+      instances: { pan: { runtime: chain[profile].runtime, runtime_profile: profile, runtime_failover_enabled: true,
+        tmux_session: 'claude-user-pan', runtime_profile_changed_at: new Date(nowMs - changedAgoMs).toISOString() } },
+    },
+    providerUsage: { providers: { 'claude-ax-backup': seen(10), 'claude-ax-cl': seen(20), codex: seen(30) } },
+    nowMs,
+  });
+
+  it('leaves a lapsed current tier at once, inside the dwell, without quarantining it', () => {
+    const { document, changes } = run('claude-ax-backup', ['claude-ax-backup']);
+    assert.deepEqual(changes.map(c => [c.toProfile, c.reason]), [['claude-ax-cl', 'plan_ineligible:claude-ax-backup']]);
+    assert.equal(document.instances.pan.runtime_failover_blocked_profiles, undefined);
+  });
+
+  it('skips every lapsed tier and never recovers into one', () => {
+    assert.equal(run('claude-ax-backup', ['claude-ax-backup', 'claude-ax-cl']).changes[0].toProfile, 'codex-subscription');
+    assert.equal(run('codex-subscription', ['claude-ax-backup', 'claude-ax-cl'], { changedAgoMs: 600_000 }).changes.length, 0);
+  });
+
+  it('recovers once the resubscribed tier leaves the list', () => {
+    const { changes } = run('claude-ax-cl', [], { changedAgoMs: 600_000 });
+    assert.equal(changes[0].toProfile, 'claude-ax-backup');
+    assert.match(changes[0].reason, /^preferred_provider_recovered/);
+  });
+});
+
 describe('Codex reserve-model downshift guard', () => {
   const nowMs = Date.parse('2026-09-24T23:00:00Z');
   const pinned = {
