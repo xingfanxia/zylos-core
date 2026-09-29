@@ -365,7 +365,8 @@ export function planSingleSessionRuntimeFailover({
   const currentProfile = next.active_profile || chain[0];
   const changedAtMs = Date.parse(next.runtime_profile_changed_at || '') || 0;
   const single = { instanceId: next.persona_id || 'single', tmuxSession: next.tmux_session || 'claude-main',
-    monitorName: next.monitor_name || 'activity-monitor', singleSession: true };
+    monitorName: next.monitor_name || 'activity-monitor', singleSession: true,
+    fromRuntime: profiles[currentProfile]?.runtime || null, dispatcherName: next.dispatcher_name || 'c4-dispatcher' };
   const currentBlockedProfiles = next.runtime_failover_blocked_profiles
     && typeof next.runtime_failover_blocked_profiles === 'object'
     && !Array.isArray(next.runtime_failover_blocked_profiles)
@@ -454,16 +455,8 @@ export function planSingleSessionRuntimeFailover({
   next.active_runtime = target.runtime;
   next.runtime_profile_changed_at = new Date(nowMs).toISOString();
   next.runtime_profile_change_reason = decision.reason;
-  changes.push({
-    instanceId: next.persona_id || 'single',
-    fromProfile: currentProfile,
-    toProfile: decision.profile,
-    runtime: target.runtime,
-    reason: decision.reason,
-    tmuxSession: next.tmux_session || 'claude-main',
-    monitorName: next.monitor_name || 'activity-monitor',
-    singleSession: true,
-  });
+  changes.push({ ...single, fromProfile: currentProfile, toProfile: decision.profile, runtime: target.runtime,
+    reason: decision.reason });
   return { document: next, changes };
 }
 
@@ -584,6 +577,12 @@ export function applyRuntimeFailover({
       stdio: 'ignore',
       timeout: 30_000,
     });
+    // The dispatcher reads the runtime once at start (c4-config ACTIVE_RUNTIME)
+    // and would keep parsing the old engine's composer after a Claude <-> Codex
+    // switch. A plain restart keeps its saved (possibly isolated) environment.
+    if (change.singleSession && change.fromRuntime && change.fromRuntime !== change.runtime) {
+      execFileSyncImpl('pm2', ['restart', change.dispatcherName], { stdio: 'ignore', timeout: 30_000 });
+    }
     log(`[runtime-failover] ${change.instanceId}: ${change.fromProfile} -> ${change.toProfile} (${change.reason})`);
   }
   return changes;
