@@ -25,7 +25,8 @@ describe('single-session hold_profiles and ineligible_profiles (Claude -> Codex 
   }).changes;
 
   it('recovers from Codex to the Claude head when its usage is low', () => {
-    assert.deepEqual(plan('codex-subscription').map(c => [c.toProfile, c.tmuxSession]), [['claude-subscription', 'claude-main']]);
+    assert.deepEqual(plan('codex-subscription').map(c => [c.toProfile, c.tmuxSession, c.fromRuntime, c.runtime, c.dispatcherName]),
+      [['claude-subscription', 'claude-main', 'codex', 'claude', 'c4-dispatcher']]);
   });
 
   it('skips a held Codex tier forward and keeps recovery to Claude open', () => {
