@@ -217,7 +217,19 @@ function rotationDeadline(state, { policy, profiles, currentProfile, providerUsa
 // switches and recovery alike, unlike auto_recover=false, which would also stop
 // recovery into every other tier of a mixed chain.
 function heldProfiles(policy) {
-  return new Set(Array.isArray(policy.hold_profiles) ? policy.hold_profiles.filter(id => typeof id === 'string') : []);
+  return new Set([...profileList(policy.hold_profiles), ...ineligibleProfiles(policy)]);
+}
+
+function profileList(value) {
+  return Array.isArray(value) ? value.filter(id => typeof id === 'string') : [];
+}
+
+// runtime_failover.ineligible_profiles: tiers whose subscription is on a free
+// or canceled plan (the rotation service reads each account's plan). Held like
+// hold_profiles, and an instance already on one leaves it at once instead of
+// waiting for the engine to fail. Removal (resubscription) restores recovery.
+function ineligibleProfiles(policy) {
+  return new Set(profileList(policy.ineligible_profiles));
 }
 
 function withHeld(blocked, held) {
@@ -274,6 +286,7 @@ export function planRuntimeFailover({
   const changes = [];
   if (!policy.enabled || chain.length < 2) return { document: next, changes };
   const held = heldProfiles(policy);
+  const ineligible = ineligibleProfiles(policy);
 
   for (const [instanceId, instance] of Object.entries(next.instances || {})) {
     if (instance.enabled === false || instance.runtime_failover_enabled !== true) continue;
@@ -302,6 +315,20 @@ export function planRuntimeFailover({
       instance.runtime_profile_change_reason = 'resumed_after_model_downshift';
       changes.push({ instanceId, fromProfile: currentProfile, toProfile: resume, runtime: profiles[resume].runtime,
         reason: 'resumed_after_model_downshift', tmuxSession: instance.tmux_session || `${profiles[resume].runtime}-${instanceId}` });
+      continue;
+    }
+    const leave = ineligible.has(currentProfile) && firstUsableTier({ chain, profiles,
+      blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))), providerUsage, policy, nowMs });
+    if (leave) {
+      const reason = `plan_ineligible:${currentProfile}`;
+      if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
+      delete instance.runtime_usage_rotation_wait;
+      instance.runtime_profile = leave;
+      instance.runtime = profiles[leave].runtime;
+      instance.runtime_profile_changed_at = new Date(nowMs).toISOString();
+      instance.runtime_profile_change_reason = reason;
+      changes.push({ instanceId, fromProfile: currentProfile, toProfile: leave, runtime: profiles[leave].runtime, reason,
+        tmuxSession: instance.tmux_session || `${profiles[leave].runtime}-${instanceId}` });
       continue;
     }
     const downshift = observedModelDownshift(modelSnapshots[instanceId], { profileId: currentProfile,
