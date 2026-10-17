@@ -74,6 +74,7 @@ let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
 let deliveryTrace = {};
 let captureCapacityReported = false;
+let singleSessionSettlement = null;
 // A live process does not prove the input channel recovered from a failed send.
 const unresolvedDeliveryFailures = new Set();
 

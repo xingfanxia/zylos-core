@@ -14,7 +14,15 @@ import { DATA_DIR, DB_PATH, CONTROL_MAX_RETRIES } from './c4-config.js';
 import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export { migrateSchema, stripTrailingAckSuffix } from './c4-migrations.js';
+export { migrateSchema } from './c4-migrations.js';
+
+// Fork: acks carry the quoted executable path, so match any single trailing
+// ack suffix rather than only the legacy bare `node` form. The pinned 0→1
+// migration keeps upstream's narrower pattern for its one-time backfill.
+export function stripTrailingAckSuffix(content) {
+  if (typeof content !== 'string') return content;
+  return content.replace(/\s---- ack via: (?!.*---- ack via: )[^\r\n]+ ack --id \d+$/, '');
+}
 
 let db = null;
 
