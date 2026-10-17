@@ -72,11 +72,11 @@ let isShuttingDown = false;
 let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
-let deliveryTrace = {};
-let captureCapacityReported = false;
 let singleSessionSettlement = null;
 // A live process does not prove the input channel recovered from a failed send.
 const unresolvedDeliveryFailures = new Set();
+let deliveryTrace = {};
+let captureCapacityReported = false;
 
 const AM_SOCKET_PATH = path.join(ACTIVITY_MONITOR_DIR, 'am.sock');
 const NOTIFY_DELIVERED_TIMEOUT_MS = 5000;
@@ -135,6 +135,10 @@ function sendEnter(kind, details = {}) {
 async function maybePeriodicEnter() {
   const pending = periodicEnter.pending;
   if (!PERIODIC_ENTER_ENABLED || !pending || pending.attempts >= PERIODIC_ENTER_MAX_ATTEMPTS) return;
+  if (VERIFIED_TERMINAL_DELIVERY) {
+    const state = readTmuxInputState({ sessionName: TMUX_SESSION, runtime: ACTIVE_RUNTIME });
+    if (!state.captureOk || state.modal || state.inputState !== 'has_content') return;
+  }
   await periodicEnter.tick({
     eligible: !isShuttingDown,
     send: async () => {
@@ -370,8 +374,16 @@ export function checkInputBoxByCursor(session = TMUX_SESSION) {
   return readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME }).inputState;
 }
 
-// Upstream v0.8.1 detector, kept verbatim for agents without
-// verified_terminal_delivery.
+export function checkInputBox(session = TMUX_SESSION) {
+  if (!VERIFIED_TERMINAL_DELIVERY) return upstreamCheckInputBox();
+  const terminal = readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME });
+  if (terminal.modal || terminal.inputState !== 'has_content' || ACTIVE_RUNTIME !== 'claude') {
+    return terminal.inputState;
+  }
+  const fallbackState = checkClaudeFallbackInputBox(terminal.capture);
+  return fallbackState === 'indeterminate' ? terminal.inputState : fallbackState;
+}
+
 function upstreamCheckInputBoxByCursor() {
   const cursorX = getCursorX();
   if (cursorX < 0) return 'indeterminate';
@@ -404,23 +416,15 @@ function upstreamCheckInputBoxByCursor() {
  * - Codex: cursor-only.
  * - Claude: cursor-first; if it reports has_content, fallback to text parser.
  */
-export function checkInputBox(session = TMUX_SESSION) {
-  if (!VERIFIED_TERMINAL_DELIVERY) return upstreamCheckInputBox();
-  const terminal = readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME });
-  if (terminal.modal || terminal.inputState !== 'has_content' || ACTIVE_RUNTIME !== 'claude') {
-    return terminal.inputState;
-  }
-  const fallbackState = checkClaudeFallbackInputBox(terminal.capture);
-  return fallbackState === 'indeterminate' ? terminal.inputState : fallbackState;
-}
-
 function upstreamCheckInputBox() {
   const cursorState = upstreamCheckInputBoxByCursor();
   if (cursorState !== 'has_content') {
+    trace('input_check', { cursorState, verdict: cursorState, detector: 'cursor' });
     return cursorState;
   }
 
   if (ACTIVE_RUNTIME !== 'claude') {
+    trace('input_check', { cursorState, verdict: cursorState, detector: 'cursor' });
     return cursorState;
   }
 
@@ -430,10 +434,12 @@ function upstreamCheckInputBox() {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000
     });
   } catch {
+    trace('input_check', { cursorState, verdict: cursorState, detector: 'capture_failed' });
     return cursorState;
   }
 
   const fallbackState = checkClaudeFallbackInputBox(capture);
+  trace('input_check', { cursorState, fallbackState, verdict: fallbackState === 'indeterminate' ? cursorState : fallbackState, detector: 'claude_fallback' });
   return fallbackState === 'indeterminate' ? cursorState : fallbackState;
 }
 
@@ -473,7 +479,9 @@ export function getCursorY() {
 
 export async function prepareInputForPaste(session = TMUX_SESSION, {
   readState = () => readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME }),
-  sendKey = (key) => execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 }),
+  sendKey = (key) => key === 'Enter' && session === TMUX_SESSION
+    ? sendEnter('verified')
+    : execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 }),
   wait = sleep,
 } = {}) {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -489,7 +497,9 @@ export async function prepareInputForPaste(session = TMUX_SESSION, {
 
 export async function submitAndVerify(session = TMUX_SESSION, {
   readState = () => readTmuxInputState({ sessionName: session, runtime: ACTIVE_RUNTIME }),
-  sendKey = (key) => execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 }),
+  sendKey = (key) => key === 'Enter' && session === TMUX_SESSION
+    ? sendEnter('verified')
+    : execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 }),
   wait = sleep,
 } = {}) {
   let state = readState();
@@ -500,6 +510,7 @@ export async function submitAndVerify(session = TMUX_SESSION, {
   sendKey('Enter');
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await wait(ENTER_VERIFY_WAIT_MS);
+    captureEnter('after', { kind: 'verified', attempt: attempt + 1 });
     state = readState();
     if (state.modal) {
       if (state.dismissibleOverlay) sendKey('Escape');
@@ -513,10 +524,11 @@ export async function submitAndVerify(session = TMUX_SESSION, {
 }
 
 async function upstreamSubmitAndVerify() {
-  execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+  sendEnter('initial');
 
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleep(ENTER_VERIFY_WAIT_MS);
+    captureEnter('after', { kind: 'normal_verify', attempt: attempt + 1 });
     const state = checkInputBox();
 
     if (state === 'empty') {
@@ -531,7 +543,11 @@ async function upstreamSubmitAndVerify() {
         });
         if (isUsageOverlayCapture(capture)) {
           log(`Enter verify attempt ${attempt + 1}: /usage overlay detected, sending Escape`);
-          execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Escape'], { stdio: 'pipe', timeout: 5000 });
+          try {
+            sendTmuxKeys(TMUX_SESSION, ['Escape'], { stdio: 'pipe', timeout: 5000 });
+          } catch (error) {
+            log(`tmux send-keys failed action=escape: ${JSON.stringify(tmuxFailureDetails(error))}`);
+          }
         }
       } catch { /* capture failed, continue retry loop */ }
       continue;
@@ -539,7 +555,7 @@ async function upstreamSubmitAndVerify() {
 
     // state === 'has_content' — message wasn't submitted, retry Enter
     log(`Enter verify attempt ${attempt + 1}: input has content, retrying Enter`);
-    execFileSync('tmux', ['send-keys', '-t', TMUX_SESSION, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+    sendEnter('verify_retry');
   }
 
   return { verified: false, state: 'has_content' };
@@ -553,13 +569,12 @@ async function sendToTmux(message, options = {}) {
   const sanitized = sanitizeMessage(message);
   const delayMs = getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8'));
   periodicEnter.reset('normal_paste');
-  trace('paste_attempt', { itemId: options.itemId, itemType: options.itemType, bytes: Buffer.byteLength(sanitized, 'utf8'), delayMs });
-
   if (VERIFIED_TERMINAL_DELIVERY && !await prepareInputForPaste(session)) {
     unresolvedDeliveryFailures.add(session);
     log('Input channel is unreadable, modal, or non-empty; refusing paste');
     return 'verify_failed';
   }
+  trace('paste_attempt', { itemId: options.itemId, itemType: options.itemType, bytes: Buffer.byteLength(sanitized, 'utf8'), delayMs });
 
   try {
     execFileSync('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
@@ -569,8 +584,8 @@ async function sendToTmux(message, options = {}) {
       periodicEnter.arm(options.itemId, options.itemType);
     }
   } catch (err) {
-    log(`Error pasting to tmux: ${err.message}`);
-    logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
+    trace('paste_failed', { itemId: options.itemId, itemType: options.itemType });
+    logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR');
     unresolvedDeliveryFailures.add(session);
     return 'paste_error';
   } finally {
