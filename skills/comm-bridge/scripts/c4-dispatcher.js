@@ -108,6 +108,9 @@ function trace(event, metadata = {}) {
   log(JSON.stringify({ event, at: new Date().toISOString(), runtime: ACTIVE_RUNTIME, ...deliveryTrace, ...metadata }));
 }
 
+// Fork: sendToTmux verifies submission through pending-submission ownership and
+// receipts, which already resume Enter for an unsubmitted paste. Upstream's
+// blind periodic Enter is therefore never armed here; the loop hook stays a no-op.
 const periodicEnter = new PeriodicEnter({
   enabled: PERIODIC_ENTER_ENABLED,
   intervalMs: PERIODIC_ENTER_INTERVAL_MS,
