@@ -1,6 +1,6 @@
 import { rejectLegacySchemaProbe } from './upgrade-admission.js';
 import { migrateSchema } from './c4-migrations.js';
-import { inspectLayout } from './sqlite-schema.js';
+import { inspectLayout, inspectWithForkExtensions } from './sqlite-schema.js';
 rejectLegacySchemaProbe();
 
 export const SUPPORTED_SCHEMA_VERSION = 1;
@@ -57,6 +57,11 @@ export const COLUMN_DEFINITIONS = {"checkpoints": {"id": {"type": "INTEGER", "pk
 export const MIGRATIONS = Object.freeze({
   0: Object.freeze({ to: 1, migrate: migrateSchema }),
 });
+// Fork: multi-session routing columns and the fork migration ledger.
+export const FORK_EXTENSIONS = Object.freeze({
+  tables: ['_migrations'],
+  columns: { checkpoints: ['target_instance'], conversations: ['target_instance'], control_queue: ['target_instance'] },
+});
 export function inspectSchema(db, { allowNew = false, strict = true, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions = strict } = {}) {
-  return inspectLayout(db, 'c4', SUPPORTED_SCHEMA_VERSION, TABLES, { allowNew, strict, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions, definitions: COLUMN_DEFINITIONS, migrateFromOlder: true });
+  return inspectWithForkExtensions(db, 'c4', SUPPORTED_SCHEMA_VERSION, TABLES, FORK_EXTENSIONS, { allowNew, strict, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions, definitions: COLUMN_DEFINITIONS, migrateFromOlder: true });
 }

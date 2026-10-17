@@ -33,8 +33,6 @@ async function normalHelpers(){
  const [diagnostic,format,registry]=await Promise.all([import('./c4-diagnostic.js'),import('./session-format.js'),import('../../activity-monitor/scripts/shard-registry.js')]);
  logHookTiming=diagnostic.logHookTiming;formatSection=format.formatSection;withinBudget=registry.withinBudget;
 }
-import { shouldUseBroker, brokerCall } from './c4-client.js';
-import { getInstanceDef } from '../../multi-session/instance-config.js';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -99,14 +97,35 @@ function recoveryBlock(context) {
 function needsRecoveryCue(context) {
   return context && (context.blocked || !context.controllerAlive);
 }
-import { isCliEntry } from "../../multi-session/cli-entry.js";
-
 const ENV_INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 
-/** Whether an instance is the group instance (type:'group'); fails safe to false. */
-function isGroupInstanceId(instanceId) {
+// Multi-session helpers load lazily so recovery cues and single-session hooks
+// run from comm-bridge alone (a partial skill deployment). A configured
+// instance must not silently fall back to single-session routing.
+let multiSession;
+async function multiHelpers() {
+  if (multiSession !== undefined) return multiSession;
   try {
-    return getInstanceDef(instanceId)?.type === 'group';
+    const [client, config] = await Promise.all([
+      import('./c4-client.js'),
+      import('../../multi-session/instance-config.js'),
+    ]);
+    multiSession = { shouldUseBroker: client.shouldUseBroker, brokerCall: client.brokerCall, getInstanceDef: config.getInstanceDef };
+  } catch (err) {
+    if (ENV_INSTANCE_ID) throw err;
+    multiSession = null;
+  }
+  return multiSession;
+}
+
+async function useBroker() {
+  return (await multiHelpers())?.shouldUseBroker() === true;
+}
+
+/** Whether an instance is the group instance (type:'group'); fails safe to false. */
+async function isGroupInstanceId(instanceId) {
+  try {
+    return (await multiHelpers())?.getInstanceDef(instanceId)?.type === 'group';
   } catch {
     return false;
   }
@@ -162,7 +181,7 @@ async function withC4Db(label, action, { closeDb = true } = {}) {
 async function fetchStartupShard(section, budget = null) {
   // Socket choice is this process's own instance, never an emitter argument.
   // The broker authenticates that socket and forces all queries to its caller.
-  const result = await brokerCall('session-init', { section, budget });
+  const result = await (await multiHelpers()).brokerCall('session-init', { section, budget });
   if (result?.section !== section || typeof result.context !== 'string') {
     throw new Error(`C4 broker did not return the requested ${section} startup shard`);
   }
@@ -170,7 +189,7 @@ async function fetchStartupShard(section, budget = null) {
 }
 
 export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTANCE_ID, closeDb = true, brokerRouting = true } = {}) {
-  if (brokerRouting && shouldUseBroker()) return fetchStartupShard('checkpoint');
+  if (brokerRouting && await useBroker()) return fetchStartupShard('checkpoint');
   const { multi, multiLoadFailed } = await loadInstanceQueries(instanceId);
   if (instanceId && (multiLoadFailed || !multi?.getLastCheckpointForInstance)) {
     throw new Error('instance-scoped checkpoint queries unavailable');
@@ -219,7 +238,7 @@ export async function emitC4Checkpoint(_payload = null, { instanceId = ENV_INSTA
  * max-group caps, so message packing is not applied there).
  */
 export async function emitC4Conversations(_payload = null, budget = null, { instanceId = ENV_INSTANCE_ID, closeDb = true, brokerRouting = true } = {}) {
-  if (brokerRouting && shouldUseBroker()) return fetchStartupShard('conversations', budget);
+  if (brokerRouting && await useBroker()) return fetchStartupShard('conversations', budget);
   const { multi, multiLoadFailed } = await loadInstanceQueries(instanceId);
   if (instanceId && (multiLoadFailed || !multi?.getUnsummarizedRangeForInstance || !multi?.getUnsummarizedConversationsForInstance)) {
     throw new Error('instance-scoped conversation queries unavailable');
@@ -284,7 +303,7 @@ export async function emitC4Conversations(_payload = null, budget = null, { inst
     // Group instance: segment injected history by chat so one busy group can't
     // crowd out others and cross-group context never blends. Each chat gets its
     // own labeled section (most-recently-active first), capped per group.
-    if (instanceId && isGroupInstanceId(instanceId)
+    if (instanceId && await isGroupInstanceId(instanceId)
       && multi?.getUnsummarizedConversationsForInstance && multi?.groupConversationsByGroup) {
       const sections = [];
       const allConvos = multi.getUnsummarizedConversationsForInstance(instanceId);
@@ -407,8 +426,8 @@ function main() {
     try {
       // Isolated agents fetch their session context from the broker (they no
       // longer open c4.db directly). Admin/scheduler compute it in-process.
-      const output = shouldUseBroker()
-        ? (await brokerCall('session-init')).context
+      const output = await useBroker()
+        ? (await (await multiHelpers()).brokerCall('session-init')).context
         : await initC4Session();
       process.stdout.write(output);
     } catch (err) {
@@ -424,6 +443,12 @@ function main() {
   });
 }
 
-if (isCliEntry(import.meta.url)) {
+// The module URL is canonicalized by Node, while argv may retain a macOS
+// /var alias (or another directory symlink). Recovery cues must still run.
+function isMainModule() {
+  try { return !!process.argv[1] && fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url)); }
+  catch { return false; }
+}
+if (isMainModule()) {
   main();
 }

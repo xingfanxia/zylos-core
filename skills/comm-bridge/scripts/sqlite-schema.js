@@ -358,3 +358,25 @@ export function preflightDatabase(Database, dbPath, owner, { allowMissing = fals
     return current;
   } finally { db.close(); }
 }
+
+// Fork: multi-session schema extensions that every fork database carries.
+// Upstream inspection reports local tables/columns as extensions and rejects
+// them in strict mode. These are known fork layout, added by the fork's own
+// migrations after the core chain, so strict inspection accepts exactly these
+// and still rejects any other extension.
+
+export function inspectWithForkExtensions(db, name, supported, tables, known, {
+  allowNew = false, strict = true, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions = strict,
+  definitions, migrateFromOlder = true,
+} = {}) {
+  const allowTables = allowExtraTables ?? !strict;
+  const allowColumns = allowExtraColumns ?? !strict;
+  const result = inspectLayout(db, name, supported, tables, {
+    allowNew, strict, allowExtraTables: true, allowExtraColumns: true, rejectUnsafeExtensions, definitions, migrateFromOlder,
+  });
+  const columns = result.extensions.columns.filter(({ table, column }) => !known.columns?.[table]?.includes(column));
+  const extraTables = result.extensions.tables.filter(table => !known.tables?.includes(table));
+  if (columns.length && !allowColumns) throw new Error(`${name}: unsupported columns ${columns.map(({ table, column }) => `${table}.${column}`).join(', ')}`);
+  if (extraTables.length && !allowTables) throw new Error(`${name}: unsupported tables in schema ${result.version}: ${extraTables.join(', ')}`);
+  return { ...result, extensions: { tables: extraTables, columns } };
+}

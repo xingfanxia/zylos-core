@@ -95,7 +95,7 @@ describe('HealthEngine', () => {
       assert.deepEqual(calls.enqueueHeartbeat, ['recovery']);
     });
 
-    it('cold-start grace resets inherited health and probes when warmup ends', () => {
+    it('cold-start grace resets inherited health without a periodic primary probe', () => {
       const { deps, calls } = createMockDeps();
       let nowMs = 1_000_000;
       const engine = new HealthEngine(deps, {
@@ -109,9 +109,10 @@ describe('HealthEngine', () => {
       assert.equal(engine.health, 'ok');
       assert.deepEqual(calls.enqueueHeartbeat, []);
 
+      // Upstream removed periodic primary probes (#807); warmup end enqueues nothing.
       nowMs = 1_030_000;
       engine.runMaintenanceCycle(true, 1030);
-      assert.deepEqual(calls.enqueueHeartbeat, ['primary']);
+      assert.deepEqual(calls.enqueueHeartbeat, []);
     });
   });
 
