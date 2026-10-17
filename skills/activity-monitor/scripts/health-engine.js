@@ -153,6 +153,7 @@ export class HealthEngine {
 
     // Cold-start grace period: skip heartbeat processing during warmup (fork)
     this.warmupUntil = 0;
+    this.readinessProbePending = false;
 
     // OK-path detection debounce counters, advanced by dispatcher delivery notifications.
     this.rateLimitConsecutiveHits = 0;
@@ -233,6 +234,10 @@ export class HealthEngine {
   notifyColdStart(seconds) {
     const nowSec = Math.floor(this.now() / 1000);
     this.warmupUntil = nowSec + seconds;
+    // Fork: a runtime/profile switch must prove the new engine works. Upstream
+    // has no periodic primary probe (0.8.3), so arm one readiness probe for the
+    // end of the grace period; its failure drives the next health-driven hop.
+    this.readinessProbePending = true;
     this.setHealth('ok', `cold_start_grace_${seconds}s`);
     this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
@@ -440,6 +445,13 @@ export class HealthEngine {
     }
 
     if (!agentRunning) {
+      return;
+    }
+
+    if (this.readinessProbePending && this.healthState === 'ok' && !this.deps.readHeartbeatPending()) {
+      this.readinessProbePending = false;
+      this.deps.log('Cold start grace ended: probing the new runtime once');
+      this.enqueueHeartbeat('primary');
       return;
     }
 
