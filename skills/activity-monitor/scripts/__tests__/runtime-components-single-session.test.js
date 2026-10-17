@@ -42,16 +42,16 @@ describe('createHealthEngine per-instance options', () => {
     return engine;
   }
 
-  it('keeps upstream defaults when config sets nothing (CL QA, herdr)', () => {
+  it('keeps upstream defaults when config sets nothing (herdr)', () => {
     const engine = make();
-    assert.equal(engine.heartbeatInterval, 1800);
     assert.equal(engine.authFailureHold, false);
     engine.destroy?.();
   });
 
-  it('forwards heartbeat_interval and auth_failure_hold (CL SWE/auto-reviewer)', () => {
-    const engine = make({ heartbeatInterval: 7200, authFailureHold: true });
-    assert.equal(engine.heartbeatInterval, 7200);
+  // Upstream 0.8.3 removed periodic primary probes, so heartbeat_interval no
+  // longer exists; only the auth-failure hold is per-instance.
+  it('forwards auth_failure_hold (CL SWE/auto-reviewer)', () => {
+    const engine = make({ authFailureHold: true });
     assert.equal(engine.authFailureHold, true);
     engine.destroy?.();
   });

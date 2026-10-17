@@ -384,6 +384,7 @@ async function runShardSideEffect(name, payload, {
   waitForFlagImpl,
   readFlagStatusImpl,
   requireHealthyContext,
+  recordContextReceipt,
   sequencerOptions = {},
 }) {
   if (name === SIDE_EFFECT_NAMES.foreground) {
@@ -400,6 +401,13 @@ async function runShardSideEffect(name, payload, {
   // injection chain has finished, or the agent starts acting with no memory
   // in context. Wait on the last in-chain shard's flag; fail open past the
   // chain-tail deadline so the prompt is never permanently withheld.
+  // Without a receipt recorder a compaction has nothing to validate or record,
+  // so it skips at once (no chain-tail wait). With one, a compaction still
+  // validates the round and records a "continued" receipt before skipping.
+  if (source === 'compact' && !recordContextReceipt) {
+    await logStep({ name: 'session-start-prompt', source, status: 'skipped', durationMs: 0 });
+    return;
+  }
 
   let waitExtra = '';
   const tail = chain.at(-1);
@@ -411,6 +419,7 @@ async function runShardSideEffect(name, payload, {
     waitExtra = `wait=${wait.ok ? 'ok' : 'timeout'}:${wait.waitedMs}`;
   }
 
+  let validatedRoundId = null;
   if (requireHealthyContext) {
     const failures = [];
     if (!sessionId) {
@@ -420,6 +429,7 @@ async function runShardSideEffect(name, payload, {
         ? readFlagStatusImpl(sessionId, tail.name, sequencerOptions)
         : { ok: false, reason: 'missing', roundId: null };
       const roundId = tailResult.roundId || null;
+      validatedRoundId = roundId;
       for (const shard of chain) {
         const result = readFlagStatusImpl(sessionId, shard.name, sequencerOptions);
         if (!result.ok) {
@@ -432,6 +442,8 @@ async function runShardSideEffect(name, payload, {
       }
     }
     if (failures.length > 0) {
+      if (recordContextReceipt && sessionId) await recordContextReceipt({ payload, healthy: false,
+        roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures });
       const notice = formatSection(
         'STARTUP CONTEXT BLOCKED',
         [
@@ -451,6 +463,12 @@ async function runShardSideEffect(name, payload, {
       });
       return;
     }
+  }
+  if (recordContextReceipt && sessionId) await recordContextReceipt({ payload, healthy: requireHealthyContext,
+    roundId: validatedRoundId, shardNames: chain.map(shard => shard.name), failures: [] });
+  if (source === 'compact') {
+    await logStep({ name: 'session-start-prompt', source, status: 'skipped', durationMs: 0 });
+    return;
   }
   await runStep({
     name: 'session-start-prompt',
@@ -479,6 +497,7 @@ export async function runSessionStartShard(name, payload = {}, {
   readFlagStatusImpl = readFlagStatus,
   writeFlagImpl = writeFlag,
   requireHealthyContext = startupContextRequired(),
+  recordContextReceipt,
   registerExitFlagImpl = fn => process.once('exit', fn),
   actions = {
     foreground: runForeground,
@@ -515,6 +534,7 @@ export async function runSessionStartShard(name, payload = {}, {
       waitForFlagImpl,
       readFlagStatusImpl,
       requireHealthyContext,
+      recordContextReceipt,
       sequencerOptions,
     });
     return;
