@@ -114,6 +114,7 @@ export class HealthEngine {
     // API error detection throttle
     this._lastStructuredQuotaScanAt = 0;
     this.warmupUntil = 0;
+    this.readinessProbePending = false;
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
 
     // OK-path detection debounce counters, advanced by dispatcher delivery notifications.
@@ -194,6 +195,10 @@ export class HealthEngine {
   notifyColdStart(seconds) {
     const nowSec = Math.floor(this.now() / 1000);
     this.warmupUntil = nowSec + seconds;
+    // Fork: a runtime/profile switch must prove the new engine works. Upstream
+    // has no periodic primary probe (0.8.3), so arm one readiness probe for the
+    // end of the grace period; its failure drives the next health-driven hop.
+    this.readinessProbePending = true;
     this.setHealth('ok', `cold_start_grace_${seconds}s`);
     this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
@@ -300,6 +305,13 @@ export class HealthEngine {
     this._trackAgentRunning(agentRunning, currentTime);
 
     const pending = this.deps.readHeartbeatPending();
+
+    if (!pending && agentRunning && this.readinessProbePending && this.healthState === 'ok') {
+      this.readinessProbePending = false;
+      this.deps.log('Cold start grace ended: probing the new runtime once');
+      this.enqueueHeartbeat('primary');
+      return;
+    }
 
     if (pending) {
       const status = this.deps.getHeartbeatStatus(pending.control_id);
