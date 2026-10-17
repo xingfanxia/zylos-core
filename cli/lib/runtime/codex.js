@@ -353,13 +353,13 @@ export class CodexAdapter extends RuntimeAdapter {
     let writeCodexConfig;
     try { ({ writeCodexConfig } = await import('../runtime-setup.js')); } catch { /* test stub */ }
     if (writeCodexConfig) {
-      try { writeCodexConfig(ZYLOS_DIR); } catch { /* best effort */ }
+      try { writeCodexConfig(ZYLOS_DIR, { bypassPermissions }); } catch { /* best effort */ }
       if (instanceCwd !== ZYLOS_DIR) {
         try {
           // The shared root hook already resolves through the instance's
           // .claude symlink. A second generated hook in the instance cwd is
           // both redundant and independently reviewed by Codex.
-          writeCodexConfig(instanceCwd, { installCoreHook: false });
+          writeCodexConfig(instanceCwd, { installCoreHook: false, bypassPermissions });
           uninstallCoreCodexHook({ zylosDir: instanceCwd });
         } catch { /* best effort */ }
       }

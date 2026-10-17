@@ -599,6 +599,7 @@ describe('Codex launch — new session', () => {
     assert.equal(spec.env.CODEX_HOME, codexHome);
     assert.equal(spec.env.AZURE_FOUNDRY_KEY, 'azure-secret-not-on-command-line');
     assert.deepEqual(spec.args, [
+      '--no-daemon',
       '-m', 'gpt-5.6-sol',
       '-c', 'model_reasoning_effort="medium"',
       'System startup trigger, not a user message. Continue with startup context.',

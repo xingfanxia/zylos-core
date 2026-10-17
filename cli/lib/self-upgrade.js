@@ -45,17 +45,12 @@ function requireFinalizerExit(dir,j,terminate){return finalizerRequire(path.join
 
 import { cleanupCoreDbRehearsals, preflightCoreDbUpgrade, probeCoreDbVersions, rehearseCoreDbUpgrade } from './core-db-backup.js';
 import { beginUpgrade, beginBackupOnly, prepareBackupOnlyInstall, saveProtectedCode, prepareProtectedInstall, markInstallationIntent, recovery, protectedDataReady, protectedSuccess, maintenance, maintenanceFor } from './upgrade-protection.js';
-// Fork modules loaded lazily to avoid top-level await (breaks node:test imports)
-let _forkConfig;
-let _upstreamMerge;
-async function loadForkModules() {
-  if (_forkConfig === undefined) {
-    try { _forkConfig = await import('./fork-config.js'); } catch { _forkConfig = null; }
-  }
-  if (_forkConfig && _upstreamMerge === undefined) {
-    try { _upstreamMerge = await import('./upstream-merge.js'); } catch { _upstreamMerge = null; }
-  }
-  return { forkConfig: _forkConfig, upstreamMerge: _upstreamMerge };
+// Fork modules are static imports so runSelfUpgrade stays synchronous, as the
+// upstream protected-upgrade pipeline and its callers require.
+import * as forkConfigModule from './fork-config.js';
+import * as upstreamMergeModule from './upstream-merge.js';
+function loadForkModules() {
+  return { forkConfig: forkConfigModule, upstreamMerge: upstreamMergeModule };
 }
 
 const REPO = 'zylos-ai/zylos-core';
@@ -1777,7 +1772,7 @@ export function runSelfUpgradeFinalize(state = {}, deps = {}) {
  * @param {object} [deps] - Isolated self-upgrade seam for npm, PM2, version, rollback, and finalizer boundaries
  * @returns {object} Upgrade result
  */
-export async function runSelfUpgrade(
+export function runSelfUpgrade(
   { tempDir, newVersion, mode, mergeUpstream, onStep } = {},
   deps = {},
 ) {
@@ -1832,7 +1827,7 @@ export async function runSelfUpgrade(
   ])];
 
   // Fork: prepend upstream merge step when mergeUpstream is requested
-  const { forkConfig, upstreamMerge } = await loadForkModules();
+  const { forkConfig, upstreamMerge } = loadForkModules();
   if (forkConfig && mergeUpstream && upstreamMerge) {
     preInstallSteps.unshift(upstreamMerge.step0_mergeUpstream);
   }

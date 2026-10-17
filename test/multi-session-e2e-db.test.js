@@ -27,6 +27,7 @@ const __dirname = path.dirname(__filename);
 // -- Paths -------------------------------------------------------------------
 
 const INIT_SQL_PATH = path.join(__dirname, '..', 'skills', 'comm-bridge', 'init-db.sql');
+const MIGRATIONS_DIR = path.join(__dirname, '..', 'skills', 'comm-bridge', 'migrations');
 
 // -- DB helpers (replicate production SQL from c4-db.js / c4-db-multi.js) ----
 
@@ -36,6 +37,10 @@ function createTestDb() {
   db.pragma('foreign_keys = ON');
   const initSql = fs.readFileSync(INIT_SQL_PATH, 'utf8');
   db.exec(initSql);
+  // Production adds the multi-session columns through the fork migrations.
+  for (const file of fs.readdirSync(MIGRATIONS_DIR).filter(f => f.endsWith('.sql')).sort()) {
+    db.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8'));
+  }
   return db;
 }
 
