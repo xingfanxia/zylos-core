@@ -135,6 +135,7 @@ The activity monitor periodically enqueues system health checks via the C4 contr
 - **Interval**: Every 24 hours (86400 seconds)
 - **Persisted state**: `~/zylos/activity-monitor/health-check-state.json` (survives restarts)
 - **Priority**: 3 (normal)
+- **Primary-only**: One fleet-wide check is enqueued by the primary instance; user-tier monitors never enqueue it
 - **Gated by health**: Only enqueued when `health === 'ok'`
 - **Gated by agent**: Only enqueued when the agent process is running
 

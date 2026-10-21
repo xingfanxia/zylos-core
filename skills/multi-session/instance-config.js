@@ -218,7 +218,9 @@ export function isInstanceEnabled(instanceId) {
 /**
  * Whether this instance is the primary.
  * Daily tasks (upgrade checks, memory commits) should only run on the primary.
- * Defaults to true in single-session mode.
+ * Defaults to true only when no instance identity is configured (legacy
+ * single-session mode). Explicit instance IDs that are absent from the
+ * configuration fail closed.
  * @param {string} [instanceId] - defaults to getInstanceId()
  * @returns {boolean}
  */
@@ -226,7 +228,7 @@ export function isPrimary(instanceId) {
   const id = instanceId ?? getInstanceId();
   if (!id) return true;
   const inst = getInstanceDef(id);
-  if (!inst) return true;
+  if (!inst) return false;
   return inst.primary === true;
 }
 
