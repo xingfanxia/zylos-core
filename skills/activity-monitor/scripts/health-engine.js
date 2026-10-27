@@ -51,6 +51,12 @@ const STICKY_ERROR_MIN_INTERVAL_MS = 30000;
 // only the ceiling itself is configurable (flap_ceiling_per_hour).
 const FLAP_WINDOW_SEC = 3600;
 
+// A runtime spends minutes on its startup turn. A recovery heartbeat queued
+// behind that turn timed out, the restart started the turn over, and the agent
+// never recovered (2026-10-27, CL SWE agent). Probe once the runtime goes idle,
+// but no later than this after a (re)start, in case the turn itself is hung.
+const STARTUP_PROBE_GRACE_SEC = 20 * 60;
+
 function isUnavailableRecoveryState(health) {
   return health === 'unavailable' || health === 'recovering';
 }
@@ -124,6 +130,8 @@ export class HealthEngine {
     this.agentRunning = false;
     this.lastAgentRunning = null; // null = unknown (first tick)
     this.signalDetectedAt = 0; // When agentRunning transitioned false→true
+    this.runtimeBusy = false;
+    this.startedAt = 0; // Monitor start or last runtime restart
 
     // Rate-limited state
     this.cooldownUntil = 0; // Epoch seconds when rate limit cooldown expires
@@ -167,6 +175,7 @@ export class HealthEngine {
 
   start() {
     if (this.maintenanceTimer) return;
+    this.startedAt = Math.floor(this.now() / 1000);
     this.maintenanceTimer = setInterval(() => {
       try {
         this.runMaintenanceCycle(this.agentRunning, Math.floor(this.now() / 1000));
@@ -194,7 +203,16 @@ export class HealthEngine {
 
   setAgentRunning(agentRunning, currentTime = Math.floor(this.now() / 1000)) {
     this.agentRunning = Boolean(agentRunning);
+    if (!this.agentRunning) this.runtimeBusy = false;
     this._trackAgentRunning(this.agentRunning, currentTime);
+  }
+
+  setRuntimeBusy(busy) {
+    this.runtimeBusy = Boolean(busy);
+  }
+
+  _inStartupTurn(currentTime) {
+    return this.runtimeBusy && this.startedAt > 0 && currentTime - this.startedAt < STARTUP_PROBE_GRACE_SEC;
   }
 
   setHealth(nextHealth, reason = '') {
@@ -452,6 +470,10 @@ export class HealthEngine {
       this.readinessProbePending = false;
       this.deps.log('Cold start grace ended: probing the new runtime once');
       this.enqueueHeartbeat('primary');
+      return;
+    }
+
+    if (isPostRestartProbeState(this.healthState) && this._inStartupTurn(currentTime)) {
       return;
     }
 
@@ -744,6 +766,10 @@ export class HealthEngine {
       return { recovered: true };
     }
 
+    if (this._inStartupTurn(Math.floor(this.now() / 1000))) {
+      return { recovered: false, reason: this.healthReason || this.healthState, startupTurn: true };
+    }
+
     this.lastRecoveryAt = Math.floor(this.now() / 1000);
 
     if (this.healthState === 'auth_failed') {
@@ -794,6 +820,7 @@ export class HealthEngine {
   }
 
   onProcessRestarted(currentTime = Math.floor(this.now() / 1000)) {
+    this.startedAt = currentTime;
     // Counter/backoff reset is gated on flap context: during a flap the
     // guardian restarts the runtime EVERY cycle, and resetting here is what
     // kept the incident loop at "attempt 1" for 11h42m. Counters reset only
