@@ -677,6 +677,35 @@ describe('HealthEngine', () => {
       assert.equal(engine.signalDetectedAt, 0); // consumed
     });
 
+    it('holds the recovery probe until the startup turn ends, bounded by the grace', async () => {
+      const { deps, calls } = createMockDeps();
+      const engine = new HeartbeatEngine(deps, { initialHealth: 'unavailable', signalGracePeriod: 30 });
+      const now = Math.floor(Date.now() / 1000);
+      engine.processHeartbeat(false, now);
+      engine.onProcessRestarted(now);
+      engine.setAgentRunning(true, now + 1);
+      engine.setRuntimeBusy(true);
+
+      // A probe queued behind the startup turn would time out and restart it.
+      engine.processHeartbeat(true, now + 31);
+      engine.processHeartbeat(true, now + 600);
+      assert.deepEqual(calls.enqueueHeartbeat, []);
+      assert.equal((await engine.runRecoveryProbe({ timeoutMs: 0 })).startupTurn, true);
+      assert.equal(calls.killTmuxSession, 0);
+
+      engine.setRuntimeBusy(false);
+      engine.processHeartbeat(true, now + 601);
+      assert.deepEqual(calls.enqueueHeartbeat, ['post_restart']);
+
+      // A turn still busy past the grace may be hung: probe it anyway.
+      calls.enqueueHeartbeat.length = 0;
+      engine.onProcessRestarted(now);
+      engine.signalDetectedAt = now;
+      engine.setRuntimeBusy(true);
+      engine.processHeartbeat(true, now + 20 * 60);
+      assert.deepEqual(calls.enqueueHeartbeat, ['post_restart']);
+    });
+
     it('resets signalDetectedAt on heartbeat success', () => {
       const { deps } = createMockDeps();
       deps._pending = { control_id: 1, phase: 'post_restart' };
