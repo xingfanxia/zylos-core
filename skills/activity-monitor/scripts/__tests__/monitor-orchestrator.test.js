@@ -37,6 +37,7 @@ describe('MonitorOrchestrator', () => {
       id: 'engine',
       enterRateLimited: (cooldownUntil, resetTime) => calls.push(['enterRateLimited', cooldownUntil, resetTime]),
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
     };
 
     const orchestrator = new MonitorOrchestrator({
@@ -236,6 +237,7 @@ describe('MonitorOrchestrator', () => {
         return true;
       },
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
       setAgentRunning: (running, currentTime) => calls.push(['setAgentRunning', running, currentTime]),
       onProcessRestarted: (currentTime) => calls.push(['onProcessRestarted', currentTime]),
     };
@@ -284,6 +286,7 @@ describe('MonitorOrchestrator', () => {
       id: 'engine',
       health: 'recovering',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
     };
     const taskScheduler = {
       id: 'taskScheduler',
@@ -345,6 +348,7 @@ describe('MonitorOrchestrator', () => {
       id: 'engine',
       health: 'ok',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
     };
     const taskScheduler = {
       id: 'taskScheduler',
@@ -722,6 +726,7 @@ describe('MonitorOrchestrator', () => {
       engine: {
         health: 'ok',
         start: () => calls.push(['engine.start']),
+        setRuntimeBusy: () => {},
         triggerRecovery: (reason) => calls.push(['engine.triggerRecovery', reason]),
       },
       initialHealth: 'ok',
@@ -826,6 +831,7 @@ describe('MonitorOrchestrator', () => {
       engine: {
         health: 'ok',
         start: () => calls.push(['engine.start']),
+        setRuntimeBusy: () => {},
         triggerRecovery: (reason) => calls.push(['engine.triggerRecovery', reason]),
       },
       initialHealth: 'ok',
@@ -897,6 +903,7 @@ describe('MonitorOrchestrator', () => {
     const engine = {
       health: 'ok',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
       setAgentRunning: (running, currentTime) => calls.push(['engine.setAgentRunning', running, currentTime]),
     };
     const { orchestrator } = createHarness({ guardian, engine, initialHealth: 'ok' });
@@ -958,6 +965,7 @@ describe('MonitorOrchestrator', () => {
     const engine = {
       health: 'ok',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
       setAgentRunning: (running, currentTime) => calls.push(['engine.setAgentRunning', running, currentTime]),
     };
     const taskScheduler = {
@@ -1073,6 +1081,7 @@ describe('MonitorOrchestrator', () => {
     const engine = {
       health: 'ok',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
       setAgentRunning: (running, currentTime) => calls.push(['engine.setAgentRunning', running, currentTime]),
     };
     const taskScheduler = {
@@ -1258,6 +1267,7 @@ describe('MonitorOrchestrator', () => {
       id: 'engine',
       health: 'ok',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
     };
     const taskScheduler = {
       tick: (payload) => calls.push(['taskScheduler.tick', payload]),
@@ -1337,6 +1347,7 @@ describe('MonitorOrchestrator', () => {
       id: 'engine',
       health: 'ok',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
     };
     const taskScheduler = {
       id: 'taskScheduler',
@@ -1412,6 +1423,7 @@ describe('MonitorOrchestrator', () => {
       id: 'engine',
       health: 'recovering',
       start: () => calls.push(['engine.start']),
+      setRuntimeBusy: () => {},
     };
     const taskScheduler = {
       id: 'taskScheduler',
