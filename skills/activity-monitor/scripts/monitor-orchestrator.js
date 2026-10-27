@@ -654,6 +654,7 @@ export class MonitorOrchestrator {
     const { engine, taskScheduler } = this.components;
     const inactiveSeconds = currentTime - activity;
     const state = (activeTools > 0 || inactiveSeconds < idleThreshold) ? 'busy' : 'idle';
+    engine.setRuntimeBusy(state === 'busy');
 
     let nextIdleSince = idleSince;
     if (state === 'idle' && lastState !== 'idle') {

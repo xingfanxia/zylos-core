@@ -31,6 +31,11 @@
 const USER_MESSAGE_CHECK_DELAY_MS = 5000;
 const CONSECUTIVE_HITS_THRESHOLD = 2;
 const STICKY_ERROR_MIN_INTERVAL_MS = 30000;
+// A runtime spends minutes on its startup turn. A recovery heartbeat queued
+// behind that turn timed out, the restart started the turn over, and the agent
+// never recovered (2026-10-27, CL SWE agent). Probe once the runtime goes idle,
+// but no later than this after a (re)start, in case the turn itself is hung.
+const STARTUP_PROBE_GRACE_SEC = 20 * 60;
 
 function isUnavailableRecoveryState(health) {
   return health === 'unavailable' || health === 'recovering';
@@ -102,6 +107,8 @@ export class HealthEngine {
     this.agentRunning = false;
     this.lastAgentRunning = null; // null = unknown (first tick)
     this.signalDetectedAt = 0; // When agentRunning transitioned false→true
+    this.runtimeBusy = false;
+    this.startedAt = 0; // Monitor start or last runtime restart
 
     // Rate-limited state
     this.cooldownUntil = 0; // Epoch seconds when rate limit cooldown expires
@@ -129,6 +136,7 @@ export class HealthEngine {
 
   start() {
     if (this.maintenanceTimer) return;
+    this.startedAt = Math.floor(this.now() / 1000);
     this.maintenanceTimer = setInterval(() => {
       try {
         this.runMaintenanceCycle(this.agentRunning, Math.floor(this.now() / 1000));
@@ -156,7 +164,16 @@ export class HealthEngine {
 
   setAgentRunning(agentRunning, currentTime = Math.floor(this.now() / 1000)) {
     this.agentRunning = Boolean(agentRunning);
+    if (!this.agentRunning) this.runtimeBusy = false;
     this._trackAgentRunning(this.agentRunning, currentTime);
+  }
+
+  setRuntimeBusy(busy) {
+    this.runtimeBusy = Boolean(busy);
+  }
+
+  _inStartupTurn(currentTime) {
+    return this.runtimeBusy && this.startedAt > 0 && currentTime - this.startedAt < STARTUP_PROBE_GRACE_SEC;
   }
 
   setHealth(nextHealth, reason = '') {
@@ -387,6 +404,10 @@ export class HealthEngine {
     // Process signal acceleration: agentRunning just transitioned false→true,
     // grace period elapsed — send immediate heartbeat to verify recovery.
     // Works in unavailable/recovering, down, and auth_failed states.
+    if (isPostRestartProbeState(this.healthState) && this._inStartupTurn(currentTime)) {
+      return;
+    }
+
     if (isPostRestartProbeState(this.healthState) && this._shouldAccelerate(currentTime)) {
       this.deps.log(`Process signal acceleration: Agent restarted (health=${this.healthState}), verifying immediately`);
       this.signalDetectedAt = 0; // Consume the signal
@@ -609,6 +630,10 @@ export class HealthEngine {
       return { recovered: true };
     }
 
+    if (this._inStartupTurn(Math.floor(this.now() / 1000))) {
+      return { recovered: false, reason: this.healthReason || this.healthState, startupTurn: true };
+    }
+
     this.lastRecoveryAt = Math.floor(Date.now() / 1000);
 
     if (this.healthState === 'auth_failed' && this.authFailureHold) {
@@ -675,6 +700,7 @@ export class HealthEngine {
   }
 
   onProcessRestarted(currentTime = Math.floor(Date.now() / 1000)) {
+    this.startedAt = currentTime;
     this.restartFailureCount = 0;
     this.lastRecoveryAt = 0;
     this.deps.log('Process restarted, recovery backoff reset');
