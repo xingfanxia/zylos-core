@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, execFileSync } from 'node:child_process';
-import { FORK_REPO } from '../fork-config.js';
 
 const cli = path.resolve(import.meta.dirname, '../../zylos.js');
 const installedVersion = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, '../../../package.json'), 'utf8')).version;
@@ -93,6 +92,8 @@ function fixture(t) {
     ZYLOS_GH_RETRY_DELAY_MS: '', ROUTING_LOG: log, ROUTING_TARBALL: tarball,
     ROUTING_CORE_TARBALL: coreTarball, ROUTING_CORE_VERSION: coreTargetVersion,
     ROUTING_SKILL: path.join(packageRoot, 'SKILL.md'), ROUTING_PROFILE: profilePath,
+    // Fork: mutating self-upgrades are refused unless explicitly allowed.
+    ZYLOS_ALLOW_SELF_UPGRADE: '1',
   };
   for (const directory of [env.PM2_HOME, env.TMPDIR]) fs.mkdirSync(directory);
   console.log(JSON.stringify({ HOME: env.HOME, ZYLOS_DIR: env.ZYLOS_DIR, PM2_HOME: env.PM2_HOME, TMPDIR: env.TMPDIR, TMUX_TMPDIR: env.TMUX_TMPDIR, tmux: 'unused', databases: 'fixture only; no production database' }));
@@ -125,7 +126,7 @@ test('CLI saved routing covers remote registry, real add pipeline, component/sel
   const requests = f.readLog();
   assert.ok(requests.some(r => r.url.includes('/raw/')));
   assert.ok(requests.some(r => r.url.includes('/api/repos/example/zylos-mirror-fixture/tags')));
-  assert.ok(requests.some(r => r.url.includes(`/api/repos/${FORK_REPO}/tags`)));
+  assert.ok(requests.some(r => r.url.includes('/api/repos/zylos-ai/zylos-core/tags')));
   assert.ok(requests.some(r => r.url.includes('/download/example/zylos-mirror-fixture/archive/refs/tags/')));
   for (const req of requests) {
     assert.equal(new URL(req.url).hostname, 'mirror.example.test');

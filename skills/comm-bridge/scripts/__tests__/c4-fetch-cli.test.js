@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const CLI_PATH = fileURLToPath(new URL('../c4-fetch.js', import.meta.url));
+const RECEIVE_PATH = fileURLToPath(new URL('../c4-receive.js', import.meta.url));
 const CHECKPOINT_PATH = fileURLToPath(new URL('../c4-checkpoint.js', import.meta.url));
 const DB_MODULE = fileURLToPath(new URL('../c4-db.js', import.meta.url));
 
@@ -34,6 +35,15 @@ function cli(args, env = {}) {
     encoding: 'utf8'
   });
   return { stdout: result.stdout, stderr: result.stderr, status: result.status };
+}
+
+// Upstream --since tests receive messages; an explicit target keeps the rows in
+// the fixture instance's strict scope.
+function receive(args, env = {}) {
+  return spawnSync('node', [RECEIVE_PATH, '--target-instance', 'test-instance', ...args], {
+    env: { ...process.env, ...env },
+    encoding: 'utf8'
+  });
 }
 
 function checkpoint(args, env = {}) {
@@ -167,6 +177,22 @@ describe('c4-fetch --since', () => {
       return fn({ env });
     });
   }
+
+  // Fork: a scoped --since reads only its own instance's rows.
+  it('keeps another instance\'s conversations out of a scoped read', () => {
+    withTmpDir(({ env }) => {
+      receive(['--channel', 'system', '--no-reply', '--content', 'mine'], env);
+      spawnSync('node', [RECEIVE_PATH, '--target-instance', 'other-instance', '--channel', 'system', '--no-reply', '--content', 'theirs'],
+        { env: { ...process.env, ...env }, encoding: 'utf8' });
+      const own = cli(['--since', '1d'], env);
+      assert.equal(own.status, 0, own.stderr);
+      assert.ok(own.stdout.includes('mine'));
+      assert.ok(!own.stdout.includes('theirs'));
+      const all = cli(['--since', '1d', '--all-instances'], env);
+      assert.equal(all.status, 0, all.stderr);
+      assert.ok(all.stdout.includes('theirs'));
+    });
+  });
 
   it('fetches conversations within a relative duration', () => {
     withMessages([utcAgo(48 * HOUR), utcAgo(3 * HOUR), utcAgo(HOUR / 6)], ({ env }) => {
