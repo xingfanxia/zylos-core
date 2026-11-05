@@ -1438,3 +1438,52 @@ describe('HealthEngine', () => {
     });
   });
 });
+
+describe('HealthEngine overloaded-turn resume', () => {
+  function setup(outcome) {
+    const { deps, calls } = createMockDeps();
+    calls.resume = 0;
+    deps._turn = outcome;
+    deps.readTurnOutcome = () => deps._turn;
+    deps.enqueueOverloadResume = () => { calls.resume++; return true; };
+    const engine = new HealthEngine(deps, { now: () => 0 });
+    return { engine, deps, calls };
+  }
+  const endedAt = 1_000_000;
+  const at = seconds => endedAt + seconds;
+
+  it('resumes once per overloaded turn after the backoff delay', () => {
+    const { engine, calls } = setup({ outcome: 'overloaded', endedAtMs: endedAt * 1000, code: 'server_overloaded' });
+    engine.runMaintenanceCycle(true, at(30));
+    assert.equal(calls.resume, 0);
+    engine.runMaintenanceCycle(true, at(60));
+    assert.equal(calls.resume, 1);
+    engine.runMaintenanceCycle(true, at(600));
+    assert.equal(calls.resume, 1);
+  });
+
+  it('backs off while the overload lasts and resets after a successful turn', () => {
+    const { engine, deps, calls } = setup({ outcome: 'overloaded', endedAtMs: endedAt * 1000, code: 'server_overloaded' });
+    engine.runMaintenanceCycle(true, at(60));
+    deps._turn = { outcome: 'overloaded', endedAtMs: at(100) * 1000, code: 'server_overloaded' };
+    engine.runMaintenanceCycle(true, at(190));
+    assert.equal(calls.resume, 1);
+    engine.runMaintenanceCycle(true, at(220));
+    assert.equal(calls.resume, 2);
+    deps._turn = { outcome: 'success', endedAtMs: at(300) * 1000 };
+    engine.runMaintenanceCycle(true, at(330));
+    deps._turn = { outcome: 'overloaded', endedAtMs: at(400) * 1000, code: 'server_overloaded' };
+    engine.runMaintenanceCycle(true, at(460));
+    assert.equal(calls.resume, 3);
+  });
+
+  it('does nothing while a turn runs, the agent is stopped or health is not ok', () => {
+    const { engine, deps, calls } = setup({ outcome: 'running' });
+    engine.runMaintenanceCycle(true, at(600));
+    deps._turn = { outcome: 'overloaded', endedAtMs: endedAt * 1000, code: 'server_overloaded' };
+    engine.runMaintenanceCycle(false, at(700));
+    engine.healthState = 'rate_limited';
+    engine.runMaintenanceCycle(true, at(800));
+    assert.equal(calls.resume, 0);
+  });
+});

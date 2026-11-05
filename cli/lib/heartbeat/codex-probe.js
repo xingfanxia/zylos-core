@@ -38,6 +38,10 @@ import { tmuxCapturePaneText } from '../runtime/tmux-helpers.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const C4_CONTROL = path.join(ZYLOS_DIR, '.claude/skills/comm-bridge/scripts/c4-control.js');
+export const OVERLOAD_RESUME_PROMPT = 'your previous turn was cut off by a provider error '
+  + '(Codex server_overloaded: the model was at capacity) before it finished. Continue the '
+  + 'interrupted work now, and answer every message from that turn or earlier that has not '
+  + 'been answered yet.';
 const AUTH_FAILURE_PATTERNS = [
   /authentication failed/i,
   /not logged in/i,
@@ -63,6 +67,27 @@ export function detectCodexQuotaFromLines(lines, { sinceMs = 0, sessionId } = {}
   return { detected: false };
 }
 
+// Codex ends a turn with server_overloaded ("Selected model is at capacity")
+// and then sits idle: the input that started the turn was delivered but never
+// answered. Report the last terminal outcome of the foreground session so the
+// HealthEngine can resume it: 'overloaded', 'success', or 'running'/'none'.
+export function readCodexTurnOutcomeFromLines(lines, { sinceMs = 0 } = {}) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let event;
+    try { event = JSON.parse(lines[i]); } catch { continue; }
+    if (event.type !== 'event_msg') continue;
+    if (event.payload?.type === 'task_started') return { outcome: 'running' };
+    if (event.payload?.type !== 'task_complete') continue;
+    const endedAtMs = Date.parse(event.timestamp || '');
+    if (!Number.isFinite(endedAtMs) || endedAtMs < sinceMs) return { outcome: 'none' };
+    const code = event.payload.error?.codex_error_info;
+    if (!code) return { outcome: 'success', endedAtMs };
+    if (code === 'server_overloaded') return { outcome: 'overloaded', endedAtMs, code };
+    return { outcome: 'error', endedAtMs, code };
+  }
+  return { outcome: 'none' };
+}
+
 function processEnvironment(pid) {
   // Reading this process-local environment selects the actual credential home,
   // including isolated instances and Azure. Values never leave this function.
@@ -73,50 +98,74 @@ function processEnvironment(pid) {
   }));
 }
 
+// Tail of the foreground session's own rollout, or null. With requireSubscription
+// only a ChatGPT-login home qualifies and sinceMs also covers a credential swap.
+function readForegroundRolloutTail({ foregroundFile, readProcessEnvironment, requireSubscription }) {
+  const foreground = JSON.parse(fs.readFileSync(foregroundFile, 'utf8'));
+  const sessionId = foreground.session_id;
+  const observedAt = Number(foreground.observed_at);
+  if (!/^[a-f0-9-]{36}$/i.test(sessionId || '') || !Number.isInteger(foreground.claude_pid)
+      || foreground.claude_pid <= 0 || !Number.isFinite(observedAt) || observedAt <= 0) return null;
+  // A disappeared/replaced process must not resurrect the old session's error.
+  const env = readProcessEnvironment(foreground.claude_pid);
+  const codexHome = env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex');
+  let sinceMs = observedAt;
+  if (requireSubscription) {
+    const authFile = path.join(codexHome, 'auth.json');
+    const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
+    if (auth.auth_mode !== 'chatgpt') return null;
+    sinceMs = Math.max(observedAt, fs.statSync(authFile).mtimeMs);
+  }
+  const sessions = path.join(codexHome, 'sessions');
+  // Match the foreground UUID exactly, never the most recently modified
+  // thread: concurrent CLI or subagent work may share the credential home.
+  let rollout;
+  for (const year of fs.readdirSync(sessions)) {
+    if (!/^\d{4}$/.test(year)) continue;
+    for (const month of fs.readdirSync(path.join(sessions, year))) {
+      if (!/^\d{2}$/.test(month)) continue;
+      for (const day of fs.readdirSync(path.join(sessions, year, month))) {
+        if (!/^\d{2}$/.test(day)) continue;
+        const dir = path.join(sessions, year, month, day);
+        const file = fs.readdirSync(dir).find(name => name.startsWith('rollout-') && name.endsWith(`-${sessionId}.jsonl`));
+        if (file) { rollout = path.join(dir, file); break; }
+      }
+      if (rollout) break;
+    }
+    if (rollout) break;
+  }
+  if (!rollout) return null;
+  const size = fs.statSync(rollout).size;
+  const bytes = Math.min(size, 262144);
+  const buffer = Buffer.alloc(bytes);
+  const fd = fs.openSync(rollout, 'r');
+  try { fs.readSync(fd, buffer, 0, bytes, size - bytes); } finally { fs.closeSync(fd); }
+  return { lines: buffer.toString('utf8').split('\n'), sinceMs, sessionId };
+}
+
 export function readCodexQuotaFailure({
   foregroundFile,
   readProcessEnvironment = processEnvironment,
 } = {}) {
   try {
-    const foreground = JSON.parse(fs.readFileSync(foregroundFile, 'utf8'));
-    const sessionId = foreground.session_id;
-    const observedAt = Number(foreground.observed_at);
-    if (!/^[a-f0-9-]{36}$/i.test(sessionId || '') || !Number.isInteger(foreground.claude_pid)
-        || foreground.claude_pid <= 0 || !Number.isFinite(observedAt) || observedAt <= 0) return { detected: false };
-    // A disappeared/replaced process must not resurrect the old session's error.
-    const env = readProcessEnvironment(foreground.claude_pid);
-    const codexHome = env.CODEX_HOME || path.join(env.HOME || os.homedir(), '.codex');
-    const authFile = path.join(codexHome, 'auth.json');
-    const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
-    if (auth.auth_mode !== 'chatgpt') return { detected: false };
-    const sinceMs = Math.max(observedAt, fs.statSync(authFile).mtimeMs);
-    const sessions = path.join(codexHome, 'sessions');
-    // Match the foreground UUID exactly, never the most recently modified
-    // thread: concurrent CLI or subagent work may share the credential home.
-    let rollout;
-    for (const year of fs.readdirSync(sessions)) {
-      if (!/^\d{4}$/.test(year)) continue;
-      for (const month of fs.readdirSync(path.join(sessions, year))) {
-        if (!/^\d{2}$/.test(month)) continue;
-        for (const day of fs.readdirSync(path.join(sessions, year, month))) {
-          if (!/^\d{2}$/.test(day)) continue;
-          const dir = path.join(sessions, year, month, day);
-          const file = fs.readdirSync(dir).find(name => name.startsWith('rollout-') && name.endsWith(`-${sessionId}.jsonl`));
-          if (file) { rollout = path.join(dir, file); break; }
-        }
-        if (rollout) break;
-      }
-      if (rollout) break;
-    }
-    if (!rollout) return { detected: false };
-    const size = fs.statSync(rollout).size;
-    const bytes = Math.min(size, 262144);
-    const buffer = Buffer.alloc(bytes);
-    const fd = fs.openSync(rollout, 'r');
-    try { fs.readSync(fd, buffer, 0, bytes, size - bytes); } finally { fs.closeSync(fd); }
-    return detectCodexQuotaFromLines(buffer.toString('utf8').split('\n'), { sinceMs, sessionId });
+    const tail = readForegroundRolloutTail({ foregroundFile, readProcessEnvironment, requireSubscription: true });
+    if (!tail) return { detected: false };
+    return detectCodexQuotaFromLines(tail.lines, { sinceMs: tail.sinceMs, sessionId: tail.sessionId });
   } catch {
     return { detected: false };
+  }
+}
+
+export function readCodexTurnOutcome({
+  foregroundFile,
+  readProcessEnvironment = processEnvironment,
+} = {}) {
+  try {
+    const tail = readForegroundRolloutTail({ foregroundFile, readProcessEnvironment, requireSubscription: false });
+    if (!tail) return { outcome: 'none' };
+    return { ...readCodexTurnOutcomeFromLines(tail.lines, { sinceMs: tail.sinceMs }), sessionId: tail.sessionId };
+  } catch {
+    return { outcome: 'none' };
   }
 }
 
@@ -197,6 +246,27 @@ export function createCodexProbe({
 
     /** Read a definitive quota failure from this engine's current session. */
     detectRateLimit: detectStructuredRateLimit,
+
+    /** Last terminal outcome of the foreground session's current turn. */
+    readTurnOutcome: () => readCodexTurnOutcome({ foregroundFile }),
+
+    /**
+     * Ask the idle runtime to resume a turn the provider cut off. Delivered
+     * through the C4 control queue like the early memory-sync request.
+     * @returns {boolean}
+     */
+    enqueueOverloadResume() {
+      try {
+        execFileSync('node', [C4_CONTROL, 'enqueue',
+          '--content', OVERLOAD_RESUME_PROMPT,
+          '--priority', '2',
+          '--no-ack-suffix',
+        ], { encoding: 'utf8', stdio: 'pipe', timeout: 15_000 });
+        return true;
+      } catch {
+        return false;
+      }
+    },
 
     /**
      * Detect auth-failure text in the Codex pane. HealthEngine verifies this
