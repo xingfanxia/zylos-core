@@ -15,7 +15,7 @@ describe('session-foreground hook', () => {
   it('binds managed process and refuses unmanaged or subagent SessionStart', async () => {
     process.env.ZYLOS_DIR = tmpDir;
     const { handleSessionForeground } = await import(`../session-foreground.js?identity=${Date.now()}`);
-    const options = { platform:'linux', claudePid: 4242, managedProcess:pid=>pid===4242 };
+    const options = { platform:'linux', claudePid: 4242, managedProcess:pid=>pid===4242, verifyManagedPane:true };
     const record = handleSessionForeground({ session_id: 'new-session' }, options);
     assert.equal(record.runtime, 'claude');
     assert.equal(record.process_start, undefined);
@@ -29,7 +29,7 @@ describe('session-foreground hook', () => {
     const {handleSessionForeground}=await import(`../session-foreground.js?darwin=${Date.now()}`);
     let strongChecks=0;
     const record=handleSessionForeground({session_id:'darwin-session',source:'startup'}, {
-      platform:'darwin',claudePid:4242,managedProcess:()=>{strongChecks++;return true;},observedAt:4321,
+      platform:'darwin',claudePid:4242,managedProcess:()=>{strongChecks++;return true;},observedAt:4321,verifyManagedPane:true,
     });
     assert.equal(record.session_id,'darwin-session');assert.equal(record.claude_pid,4242);
     assert.equal(record.observed_at,4321);assert.equal(record.process_start,undefined);assert.equal(strongChecks,1);
