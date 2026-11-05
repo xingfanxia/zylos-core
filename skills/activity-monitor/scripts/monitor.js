@@ -282,6 +282,11 @@ function readConfigObject() {
 }
 
 const USAGE_MONITOR_ENABLED = readConfigBool('usage_monitor_enabled', true);
+// Fork: upstream #835 hook evidence and first-failure replies stay off unless a
+// host opts in. Its store and notice selection assume one global Claude runtime,
+// so on this fleet the fork HealthEngine and the agent-status file stay the
+// authority (zylos-v095 catch-up, 2026-11-05).
+const RUNTIME_HEALTH_EVIDENCE = readConfigBool('runtime_health_evidence', false);
 const USAGE_CHECK_INTERVAL = readConfigInt('usage_check_interval', 3600);     // seconds between checks (default 1 hour)
 const USAGE_IDLE_GATE = readConfigInt('usage_idle_gate', 30);                 // idle seconds required (default 30)
 const USAGE_ALERT_ENABLED = readConfigBool('usage_alert_enabled', false);
@@ -401,7 +406,7 @@ function enqueueContextRotationHandoff({ ratio = 0, used = 0, ceiling = 0 } = {}
 
 function loadInitialHealth(activeAdapter) {
   const projection = readInitialStatus({ statusFile: STATUS_FILE });
-  if (activeAdapter?.runtimeId !== 'claude') return projection;
+  if (activeAdapter?.runtimeId !== 'claude' || !RUNTIME_HEALTH_EVIDENCE) return projection;
   const state = new HealthStore({ runtime: activeAdapter.runtimeId, zylosDir: ZYLOS_DIR, log }).read();
   return {
     health: state.health,
@@ -1002,7 +1007,7 @@ function createToolPipeline(activeAdapter, config) {
     isPidAlive,
     log,
     onHealthEvent: event => {
-      if (activeAdapter.runtimeId !== 'claude') return;
+      if (activeAdapter.runtimeId !== 'claude' || !RUNTIME_HEALTH_EVIDENCE) return;
       if (!engine?.evidence) throw new Error('Health consumer not ready');
       engine.evidence.consume(event);
     },
@@ -1016,7 +1021,7 @@ function createHealthEngine(activeAdapter, initialStatus) {
     userMessageRecoveryCooldown: USER_MESSAGE_RECOVERY_COOLDOWN,
     authFailureHold: readConfigBool('auth_failure_hold', false),
   });
-  if(activeAdapter.runtimeId==='claude') {
+  if(activeAdapter.runtimeId==='claude' && RUNTIME_HEALTH_EVIDENCE) {
     const identity=()=>readDeliveryIdentity({zylosDir:ZYLOS_DIR,session:activeAdapter.sessionName});
     const fingerprint=()=>{
       try {

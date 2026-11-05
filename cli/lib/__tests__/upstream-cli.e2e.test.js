@@ -92,6 +92,8 @@ function fixture(t) {
     ZYLOS_GH_RETRY_DELAY_MS: '', ROUTING_LOG: log, ROUTING_TARBALL: tarball,
     ROUTING_CORE_TARBALL: coreTarball, ROUTING_CORE_VERSION: coreTargetVersion,
     ROUTING_SKILL: path.join(packageRoot, 'SKILL.md'), ROUTING_PROFILE: profilePath,
+    // Fork: mutating self-upgrades are refused unless explicitly allowed.
+    ZYLOS_ALLOW_SELF_UPGRADE: '1',
   };
   for (const directory of [env.PM2_HOME, env.TMPDIR]) fs.mkdirSync(directory);
   console.log(JSON.stringify({ HOME: env.HOME, ZYLOS_DIR: env.ZYLOS_DIR, PM2_HOME: env.PM2_HOME, TMPDIR: env.TMPDIR, TMUX_TMPDIR: env.TMUX_TMPDIR, tmux: 'unused', databases: 'fixture only; no production database' }));

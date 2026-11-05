@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getClaudePid } from './claude-pid.js';
 import { isManagedClaudeProcess } from './runtime-generation.js';
+import { TMUX_SESSION } from '../../comm-bridge/scripts/c4-config.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
@@ -22,10 +23,11 @@ export function handleSessionForeground(payload, {
   claudePid = getClaudePid(),
   managedProcess = isManagedClaudeProcess,
   platform = process.platform,
+  session = TMUX_SESSION,
 } = {}) {
   const sessionId = payload?.session_id || process.env.CLAUDE_SESSION_ID || null;
   if (!sessionId) return null;
-  if (payload?.agent_id || !managedProcess(claudePid, { platform })) return null;
+  if (payload?.agent_id || !managedProcess(claudePid, { platform, session })) return null;
 
   if (!fs.existsSync(MONITOR_DIR)) {
     fs.mkdirSync(MONITOR_DIR, { recursive: true });

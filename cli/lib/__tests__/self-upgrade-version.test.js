@@ -13,7 +13,7 @@ const DATABASE_CONTENT = 'isolated version-selection database sentinel\n';
 // These tests exercise the real CLI across its version selector, GitHub client,
 // archive downloader and target handoff. Only external commands and downloaded
 // target/recovery materials are fixtures; installed product sources stay intact.
-function fixture(t, { pages = [[]], target = '1.0.0', downloadFails = false } = {}) {
+function fixture(t, { pages = [[]], target = '1.0.0', downloadFails = false, allowSelfUpgrade = true } = {}) {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'suv-')));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   const home = path.join(root, 'home');
@@ -95,6 +95,8 @@ process.exit(99);
     ZYLOS_UPSTREAM_CONFIG: 'direct',
     ZYLOS_UPSTREAM_TRUST_HOSTS: 'none',
     ZYLOS_GH_RETRY_DELAY_MS: '0,0',
+    // Fork: mutating self-upgrades are refused unless explicitly allowed.
+    ...(allowSelfUpgrade ? { ZYLOS_ALLOW_SELF_UPGRADE: '1' } : {}),
   };
   const calls = () => fs.existsSync(callsFile)
     ? fs.readFileSync(callsFile, 'utf8').trim().split('\n').map(JSON.parse) : [];
@@ -342,4 +344,16 @@ test('explicit upgrade with a missing tag never downloads or executes a target',
   assert.equal(fs.existsSync(f.handoffFile), false);
   assert.ok(f.calls().filter(call => call.command === 'curl')
     .every(call => new URL(call.args.at(-1)).pathname.endsWith('/tags')));
+});
+
+// Fork: a managed fork host refuses a mutating self-upgrade before any download
+// or recovery, and still answers a check.
+test('a managed fork refuses upgrade --self unless explicitly allowed', t => {
+  const f = fixture(t, { allowSelfUpgrade: false });
+  const refused = f.run(['upgrade', '--self', '--yes', '--json']);
+  assert.equal(refused.status, 1, refused.stdout + refused.stderr);
+  assert.equal(JSON.parse(refused.stdout).code, 'FORK_MANAGED');
+  assertNoWork(f);
+  const check = f.run(['upgrade', '--self', '--check', '--version', CURRENT]);
+  assert.equal(check.status, 0, check.stdout + check.stderr);
 });

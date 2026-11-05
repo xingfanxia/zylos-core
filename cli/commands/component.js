@@ -398,6 +398,14 @@ export async function upgradeComponent(args) {
     if (checkOnly) {
       return handleSelfCheckOnly({ jsonOutput, branch, beta, version });
     }
+    // Fork: this package is a managed deploy branch of the zylos-core fork. An
+    // upstream self-upgrade replaces the fork's runtime files (herdr, 2026-09-29),
+    // so hosts upgrade from the fork instead. Checks stay available.
+    if (process.env.ZYLOS_ALLOW_SELF_UPGRADE !== '1') {
+      printSelfUpgradeFailure(upgradeBridgeFailure('This host runs a managed zylos-core fork; upgrade it from the fork deploy branch (azure-agents-infra docs/RUNBOOK.md), not from upstream. Set ZYLOS_ALLOW_SELF_UPGRADE=1 to override.', { code: 'FORK_MANAGED' }), jsonOutput);
+      process.exitCode = 1;
+      return;
+    }
     const exitCode = await upgradeSelfCore({ branch, beta, version });
     if (exitCode !== 0) process.exitCode = exitCode;
     return;
