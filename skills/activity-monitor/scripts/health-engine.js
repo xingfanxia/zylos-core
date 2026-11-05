@@ -120,6 +120,9 @@ export class HealthEngine {
 
     // API error detection throttle
     this._lastStructuredQuotaScanAt = 0;
+    this._lastTurnOutcomeScanAt = 0;
+    this.overloadResumedFor = 0; // endedAtMs of the overloaded turn last resumed
+    this.overloadResumeAttempts = 0; // consecutive resumes without a successful turn
     this.warmupUntil = 0;
     this.readinessProbePending = false;
     this._lastApiErrorScanAt = 0; // Last time tmux pane was scanned for API errors
@@ -317,6 +320,24 @@ export class HealthEngine {
     return false;
   }
 
+  // Codex ends a turn on provider overload and then waits idle, so the input
+  // that started it stays unanswered. Ask it to resume, backing off 1, 2, 4, 8
+  // and then 10 minutes while the overload lasts; a successful turn resets.
+  _resumeOverloadedTurn(currentTime) {
+    const turn = this.deps.readTurnOutcome();
+    if (turn?.outcome === 'success') {
+      this.overloadResumeAttempts = 0;
+      return;
+    }
+    if (turn?.outcome !== 'overloaded' || turn.endedAtMs === this.overloadResumedFor) return;
+    const delay = Math.min(60 * 2 ** this.overloadResumeAttempts, 600);
+    if (currentTime - turn.endedAtMs / 1000 < delay) return;
+    if (!this.deps.enqueueOverloadResume?.()) return;
+    this.overloadResumedFor = turn.endedAtMs;
+    this.overloadResumeAttempts += 1;
+    this.deps.log(`Turn ended with ${turn.code}; resume requested (attempt ${this.overloadResumeAttempts})`);
+  }
+
   runMaintenanceCycle(agentRunning, currentTime) {
     this.evidence?.drain();
     if (currentTime < this.warmupUntil) return;
@@ -332,6 +353,11 @@ export class HealthEngine {
         this.enterRateLimited(limit.cooldownUntil || currentTime + this.rateLimitDefaultCooldown, limit.resetTime || '');
         return;
       }
+    }
+    if (agentRunning && this.healthState === 'ok' && this.deps.readTurnOutcome
+        && currentTime - this._lastTurnOutcomeScanAt >= 30) {
+      this._lastTurnOutcomeScanAt = currentTime;
+      this._resumeOverloadedTurn(currentTime);
     }
 
     this._trackAgentRunning(agentRunning, currentTime);
