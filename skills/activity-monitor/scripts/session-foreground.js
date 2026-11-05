@@ -21,6 +21,17 @@ try {
 } catch { /* single-session fallback */ }
 const FOREGROUND_SESSION_FILE = path.join(MONITOR_DIR, 'foreground-session.json');
 
+// Fork: upstream's managed-pane check runs a tmux client from this hook, which
+// an OS-isolated persona cannot reach (the server belongs to the service user).
+// While #835 evidence is off the hook records as in 0.9.1; the monitor still
+// validates the PID and foreground identity it reads.
+function healthEvidenceEnabled() {
+  try {
+    const config = JSON.parse(fs.readFileSync(path.join(ZYLOS_DIR, '.zylos', 'config.json'), 'utf8'));
+    return config.runtime_health_evidence === true || config.runtime_health_evidence === 'true';
+  } catch { return false; }
+}
+
 function atomicWriteJson(filePath, value) {
   const tmp = `${filePath}.tmp.${process.pid}.${Date.now()}`;
   fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
@@ -33,10 +44,11 @@ export function handleSessionForeground(payload, {
   managedProcess = isManagedClaudeProcess,
   platform = process.platform,
   session = MANAGED_SESSION,
+  verifyManagedPane = healthEvidenceEnabled(),
 } = {}) {
   const sessionId = payload?.session_id || process.env.CLAUDE_SESSION_ID || null;
   if (!sessionId) return null;
-  if (payload?.agent_id || !managedProcess(claudePid, { platform, session })) return null;
+  if (payload?.agent_id || (verifyManagedPane && !managedProcess(claudePid, { platform, session }))) return null;
 
   if (!fs.existsSync(MONITOR_DIR)) {
     fs.mkdirSync(MONITOR_DIR, { recursive: true });
