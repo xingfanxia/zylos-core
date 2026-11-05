@@ -385,6 +385,20 @@ export function getUnsummarizedConversationsForInstance(instanceId, opts) {
  * @param {string} instanceId - the instance ID to filter by
  * @returns {object[]} conversation records in chronological order
  */
+/**
+ * Conversations at or after a UTC timestamp for one instance, in timestamp
+ * order (the scoped form of upstream getConversationsSince).
+ */
+export function getConversationsSinceForInstance(since, instanceId) {
+  const db = getDb();
+  return db.prepare(`
+    SELECT * FROM conversations
+    WHERE timestamp >= ?
+      AND target_instance = ?
+    ORDER BY timestamp ASC, id ASC
+  `).all(since, instanceId);
+}
+
 export function getConversationsByRangeForInstance(begin, end, instanceId) {
   const db = getDb();
   return db.prepare(`

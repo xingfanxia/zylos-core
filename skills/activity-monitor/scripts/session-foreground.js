@@ -12,9 +12,12 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 // foreground-session.json from getMonitorDir(), so a shared-dir write here
 // leaves every instance's monitor reading a file nothing writes.
 let MONITOR_DIR = path.join(ZYLOS_DIR, 'activity-monitor');
+// Fork: the managed pane is the instance's own tmux session, not claude-main.
+let MANAGED_SESSION = process.env.ZYLOS_TMUX_SESSION || 'claude-main';
 try {
-  const { getMonitorDir } = await import('../../multi-session/instance-config.js');
+  const { getMonitorDir, getSessionName } = await import('../../multi-session/instance-config.js');
   MONITOR_DIR = getMonitorDir(process.env.ZYLOS_INSTANCE_ID || undefined);
+  if (!process.env.ZYLOS_TMUX_SESSION) MANAGED_SESSION = getSessionName(process.env.ZYLOS_INSTANCE_ID || undefined) || MANAGED_SESSION;
 } catch { /* single-session fallback */ }
 const FOREGROUND_SESSION_FILE = path.join(MONITOR_DIR, 'foreground-session.json');
 
@@ -29,10 +32,11 @@ export function handleSessionForeground(payload, {
   claudePid = getClaudePid(),
   managedProcess = isManagedClaudeProcess,
   platform = process.platform,
+  session = MANAGED_SESSION,
 } = {}) {
   const sessionId = payload?.session_id || process.env.CLAUDE_SESSION_ID || null;
   if (!sessionId) return null;
-  if (payload?.agent_id || !managedProcess(claudePid, { platform })) return null;
+  if (payload?.agent_id || !managedProcess(claudePid, { platform, session })) return null;
 
   if (!fs.existsSync(MONITOR_DIR)) {
     fs.mkdirSync(MONITOR_DIR, { recursive: true });

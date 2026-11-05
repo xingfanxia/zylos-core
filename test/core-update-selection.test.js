@@ -32,6 +32,8 @@ function fixture(versions) {
     PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
     GITHUB_TOKEN: '', GH_TOKEN: '', ZYLOS_GH_RETRY_DELAY_MS: '',
     CORE_SELECTION_HANDOFF: handoff,
+    // Fork: mutating self-upgrades are refused unless explicitly allowed.
+    ZYLOS_ALLOW_SELF_UPGRADE: '1',
   };
   // No service or installer command may escape to the host. No tmux or database
   // is needed: this boundary stops at a fixture upgrade entry, before installation.

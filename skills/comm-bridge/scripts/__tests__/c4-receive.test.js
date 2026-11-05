@@ -319,6 +319,8 @@ describe('c4-receive option manifest', () => {
     '--block-queue-until-idle': { field: 'require_idle', expected: 1 },
     '--json': {},
     '--content': { value: '--literal-content', field: 'content', expected: '--literal-content' },
+    // Fork: an explicit target is parsed, not tolerated as an unknown option.
+    '--target-instance': { value: 'selected-instance', field: 'target_instance', expected: 'selected-instance' },
   };
   const manifest = JSON.parse(fs.readFileSync(new URL('../c4-receive-options.json', import.meta.url), 'utf8'));
   for (const name of Object.keys(manifest.options)) {

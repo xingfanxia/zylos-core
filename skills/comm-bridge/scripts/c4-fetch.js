@@ -7,7 +7,7 @@
  *   node c4-fetch.js --unsummarized           Fetch all unsummarized conversations
  *   node c4-fetch.js --begin <id> --end <id>  Fetch conversations in a specific range
  *   node c4-fetch.js --since <time>           Fetch conversations from a point in time
- *                                             (all-instance reads only in multi-session)
+ *                                             (not through the broker for isolated instances)
  */
 
 import {
@@ -26,11 +26,13 @@ const INSTANCE_ID = process.env.ZYLOS_INSTANCE_ID || null;
 let _getUnsummarizedRangeForInstance = null;
 let _getConversationsByRangeForInstance = null;
 let _getLastCheckpointForInstance = null;
+let _getConversationsSinceForInstance = null;
 try {
   const multiMod = await import('./c4-db-multi.js');
   _getUnsummarizedRangeForInstance = multiMod.getUnsummarizedRangeForInstance;
   _getConversationsByRangeForInstance = multiMod.getConversationsByRangeForInstance;
   _getLastCheckpointForInstance = multiMod.getLastCheckpointForInstance;
+  _getConversationsSinceForInstance = multiMod.getConversationsSinceForInstance;
 } catch {
   // c4-db-multi.js not available — instance-scoped queries disabled
 }
@@ -46,7 +48,7 @@ function usage() {
     '  c4-fetch.js --unsummarized --all-instances  Fetch unsummarized conversations across ALL instances',
     '  c4-fetch.js --begin <id> --end <id>         Fetch conversations in a specific range',
     '  c4-fetch.js --begin <id> --end <id> --all-instances  Fetch range across ALL instances',
-    '  c4-fetch.js --since <duration|datetime>    Fetch from a point in time (all-instance reads only)',
+    '  c4-fetch.js --since <duration|datetime>    Fetch conversations from a point in time',
   ].join('\n'));
   process.exit(1);
 }
@@ -124,10 +126,15 @@ function outputConversations(beginId, endId, { allInstances = false } = {}) {
   printConversations(`id ${beginId} ~ ${endId}`, conversations, checkpoint);
 }
 
-// Upstream --since reads every tenant's rows, so it is served only to unscoped
-// callers; an instance-scoped read keeps --begin/--end (fork, 0.9.5 catch-up).
-function outputConversationsSince(since) {
-  const conversations = getConversationsSince(since);
+// Fork: --since keeps the same instance scope and checkpoint as --begin/--end.
+function outputConversationsSince(since, { allInstances = false } = {}) {
+  const scoped = !allInstances && INSTANCE_ID;
+  const checkpoint = (scoped && _getLastCheckpointForInstance)
+    ? _getLastCheckpointForInstance(INSTANCE_ID)
+    : getLastCheckpoint();
+  const conversations = scoped
+    ? _getConversationsSinceForInstance(since, INSTANCE_ID)
+    : getConversationsSince(since);
   // Rows come in timestamp order; report the full id span for --begin/--end.
   let minId = Infinity;
   let maxId = -Infinity;
@@ -138,7 +145,7 @@ function outputConversationsSince(since) {
   const label = conversations.length === 0
     ? `since ${since} UTC`
     : `since ${since} UTC, id ${minId} ~ ${maxId}`;
-  printConversations(label, conversations, getLastCheckpoint());
+  printConversations(label, conversations, checkpoint);
 }
 
 /** Print a broker fetch response ({checkpoint, range, conversations, formatted}). */
@@ -182,8 +189,10 @@ async function main() {
   catch (err) { console.error(err.message); process.exit(1); }
 
   const sinceRequested = args.includes('--since');
-  if (sinceRequested && (useBroker || (INSTANCE_ID && !allInstances))) {
-    console.error('--since is not available for instance-scoped fetch; use --begin/--end');
+  // The broker serves isolated instances only ranges; a scoped read without the
+  // instance query would read every tenant.
+  if (sinceRequested && (useBroker || (INSTANCE_ID && !allInstances && !_getConversationsSinceForInstance))) {
+    console.error('--since is not available for this instance; use --begin/--end');
     process.exit(1);
   }
 
@@ -236,7 +245,7 @@ async function main() {
       usage();
     }
     try {
-      outputConversationsSince(since);
+      outputConversationsSince(since, { allInstances });
     } catch (err) {
       console.error(`Error fetching conversations: ${err.stack}`);
       process.exit(1);
