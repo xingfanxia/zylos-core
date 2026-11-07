@@ -29,6 +29,11 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const HOOK_LOG = path.join(ZYLOS_DIR, 'activity-monitor', 'hook-timing.log');
 const SOCKET_NAME = 'c4-broker.sock';
 const BROKER_TIMEOUT_MS = 8000;
+// The broker answers a send only after the channel's send.js exits, which for
+// an attachment includes uploading it (an 0.7 MB image took over 8 s on
+// 2026-11-06). Timing out earlier reports a failure for a message that is
+// still being delivered, and the agent's retry duplicates it.
+export const BROKER_OP_TIMEOUT_MS = { send: 150000 };
 
 /** Isolated tier = this instance declares an os_user in instances.json. */
 export function instanceIsIsolated(instanceId = getInstanceId()) {
@@ -78,7 +83,9 @@ let _reqSeq = 0;
  * @param {string} [instanceId]
  * @returns {Promise<any>}
  */
-export function brokerCall(op, params = {}, instanceId = getInstanceId()) {
+export function brokerCall(op, params = {}, instanceId = getInstanceId(), {
+  timeoutMs = BROKER_OP_TIMEOUT_MS[op] ?? BROKER_TIMEOUT_MS,
+} = {}) {
   const sockPath = brokerSocketPath(instanceId);
   const id = ++_reqSeq;
   return new Promise((resolve, reject) => {
@@ -91,7 +98,7 @@ export function brokerCall(op, params = {}, instanceId = getInstanceId()) {
       try { conn.destroy(); } catch { /* already gone */ }
       fn(arg);
     };
-    conn.setTimeout(BROKER_TIMEOUT_MS);
+    conn.setTimeout(timeoutMs);
     conn.setEncoding('utf8');
     conn.on('connect', () => { conn.write(JSON.stringify({ id, op, params }) + '\n'); });
     conn.on('data', (chunk) => {
@@ -104,7 +111,13 @@ export function brokerCall(op, params = {}, instanceId = getInstanceId()) {
       if (res.ok) done(resolve, res.data);
       else done(reject, new Error(`broker: ${res.error || 'unknown_error'}`));
     });
-    conn.on('timeout', () => done(reject, new Error('broker: timeout')));
+    conn.on('timeout', () => {
+      // The request may still complete on the broker side: callers must treat
+      // this as an unknown outcome, not a failure.
+      const err = new Error('broker: timeout');
+      err.code = 'BROKER_TIMEOUT';
+      done(reject, err);
+    });
     conn.on('error', (err) => done(reject, err));
     conn.on('close', () => done(reject, new Error('broker: closed without response')));
   });

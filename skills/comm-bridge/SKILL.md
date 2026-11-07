@@ -65,6 +65,11 @@ separate text message IN ORDER: a lead-in above the directive is sent before the
 file, a caption below it after. (Multiple `[MEDIA:]` directives per message are
 not supported — send one file per message.)
 
+A broker send waits up to 150 s for the channel to finish, attachment upload
+included. If it still reports `Broker send outcome unknown`, the message may
+already have been delivered: do not resend it; ask the recipient whether it
+arrived.
+
 
 ## Database
 
