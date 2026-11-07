@@ -366,7 +366,9 @@ function cmdDone(taskId) {
   if (!task) return;
   const currentTime = now();
   write(() => {
-    db.prepare(`UPDATE tasks SET status='completed',last_run_at=?,updated_at=? WHERE id=?`)
+    // A successful run clears the error of an earlier run; otherwise one old
+    // timeout stays on a recurring task forever.
+    db.prepare(`UPDATE tasks SET status='completed',last_run_at=?,updated_at=?,last_error=NULL WHERE id=?`)
       .run(currentTime, currentTime, task.id);
     const historyEntry = db.prepare(`SELECT id,executed_at FROM task_history
       WHERE task_id=? AND status='started' ORDER BY executed_at DESC LIMIT 1`).get(task.id);
