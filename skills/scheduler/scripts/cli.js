@@ -333,10 +333,11 @@ function cmdDone(taskId) {
 
   const currentTime = now();
 
-  // Update task status
+  // Update task status. A successful run clears the error of an earlier run;
+  // otherwise one old timeout stays on a recurring task forever.
   db.prepare(`
     UPDATE tasks
-    SET status = 'completed', last_run_at = ?, updated_at = ?
+    SET status = 'completed', last_run_at = ?, updated_at = ?, last_error = NULL
     WHERE id = ?
   `).run(currentTime, currentTime, task.id);
 
