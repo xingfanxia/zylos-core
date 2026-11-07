@@ -65,10 +65,18 @@ separate text message IN ORDER: a lead-in above the directive is sent before the
 file, a caption below it after. (Multiple `[MEDIA:]` directives per message are
 not supported — send one file per message.)
 
-A broker send waits up to 150 s for the channel to finish, attachment upload
-included. If it still reports `Broker send outcome unknown`, the message may
-already have been delivered: do not resend it; ask the recipient whether it
-arrived.
+A broker send waits for the channel to finish, attachment upload included; the
+broker stops a send after 135 s. If c4-send reports `Broker send outcome
+unknown` or `channel_send_timeout`, the message may already have been
+delivered: do not resend it yet. Check what you sent with
+
+```bash
+node ~/zylos/.claude/skills/comm-bridge/scripts/c4-send.js --recent 5
+```
+
+Each line is `#id time status channel chat preview`; status is `sending`,
+`delivered`, `failed` or `unknown`. Resend only a `failed` message; for
+`unknown`, ask the recipient whether it arrived.
 
 
 ## Database

@@ -28,7 +28,7 @@
 import path from 'path';
 import fs from 'fs';
 import { spawn } from 'child_process';
-import { insertConversation, markFailed, close } from './c4-db.js';
+import { insertConversation, markFailed, setSendStatus, getRecentSends, close } from './c4-db.js';
 import { SKILLS_DIR } from './c4-config.js';
 import { validateChannel, validateEndpoint } from './c4-validate.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
@@ -39,6 +39,7 @@ function printUsage() {
   console.log('       EOF');
   console.log('       node c4-send.js <channel> [endpoint_id] "message"');
   console.log('Example: node c4-send.js telegram 8101553026 "Hello!"');
+  console.log('       node c4-send.js --recent [N]   list your last N sends and their status');
   process.exit(1);
 }
 
@@ -55,8 +56,42 @@ function readStdin() {
   });
 }
 
+/** Format the caller's recent sends, newest first (see getRecentSends). */
+function formatRecentSends(rows) {
+  if (!rows.length) return 'No sends recorded.';
+  return rows.map(r => `#${r.id} ${r.timestamp} ${r.status} ${r.channel} ${String(r.endpoint_id || '').split('|')[0]} `
+    + String(r.preview || '').replace(/\s+/g, ' ').slice(0, 100)).join('\n');
+}
+
+/**
+ * --recent [N]: what this agent already sent (status sending | delivered |
+ * failed | unknown). Isolated agents read it through the broker; they cannot
+ * open c4.db. Check it before resending after an unknown outcome.
+ */
+async function showRecent(limitArg) {
+  const limit = Number.parseInt(limitArg, 10) || 10;
+  let rows;
+  if (shouldUseBroker()) {
+    rows = await brokerCall('sends', { limit });
+  } else {
+    rows = getRecentSends(process.env.ZYLOS_INSTANCE_ID || null, limit);
+    close();
+  }
+  console.log(formatRecentSends(rows));
+}
+
 async function main() {
   const args = process.argv.slice(2);
+
+  if (args[0] === '--recent') {
+    try {
+      await showRecent(args[1]);
+      process.exit(0);
+    } catch (err) {
+      console.error(`[C4] ${err.message}`);
+      process.exit(1);
+    }
+  }
 
   if (args.length < 2) {
     printUsage();
@@ -206,8 +241,8 @@ async function main() {
     } catch (err) {
       if (err.code === 'BROKER_TIMEOUT') {
         console.error('[C4] Broker send outcome unknown: no reply before the timeout. '
-          + 'The message may still have been delivered, so do not resend it; '
-          + 'ask the recipient whether it arrived.');
+          + 'The message may still have been delivered, so do not resend it yet: '
+          + 'run c4-send.js --recent to see its status, and ask the recipient if it is still unclear.');
       } else {
         console.error(`[C4] Broker send failed: ${err.message}`);
       }
@@ -221,7 +256,7 @@ async function main() {
     // configured), but keep both sides of an identified instance's conversation
     // visible to its own strictly-scoped history readers.
     outRecord = insertConversation(
-      'out', channel, endpoint, message, null, 3, false, deliveryAction,
+      'out', channel, endpoint, message, 'sending', 3, false, deliveryAction,
       process.env.ZYLOS_INSTANCE_ID || null,
     );
   } catch (err) {
@@ -263,6 +298,10 @@ async function main() {
 
   child.on('close', (code) => {
     if (code === 0) {
+      if (outRecord?.id != null) {
+        try { setSendStatus(outRecord.id, 'delivered'); } catch { /* audit-only, best effort */ }
+        try { close(); } catch { /* reopened above */ }
+      }
       console.log(`[C4] Message sent via ${channel}`);
     } else {
       console.log(`[C4] Failed to send message via ${channel} (exit code: ${code})`);

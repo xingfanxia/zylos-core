@@ -46,6 +46,8 @@ import {
   expireTimedOutControls,
   getDb,
   markFailed,
+  setSendStatus,
+  getRecentSends,
   close as closeDb,
 } from './c4-db.js';
 import {
@@ -239,6 +241,7 @@ async function handleRequest(req, caller) {
   switch (op) {
     case 'ping':         return { ok: true, data: { pong: true, instance: caller } };
     case 'send':         return await opSend(p, caller);
+    case 'sends':        return { ok: true, data: getRecentSends(caller, p.limit) };
     case 'void':         return opVoid(p, caller);
     case 'fetch':        return opFetch(p, caller);
     case 'unsummarized': return opUnsummarized(caller);
@@ -348,7 +351,7 @@ async function opSend(p, caller) {
   // both sides of the conversation without exposing the reply to peer instances.
   let conversationId = null;
   try {
-    const row = insertConversation('out', channel, endpoint, content, null, 3, false, deliveryAction, caller);
+    const row = insertConversation('out', channel, endpoint, content, 'sending', 3, false, deliveryAction, caller);
     conversationId = row.id;
   } catch (e) {
     log(`WARN audit insert failed (${caller}): ${e.message}`);
@@ -440,18 +443,35 @@ async function opSend(p, caller) {
     }
   }
 
-  let code;
+  let outcome;
   try {
-    code = await spawnSend(channelScript, endpoint, content);
+    outcome = await spawnSend(channelScript, endpoint, content);
   } finally {
     if (stagingSubdir) {
       try { fs.rmSync(stagingSubdir, { recursive: true, force: true }); }
       catch (e) { log(`WARN staging cleanup failed (${caller}): ${e.message}`); }
     }
   }
-  if (code === 0) return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
+  const settle = (status) => {
+    if (conversationId == null) return;
+    try { setSendStatus(conversationId, status); } catch (e) { log(`WARN audit status ${status} (${conversationId}) failed: ${e.message}`); }
+  };
+  if (outcome.code === 0) {
+    settle('delivered');
+    return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
+  }
+  if (outcome.timedOut) {
+    settle('unknown');
+    log(`SEND TIMEOUT ${caller}: ${channel} send stopped after ${SEND_TIMEOUT_MS} ms (conversation ${conversationId})`);
+    return {
+      ok: false,
+      error: `channel_send_timeout: stopped after ${Math.round(SEND_TIMEOUT_MS / 1000)} s, so the message may or may not have arrived; `
+        + 'run c4-send.js --recent to see it, and ask the recipient before resending',
+      data: { conversation_id: conversationId },
+    };
+  }
   markAuditFailed();
-  return { ok: false, error: `channel_send_failed:exit_${code}`, data: { conversation_id: conversationId } };
+  return { ok: false, error: `channel_send_failed:exit_${outcome.code}`, data: { conversation_id: conversationId } };
 }
 
 /**
@@ -477,19 +497,41 @@ function opVoid(p, caller) {
   }
 }
 
-function spawnSend(channelScript, endpoint, content) {
+/**
+ * Upper bound for one channel send.js run (upload + send). It stays below the
+ * client's 150 s send wait (c4-client BROKER_OP_TIMEOUT_MS.send) plus the kill
+ * grace, so the agent always gets a definite answer. Before 2026-11-08 a hung
+ * child had no bound and left the request waiting forever.
+ */
+export const SEND_TIMEOUT_MS = Number(process.env.C4_SEND_TIMEOUT_MS) || 135000;
+const KILL_GRACE_MS = 5000;
+
+export function spawnSend(channelScript, endpoint, content, timeoutMs = SEND_TIMEOUT_MS) {
   return new Promise((resolve) => {
     // Same arg shape c4-send uses: [endpoint, message] or [message].
     const args = endpoint != null ? [channelScript, endpoint, content] : [channelScript, content];
     const child = spawn('node', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+    let timedOut = false;
+    let killTimer = null;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGTERM');
+      killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
+    }, timeoutMs);
     child.stdout.on('data', () => {});
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('close', (code) => {
+      clearTimeout(timer);
+      if (killTimer) clearTimeout(killTimer);
       if (code !== 0 && stderr) log(`channel send stderr: ${stderr.trim().slice(0, 500)}`);
-      resolve(code == null ? 1 : code);
+      resolve({ code: code == null ? 1 : code, timedOut });
     });
-    child.on('error', (err) => { log(`channel spawn error: ${err.message}`); resolve(1); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      log(`channel spawn error: ${err.message}`);
+      resolve({ code: 1, timedOut: false });
+    });
   });
 }
 

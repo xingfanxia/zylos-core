@@ -19,6 +19,8 @@ import path from 'node:path';
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c4-broker-'));
 process.env.ZYLOS_DIR = tmpDir;
 process.env.C4_BROKER_DISABLE_MAIN = '1';
+// Short send bound so the hung-send test runs fast (production default 135 s).
+process.env.C4_SEND_TIMEOUT_MS = '1500';
 delete process.env.ZYLOS_INSTANCE_ID;
 
 const stateDir = (id) => path.join(tmpDir, 'state', id);
@@ -520,6 +522,41 @@ describe('broker handleRequest', () => {
     const row = getDb().prepare('SELECT status, target_instance FROM conversations WHERE id = ?').get(r.data.conversation_id);
     assert.equal(row.status, 'failed');
     assert.equal(row.target_instance, 'inst-a', 'failed audit rows retain caller attribution');
+  });
+
+  it('send: a delivered send ends delivered; the row is written as sending first', async () => {
+    const r = await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'status check' } }, 'inst-a');
+    assert.equal(r.ok, true, r.error);
+    const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+    assert.equal(row.status, 'delivered');
+  });
+
+  it('send: a hung channel script is stopped at the bound and recorded as unknown, not delivered', async () => {
+    const script = path.join(tmpDir, '.claude', 'skills', 'web-console', 'scripts', 'send.js');
+    const original = fs.readFileSync(script, 'utf8');
+    fs.writeFileSync(script, 'setTimeout(() => {}, 60000);\n');
+    try {
+      const started = Date.now();
+      const r = await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'hangs' } }, 'inst-a');
+      assert.ok(Date.now() - started < 10000, 'returned within the bound');
+      assert.equal(r.ok, false);
+      assert.match(r.error, /channel_send_timeout/);
+      assert.match(r.error, /--recent/);
+      const row = getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id);
+      assert.equal(row.status, 'unknown');
+    } finally {
+      fs.writeFileSync(script, original);
+    }
+  });
+
+  it('sends: lists only the caller\'s recent sends with their status, newest first', async () => {
+    await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'from b' } }, 'inst-b');
+    const a = await broker.handleRequest({ op: 'sends', params: { limit: 3 } }, 'inst-a');
+    assert.equal(a.ok, true);
+    assert.ok(a.data.length > 0 && a.data.length <= 3);
+    assert.ok(a.data.every(r => !r.preview.includes('from b')), 'no peer rows');
+    assert.ok(a.data[0].id > a.data[a.data.length - 1].id || a.data.length === 1);
+    assert.ok(a.data.every(r => ['sending', 'delivered', 'failed', 'unknown'].includes(r.status)));
   });
 });
 

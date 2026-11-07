@@ -331,6 +331,34 @@ export function markFailed(id) {
 }
 
 /**
+ * Outbound send lifecycle: an out-row is written 'sending' before the channel
+ * script runs and ends 'delivered', 'failed' or 'unknown' (the script was
+ * stopped at the time limit, so the message may or may not have arrived).
+ */
+export const SEND_STATUSES = Object.freeze(['sending', 'delivered', 'failed', 'unknown']);
+
+export function setSendStatus(id, status) {
+  if (!SEND_STATUSES.includes(status)) throw new Error(`invalid send status: ${status}`);
+  getDb().prepare("UPDATE conversations SET status = ? WHERE id = ? AND direction = 'out'").run(status, id);
+}
+
+/**
+ * An instance's most recent outbound sends on real channels, newest first, so
+ * an agent can check what it already sent before resending. `instanceId` null
+ * means unattributed rows (single-session / unscoped admin).
+ */
+export function getRecentSends(instanceId, limit = 10) {
+  const n = Math.min(Math.max(Number.parseInt(limit, 10) || 10, 1), 50);
+  return getDb().prepare(`
+    SELECT id, timestamp, channel, endpoint_id, status, substr(content, 1, 160) AS preview
+    FROM conversations
+    WHERE direction = 'out' AND channel NOT IN ('void', 'system')
+      AND target_instance IS ?
+    ORDER BY id DESC LIMIT ?
+  `).all(instanceId ?? null, n);
+}
+
+/**
  * Get count of pending messages
  * @returns {number}
  */
