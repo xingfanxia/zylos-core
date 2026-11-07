@@ -204,7 +204,13 @@ async function main() {
       console.log(`[C4] Message sent via ${channel} (broker)`);
       process.exit(0);
     } catch (err) {
-      console.error(`[C4] Broker send failed: ${err.message}`);
+      if (err.code === 'BROKER_TIMEOUT') {
+        console.error('[C4] Broker send outcome unknown: no reply before the timeout. '
+          + 'The message may still have been delivered, so do not resend it; '
+          + 'ask the recipient whether it arrived.');
+      } else {
+        console.error(`[C4] Broker send failed: ${err.message}`);
+      }
       process.exit(1);
     }
   }
