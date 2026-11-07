@@ -295,6 +295,21 @@ describe('cli done', () => {
     });
   });
 
+  it('clears the error left by an earlier timed-out run', () => {
+    withTmpDir(({ dbPath, env }) => {
+      cli(['add', 'recurring', '--cron', '0 9 * * *'], env);
+      const db = new Database(dbPath);
+      try {
+        const task = db.prepare('SELECT id FROM tasks LIMIT 1').get();
+        db.prepare("UPDATE tasks SET last_error = 'Task timed out' WHERE id = ?").run(task.id);
+        cli(['done', task.id], env);
+        assert.equal(db.prepare('SELECT last_error FROM tasks WHERE id = ?').get(task.id).last_error, null);
+      } finally {
+        db.close();
+      }
+    });
+  });
+
   it('reports error for non-existent task', () => {
     withTmpDir(({ env }) => {
       const { stderr } = cliRaw(['done', 'nonexistent-id'], env);

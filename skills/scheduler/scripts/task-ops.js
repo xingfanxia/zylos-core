@@ -96,6 +96,8 @@ export function insertTask(db, spec) {
  * Mark a task completed and close its open history entry.
  * @returns {{ok:true, task:object} | {ok:false, error, matches?}}
  */
+// A successful run clears the error of an earlier run; otherwise one old
+// timeout stays on a recurring task forever.
 export function completeTask(db, prefix, { scope = null } = {}) {
   const resolved = resolveTaskByPrefix(db, prefix, { scope });
   if (!resolved.ok) return resolved;
@@ -104,7 +106,7 @@ export function completeTask(db, prefix, { scope = null } = {}) {
 
   db.prepare(`
     UPDATE tasks
-    SET status = 'completed', last_run_at = ?, updated_at = ?
+    SET status = 'completed', last_run_at = ?, updated_at = ?, last_error = NULL
     WHERE id = ?
   `).run(currentTime, currentTime, task.id);
 
