@@ -116,6 +116,14 @@ test('endpoint keys ignore message IDs but preserve health, reason, channel, roo
   assert.notEqual(statusNoticeKey('lark', 'ep'), statusNoticeKey('other', 'ep'));
 });
 
+test('a Feishu group gets one notice whoever asked: the sender field is ignored', () => {
+  assert.equal(normalizeStatusEndpoint('oc_g|type:group|msg:om_1|sender:ou_a'), 'oc_g|type:group');
+  assert.equal(statusNoticeKey('feishu', 'oc_g|type:group|msg:om_1|sender:ou_a'),
+    statusNoticeKey('feishu', 'oc_g|type:group|msg:om_2|sender:ou_b'));
+  assert.notEqual(statusNoticeKey('feishu', 'oc_g|type:group|thread:t|sender:ou_a'),
+    statusNoticeKey('feishu', 'oc_g|type:group|thread:u|sender:ou_a'));
+});
+
 test('reservation atomically suppresses sends and successful completion retains cooldown', t => {
   const { db, input } = fixture(t);
   const claim = claimStatusNotice(input, db);
