@@ -125,3 +125,37 @@ describe('select row vs composer', () => {
     assert.equal(state.modal, null);
   });
 });
+
+describe('dialog identity, not wording (Astra #5)', () => {
+  it('a permission prompt for echo "You\'ve reached your Fable limit" is a permission prompt', () => {
+    assert.equal(detectModal(fx.PERMISSION_ECHO_LIMIT)?.kind, 'permission');
+    assert.equal(classifyLimitDialog(fx.PERMISSION_ECHO_LIMIT), null);
+  });
+
+  it('limit wording inside a diff preview leaves an edit prompt a permission prompt', () => {
+    assert.equal(detectModal(fx.PERMISSION_DIFF_LIMIT)?.kind, 'permission');
+    assert.equal(classifyLimitDialog(fx.PERMISSION_DIFF_LIMIT), null);
+  });
+
+  it('limit wording in an AskUserQuestion-style select is an unknown modal, not the limit dialog', () => {
+    assert.equal(detectModal(fx.ASK_QUESTION_LIMIT)?.kind, 'unknown');
+    assert.equal(classifyLimitDialog(fx.ASK_QUESTION_LIMIT), null);
+  });
+
+  it('limit wording in tool output above an unrelated bare select is an unknown modal', () => {
+    assert.equal(detectModal(fx.TOOL_OUTPUT_ABOVE_SELECT)?.kind, 'unknown');
+    assert.equal(classifyLimitDialog(fx.TOOL_OUTPUT_ABOVE_SELECT), null);
+  });
+
+  it('limit wording in tool output above a real permission prompt leaves it a permission prompt', () => {
+    assert.equal(detectModal(fx.TOOL_OUTPUT_ABOVE_PERMISSION)?.kind, 'permission');
+    assert.equal(classifyLimitDialog(fx.TOOL_OUTPUT_ABOVE_PERMISSION), null);
+  });
+
+  it('a limit-titled dialog with numbered (non-limit) options is not the limit dialog', () => {
+    // ASK_QUESTION_LIMIT carries the exact limit title; its numbered option set decides.
+    assert.ok(fx.ASK_QUESTION_LIMIT.split('\n').includes("  You've reached your Fable limit"));
+    assert.equal(classifyLimitDialog(fx.ASK_QUESTION_LIMIT), null);
+  });
+});
+

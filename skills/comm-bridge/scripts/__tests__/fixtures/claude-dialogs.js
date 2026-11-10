@@ -139,3 +139,97 @@ export const PLAIN_COMPOSER_PROMPT_Y = transcript.length + 1;
 
 // Composer holding the pasted (not yet submitted) message.
 export const COMPOSER_WITH_TEXT = [...transcript, ...composer('hello from feishu')].join('\n');
+
+// ── Limit wording inside OTHER dialogs (classifier identity, Astra #5) ─────
+// The limit sentence appears as content of a dialog that is not the limit
+// dialog: a quoted command, a diff preview, a question/option label, or tool
+// output drawn above a real unrelated modal. Identity (title row, option set,
+// the question row directly above the options) decides the kind, never
+// wording found somewhere in the dialog.
+
+// The reviewer's case: the permission prompt for a command that echoes the
+// limit sentence.
+export const PERMISSION_ECHO_LIMIT = [
+  ...transcript,
+  '',
+  RULE,
+  '  Bash command',
+  '',
+  '    echo "You\'ve reached your Fable limit"',
+  '    Print a test string',
+  '',
+  '  Do you want to proceed?',
+  '  ❯ 1. Yes',
+  "    2. Yes, and don't ask again for echo commands",
+  '    3. No, and tell Claude what to do differently (esc)',
+  '',
+  '  Esc to cancel',
+].join('\n');
+
+// An edit whose diff adds the limit dialog's own title and option labels.
+export const PERMISSION_DIFF_LIMIT = [
+  ...transcript,
+  '',
+  RULE,
+  '  Edit file',
+  '  docs/limits.md',
+  '  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+  '   12 -The dialog title is unknown.',
+  "   12 +You've reached your Fable limit",
+  '   13 +Claude Fable 5.2 now uses usage credits',
+  '   14 +Switch to Opus 5.5 and continue',
+  '  ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+  '  Do you want to make this edit to limits.md?',
+  '  ❯ 1. Yes',
+  '    2. Yes, allow all edits during this session (shift+tab)',
+  '    3. No, and tell Claude what to do differently (esc)',
+  '',
+  '  Esc to cancel',
+].join('\n');
+
+// An AskUserQuestion-style select that asks about the limit and offers the
+// limit dialog's own option labels.
+export const ASK_QUESTION_LIMIT = [
+  ...transcript,
+  '',
+  RULE,
+  "  You've reached your Fable limit",
+  '',
+  "  You've reached your Fable limit. Claude Fable 5.2 now uses usage credits. What next?",
+  '',
+  '  ❯ 1. Switch to Opus 5.5 and continue',
+  '       Keep working on the fallback model',
+  '    2. Request usage credits from your admin',
+  '       Ask the org admin',
+  '    3. Type something.',
+  '',
+  '  Enter to select · Tab/Arrow keys to navigate · Esc to cancel',
+].join('\n');
+
+// Tool output quoting the limit sentence, directly above a bare select list
+// (no pane divider, no composer on screen).
+export const TOOL_OUTPUT_ABOVE_SELECT = [
+  '⏺ Bash(cat notes.txt)',
+  "  ⎿  You've reached your Fable limit",
+  '     Claude Fable 5.2 now uses usage credits',
+  '  ❯ Option one',
+  '    Option two',
+].join('\n');
+
+// Tool output quoting the limit sentence, then a real permission prompt.
+export const TOOL_OUTPUT_ABOVE_PERMISSION = [
+  '⏺ Bash(cat notes.txt)',
+  "  ⎿  You've reached your Fable limit",
+  '     Switch to Opus 5.5 and continue',
+  '',
+  RULE,
+  '  Bash command',
+  '',
+  '    rm notes.txt',
+  '',
+  '  Do you want to proceed?',
+  '  ❯ 1. Yes',
+  '    2. No, and tell Claude what to do differently (esc)',
+  '',
+  '  Esc to cancel',
+].join('\n');

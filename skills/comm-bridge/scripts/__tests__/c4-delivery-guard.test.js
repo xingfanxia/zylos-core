@@ -24,6 +24,8 @@ fs.writeFileSync(path.join(root, 'instances.json'), JSON.stringify({ version: 1,
 const dispatcher = await import('../c4-dispatcher.js');
 const { sendToTmux, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey } = dispatcher;
 const { processWithMultiSession } = await import('../c4-dispatcher-multi.js');
+const { detectModal } = await import('../tmux-input-state.js');
+const fx = await import('./fixtures/claude-dialogs.js');
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 const LIMIT = { kind: 'fable_limit', text: "You've reached your Fable limit" };
@@ -143,6 +145,16 @@ describe('keystroke policy', () => {
     assert.equal(keystrokeBlockedByModal({ kind: 'credits_offer', text: '' }), true);
     assert.equal(keystrokeBlockedByModal({ kind: 'unknown', text: '' }), true);
     assert.equal(keystrokeBlockedByModal({ kind: 'permission', text: '' }), false);
+  });
+
+  it('the permission exception holds for every permission variant and never for a limit dialog (Astra #5)', () => {
+    for (const capture of [fx.PERMISSION_PROMPT_LIVE, fx.PERMISSION_ECHO_LIMIT, fx.PERMISSION_DIFF_LIMIT, fx.TOOL_OUTPUT_ABOVE_PERMISSION]) {
+      assert.equal(keystrokeBlockedByModal(detectModal(capture)), false);
+    }
+    for (const capture of [fx.FABLE_LIMIT_LIVE, fx.FABLE_LIMIT_ABOVE_COMPOSER, fx.CREDITS_OFFER_LIVE, fx.CREDITS_CHECKING_LIVE,
+      fx.ASK_QUESTION_LIMIT, fx.TOOL_OUTPUT_ABOVE_SELECT, fx.UNKNOWN_DIALOG_LIVE]) {
+      assert.equal(keystrokeBlockedByModal(detectModal(capture)), true);
+    }
   });
 });
 
