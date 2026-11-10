@@ -530,6 +530,28 @@ describe('Fable guard account + model + generation journal (review #2)', () => {
     assert.equal(sim.state.personas['user-pan'].verified, undefined);
   });
 
+  it('a guard-state commit whose instances.json write was lost launches Opus meanwhile and re-adopts the running launch', () => {
+    const sim = onAccounts();
+    const runningLaunch = sim.launches['user-pan'].launch_id;
+    sim.document.instances['user-pan'].runtime_profile = CL;
+    sim.pass({ failover: ['user-pan'] }); // guard file says CL ...
+    sim.document.instances['user-pan'].runtime_profile = BACKUP; // ... instances.json still says BACKUP
+    // What a Guardian relaunch inside the torn window would launch (the running session is left alone).
+    const torn = prepareFableLaunch({ profile: sim.cached['user-pan'], instanceId: 'user-pan', zylosDir: '/sim', nowMs: sim.now,
+      readFileSync: file => sim.read(file), writeRecord: () => {} });
+    assert.equal(torn.model, OPUS, 'the committed account is not the instance account: Opus only');
+    assert.equal(torn.fable.reason, 'account_mismatch');
+    assert.equal(sim.launches['user-pan'].launch_id, runningLaunch);
+    sim.advance(MIN);
+    const result = sim.pass();
+    assert.equal(sim.state.personas['user-pan'].desired.account, BACKUP);
+    assert.deepEqual(result.restarts, [], 'the running BACKUP launch already has the recommitted policy');
+    assert.equal(sim.state.personas['user-pan'].desired.adopted_launch_id, runningLaunch);
+    sim.advance(MIN);
+    sim.pass();
+    assert.ok(sim.state.personas['user-pan'].verified.model_at);
+  });
+
   it('a Guardian relaunch that read the old generation does not verify the new one', () => {
     const sim = onAccounts();
     const old = JSON.parse(JSON.stringify(sim.state));
