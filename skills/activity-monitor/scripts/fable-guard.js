@@ -14,10 +14,12 @@ import { execFileSync } from 'node:child_process';
 import {
   expectedFableLaunch,
   FABLE_LAUNCH_FILE,
+  FABLE_OBSERVATION_FILE,
   fableAccountSettingsFile,
   fableGuardStatePath,
   fableLastObservation,
   fableLeaseObservation,
+  fableObservationBlocked,
   fableUsagePath,
   readFableGuardConfig,
 } from '../../multi-session/runtime-files.js';
@@ -236,6 +238,7 @@ export function planFableGuard({
   failuresByInstance = {},
   launchByInstance = {},
   readinessByInstance = {},
+  observationByInstance = {},
   failoverInstanceIds = new Set(),
   nowMs = Date.now(),
 } = {}) {
@@ -297,7 +300,9 @@ export function planFableGuard({
     const eligible = enabled && Boolean(fableAccountSettingsFile(document, profileId));
     const priorMode = persona.desired?.mode || 'opus';
     let mode = 'opus';
-    const allowed = eligible && accountAllowsFable(next, usage, profileId, config, nowMs);
+    // The persona's monitor cannot observe its session's model: Opus until it can.
+    const blind = eligible && fableObservationBlocked(observationByInstance[id]);
+    const allowed = eligible && !blind && accountAllowsFable(next, usage, profileId, config, nowMs);
     if (allowed) mode = priorMode === 'fable' || upgradeReady(persona, status, nowMs, config) ? 'fable' : 'opus';
     // An account without its own settings file (claude-ax-main) cannot be
     // probed, so it never runs Fable. That is a supported, final state.
@@ -312,7 +317,7 @@ export function planFableGuard({
     if (changed) {
       const generation = ++next.generation_seq;
       const reason = !enabled ? 'fable_disabled' : !eligible ? 'unsupported_account' : mode === 'fable' ? 'fable_allowed'
-        : allowed ? 'upgrade_pending' : `fable_blocked:${Object.keys(next.holds[profileId] || {}).join('+') || 'no_lease'}`;
+        : allowed ? 'upgrade_pending' : blind ? 'fable_blocked:observation_unavailable' : `fable_blocked:${Object.keys(next.holds[profileId] || {}).join('+') || 'no_lease'}`;
       if (priorMode !== mode) persona.last_transition_at = iso(nowMs);
       persona.desired = { account: profileId, mode, generation, key: expected.key, model: baseModel(expected.model),
         committed_at: iso(nowMs), reason };
@@ -553,7 +558,8 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
   if (!readFableGuardConfig(document) && !Object.keys(state?.personas || {}).length) {
     return { state, restarts: [], events: [], changed: false };
   }
-  const inputs = { statusByInstance: {}, modelByInstance: {}, evidenceByInstance: {}, failuresByInstance: {}, launchByInstance: {}, readinessByInstance: {} };
+  const inputs = { statusByInstance: {}, modelByInstance: {}, evidenceByInstance: {}, failuresByInstance: {}, launchByInstance: {},
+    readinessByInstance: {}, observationByInstance: {} };
   for (const [id, instance] of Object.entries(document?.instances || {})) {
     if (instance?.fable_enabled !== true && !state?.personas?.[id]) continue;
     const dir = monitorDirFor(zylosDir, id, instance);
@@ -563,6 +569,7 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
     inputs.failuresByInstance[id] = readJson(path.join(dir, SESSION_FAILURES_FILE), null);
     inputs.launchByInstance[id] = readJson(path.join(dir, FABLE_LAUNCH_FILE), null);
     inputs.readinessByInstance[id] = readJson(path.join(dir, READINESS_FILE), null);
+    inputs.observationByInstance[id] = readJson(path.join(dir, FABLE_OBSERVATION_FILE), null);
   }
   return planFableGuard({ document, state, usage: readJson(fableUsagePath(zylosDir), {}),
     failoverInstanceIds, nowMs, ...inputs });

@@ -340,7 +340,8 @@ these hold at the moment of the launch (`fableAdmission` in
 `runtime-files.js`): the account has its own settings file; the guard committed
 Fable for the persona's current account; that account has no hold; and
 `fable-usage.json` holds a lease (a valid observation younger than
-`lease_sec`, window not reset, below `threshold`). Otherwise it is the
+`lease_sec`, window not reset, below `threshold`); and the persona's monitor
+has no open "model observation unavailable" alert (below). Otherwise it is the
 profile's model. The committed state alone never admits Fable: it can be
 arbitrarily old when the daemon is dead or hung. All other personas launch
 exactly as before. `CLAUDE_CODE_NO_MODEL_FALLBACK` is never set.
@@ -398,6 +399,38 @@ that session:
   (`status: confirmed`, `confirmed_at`); otherwise it stays pending and is
   retried after 15 s, 30 s, 1 min … (at most 5 min) with an `ALERT … not
   confirmed` each time.
+
+Unknown evidence is bounded across launches. When neither the process
+`--model` nor a fresh `statusline.json` model can be read, the first such stop
+is kept (the session may be on Fable). Such stops are counted per persona in
+`<monitor dir>/fable-observation.json` (`unknown_stops`), which survives
+relaunches and monitor restarts; at most one is made per 6 hours. When the
+budget is spent, a session launched on Opus (its own launch record says
+`opus`) is not stopped again: the monitor raises a persistent `alert`
+(`reason: model_observation_unavailable`, one `Fable guard ALERT: model
+observation unavailable` log line per incident, `ALERT model observation
+unavailable` in `fable-guard-cli.js status`), and while it is open the
+launcher admits no Fable for that persona (`reason: observation_unavailable`)
+and the guard commits Opus (`fable_blocked:observation_unavailable`). A
+session whose launch record says `fable` is still stopped on unknown
+evidence; its relaunch is Opus because of the alert. The alert clears by
+itself (`model observation recovered` in the monitor log) as soon as either
+source is readable again, after which Fable can be admitted on the next
+upgrade.
+
+Observation readability on ax-devbox (checked 2026-11-10 over read-only SSH
+as `xingfanxia`, the user of the PM2 daemon that runs every
+`activity-monitor-*`): `/proc` is mounted without `hidepid`, so the monitor
+user reads the command line of the isolated personas' CLIs, which run as
+`zylos-pan`, `zylos-elaine`, `zylos-group` and `zylos-sean` under
+`sudo -> sudo -> node -> claude` in tmux sessions owned by `xingfanxia`.
+`findRuntimePidUnderPane` resolves that `claude` pid and `ps -o args=` shows
+`--model claude-opus-5-5[1m]` for `admin`, `user-pan`, `user-elaine`, `group`
+and `user-sean`. Each persona's `statusline.json` (owned by the persona user,
+mode `0660`, ACL `user:xingfanxia:rwx`, effective `rw-`) is readable by
+`xingfanxia` and reports `model.id`. Both sources are readable for every
+persona; re-check them before enabling a new persona, because a persona whose
+monitor user can read neither never gets past the observation alert.
 
 The Guardian relaunch re-evaluates admission and comes up on Opus. The monitor
 only ever forces Opus. It never upgrades and never writes the guard state; the
@@ -554,7 +587,7 @@ Do **not** drop the column or the table, or delete the `003`/`004` rows from
 ledger row exists, so removing only one side leaves a schema the new code
 cannot use. Remove the guard's runtime files instead if wanted
 (`activity-monitor/fable-guard.json`, `fable-usage.json`, `activity-monitor/fable-exec/`, and per persona
-`fable-launch.json`, `fable-readiness.json`, `fable-lease-enforcement.json`,
+`fable-launch.json`, `fable-readiness.json`, `fable-lease-enforcement.json`, `fable-observation.json`,
 `fable-uncertain-deliveries.json`, `fable-session-failures.json`,
 `fable-limit-evidence.json`); the old code ignores them.
 

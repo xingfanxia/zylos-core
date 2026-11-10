@@ -17,7 +17,7 @@ import path from 'node:path';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { fableGuardStatePath, fableUsagePath, readFableGuardConfig } from '../../multi-session/runtime-files.js';
 import { clearFableHold, reconcileFableGuardNow, writeJsonAtomic } from './fable-guard.js';
-import { LEASE_ENFORCEMENT_FILE, UNCERTAIN_DELIVERIES_FILE } from './fable-monitor.js';
+import { FABLE_OBSERVATION_FILE, LEASE_ENFORCEMENT_FILE, UNCERTAIN_DELIVERIES_FILE } from './fable-monitor.js';
 import { FABLE_LAUNCH_FILE } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -57,6 +57,7 @@ export function fableGuardStatus({ zylosDir = ZYLOS_DIR, nowMs = Date.now() } = 
     const monitorDir = monitorDirOf(zylosDir, id, document.instances?.[id]);
     const launch = readJson(path.join(monitorDir, FABLE_LAUNCH_FILE), null);
     const enforcement = readJson(path.join(monitorDir, LEASE_ENFORCEMENT_FILE), null);
+    const observation = readJson(path.join(monitorDir, FABLE_OBSERVATION_FILE), null);
     personas[id] = {
       fable_enabled: document.instances?.[id]?.fable_enabled === true,
       desired: persona.desired || null,
@@ -69,6 +70,8 @@ export function fableGuardStatus({ zylosDir = ZYLOS_DIR, nowMs = Date.now() } = 
       ...(persona.gave_up ? { gave_up: persona.gave_up } : {}),
       ...(persona.safe_stop ? { safe_stop: persona.safe_stop } : {}),
       ...(enforcement ? { lease_enforcement: enforcement } : {}),
+      ...(observation?.alert ? { observation_alert: observation.alert } : {}),
+      ...(observation?.unknown_stops?.length ? { unknown_evidence_stops: observation.unknown_stops } : {}),
       uncertain_deliveries: (readJson(path.join(monitorDir, UNCERTAIN_DELIVERIES_FILE), {})?.records || []).slice(-5),
     };
   }
@@ -141,6 +144,9 @@ function formatStatus({ config, accounts, personas }) {
         : item.safe_stop ? ` SAFE-STOP PENDING (${item.safe_stop.why}, attempt ${item.safe_stop.attempts || 1}`
           + `${item.safe_stop.last_error ? `: ${item.safe_stop.last_error}` : ''}); Fable may still be running` : '')
       + (item.gave_up && !item.safe_stop ? ` GAVE UP (${item.gave_up})` : '')
+      + (item.observation_alert ? ` ALERT model observation unavailable since ${item.observation_alert.since}`
+        + ` (session ${item.observation_alert.session_ref || '-'}): no process --model and no statusline model readable by the monitor;`
+        + ' Fable not admitted, Opus launch kept, not recycled' : '')
       + (item.lease_enforcement ? ` lease-enforcement ${item.lease_enforcement.status || 'stopped'} ${item.lease_enforcement.at}`
         + (item.lease_enforcement.last_error && item.lease_enforcement.status === 'pending' ? ` (${item.lease_enforcement.last_error})` : '') : '')
       + item.uncertain_deliveries.map(entry => ` UNCERTAIN DELIVERY ${entry.item_type} #${entry.item_id}`

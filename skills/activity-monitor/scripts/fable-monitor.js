@@ -15,7 +15,10 @@
  *    unconfirmed stop is retried with backoff and an ALERT. The Guardian
  *    relaunch re-evaluates admission (prepareFableLaunch) and comes up on Opus.
  *    The monitor only ever forces this safe direction; every upgrade stays
- *    with the daemon, the single transition owner.
+ *    with the daemon, the single transition owner. Stops on UNKNOWN evidence
+ *    are budgeted across launches (fable-observation.json); past the budget an
+ *    Opus-launched session is kept and a persistent "model observation
+ *    unavailable" alert blocks Fable for the persona until evidence returns.
  *  - evidence for the daemon, stamped with the CURRENT launch record (a
  *    Guardian relaunch can change the mode without a new monitor): classified
  *    limit dialogs, Fable-session failures (recovery kills and unexpected
@@ -35,6 +38,7 @@ import { runtimeSwitchSignalPath } from './runtime-switch-signal.js';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import {
   FABLE_LAUNCH_FILE,
+  FABLE_OBSERVATION_FILE,
   fableAdmission,
   fableGuardStatePath,
   fableUsagePath,
@@ -42,7 +46,7 @@ import {
 } from '../../multi-session/runtime-files.js';
 
 export const LEASE_ENFORCEMENT_FILE = 'fable-lease-enforcement.json';
-export { READINESS_FILE };
+export { READINESS_FILE, FABLE_OBSERVATION_FILE };
 export const UNCERTAIN_DELIVERIES_FILE = 'fable-uncertain-deliveries.json';
 // End-to-end heartbeat phase: the dispatcher never auto-ACKs it.
 const READINESS_PHASE = 'post_restart';
@@ -61,6 +65,13 @@ export const NOTIFY_MAX_ATTEMPTS = 12;
 // A launch record describes a session when it was written shortly before that
 // session was created (prepareFableLaunch runs right before the tmux launch).
 const RECORD_SESSION_WINDOW_MS = 120_000;
+// Stops of a session whose model could not be observed at all (neither the
+// process --model nor the statusline report), across launches and monitor
+// restarts: at most UNKNOWN_STOP_BUDGET per window. Past that, a session
+// launched on Opus is kept and the persona raises "model observation
+// unavailable" (no Fable admitted) until its model is observable again.
+export const UNKNOWN_STOP_BUDGET = 1;
+export const UNKNOWN_STOP_WINDOW_MS = 6 * 3_600_000;
 const SESSION_GONE_RE = /can't find session|no server running|session not found/i;
 const SESSION_REF_RE = /^\$\d+:\d+:%\d+:\d+$/;
 
@@ -102,6 +113,25 @@ export function probeTmuxSessionRef(sessionRef, { execFileSyncImpl = execFileSyn
 export function killTmuxSessionRef(sessionRef, { execFileSyncImpl = execFileSync } = {}) {
   if (!SESSION_REF_RE.test(sessionRef || '')) throw new Error(`invalid sessionRef ${sessionRef}`);
   execFileSyncImpl('tmux', ['kill-session', '-t', sessionRef.split(':')[0]], { stdio: 'pipe', timeout: 10_000 });
+}
+
+/**
+ * The CLI's --model from its command line as the monitor's user sees it:
+ * `ps -o args=`, else /proc/<pid>/cmdline (Linux). { model, pid, source } or
+ * null when neither can be read or there is no --model argument.
+ */
+export function readProcessModelArgument(pid, { execFileSyncImpl = execFileSync, readFileSync = fs.readFileSync } = {}) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const sources = [
+    ['ps', () => execFileSyncImpl('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: 'pipe', timeout: 3000 })],
+    ['proc', () => String(readFileSync(`/proc/${pid}/cmdline`, 'utf8')).split('\0').join(' ')],
+  ];
+  for (const [source, read] of sources) {
+    let model = null;
+    try { model = parseModelArgument(read()); } catch { continue; }
+    if (model) return { model, pid, source };
+  }
+  return null;
 }
 
 /** The model the persona's CLI last reported (statusline.json), with the time of that report. */
@@ -313,6 +343,54 @@ export function createFableMonitor({
     return Number.isFinite(launchedMs) && launchedMs >= createdMs - RECORD_SESSION_WINDOW_MS ? launch : null;
   }
 
+  // ── Model observation budget (persisted across launches and monitor restarts) ──
+  const observationFile = path.join(monitorDir, FABLE_OBSERVATION_FILE);
+  function readObservation() {
+    const doc = readJson(observationFile, {}) || {};
+    return { version: 1, unknown_stops: Array.isArray(doc.unknown_stops) ? doc.unknown_stops : [], alert: doc.alert || null,
+      ...(doc.last_recovered_at ? { last_recovered_at: doc.last_recovered_at } : {}) };
+  }
+  const saveObservation = doc => { try { writeJsonAtomic(observationFile, doc); } catch (err) { log(`Fable guard: ${FABLE_OBSERVATION_FILE} not written (${err.message})`); } };
+  const recentUnknownStops = (doc, nowMs) => doc.unknown_stops.filter(item => nowMs - Date.parse(item.at) < UNKNOWN_STOP_WINDOW_MS);
+
+  // Evidence readable again: the alert clears by itself.
+  function observationRecovered(nowMs, evidence) {
+    const doc = readObservation();
+    if (!doc.alert) return;
+    saveObservation({ ...doc, alert: null, last_recovered_at: iso(nowMs) });
+    log(`Fable guard: model observation recovered for ${instanceId} (session model: ${evidence}); `
+      + `the alert raised ${doc.alert.since} is cleared and Fable can be admitted again`);
+  }
+
+  // May a session whose model is unknown be stopped? A session launched to
+  // Fable always may; any other only within the budget and without an alert.
+  function unknownStopAllowed(record, nowMs) {
+    if (record?.mode === 'fable') return true;
+    const doc = readObservation();
+    return !doc.alert && recentUnknownStops(doc, nowMs).length < UNKNOWN_STOP_BUDGET;
+  }
+
+  function recordUnknownStop(nowMs, sessionRef, record) {
+    const doc = readObservation();
+    saveObservation({ ...doc, unknown_stops: [...recentUnknownStops(doc, nowMs),
+      { at: iso(nowMs), session_ref: sessionRef, launch_id: record?.launch_id ?? null, launch_mode: record?.mode ?? null }].slice(-10) });
+  }
+
+  function raiseObservationAlert(nowMs, sessionRef, record, reason) {
+    const doc = readObservation();
+    if (doc.alert) {
+      if (doc.alert.session_ref !== sessionRef) saveObservation({ ...doc, alert: { ...doc.alert, session_ref: sessionRef, launch_id: record?.launch_id ?? null } });
+      return;
+    }
+    saveObservation({ ...doc, alert: { since: iso(nowMs), reason: 'model_observation_unavailable', session_ref: sessionRef,
+      launch_id: record?.launch_id ?? null, launch_mode: record?.mode ?? null, admission: reason } });
+    log(`Fable guard ALERT: model observation unavailable for ${instanceId}: session ${sessionRef} (launch ${record?.launch_id || 'unrecorded'}, `
+      + `${record?.mode || 'no'} launch record) shows neither a process --model nor a statusline model, and `
+      + `${recentUnknownStops(doc, nowMs).length} unknown-evidence stop(s) were already made in the last `
+      + `${Math.round(UNKNOWN_STOP_WINDOW_MS / 3_600_000)} h. Not stopping it again; the persona stays on its Opus launch and `
+      + 'Fable is not admitted until its model can be observed (fable-guard-cli.js status)');
+  }
+
   function writeEnforcement(extra) {
     try {
       writeJsonAtomic(path.join(monitorDir, LEASE_ENFORCEMENT_FILE), { instance_id: instanceId, reason: pending?.reason || null,
@@ -405,6 +483,7 @@ export function createFableMonitor({
     const document = readJson(path.join(zylosDir, 'instances.json'), null);
     const config = readFableGuardConfig(document);
     const evidence = sessionModel(sessionRef, config);
+    if (evidence !== 'unknown') observationRecovered(nowMs, evidence);
     if (evidence === 'opus') { unadmitted = null; return null; }
     // Fable or unknown: missing evidence is never taken as safe.
     const launch = readLaunch();
@@ -415,6 +494,13 @@ export function createFableMonitor({
     if (admission?.admitted) { unadmitted = null; return null; }
     if (!unadmitted || unadmitted.sessionRef !== sessionRef) unadmitted = { sessionRef, since: nowMs };
     if (nowMs - unadmitted.since < graceMs) return null;
+    if (evidence === 'unknown') {
+      if (!unknownStopAllowed(record, nowMs)) {
+        raiseObservationAlert(nowMs, sessionRef, record, admission?.reason || 'not_enabled');
+        return null;
+      }
+      recordUnknownStop(nowMs, sessionRef, record);
+    }
     unadmitted = null;
     pending = { sessionRef, launchId: record?.launch_id ?? null, generation: record?.generation ?? null, profileId,
       reason: admission?.reason || 'not_enabled', evidence, since: nowMs, attempts: 0, nextAt: nowMs };
