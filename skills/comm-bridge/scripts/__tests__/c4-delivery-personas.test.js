@@ -2,7 +2,10 @@
 // not the Fable allowance guard is configured (Astra #5, scope). With no modal
 // on screen, each of six personas gets the base d16221a4 tmux call sequence for
 // a conversation (session name normalized), and a [KEYSTROKE] key gets the
-// base key call preceded by exactly one standard pane read — under an
+// base key call preceded by exactly one standard pane read. The one intended
+// difference from base: send-keys / paste-buffer target the pane id of the
+// deciding read (`%2` in the pane model), not the session name (finding 5);
+// baseWithPaneTargets rewrites exactly that argument of the recording — under an
 // instances.json with the Fable guard configured and with it absent. The
 // dispatcher resolves each session's runtime from that file (runtime not
 // injected).
@@ -38,7 +41,9 @@ function writeInstances({ guard }) {
 const dispatcher = await import('../c4-dispatcher.js');
 const { processWithMultiSession } = await import('../c4-dispatcher-multi.js');
 const model = await import('./fixtures/tmux-pane-model.js');
-const base = JSON.parse(fs.readFileSync(new URL('./fixtures/base-delivery-calls.d16221a.json', import.meta.url), 'utf8'));
+const base = model.baseWithPaneTargets(
+  JSON.parse(fs.readFileSync(new URL('./fixtures/base-delivery-calls.d16221a.json', import.meta.url), 'utf8')),
+  'claude-user-pan', '%2');
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 const sessionNeutral = (calls, session) => calls.map((call) => call.map((arg) => (arg === session ? '<session>' : arg)));

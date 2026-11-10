@@ -5,6 +5,7 @@ import {
   evaluateToolWatchdogTransition,
 } from './tool-watchdog.js';
 import { consumeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import { readSessionRef as readTmuxSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 
 // Older single-session adapters predate runtimeProfile metadata. Bind the
 // switch signal to the actual runtime and pane in the existing profile file.
@@ -531,16 +532,24 @@ export class MonitorOrchestrator {
           toolPipeline.applySyntheticClearHint(sessionId, pid, reason, eventNowMs);
         },
         // A live limit dialog belongs to the Fable guard; the watchdog retries later.
-        enqueueInterrupt: (interruptKey) => engine.limitDialogActive?.('watchdog_interrupt')
-          ? { ok: false, output: 'fable_limit_dialog' }
-          : runC4Control([
-          'enqueue',
-          '--content', `[KEYSTROKE]${interruptKey}`,
-          '--priority', '0',
-          '--bypass-state',
-          '--available-in', String(WATCHDOG_INTERRUPT_AVAILABLE_IN_SEC),
-          '--no-ack-suffix',
-        ]),
+        enqueueInterrupt: (interruptKey) => {
+          if (engine.limitDialogActive?.('watchdog_interrupt')) return { ok: false, output: 'fable_limit_dialog' };
+          // Bind the key to the session the watchdog judged, read right before
+          // the enqueue: the dispatcher supersedes it if that session has been
+          // replaced by the time it is claimed. Unreadable -> unbound, as before.
+          const sessionName = this.components.adapter?.sessionName;
+          const sessionRef = (this.deps.readSessionRef || readTmuxSessionRef)(sessionName);
+          if (!sessionRef) this.deps.log(`Tool watchdog: no session ref for tmux session ${sessionName}; interrupt key enqueued unbound`);
+          return runC4Control([
+            'enqueue',
+            '--content', `[KEYSTROKE]${interruptKey}`,
+            '--priority', '0',
+            '--bypass-state',
+            '--available-in', String(WATCHDOG_INTERRUPT_AVAILABLE_IN_SEC),
+            '--no-ack-suffix',
+            ...(sessionRef ? ['--session-ref', sessionRef] : []),
+          ]);
+        },
         triggerRecovery: (reason) => engine.triggerRecovery(reason),
         log: this.deps.log,
       },

@@ -586,7 +586,12 @@ export async function processWithMultiSession(helpers) {
         const key = parseKeystrokeKey(item.content || '');
         log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority}${targetInstance ? ` -> ${targetInstance}` : ''})`);
         try {
-          sendKeystroke(session, key);
+          // The pane id of the read that decided this key (`%N` of its
+          // sessionRef), so a session replaced under the same name since then
+          // makes the send fail instead of receiving the key. Without a read
+          // (no readKeystrokeTarget wired) the session name is the only target.
+          const paneId = /^\$\d+:\d+:(%\d+):\d+$/.exec(target?.sessionRef ?? '')?.[1];
+          sendKeystroke(paneId || session, key);
           ackControl(item.id);
           inFlight = null;
           log(`Keystroke delivered: key=${key} (control id=${item.id})`);

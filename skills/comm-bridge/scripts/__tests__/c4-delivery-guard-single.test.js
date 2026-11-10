@@ -16,8 +16,15 @@ fs.writeFileSync(path.join(fake, 'bin', 'tmux'), `#!/bin/sh
 d="$FAKE_TMUX_DIR"
 [ "$1" = "-V" ] && { echo "tmux 3.4"; exit 0; }
 echo "$*" >> "$d/log"
+t=""; prev=""; for a in "$@"; do [ "$prev" = "-t" ] && t="$a"; prev="$a"; done
+# A pane id named in "$d/dead" no longer exists (the session was replaced).
+case "$1" in send-keys|paste-buffer)
+  [ -f "$d/dead" ] && [ "$t" = "$(cat "$d/dead")" ] && { echo "can't find pane: $t" >&2; exit 1; } ;;
+esac
 case "$*" in
-  *capture-pane*) cat "$d/screen"; printf '\\n'; cat "$d/cursor"; printf '\\n' ;;
+  *capture-pane*) cat "$d/screen"; printf '\\n'; cat "$d/cursor"; printf '\\n'
+    # Replace the session under the same name right after this read.
+    [ -f "$d/replace-cursor" ] && mv "$d/replace-cursor" "$d/cursor" && mv "$d/replace-dead" "$d/dead" ;;
   *paste-buffer*) [ -f "$d/on-paste" ] && mv "$d/on-paste" "$d/screen" && mv "$d/on-paste-cursor" "$d/cursor" ;;
   *send-keys*Enter*) [ -f "$d/on-enter" ] && mv "$d/on-enter" "$d/screen" && mv "$d/on-enter-cursor" "$d/cursor" ;;
 esac
@@ -191,6 +198,29 @@ describe('single-session keystroke session fence (Astra #5)', () => {
     assert.equal(fenced(blind.id).status, 'pending');
     assert.equal(fenced(blind.id).last_error, 'KEYSTROKE_PANE_UNREADABLE');
     db.getDb().prepare("UPDATE control_queue SET status = 'failed' WHERE id = ?").run(blind.id);
+  });
+});
+
+// ── F: the key goes to the pane id the deciding read saw (finding 5) ──────
+describe('single-session [KEYSTROKE]: session replaced between the read and the key', () => {
+  it('the key targets the old pane id and fails there; the replacement gets nothing', async () => {
+    resetLog();
+    idleComposer();
+    onPane('$1:1000:%2:123', [2, promptY]);
+    // Right after the dispatcher's read of %2 the session is replaced by %9.
+    fs.writeFileSync(path.join(fake, 'replace-cursor'), `__ZYLOS_CURSOR__ 2 ${promptY} $7 ${nowSec() - 5} %9 777`);
+    fs.writeFileSync(path.join(fake, 'replace-dead'), '%2');
+    const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
+    try {
+      assert.equal((await tick()).delivered, false);
+      assert.equal(keys().length, 1);
+      assert.match(keys()[0], / -t %2 Escape$/, 'the key names the pane the read saw, not the session name');
+      assert.notEqual(fenced(id).status, 'done', 'a failed send is not a delivery');
+      assert.match(fenced(id).last_error, /^KEYSTROKE_ERROR/);
+    } finally {
+      for (const name of ['dead', 'replace-cursor', 'replace-dead']) fs.rmSync(path.join(fake, name), { force: true });
+      db.getDb().prepare("UPDATE control_queue SET status = 'failed' WHERE id = ?").run(id);
+    }
   });
 });
 

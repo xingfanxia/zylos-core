@@ -173,3 +173,64 @@ describe('hook-auth-prompt', () => {
     });
   });
 });
+
+// ── finding 5: the auto-approve Enter is bound to the hook's own pane ──────
+// Runs the real hook (not the wrapper copy above) with HOME pointed at a temp
+// dir: a fake c4-control.js records the enqueue argv and a fake `tmux` on PATH
+// answers the pane-identity read. No real tmux is spawned.
+describe('hook-auth-prompt (real hook): --session-ref binding', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'auth-prompt-real-'));
+  const zylos = path.join(home, 'zylos');
+  const bin = path.join(home, 'bin');
+  const argsFile = path.join(home, 'enqueue-args.json');
+  const tmuxLog = path.join(home, 'tmux-args.log');
+  const c4Dir = path.join(zylos, '.claude', 'skills', 'comm-bridge', 'scripts');
+  fs.mkdirSync(c4Dir, { recursive: true });
+  fs.mkdirSync(path.join(zylos, 'activity-monitor'), { recursive: true });
+  fs.mkdirSync(bin, { recursive: true });
+  fs.writeFileSync(path.join(c4Dir, 'c4-control.js'),
+    `require('fs').writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));\n`);
+  fs.writeFileSync(path.join(c4Dir, 'package.json'), '{"type":"commonjs"}');
+  fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
+printf '%s\\n' "$@" >> ${JSON.stringify(tmuxLog)}
+[ -n "$FAKE_TMUX_FAIL" ] && { echo "no server running" >&2; exit 1; }
+printf '%s\\n' "$FAKE_TMUX_OUT"
+`, { mode: 0o755 });
+  after(() => fs.rmSync(home, { recursive: true, force: true }));
+
+  function runReal(env) {
+    for (const f of [argsFile, tmuxLog]) fs.rmSync(f, { force: true });
+    const base = { ...process.env, HOME: home, PATH: `${bin}:${path.dirname(process.execPath)}:${process.env.PATH}` };
+    delete base.TMUX_PANE;
+    delete base.FAKE_TMUX_FAIL;
+    execFileSync(process.execPath, [hookScript], { input: JSON.stringify(sampleInput), env: { ...base, ...env },
+      stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 });
+    return {
+      args: JSON.parse(fs.readFileSync(argsFile, 'utf8')),
+      tmux: fs.existsSync(tmuxLog) ? fs.readFileSync(tmuxLog, 'utf8').trim().split('\n') : [],
+    };
+  }
+  const UNBOUND = ['enqueue', '--content', '[KEYSTROKE]Enter', '--priority', '0', '--bypass-state',
+    '--available-in', '1', '--no-ack-suffix'];
+  const REF = '$3:1762790000:%12:48211';
+
+  it('reads its own pane identity via TMUX_PANE and binds the key with --session-ref', () => {
+    const got = runReal({ TMUX_PANE: '%12', FAKE_TMUX_OUT: REF });
+    assert.deepEqual(got.tmux, ['display-message', '-p', '-t', '%12', '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}']);
+    assert.deepEqual(got.args, [...UNBOUND, '--session-ref', REF]);
+  });
+
+  it('enqueues unbound exactly as before when TMUX_PANE is unset (no tmux read)', () => {
+    const got = runReal({ FAKE_TMUX_OUT: REF });
+    assert.deepEqual(got.tmux, []);
+    assert.deepEqual(got.args, UNBOUND);
+  });
+
+  it('enqueues unbound when the identity read fails (e.g. no access to the tmux socket)', () => {
+    assert.deepEqual(runReal({ TMUX_PANE: '%12', FAKE_TMUX_FAIL: '1' }).args, UNBOUND);
+  });
+
+  it('enqueues unbound when tmux answers something that is not a pane identity', () => {
+    assert.deepEqual(runReal({ TMUX_PANE: '%12', FAKE_TMUX_OUT: 'garbage' }).args, UNBOUND);
+  });
+});
