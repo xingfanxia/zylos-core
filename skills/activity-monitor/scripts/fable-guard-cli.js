@@ -17,8 +17,15 @@ import path from 'node:path';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { fableGuardStatePath, fableUsagePath, readFableGuardConfig } from '../../multi-session/runtime-files.js';
 import { clearFableHold, reconcileFableGuardNow, writeJsonAtomic } from './fable-guard.js';
+import { LEASE_ENFORCEMENT_FILE } from './fable-monitor.js';
+import { FABLE_LAUNCH_FILE } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+
+function monitorDirOf(zylosDir, id, instance) {
+  return typeof instance?.state_dir === 'string' && instance.state_dir
+    ? instance.state_dir.replace(/^~/, os.homedir()) : path.join(zylosDir, 'activity-monitor', id);
+}
 
 function readJson(filePath, fallback = null) {
   try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { return fallback; }
@@ -47,12 +54,21 @@ export function fableGuardStatus({ zylosDir = ZYLOS_DIR, nowMs = Date.now() } = 
   }
   const personas = {};
   for (const [id, persona] of Object.entries(state.personas || {})) {
+    const monitorDir = monitorDirOf(zylosDir, id, document.instances?.[id]);
+    const launch = readJson(path.join(monitorDir, FABLE_LAUNCH_FILE), null);
+    const enforcement = readJson(path.join(monitorDir, LEASE_ENFORCEMENT_FILE), null);
     personas[id] = {
       fable_enabled: document.instances?.[id]?.fable_enabled === true,
       desired: persona.desired || null,
       verified: persona.verified || null,
       attempts: persona.attempts || 0,
+      launch: launch && { launch_id: launch.launch_id, mode: launch.mode, runtime_profile: launch.runtime_profile,
+        generation: launch.generation, reason: launch.reason, at: new Date(Number(launch.launched_at_ms)).toISOString() },
+      ...(persona.unsupported ? { unsupported: persona.unsupported } : {}),
+      ...(persona.executing ? { executing: persona.executing } : {}),
       ...(persona.gave_up ? { gave_up: persona.gave_up } : {}),
+      ...(persona.safe_stop ? { safe_stop: persona.safe_stop } : {}),
+      ...(enforcement ? { lease_enforcement: enforcement } : {}),
       ...(persona.possible_dropped_message ? { possible_dropped_message: persona.possible_dropped_message } : {}),
     };
   }
@@ -109,8 +125,20 @@ function formatStatus({ config, accounts, personas }) {
       + (item.last_attempt ? ` last=${item.last_attempt.outcome}` : ''));
   }
   for (const [id, item] of Object.entries(personas)) {
-    lines.push(`persona ${id}: enabled=${item.fable_enabled} desired=${item.desired?.mode || '-'}@${item.desired?.account || '-'}`
-      + ` g${item.desired?.generation ?? '-'} verified=${item.verified ? Object.keys(item.verified).join('+') : 'pending'}`
+    const head = `persona ${id}: enabled=${item.fable_enabled} desired=${item.desired?.mode || '-'}@${item.desired?.account || '-'}`
+      + ` g${item.desired?.generation ?? '-'}`;
+    if (item.unsupported) {
+      lines.push(`${head} UNSUPPORTED account ${item.desired?.account}: always Opus (no own settings file to probe)`);
+      continue;
+    }
+    const verified = item.verified || {};
+    const state = verified.ready_at ? 'ready' : verified.model_at ? `model ok, readiness ${verified.readiness || 'pending'}`
+      : verified.not_running_at ? 'not running' : 'converging';
+    lines.push(`${head} launch=${item.launch ? `${item.launch.mode}@${item.launch.runtime_profile} g${item.launch.generation ?? '-'}` : '-'}`
+      + ` state=${state}`
+      + (item.safe_stop ? ` SAFE-STOPPED (${item.safe_stop.why}); after checking: pm2 start activity-monitor-${id}` : '')
+      + (item.gave_up && !item.safe_stop ? ` GAVE UP (${item.gave_up})` : '')
+      + (item.lease_enforcement ? ` lease-enforced ${item.lease_enforcement.at}` : '')
       + (item.possible_dropped_message ? ` POSSIBLE DROPPED MESSAGE near ${item.possible_dropped_message.at}` : ''));
   }
   return lines.join('\n');

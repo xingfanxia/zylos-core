@@ -50,9 +50,18 @@ Out-of-range numbers fall back to the default; they never disable the guard.
 
 **Accounts** are Claude runtime profile ids (`claude-ax-backup`, not
 `ax-backup`). A profile is probe-able, and can run Fable, only when it has
-`runtime: "claude"` and its own `claude_settings_file`. A profile without one
-(for example a host-default credential) never gets an observation, so its
-personas stay on Opus. A persona's account is its current `runtime_profile`.
+`runtime: "claude"` and its own `claude_settings_file`. A persona's account is
+its current `runtime_profile`.
+
+**Unsupported accounts.** A profile without its own settings file (on
+ax-devbox: `claude-ax-main`, the host-default credential) cannot be probed, so
+Fable is **unsupported** there, not pending: a `fable_enabled` persona on such
+an account always runs Opus (with the subagent pin), its commit reason and
+launch reason are `unsupported_account`, the guard state marks it
+`unsupported: account_without_settings_file`, and `fable-guard-cli.js status`
+prints `UNSUPPORTED account …: always Opus`. It is never shown as converging
+or recovering, and nothing will move it to Fable until the account gets its
+own settings file.
 
 For `azure-agents-infra` `devbox-runtime-policy.mjs`:
 
