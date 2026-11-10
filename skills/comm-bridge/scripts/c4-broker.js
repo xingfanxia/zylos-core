@@ -40,6 +40,7 @@ import { DATA_DIR, SKILLS_DIR } from './c4-config.js';
 import {
   insertConversation,
   insertControl,
+  assertSessionRef,
   getControlById,
   ackControl,
   formatConversations,
@@ -570,7 +571,13 @@ function opCheckpoint(p, caller) {
 function opEnqueue(p, caller) {
   const content = p.content;
   if (typeof content !== 'string' || content.length === 0) return { ok: false, error: 'content_required' };
+  // A session binding only restricts delivery of the caller's own control.
+  const sessionRef = p.sessionRef ?? null;
+  if (sessionRef !== null) {
+    try { assertSessionRef(sessionRef); } catch { return { ok: false, error: 'invalid_session_ref' }; }
+  }
   const row = insertControl(content, {
+    sessionRef,
     priority: Number.isInteger(p.priority) ? p.priority : 3,
     requireIdle: Boolean(p.requireIdle),
     bypassState: Boolean(p.bypassState),

@@ -658,3 +658,78 @@ describe('resetOrphanedRunning', () => {
     assert.equal(db.prepare('SELECT status FROM conversations WHERE id=?').get(out.id).status, 'delivered');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Session fence for [KEYSTROKE] controls (Astra #5)
+// ---------------------------------------------------------------------------
+describe('supersedeControlsForSession', () => {
+  beforeEach(() => resetTables());
+  const OLD = '$3:1762790000:%12:48211';
+  const NEW = '$4:1762790100:%13:48300';
+  const status = (id) => db.prepare('SELECT status, last_error, session_ref FROM control_queue WHERE id = ?').get(id);
+
+  it('supersedes pending and already-claimed keys bound to the old session only', () => {
+    const pendingOld = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', sessionRef: OLD, appendAckSuffix: false });
+    const claimedOld = mod.insertControl('[KEYSTROKE]Enter', { targetInstance: 'user-pan', sessionRef: OLD, appendAckSuffix: false });
+    assert.equal(mod.claimControl(claimedOld.id), true);
+    const forNew = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', sessionRef: NEW, appendAckSuffix: false });
+    const unbound = mod.insertControl('[KEYSTROKE]Tab', { targetInstance: 'user-pan', appendAckSuffix: false });
+    const otherPersona = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-elaine', sessionRef: OLD, appendAckSuffix: false });
+    const text = mod.insertControl('/clear', { targetInstance: 'user-pan', sessionRef: OLD, appendAckSuffix: false });
+
+    const result = mod.supersedeControlsForSession({ instanceId: 'user-pan', sessionRef: OLD, reason: 'FABLE_GUARD_RELAUNCH' });
+    assert.deepEqual(result, { superseded: 2 });
+    assert.deepEqual(status(pendingOld.id), { status: 'superseded', last_error: 'FABLE_GUARD_RELAUNCH', session_ref: OLD });
+    assert.equal(status(claimedOld.id).status, 'superseded');
+    assert.equal(status(forNew.id).status, 'pending', 'a key queued for the replacement session is never touched');
+    assert.equal(status(unbound.id).status, 'pending');
+    assert.equal(status(otherPersona.id).status, 'pending');
+    assert.equal(status(text.id).status, 'pending', 'only keystroke controls are fenced');
+  });
+
+  it('an equivalent new key only replaces a pending key of the same session binding', () => {
+    const oldKey = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', sessionRef: OLD, appendAckSuffix: false });
+    const newKey = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', sessionRef: NEW, appendAckSuffix: false });
+    const lateOld = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', sessionRef: OLD, appendAckSuffix: false });
+    assert.equal(newKey.superseded_count, 0);
+    assert.equal(lateOld.superseded_count, 1, 'replaces only the older key of its own session');
+    assert.equal(status(oldKey.id).status, 'superseded');
+    assert.equal(status(newKey.id).status, 'pending', "a late key of the old session never discards the replacement's key");
+  });
+
+  it('a superseded claimed key cannot be requeued, acked into done, or claimed again', () => {
+    const key = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', sessionRef: OLD, appendAckSuffix: false });
+    assert.equal(mod.claimControl(key.id), true);
+    mod.supersedeControlsForSession({ instanceId: 'user-pan', sessionRef: OLD, reason: 'FABLE_GUARD_RELAUNCH' });
+    mod.requeueControl(key.id, 'MODAL_DEFERRED');
+    assert.equal(status(key.id).status, 'superseded');
+    assert.equal(mod.claimControl(key.id), false);
+    assert.equal(mod.ackControl(key.id).status, 'superseded');
+    mod.resetOrphanedRunning();
+    assert.equal(status(key.id).status, 'superseded');
+  });
+
+  it('requires instanceId and sessionRef', () => {
+    assert.throws(() => mod.supersedeControlsForSession({ instanceId: 'user-pan' }), /sessionRef/);
+    assert.throws(() => mod.supersedeControlsForSession({ sessionRef: OLD }), /instanceId/);
+  });
+});
+
+describe('bindControlSession', () => {
+  beforeEach(() => resetTables());
+  const REF = '$3:1762790000:%12:48211';
+
+  it('stamps an unbound claimed control once and reports an existing binding unchanged', () => {
+    const key = mod.insertControl('[KEYSTROKE]Escape', { targetInstance: 'user-pan', appendAckSuffix: false });
+    assert.equal(mod.claimControl(key.id), true);
+    assert.deepEqual(mod.bindControlSession(key.id, REF), { sessionRef: REF, stamped: true });
+    assert.deepEqual(mod.bindControlSession(key.id, '$9:1:%1:1'), { sessionRef: REF, stamped: false });
+    assert.equal(db.prepare('SELECT session_ref FROM control_queue WHERE id = ?').get(key.id).session_ref, REF);
+  });
+
+  it('insertControl stores an explicit binding; rows without one stay NULL (legacy behavior)', () => {
+    assert.equal(mod.insertControl('[KEYSTROKE]Enter', { sessionRef: REF, appendAckSuffix: false }).session_ref, REF);
+    assert.equal(mod.insertControl('[KEYSTROKE]Enter', { appendAckSuffix: false }).session_ref, null);
+    assert.throws(() => mod.insertControl('[KEYSTROKE]Enter', { sessionRef: 'claude-user-pan' }), /sessionRef/);
+  });
+});

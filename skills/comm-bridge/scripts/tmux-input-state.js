@@ -51,37 +51,41 @@ const RULE_RE = /^─{10,}$/;
 const GUIDE_RE = /\b(?:Esc|Enter) to (?:cancel|close|go back|exit|select|confirm|continue)\b|↑\/↓ to navigate/i;
 const MAX_DIALOG_ROWS = 40;
 
-// Tracks the Claude Code CLI text of the usage-credits consent dialog and its
-// follow-up states, extracted from the shipped 2.1.322 binary. CLI auto-update
-// can change this wording at any time. A miss is safe: the dialog still reads as
-// kind 'unknown' in detectModal(), which keeps paste, Enter and raw keys
-// deferred; only the quota-hold classification is lost.
-export const LIMIT_DIALOG_WORDING = Object.freeze({
-  fable_limit: Object.freeze([
-    /You['’]ve reached your Fable limit/,
-    /You['’]ve used your included Fable usage for this week/,
-  ]),
-  credits_offer: Object.freeze([
-    /\S now uses usage credits/,
-    /\S runs on usage credits/,
-    /Usage credits are turned off\. Re-enable to use/,
-    /You don['’]t have usage credits yet\./,
-    /Yes, re-enable and continue/,
-    /(?:Yes, buy|Buy) usage credits/,
-    /(?:Set up|Manage) usage credits on claude\.ai/,
-    /Request (?:usage credits|more) from your admin/,
-    /This will send a request to your organization['’]s admins/,
-    /(?:Checking|Turning on|Setting up|Opening) usage credits…/,
-  ]),
+// Dialog IDENTITY, not wording. Text such as "You've reached your Fable limit"
+// can be CONTENT of any dialog: a quoted command in a permission prompt, a
+// diff line, a question or option label, tool output. Only the structural
+// positions below decide a dialog's kind:
+//   - title: the first row after the pane divider;
+//   - option set: the select rows (`❯ label` focused, the others two columns
+//     further right); the limit dialog hides indexes, a permission prompt and
+//     an AskUserQuestion number their options (`1. Yes`);
+//   - question: the row directly above the option block.
+// Tracks the Claude Code CLI 2.1.322 text, extracted from the shipped binary;
+// CLI auto-update can change it. A miss is safe: the dialog still reads as kind
+// 'unknown' in detectModal(), which keeps paste, Enter and raw keys deferred;
+// only the quota-hold classification (or the permission auto-approve) is lost.
+export const LIMIT_DIALOG_TITLES = Object.freeze({
+  fable_limit: Object.freeze([/^You['’]ve reached your Fable limit$/]),
+  credits_offer: Object.freeze([/^\S.* now uses usage credits$/, /^Switch to \S.*\?$/]),
 });
+export const LIMIT_DIALOG_OPTIONS = Object.freeze([
+  /^Switch to \S.* and continue$/,
+  /^Not now$/,
+  /^No, keep my current model$/,
+  /^Continue with \S.*$/,
+  /^Yes, re-enable and continue$/,
+  /^(?:Yes, buy|Buy) usage credits$/,
+  /^Request (?:usage credits|more) from your admin$/,
+  /^(?:Set up|Manage) usage credits on claude\.ai$/,
+  /^Upgrade to \S.*$/,
+]);
 
 // Permission prompts are the one modal the [KEYSTROKE] auto-approve path is
-// meant to answer; recognizing them keeps that path working.
-const PERMISSION_DIALOG_WORDING = [
-  /Do you want to proceed\?/,
-  /Do you want to allow\b/,
-  /and tell Claude what to do differently/,
-];
+// meant to answer: a numbered option list whose question row asks for consent,
+// or whose options include the fixed "No, and tell Claude …" answer.
+const PERMISSION_QUESTION_RE = /^Do you want to .+\?$/;
+const PERMISSION_DECLINE_OPTION_RE = /^\d+\. No, and tell Claude what to do differently\b/;
+const NUMBERED_OPTION_RE = /^\d+\.\s/;
 
 function trimRight(line) {
   return String(line).replace(/\s+$/, '');
@@ -95,8 +99,9 @@ function findComposerTop(lines) {
   return -1;
 }
 
-// Returns the rows of the live dialog (or bare select list) that owns the
-// bottom of the screen, or null.
+// Returns the live dialog (or bare select list) that owns the bottom of the
+// screen as { rows, bounded } — bounded: drawn in a pane under a divider — or
+// null.
 function findLiveDialogRows(lines) {
   const composerTop = findComposerTop(lines);
   let bottom = composerTop >= 0 ? composerTop - 1 : lines.length - 1;
@@ -113,19 +118,57 @@ function findLiveDialogRows(lines) {
   }
   const rows = lines.slice(top + 1, bottom + 1).filter(Boolean);
   const hasSelect = rows.some(isSelectRow);
-  if (bounded && (hasSelect || rows.some((line) => GUIDE_RE.test(line)))) return rows;
+  if (bounded && (hasSelect || rows.some((line) => GUIDE_RE.test(line)))) return { rows, bounded };
   // Without a composer on screen nothing else can own the keyboard, so a bare
   // select list at the bottom is a modal even without the pane divider.
-  if (composerTop < 0 && hasSelect) return rows;
+  if (composerTop < 0 && hasSelect) return { rows, bounded: false };
   return null;
 }
 
-function dialogText(rows) {
-  return rows.map((line) => line.trim()).join(' ').replace(/\s+/g, ' ');
+function indentOf(line) {
+  return line.match(/^ */)[0].length;
 }
 
 function dialogTitle(rows) {
   return rows[0].trim().replace(/^❯\s*/, '');
+}
+
+// The dialog's structural parts: title, the option block around the focused
+// select row, and the question row directly above that block.
+function dialogStructure(rows) {
+  const title = dialogTitle(rows);
+  const focused = rows.findIndex(isSelectRow);
+  if (focused < 0) return { title, options: [], question: null };
+  const optionIndent = indentOf(rows[focused]) + 2;
+  const isOption = (line) => indentOf(line) === optionIndent && !GUIDE_RE.test(line);
+  let first = focused;
+  while (first - 1 > 0 && indentOf(rows[first - 1]) >= optionIndent) first--;
+  const block = [];
+  for (let i = first; i < rows.length; i++) {
+    if (i !== focused && indentOf(rows[i]) < optionIndent) break;
+    if (i === focused || isOption(rows[i])) block.push(rows[i].trim().replace(/^❯\s*/, ''));
+  }
+  const question = first > 0 && first - 1 !== 0 ? rows[first - 1].trim() : null;
+  return { title, options: block, question };
+}
+
+function limitKind({ title, options }, rows) {
+  const kind = Object.keys(LIMIT_DIALOG_TITLES).find((name) => LIMIT_DIALOG_TITLES[name].some((re) => re.test(title)));
+  if (!kind) return null;
+  if (options.length) {
+    // The limit dialog hides indexes and offers its own fixed answers.
+    if (options.some((label) => NUMBERED_OPTION_RE.test(label))) return null;
+    if (!options.some((label) => LIMIT_DIALOG_OPTIONS.some((re) => re.test(label)))) return null;
+    return kind;
+  }
+  // Loading / follow-up states draw no select list, only the input guide.
+  return rows.some((line) => GUIDE_RE.test(line)) ? kind : null;
+}
+
+function isPermissionPrompt({ options, question }) {
+  if (!options.length || !NUMBERED_OPTION_RE.test(options[0])) return false;
+  return (question !== null && PERMISSION_QUESTION_RE.test(question))
+    || options.some((label) => PERMISSION_DECLINE_OPTION_RE.test(label));
 }
 
 /**
@@ -135,23 +178,26 @@ function dialogTitle(rows) {
 export function detectModal(paneText) {
   if (!paneText) return null;
   const lines = String(paneText).split('\n').map(trimRight);
-  const rows = findLiveDialogRows(lines);
-  if (!rows) {
+  const live = findLiveDialogRows(lines);
+  if (!live) {
     return isUsageOverlayCapture(paneText) ? { kind: 'usage_overlay', text: 'usage overlay' } : null;
   }
-  const text = dialogText(rows);
+  const { rows, bounded } = live;
   const title = dialogTitle(rows);
-  for (const kind of ['fable_limit', 'credits_offer']) {
-    if (LIMIT_DIALOG_WORDING[kind].some((pattern) => pattern.test(text))) return { kind, text: title };
-  }
-  if (PERMISSION_DIALOG_WORDING.some((pattern) => pattern.test(text))) return { kind: 'permission', text: title };
-  return { kind: 'unknown', text: title };
+  // A bare select list (no pane divider) has no title row: it can be neither
+  // the limit dialog nor a permission prompt, both of which are panes.
+  if (!bounded) return { kind: 'unknown', text: title };
+  const structure = dialogStructure(rows);
+  if (isPermissionPrompt(structure)) return { kind: 'permission', text: title };
+  const kind = limitKind(structure, rows);
+  return { kind: kind || 'unknown', text: title };
 }
 
 /**
  * Classify a live Fable-limit / usage-credits dialog at the bottom of the
- * current pane. The same words quoted in conversation output or scrollback
- * never classify.
+ * current pane by its identity (title row + unnumbered limit option set). The
+ * same words quoted in conversation output, scrollback, a command, a diff, a
+ * question or tool output never classify.
  * @returns {null | { kind: 'fable_limit'|'credits_offer', text: string }}
  */
 export function classifyLimitDialog(paneText) {
@@ -176,6 +222,27 @@ export function hasInProgressCapture(capture) {
     .map((line) => line.trim())
     .filter(Boolean);
   return recentLines.some((line) => IN_PROGRESS_CAPTURE_PATTERNS.some((pattern) => pattern.test(line)));
+}
+
+/**
+ * The session reference (`sessionRef`) of the pane a tmux target resolves to:
+ * `${session_id}:${session_created}:${pane_id}:${pane_pid}`, e.g.
+ * `$3:1762790000:%12:48211` — identical to readTmuxInputState().paneIdentity.
+ * A Guardian/Fable-guard relaunch kills the tmux session and creates a new one,
+ * so every relaunch gets a new sessionRef. Bind [KEYSTROKE] controls with it
+ * (insertControl({ sessionRef }), `c4-control.js enqueue --session-ref`) and
+ * fence a replaced session with c4-db supersedeControlsForSession().
+ * @returns {string|null} null when tmux cannot resolve the target
+ */
+export function readSessionRef(sessionName, { execFileSyncImpl = execFileSync } = {}) {
+  if (!sessionName) return null;
+  try {
+    const out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', sessionName,
+      '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'], { encoding: 'utf8', stdio: 'pipe', timeout: 5000 })).trim();
+    return /^\$\d+:\d+:%\d+:\d+$/.test(out) ? out : null;
+  } catch {
+    return null;
+  }
 }
 
 function readPaneSnapshot(sessionName, execFileSyncImpl) {

@@ -370,8 +370,9 @@ export function multiSessionDispatch(item, helpers) {
  * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingControlForInstances
  * @param {(id: number) => void} helpers.markRejected
  * @param {(id: number) => void} helpers.markControlRejected
- * @param {(session: string) => object | null} [helpers.readSessionModal] - modal owning the pane's keyboard
- * @param {(modal: object) => boolean} [helpers.keystrokeBlockedByModal]
+ * @param {(session: string) => object} [helpers.readKeystrokeTarget] - one pane read before a raw key
+ * @param {(item: object, target: object) => { action: string, reason?: string }} [helpers.fenceKeystrokeControl]
+ * @param {(id: number, reason: string) => boolean} [helpers.supersedeControl]
  * @returns {Promise<ProcessResult>}
  */
 export async function processWithMultiSession(helpers) {
@@ -403,8 +404,9 @@ export async function processWithMultiSession(helpers) {
     sendKeystroke,
     isKeystrokeControl,
     parseKeystrokeKey,
-    readSessionModal,
-    keystrokeBlockedByModal,
+    readKeystrokeTarget,
+    fenceKeystrokeControl,
+    supersedeControl,
   } = helpers;
 
   // Reap idle non-primary instances before processing.
@@ -561,10 +563,25 @@ export async function processWithMultiSession(helpers) {
       // as literal chat text, so auto-approve Enter / watchdog keys never
       // functioned in multi-session mode.
       if (isKeystrokeControl && sendKeystroke && isKeystrokeControl(item)) {
-        const modal = readSessionModal ? readSessionModal(session) : null;
-        if (modal && keystrokeBlockedByModal(modal)) {
-          holdForModal(item, modal.kind);
+        // One read of the instance pane decides the key (modal, session fence);
+        // nothing but DB bookkeeping runs between it and the key.
+        const target = readKeystrokeTarget ? readKeystrokeTarget(session) : null;
+        const fence = target ? fenceKeystrokeControl(item, target) : { action: 'deliver' };
+        if (fence.action === 'defer') {
+          holdForModal(item, target.modal?.kind);
           continue;
+        }
+        if (fence.action === 'supersede') {
+          supersedeControl(item.id, fence.reason);
+          inFlight = null;
+          log(`Superseded keystroke control id=${item.id} for ${targetInstance || 'default'}: ${fence.reason} (pane ${target.sessionRef})`);
+          continue;
+        }
+        if (fence.action === 'fail') {
+          log(`Keystroke control id=${item.id} not sent: ${fence.reason}`);
+          await handleControlDeliveryFailure(item, fence.reason);
+          inFlight = null;
+          return summarize({ delivered: false, state: claudeState.state });
         }
         const key = parseKeystrokeKey(item.content || '');
         log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority}${targetInstance ? ` -> ${targetInstance}` : ''})`);
@@ -609,6 +626,14 @@ export async function processWithMultiSession(helpers) {
       if (result === 'modal_deferred') {
         holdForModal(item);
         continue;
+      }
+
+      if (result === 'uncertain') {
+        // Enter went out and a limit dialog followed: the uncertain record
+        // owns the row now (not delivered, not failed, never replayed).
+        inFlight = null;
+        log(`Uncertain ${item.type} id=${item.id}${targetInstance ? ` -> ${targetInstance}` : ''}: limit dialog right after its Enter`);
+        return summarize({ delivered: false, state: claudeState.state });
       }
 
       if (result === 'submitted') {

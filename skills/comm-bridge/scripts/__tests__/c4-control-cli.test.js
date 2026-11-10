@@ -79,6 +79,21 @@ describe('c4-control enqueue', () => {
     });
   });
 
+  it('--session-ref binds a keystroke to one session; a malformed ref is rejected', () => {
+    withTmpDir(({ env, tmpDir }) => {
+      const ok = cliRaw(['enqueue', '--content', '[KEYSTROKE]Enter', '--no-ack-suffix', '--target-instance', 'user-pan',
+        '--session-ref', '$3:1762790000:%12:48211'], env);
+      assert.equal(ok.status, 0, ok.stderr);
+      const result = spawnSync('sqlite3', ['-json', path.join(tmpDir, 'comm-bridge/c4.db'),
+        `SELECT session_ref FROM control_queue WHERE id = ${parseControlId(ok.stdout)};`], { encoding: 'utf8' });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(JSON.parse(result.stdout), [{ session_ref: '$3:1762790000:%12:48211' }]);
+      const bad = cliRaw(['enqueue', '--content', '[KEYSTROKE]Enter', '--session-ref', 'claude-user-pan'], env);
+      assert.notEqual(bad.status, 0);
+      assert.match(bad.stderr, /sessionRef/);
+    });
+  });
+
   it('basic enqueue returns OK and id', () => {
     withTmpDir(({ env }) => {
       const { stdout, status } = cliRaw(['enqueue', '--content', 'hello world'], env);

@@ -118,3 +118,111 @@ describe('single-session dispatcher delivery guard', () => {
     assert.equal(keys().length, 1);
   });
 });
+
+// ── B: [KEYSTROKE] controls are fenced to the session they were meant for ──
+// sessionRef = `${session_id}:${session_created}:${pane_id}:${pane_pid}`, the
+// same pane identity the dispatcher reads with every frame.
+function onPane(ref, [x, y]) {
+  const [sid, created, pane, pid] = ref.split(':');
+  fs.writeFileSync(path.join(fake, 'cursor'), `__ZYLOS_CURSOR__ ${x} ${y} ${sid} ${created} ${pane} ${pid}`);
+}
+const nowSec = () => Math.floor(Date.now() / 1000);
+const fenced = (id) => db.getDb().prepare('SELECT status, last_error, session_ref FROM control_queue WHERE id = ?').get(id);
+
+describe('single-session keystroke session fence (Astra #5)', () => {
+  const OLD = '$1:1000:%2:123';
+  const NEW = `$7:${nowSec() - 5}:%9:777`;
+
+  it('a key bound to the old session is superseded, never sent into the replacement', async () => {
+    resetLog();
+    idleComposer();
+    onPane(NEW, [2, promptY]);
+    const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, sessionRef: OLD });
+    await tick();
+    assert.deepEqual(keys(), []);
+    assert.equal(fenced(id).status, 'superseded');
+    assert.equal(fenced(id).last_error, 'SESSION_REPLACED');
+  });
+
+  it('an already-claimed key held back by a modal is not delivered to the replacement after a restart', async () => {
+    resetLog();
+    screen(fx.UNKNOWN_DIALOG_LIVE, [2, 10]);
+    const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
+    await tick(); // claimed in the old session, bound to it, released back to pending
+    assert.deepEqual(keys(), []);
+    assert.equal(fenced(id).status, 'pending');
+    assert.equal(fenced(id).session_ref, OLD);
+
+    idleComposer(); // --apply-style restart: replacement session, idle composer
+    onPane(NEW, [2, promptY]);
+    await tick();
+    assert.deepEqual(keys(), [], 'the old session key never reaches the replacement');
+    assert.equal(fenced(id).status, 'superseded');
+  });
+
+  it('an unbound key queued before the replacement session started is superseded', async () => {
+    resetLog();
+    idleComposer();
+    onPane(`$8:${nowSec() + 60}:%10:888`, [2, promptY]);
+    const { id } = db.insertControl('[KEYSTROKE]Enter', { priority: 0, bypassState: true, appendAckSuffix: false });
+    await tick();
+    assert.deepEqual(keys(), []);
+    assert.equal(fenced(id).status, 'superseded');
+    assert.equal(fenced(id).last_error, 'SESSION_PREDATES');
+  });
+
+  it('a key for the current session (bound or not) is delivered, and an unreadable pane gets no key', async () => {
+    resetLog();
+    idleComposer();
+    onPane(NEW, [2, promptY]);
+    const bound = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, sessionRef: NEW });
+    await tick();
+    assert.equal(fenced(bound.id).status, 'done');
+    const unbound = db.insertControl('[KEYSTROKE]Tab', { priority: 0, bypassState: true, appendAckSuffix: false });
+    await tick();
+    assert.equal(fenced(unbound.id).status, 'done');
+    assert.equal(fenced(unbound.id).session_ref, NEW, 'bound at claim to the session it was sent to');
+    assert.equal(keys().length, 2);
+
+    fs.writeFileSync(path.join(fake, 'cursor'), 'garbage'); // capture parses as failed
+    const blind = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
+    await tick();
+    assert.equal(keys().length, 2, 'no key without a successful read of the target pane');
+    assert.equal(fenced(blind.id).status, 'pending');
+    assert.equal(fenced(blind.id).last_error, 'KEYSTROKE_PANE_UNREADABLE');
+    db.getDb().prepare("UPDATE control_queue SET status = 'failed' WHERE id = ?").run(blind.id);
+  });
+});
+
+// ── E: the uncertain record, end to end through the real DB ───────────────
+describe('single-session: limit dialog right after Enter (Astra (h))', () => {
+  it('records the message identity as uncertain, never delivered or replayed, and exposes it', async () => {
+    resetLog();
+    screen(fx.PLAIN_COMPOSER, [2, promptY], {
+      onPaste: [fx.COMPOSER_WITH_TEXT, [19, promptY]],
+      onEnter: [fx.FABLE_LIMIT_LIVE, [2, 10]],
+    });
+    const { id } = db.insertConversation('in', 'feishu', 'chat-42', 'please run the report');
+    assert.equal((await tick()).delivered, false);
+    assert.equal(conversation(id).status, 'uncertain');
+    assert.equal(keys().length, 1);
+
+    const records = db.getUncertainDeliveries();
+    assert.equal(records.length, 1);
+    const [rec] = records;
+    assert.deepEqual({ item_type: rec.item_type, item_id: rec.item_id, channel: rec.channel, endpoint_id: rec.endpoint_id,
+      dialog_kind: rec.dialog_kind, outcome: rec.outcome, session_ref: rec.session_ref, notified_at: rec.notified_at },
+    { item_type: 'conversation', item_id: Number(id), channel: 'feishu', endpoint_id: 'chat-42',
+      dialog_kind: 'fable_limit', outcome: 'uncertain', session_ref: '$1:1000:%2:123', notified_at: null });
+    assert.match(rec.preview, /^please run the report/);
+
+    idleComposer();
+    for (let i = 0; i < 2; i++) await tick();
+    assert.equal(pastes().length, 1, 'never replayed');
+    assert.equal(conversation(id).status, 'uncertain');
+
+    assert.equal(db.markUncertainDeliveryNotified(rec.id), true);
+    assert.deepEqual(db.getUncertainDeliveries(), [], 'unnotified only by default');
+    assert.equal(db.getUncertainDeliveries({ unnotifiedOnly: false }).length, 1);
+  });
+});

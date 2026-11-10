@@ -33,7 +33,10 @@ import {
   retryOrFailControl,
   ackControl,
   expireTimedOutControls,
-  cleanupControlQueue
+  cleanupControlQueue,
+  bindControlSession,
+  supersedeControl,
+  recordUncertainDelivery
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -442,15 +445,47 @@ export function checkInputBox(session = TMUX_SESSION) {
   return deliveryInputState(session, runtimeForSession(session)).inputState;
 }
 
-/** The modal (dialog or select list) that owns the session's keyboard, or null. */
-export function readSessionModal(session = TMUX_SESSION) {
-  return deliveryInputState(session, runtimeForSession(session)).modal || null;
-}
-
 // Raw keys are withheld while a modal owns the keyboard. A permission prompt is
 // the exception: answering it is what the auto-approve [KEYSTROKE]Enter is for.
 export function keystrokeBlockedByModal(modal) {
   return !!modal && modal.kind !== 'permission';
+}
+
+/**
+ * One pane read for a [KEYSTROKE] control: the same capture as a delivery
+ * frame. `sessionRef` is the pane identity
+ * `${session_id}:${session_created}:${pane_id}:${pane_pid}`.
+ */
+export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl = execFileSync } = {}) {
+  const state = deliveryInputState(session, runtimeForSession(session), execFileSyncImpl);
+  const sessionRef = state.captureOk !== false && state.paneIdentity ? state.paneIdentity : null;
+  return { ok: !!sessionRef, sessionRef, modal: state.modal || null,
+    sessionCreatedAt: sessionRef ? Number(sessionRef.split(':')[1]) : null };
+}
+
+/**
+ * Decide a claimed [KEYSTROKE] control against the pane just read (no tmux
+ * call may follow before the key itself):
+ *   fail      - the pane could not be read: no key (a retry is consumed)
+ *   supersede - the key belongs to another session: bound to a different
+ *               sessionRef, or unbound and queued before this session started
+ *   defer     - a modal other than a permission prompt owns the keyboard
+ *   deliver   - send the key
+ * An unbound key is bound to the pane read here before any deferral, so a
+ * later requeue or orphan reset can never move it to a replacement session.
+ * @returns {{ action: 'fail'|'defer'|'supersede'|'deliver', reason?: string }}
+ */
+export function fenceKeystrokeControl(item, target, { bind = bindControlSession } = {}) {
+  if (!target?.ok) return { action: 'fail', reason: 'KEYSTROKE_PANE_UNREADABLE' };
+  // Bind first, so a key held back by a modal stays with this session.
+  const binding = bind(item.id, target.sessionRef);
+  if (binding.sessionRef && binding.sessionRef !== target.sessionRef) return { action: 'supersede', reason: 'SESSION_REPLACED' };
+  if (binding.stamped && Number.isFinite(item.created_at) && Number.isFinite(target.sessionCreatedAt)
+      && item.created_at < target.sessionCreatedAt) {
+    return { action: 'supersede', reason: 'SESSION_PREDATES' };
+  }
+  if (keystrokeBlockedByModal(target.modal)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
+  return { action: 'deliver' };
 }
 
 export function isUsageOverlayCapture(capture) {
@@ -489,6 +524,32 @@ const pendingSubmissions = new Map();
 // Receipts exist only for reconciled/retired ambiguous deliveries, keyed by C4
 // row identity. A later retry cannot replay their old payload into a new pane.
 const submissionReceipts = new Map();
+// Last verified submission per session, so a limit dialog read moments later
+// can still name the row whose Enter opened it (see settleUncertain).
+const recentSubmissions = new Map();
+// Short on purpose: a mid-session limit dialog during a long agent turn must
+// not be pinned on a message that was submitted and running long before.
+const LIMIT_AFTER_SUBMIT_WINDOW_MS = 30_000;
+
+function isLimitModal(modal) {
+  return !!modal && (modal.kind === 'fable_limit' || modal.kind === 'credits_offer');
+}
+
+/**
+ * Default uncertain-outcome sink: persist the record (c4-db
+ * recordUncertainDelivery) for a `<type>:<id>` delivery id. A DB error is
+ * logged; the in-memory receipt still prevents any replay.
+ */
+export function recordUncertainSubmission({ deliveryId, kind, sessionRef = null, delivered = false }) {
+  const match = /^(conversation|control):(\d+)$/.exec(String(deliveryId));
+  log(`UNCERTAIN: ${deliveryId} - ${kind} dialog right after its Enter (${delivered ? 'was marked delivered' : 'unverified'}); not replayed`);
+  if (!match) return;
+  try {
+    recordUncertainDelivery({ itemType: match[1], itemId: Number(match[2]), dialogKind: kind, sessionRef });
+  } catch (err) {
+    log(`UNCERTAIN: failed to record ${deliveryId}: ${err.message}`);
+  }
+}
 
 export function retireSubmission(deliveryId, { pendingSubmissions: submissions = pendingSubmissions,
   submissionReceipts: receipts = submissionReceipts } = {}) {
@@ -508,19 +569,26 @@ function replacementResult(pending) {
   return { verified: !!(pending.shutdown && pending.observed && pending.enterSent), state: 'replaced' };
 }
 
+// The read that decides an Enter is the last tmux call before it: no await and
+// no other tmux call in between. It must have succeeded, show the pane the text
+// was pasted into (pane identity = session id, session start, pane id, pane
+// pid), and show no modal. A failed capture or another pane means no Enter.
+function enterAllowed(pending, state) {
+  if (!state || state.captureOk === false) return false;
+  if (pending.paneIdentity && state.paneIdentity !== pending.paneIdentity) return false;
+  return !state.modal;
+}
+
 export async function submitAndVerify(session, {
-  pending, readState, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
+  pending, readState, lastState = null, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
 } = {}) {
   const enter = () => execFileSyncImpl('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   const deferred = () => { pending.modalDeferred = true; return { verified: false, state: 'modal' }; };
+  const unbound = () => ({ verified: false, state: 'capture_failed' });
   // A modal can open at any moment (a usage-credits consent dialog opens on its
-  // own). Every Enter therefore gets a fresh frame of its own, read right before
-  // the key, and is withheld while a modal owns the keyboard.
-  const enterUnlessModal = () => {
-    if (readState().modal) return false;
-    enter();
-    return true;
-  };
+  // own), and the pane can be replaced. Each Enter is therefore decided by the
+  // read directly before it (enterAllowed), never by an older frame.
+  let decisive = lastState;
   if (!pending.observed) {
     // Native bracketed paste is asynchronous. An old empty frame cannot prove
     // that the newly pasted message was consumed. Observe its populated
@@ -531,6 +599,7 @@ export async function submitAndVerify(session, {
       if (state.modal) return deferred();
       if (state.inputState === 'has_content' && !state.usageOverlay) {
         pending.observed = true;
+        decisive = state;
         break;
       }
       await sleepImpl(250);
@@ -538,21 +607,31 @@ export async function submitAndVerify(session, {
     if (!pending.observed) return { verified: false, state: 'paste_unobserved' };
   }
   if (!pending.enterSent) {
-    if (!enterUnlessModal()) return deferred();
+    // A resumed submission is decided by the caller's last read (passed as
+    // lastState with no tmux call after it), or by a fresh read.
+    const state = decisive || readState();
+    if (wasReplaced(pending, state)) return replacementResult(pending);
+    if (state.modal) return deferred();
+    if (!enterAllowed(pending, state)) return unbound();
+    enter();
     pending.enterSent = true;
   }
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleepImpl(ENTER_VERIFY_WAIT_MS);
     const state = readState();
     if (wasReplaced(pending, state)) return replacementResult(pending);
+    // Enter is out: a limit dialog now means the message may or may not reach
+    // the model (it depends on the answer). That is an outcome, not a deferral.
+    if (isLimitModal(state.modal)) return { verified: false, state: 'uncertain', modal: state.modal, paneIdentity: state.paneIdentity };
     if (state.modal) return deferred();
     if (state.inputState === 'empty') return { verified: true, state: 'empty' };
     // A working model must never receive repeated Enter, nor an Escape that
     // could interrupt it. Keep the delivery pending until its composer clears.
     if (state.inProgressCapture) return { verified: false, state: 'working' };
     if (state.inputState === 'has_content' && !state.usageOverlay) {
+      if (!enterAllowed(pending, state)) return unbound();
       logImpl(`Enter verify attempt ${attempt + 1}: owned input remains, retrying Enter`);
-      if (!enterUnlessModal()) return deferred();
+      enter();
     }
   }
   return { verified: false, state: 'indeterminate' };
@@ -567,6 +646,8 @@ async function sendToTmux(message, options = {}) {
   const submissions = options.pendingSubmissions || pendingSubmissions;
   const receipts = options.submissionReceipts || submissionReceipts;
   const statusFile = options.statusFile || AGENT_STATUS_FILE;
+  const onUncertain = options.onUncertain || recordUncertainSubmission;
+  const recent = options.recentSubmissions || recentSubmissions;
   const sanitized = sanitizeMessage(message);
   const deliveryId = options.deliveryId || sanitized;
   const receiptKey = `${session}\0${deliveryId}`;
@@ -585,6 +666,28 @@ async function sendToTmux(message, options = {}) {
     submissions.delete(session);
     pending = null;
     if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+  }
+  // A limit dialog right after a submission's Enter: that row's outcome is
+  // uncertain (record it, never replay it). Covers a still-unverified
+  // submission and one verified moments before the dialog was drawn.
+  const settleUncertain = (info) => {
+    receipts.set(`${session}\0${info.deliveryId}`, 'uncertain');
+    onUncertain({ ...info, session });
+  };
+  if (isLimitModal(initial.modal)) {
+    if (pending && pending.enterSent && !pending.terminal) {
+      submissions.delete(session);
+      recent.delete(session);
+      settleUncertain({ deliveryId: pending.deliveryId, kind: initial.modal.kind, sessionRef: initial.paneIdentity, delivered: false });
+      pending = null;
+      if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+    } else if (!pending) {
+      const last = recent.get(session);
+      if (last && last.paneIdentity === initial.paneIdentity && Date.now() - last.at <= LIMIT_AFTER_SUBMIT_WINDOW_MS) {
+        recent.delete(session);
+        settleUncertain({ deliveryId: last.deliveryId, kind: initial.modal.kind, sessionRef: initial.paneIdentity, delivered: true });
+      }
+    }
   }
   // Delivery guard: while a modal owns the keyboard nothing is pasted or
   // submitted. The row is deferred, not failed; ownership of any paste stays.
@@ -641,12 +744,21 @@ async function sendToTmux(message, options = {}) {
     await wait(getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8')));
   }
   let result = { verified: false, state: 'indeterminate' };
-  try { result = await submitAndVerify(session, { pending, readState, execFileSyncImpl: exec, sleepImpl: wait }); }
+  // `initial` is the last read when the paste already exists (no tmux call
+  // since); a fresh paste is observed, and so decided, inside submitAndVerify.
+  try { result = await submitAndVerify(session, { pending, readState, lastState: initial, execFileSyncImpl: exec, sleepImpl: wait }); }
   catch (err) { log(`Warning: Enter verification error: ${err.message}`); }
   if (result.verified) {
     submissions.delete(session);
     if (result.state === 'replaced') receipts.set(receiptKey, 'submitted');
+    else recent.set(session, { deliveryId, paneIdentity: pending.paneIdentity, at: Date.now() });
     return 'submitted';
+  }
+  if (result.state === 'uncertain') {
+    submissions.delete(session);
+    recent.delete(session);
+    settleUncertain({ deliveryId, kind: result.modal.kind, sessionRef: result.paneIdentity, delivered: false });
+    return 'uncertain';
   }
   if (result.state === 'modal') return 'modal_deferred';
   if (result.state === 'replaced' && pending.modalDeferred && !pending.enterSent) {
@@ -899,7 +1011,7 @@ async function processNextMessage() {
         waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
         markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
         sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
-        readSessionModal, keystrokeBlockedByModal,
+        readKeystrokeTarget, fenceKeystrokeControl, supersedeControl,
         getNextPendingForInstances: multi.getNextPendingForInstances,
         getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
         getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
@@ -976,10 +1088,23 @@ async function processNextMessage() {
   // without buffer paste or "Meanwhile" prefix. Used for auto-approve permission prompts.
   const rawContent = item.content || '';
   if (isKeystrokeControl(item)) {
-    const modal = readSessionModal(TMUX_SESSION);
-    if (keystrokeBlockedByModal(modal)) {
-      log(`Deferred keystroke control id=${item.id}: modal=${modal.kind} owns the keyboard`);
+    // One read of the target pane decides the key; nothing but DB bookkeeping
+    // runs between it and send-keys.
+    const target = readKeystrokeTarget(TMUX_SESSION);
+    const fence = fenceKeystrokeControl(item, target);
+    if (fence.action === 'defer') {
+      log(`Deferred keystroke control id=${item.id}: modal=${target.modal.kind} owns the keyboard`);
       releaseItem(item, 'MODAL_DEFERRED');
+      return { delivered: false, state: agentState.state };
+    }
+    if (fence.action === 'supersede') {
+      supersedeControl(item.id, fence.reason);
+      log(`Superseded keystroke control id=${item.id}: ${fence.reason} (pane ${target.sessionRef})`);
+      return { delivered: false, state: agentState.state };
+    }
+    if (fence.action === 'fail') {
+      log(`Keystroke control id=${item.id} not sent: ${fence.reason}`);
+      await handleControlDeliveryFailure(item, fence.reason);
       return { delivered: false, state: agentState.state };
     }
     periodicEnter.reset('keystroke_control');
@@ -1015,6 +1140,13 @@ async function processNextMessage() {
     // retried once the modal is gone or the session has been replaced.
     log(`Deferred ${item.type} id=${item.id}: a modal owns the keyboard`);
     releaseItem(item, 'MODAL_DEFERRED');
+    return { delivered: false, state: agentState.state };
+  }
+
+  if (result === 'uncertain') {
+    // Enter went out and a limit dialog followed: recordUncertainSubmission
+    // finalized the row (status 'uncertain') and named it for the operator.
+    // Not delivered, not failed, never replayed.
     return { delivered: false, state: agentState.state };
   }
 

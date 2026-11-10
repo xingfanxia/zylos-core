@@ -419,8 +419,10 @@ export function insertControl(content, options = {}) {
     ackDeadlineAt = null,
     availableAt = null,
     appendAckSuffix = true,
-    targetInstance = null
+    targetInstance = null,
+    sessionRef = null
   } = options;
+  if (sessionRef !== null) assertSessionRef(sessionRef);
 
   const tx = database.transaction(() => {
     const current = nowSeconds();
@@ -464,19 +466,27 @@ export function insertControl(content, options = {}) {
       SET content = ?, updated_at = ?
       WHERE id = ?
     `).run(finalContent, current, id);
+    if (sessionRef !== null) {
+      database.prepare('UPDATE control_queue SET session_ref = ? WHERE id = ?').run(sessionRef, id);
+    }
 
+    // A keystroke only replaces an equivalent pending key for the SAME session
+    // binding: a late key of a replaced session must never discard the key
+    // queued for its replacement, nor the other way round.
+    const sameSession = content.startsWith(KEYSTROKE_PREFIX);
     const supersedeResult = database.prepare(`
       UPDATE control_queue
       SET status = 'superseded', updated_at = ?, last_error = NULL
       WHERE id != ?
         AND status = 'pending'
         AND raw_content = ?
-        AND target_instance IS ?
+        AND target_instance IS ?${sameSession ? '\n        AND session_ref IS ?' : ''}
     `).run(
       current,
       id,
       content,
-      targetInstance
+      targetInstance,
+      ...(sameSession ? [sessionRef] : [])
     );
 
     const row = database.prepare(`
@@ -488,11 +498,85 @@ export function insertControl(content, options = {}) {
 
     return {
       ...row,
+      session_ref: sessionRef,
       superseded_count: supersedeResult.changes || 0
     };
   });
 
   return tx();
+}
+
+// ── [KEYSTROKE] session fence ──────────────────────────────────────────────
+//
+// A keystroke control is a raw key for one particular Claude session. Its
+// binding (control_queue.session_ref) is the tmux pane identity
+// `${session_id}:${session_created}:${pane_id}:${pane_pid}` — the same string
+// readSessionRef() / readTmuxInputState().paneIdentity return. An enqueuer that
+// knows the session passes it (insertControl({ sessionRef }) or
+// `c4-control.js enqueue --session-ref`); otherwise the dispatcher binds the
+// key to the pane it reads when it claims the row. A key whose binding is not
+// the pane on screen is superseded, never delivered (see c4-dispatcher.js
+// fenceKeystrokeControl). Rows without a binding behave as before this column.
+
+const SESSION_REF_RE = /^\$\d+:\d+:%\d+:\d+$/;
+const KEYSTROKE_PREFIX = '[KEYSTROKE]';
+
+export function assertSessionRef(sessionRef) {
+  if (typeof sessionRef !== 'string' || !SESSION_REF_RE.test(sessionRef)) {
+    throw new Error(`invalid sessionRef ${JSON.stringify(sessionRef)}: expected session_id:session_created:pane_id:pane_pid`);
+  }
+}
+
+/**
+ * Bind a claimed control to a session unless it already has a binding.
+ * @returns {{ sessionRef: string|null, stamped: boolean }} the binding now on
+ *   the row; `stamped` is true when this call set it.
+ */
+export function bindControlSession(id, sessionRef) {
+  assertSessionRef(sessionRef);
+  const database = getDb();
+  return database.transaction(() => {
+    const row = database.prepare('SELECT session_ref FROM control_queue WHERE id = ?').get(id);
+    if (!row) return { sessionRef: null, stamped: false };
+    if (row.session_ref) return { sessionRef: row.session_ref, stamped: false };
+    const changed = database.prepare(`
+      UPDATE control_queue SET session_ref = ?, updated_at = ?
+      WHERE id = ? AND session_ref IS NULL AND status = 'running'
+    `).run(sessionRef, nowSeconds(), id).changes > 0;
+    return { sessionRef: changed ? sessionRef : null, stamped: changed };
+  })();
+}
+
+/** Supersede one pending or claimed control (final; never delivered). */
+export function supersedeControl(id, reason) {
+  return getDb().prepare(`
+    UPDATE control_queue
+    SET status = 'superseded', last_error = ?, updated_at = ?
+    WHERE id = ? AND status IN ('pending', 'running')
+  `).run(reason || 'SUPERSEDED', nowSeconds(), id).changes > 0;
+}
+
+/**
+ * Fence a replaced session: supersede every pending AND already-claimed
+ * [KEYSTROKE] control of `instanceId` bound to `sessionRef` (the OLD session).
+ * Controls bound to any other session — the replacement's included — and
+ * unbound controls are untouched; the dispatcher fences unbound ones at claim.
+ * A superseded row is final: requeue, ack, claim and orphan reset leave it be.
+ * @param {{ instanceId: string, sessionRef: string, reason?: string }} args
+ * @returns {{ superseded: number }}
+ */
+export function supersedeControlsForSession({ instanceId, sessionRef, reason } = {}) {
+  if (typeof instanceId !== 'string' || !instanceId) throw new Error('supersedeControlsForSession: instanceId is required');
+  assertSessionRef(sessionRef);
+  const changes = getDb().prepare(`
+    UPDATE control_queue
+    SET status = 'superseded', last_error = ?, updated_at = ?
+    WHERE target_instance = ? AND session_ref = ?
+      AND status IN ('pending', 'running')
+      AND substr(raw_content, 1, ?) = ?
+  `).run(reason || 'SESSION_SUPERSEDED', nowSeconds(), instanceId, sessionRef,
+    KEYSTROKE_PREFIX.length, KEYSTROKE_PREFIX).changes || 0;
+  return { superseded: changes };
 }
 
 /**
@@ -674,6 +758,84 @@ export function cleanupControlQueue(cutoff) {
       AND updated_at < ?
   `).run(cutoff);
   return result.changes || 0;
+}
+
+// ── Uncertain delivery outcomes (Fable guard (h)) ─────────────────────────
+//
+// A limit / usage-credits dialog classified right after the dispatcher sent
+// Enter for a row: the message may or may not have reached the model. The row
+// is finalized without replay and a delivery_uncertain record names it:
+//   conversation          -> status 'uncertain' (also when it was already
+//                            marked delivered moments before the dialog)
+//   control, ack-mode     -> stays 'running' (its ack or ack deadline decides)
+//   control, no-ack       -> 'failed', last_error 'DELIVERY_UNCERTAIN:<kind>'
+// The activity monitor reads getUncertainDeliveries() to notify the operator
+// and marks each record notified.
+
+export const UNCERTAIN_DIALOG_KINDS = Object.freeze(['fable_limit', 'credits_offer']);
+
+/**
+ * @param {{ itemType: 'conversation'|'control', itemId: number, dialogKind: string,
+ *   sessionRef?: string|null, detectedAt?: number }} args
+ * @returns {{ recorded: boolean, id: number|null }}
+ */
+export function recordUncertainDelivery({ itemType, itemId, dialogKind, sessionRef = null, detectedAt = nowSeconds() }) {
+  if (itemType !== 'conversation' && itemType !== 'control') throw new Error(`invalid itemType: ${itemType}`);
+  if (!UNCERTAIN_DIALOG_KINDS.includes(dialogKind)) throw new Error(`invalid dialogKind: ${dialogKind}`);
+  const database = getDb();
+  return database.transaction(() => {
+    let source;
+    if (itemType === 'conversation') {
+      source = database.prepare('SELECT target_instance, channel, endpoint_id FROM conversations WHERE id = ?').get(itemId);
+      if (!source) return { recorded: false, id: null };
+      database.prepare(`UPDATE conversations SET status = 'uncertain'
+        WHERE id = ? AND direction = 'in' AND status IN ('pending', 'running', 'delivered')`).run(itemId);
+    } else {
+      const row = database.prepare('SELECT target_instance, content, status FROM control_queue WHERE id = ?').get(itemId);
+      if (!row) return { recorded: false, id: null };
+      source = { target_instance: row.target_instance, channel: null, endpoint_id: null };
+      if (!String(row.content || '').includes('---- ack via:')) {
+        database.prepare(`UPDATE control_queue SET status = 'failed', last_error = ?, updated_at = ?
+          WHERE id = ? AND status IN ('pending', 'running', 'done')`).run(`DELIVERY_UNCERTAIN:${dialogKind}`, nowSeconds(), itemId);
+      }
+    }
+    const result = database.prepare(`
+      INSERT OR IGNORE INTO delivery_uncertain
+        (item_type, item_id, target_instance, channel, endpoint_id, session_ref, dialog_kind, outcome, detected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'uncertain', ?)
+    `).run(itemType, itemId, source.target_instance ?? null, source.channel ?? null, source.endpoint_id ?? null,
+      sessionRef, dialogKind, detectedAt);
+    return { recorded: result.changes > 0, id: result.changes > 0 ? Number(result.lastInsertRowid) : null };
+  })();
+}
+
+/**
+ * Uncertain delivery records, oldest first, with a short preview of the
+ * conversation text so a notification can name the message.
+ * @param {{ instanceId?: string|null, unnotifiedOnly?: boolean, limit?: number }} [options]
+ *   instanceId undefined = all instances; null = unattributed rows only.
+ */
+export function getUncertainDeliveries({ instanceId, unnotifiedOnly = true, limit = 50 } = {}) {
+  const n = Math.min(Math.max(Number.parseInt(limit, 10) || 50, 1), 500);
+  const where = [];
+  const params = [];
+  if (unnotifiedOnly) where.push('u.notified_at IS NULL');
+  if (instanceId !== undefined) { where.push('u.target_instance IS ?'); params.push(instanceId); }
+  return getDb().prepare(`
+    SELECT u.id, u.item_type, u.item_id, u.target_instance, u.channel, u.endpoint_id, u.session_ref,
+           u.dialog_kind, u.outcome, u.detected_at, u.notified_at,
+           CASE WHEN u.item_type = 'conversation' THEN substr(c.content, 1, 120) END AS preview
+    FROM delivery_uncertain u
+    LEFT JOIN conversations c ON u.item_type = 'conversation' AND c.id = u.item_id
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+    ORDER BY u.id ASC LIMIT ?
+  `).all(...params, n);
+}
+
+/** Mark an uncertain record as notified to the operator. */
+export function markUncertainDeliveryNotified(id, at = nowSeconds()) {
+  return getDb().prepare('UPDATE delivery_uncertain SET notified_at = ? WHERE id = ? AND notified_at IS NULL')
+    .run(at, id).changes > 0;
 }
 
 /**

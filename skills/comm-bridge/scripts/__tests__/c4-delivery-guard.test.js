@@ -22,14 +22,18 @@ fs.writeFileSync(path.join(root, 'instances.json'), JSON.stringify({ version: 1,
 } }));
 
 const dispatcher = await import('../c4-dispatcher.js');
-const { sendToTmux, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey } = dispatcher;
+const { sendToTmux, submitAndVerify, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey, fenceKeystrokeControl } = dispatcher;
 const { processWithMultiSession } = await import('../c4-dispatcher-multi.js');
+const { detectModal } = await import('../tmux-input-state.js');
+const fx = await import('./fixtures/claude-dialogs.js');
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 
 const LIMIT = { kind: 'fable_limit', text: "You've reached your Fable limit" };
 const st = (inputState, extra = {}) => ({ inputState, paneIdentity: 'pane-one', inProgressCapture: false,
   usageOverlay: false, modal: null, ...extra });
 const modal = (extra = {}) => st('indeterminate', { modal: LIMIT, ...extra });
+// A non-limit dialog (e.g. a permission prompt or a future CLI dialog).
+const otherModal = (extra = {}) => st('indeterminate', { modal: { kind: 'unknown', text: 'Something new' }, ...extra });
 
 function harness(states) {
   let i = 0;
@@ -49,31 +53,32 @@ describe('sendToTmux delivery guard', () => {
     const h = harness([modal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.calls.length, 0);
-    h.useStates([st('empty'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('empty'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 1);
   });
 
   it('withholds the first Enter when the modal opens between paste and Enter', async () => {
-    // initial, observed paste, then the frame read right before Enter shows the dialog
-    const h = harness([st('empty'), st('has_content'), modal()]);
+    // initial, then the read that decides the first Enter (right after the
+    // paste, no tmux call in between) shows the dialog
+    const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 0);
     // Dialog dismissed, the composer shows the owned text again: Enter once, no second paste.
-    h.useStates([st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 1);
   });
 
   it('withholds a retried Enter when the modal opens after the first Enter', async () => {
-    // first Enter did not take (composer still holds text); the pre-retry frame shows the dialog
-    const h = harness([st('empty'), st('has_content'), st('has_content'), st('has_content'), modal()]);
+    // the read after the first Enter (the one that would decide a retry) shows a dialog
+    const h = harness([st('empty'), st('has_content'), otherModal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.enters(), 1);
-    h.useStates([st('has_content'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('has_content'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 2);
@@ -82,17 +87,17 @@ describe('sendToTmux delivery guard', () => {
   it('re-pastes once when the modal swallowed the paste (no Enter was ever sent)', async () => {
     const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
-    h.useStates([st('empty'), st('empty'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('empty'), st('empty'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 2);
     assert.equal(h.enters(), 1);
   });
 
   it('carries a held-back message into the replacement pane after a guard restart', async () => {
-    const h = harness([st('empty'), st('has_content'), modal()]);
+    const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:7' }), 'modal_deferred');
     const two = { paneIdentity: 'pane-two' };
-    h.useStates([st('empty', two), st('has_content', two), st('has_content', two), st('empty', two)]);
+    h.useStates([st('empty', two), st('has_content', two), st('empty', two)]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:7' }), 'submitted');
     assert.equal(h.pastes(), 2, 'one paste per pane');
     assert.equal(h.enters(), 1, 'Enter only in the replacement pane');
@@ -100,7 +105,7 @@ describe('sendToTmux delivery guard', () => {
   });
 
   it('never replays into a replacement pane once Enter was sent (no duplicate execution)', async () => {
-    const h = harness([st('empty'), st('has_content'), st('has_content'), st('has_content'), modal()]);
+    const h = harness([st('empty'), st('has_content'), otherModal()]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:8' }), 'modal_deferred');
     h.useStates([st('empty', { paneIdentity: 'pane-two' })]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:8' }), 'verify_failed');
@@ -109,7 +114,7 @@ describe('sendToTmux delivery guard', () => {
   });
 
   it('defers another row too, without pasting over the held-back text', async () => {
-    const h = harness([st('empty'), st('has_content'), modal()]);
+    const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('first', { ...h.options, deliveryId: 'conversation:1' }), 'modal_deferred');
     h.useStates([modal()]);
     assert.equal(await sendToTmux('second', { ...h.options, deliveryId: 'control:2' }), 'modal_deferred');
@@ -144,6 +149,16 @@ describe('keystroke policy', () => {
     assert.equal(keystrokeBlockedByModal({ kind: 'unknown', text: '' }), true);
     assert.equal(keystrokeBlockedByModal({ kind: 'permission', text: '' }), false);
   });
+
+  it('the permission exception holds for every permission variant and never for a limit dialog (Astra #5)', () => {
+    for (const capture of [fx.PERMISSION_PROMPT_LIVE, fx.PERMISSION_ECHO_LIMIT, fx.PERMISSION_DIFF_LIMIT, fx.TOOL_OUTPUT_ABOVE_PERMISSION]) {
+      assert.equal(keystrokeBlockedByModal(detectModal(capture)), false);
+    }
+    for (const capture of [fx.FABLE_LIMIT_LIVE, fx.FABLE_LIMIT_ABOVE_COMPOSER, fx.CREDITS_OFFER_LIVE, fx.CREDITS_CHECKING_LIVE,
+      fx.ASK_QUESTION_LIMIT, fx.TOOL_OUTPUT_ABOVE_SELECT, fx.UNKNOWN_DIALOG_LIVE]) {
+      assert.equal(keystrokeBlockedByModal(detectModal(capture)), true);
+    }
+  });
 });
 
 // A tiny queue with the same row semantics the DB gives the dispatcher.
@@ -169,6 +184,9 @@ function rowQueue(rows) {
   };
 }
 
+const paneTarget = (modal, sessionRef = '$1:1000:%2:123') => ({ ok: true, sessionRef, modal, sessionCreatedAt: 1000 });
+const noBinding = () => ({ sessionRef: null, stamped: false });
+
 function multiHelpers(queue, overrides = {}) {
   return {
     getAgentState: () => ({ state: 'idle', health: 'ok', idleSeconds: 10, healthy: true }),
@@ -187,8 +205,10 @@ function multiHelpers(queue, overrides = {}) {
     getNextPendingForInstances: () => null,
     getPendingTargetInstancesNeedingWake: () => [],
     getNextPendingControlForInstances: () => null,
-    isKeystrokeControl, parseKeystrokeKey, keystrokeBlockedByModal,
-    readSessionModal: () => null,
+    isKeystrokeControl, parseKeystrokeKey,
+    readKeystrokeTarget: () => paneTarget(null),
+    fenceKeystrokeControl: (item, target) => fenceKeystrokeControl(item, target, { bind: noBinding }),
+    supersedeControl: () => true,
     sendKeystroke: () => { throw new Error('unexpected keystroke'); },
     ...queue,
     ...overrides,
@@ -214,7 +234,7 @@ describe('multi-session delivery guard', () => {
     assert.deepEqual(queue.notified, [], 'no delivery notification (no false ACK path)');
     assert.equal(h.calls.length, 0);
 
-    h.useStates([st('empty'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('empty'), st('has_content'), st('empty')]);
     const res = await processWithMultiSession(helpers);
     assert.equal(res.delivered, true);
     assert.deepEqual(queue.delivered, [42]);
@@ -242,7 +262,7 @@ describe('multi-session delivery guard', () => {
     const keys = [];
     let screenModal = LIMIT;
     const helpers = multiHelpers(queue, {
-      readSessionModal: () => screenModal,
+      readKeystrokeTarget: () => paneTarget(screenModal),
       sendKeystroke: (session, key) => keys.push({ session, key }),
       sendToTmux: async () => { throw new Error('keystroke must never be pasted'); },
     });
@@ -264,10 +284,196 @@ describe('multi-session delivery guard', () => {
     const queue = rowQueue([{ id: 9, type: 'control', priority: 0, bypass_state: 1, target_instance: 'user-pan', content: '[KEYSTROKE]Enter' }]);
     const keys = [];
     const res = await processWithMultiSession(multiHelpers(queue, {
-      readSessionModal: () => ({ kind: 'permission', text: 'Bash command' }),
+      readKeystrokeTarget: () => paneTarget({ kind: 'permission', text: 'Bash command' }),
       sendKeystroke: (session, key) => keys.push(key),
     }));
     assert.equal(res.delivered, true);
     assert.deepEqual(keys, ['Enter']);
+  });
+});
+
+// ── A: every Enter is bound to the pasted pane (Astra #5) ──────────────────
+// Invariant checked on the interleaved log of reads and tmux calls: each
+// Enter directly follows (no other tmux call, no await in between) a read that
+// succeeded, shows the pane the text was pasted into, and shows no modal.
+function boundHarness(states) {
+  let i = 0;
+  const events = [];
+  const options = { session: 'claude-user-pan', pendingSubmissions: new Map(), submissionReceipts: new Map(),
+    sleepImpl: async () => { events.push({ sleep: true }); },
+    readInputStateImpl: () => { const s = states[Math.min(i++, states.length - 1)]; events.push({ read: s }); return s; },
+    execFileSyncImpl: (command, args) => { events.push({ exec: args }); return ''; } };
+  return { options, events, useStates: (next) => { states = next; i = 0; },
+    enters: () => events.filter((e) => e.exec && e.exec[0] === 'send-keys').length };
+}
+
+function enterViolations(events) {
+  const violations = [];
+  let bound = null;
+  for (let k = 0; k < events.length; k++) {
+    const e = events[k];
+    if (e.exec?.[0] === 'paste-buffer') {
+      const lastRead = [...events.slice(0, k)].reverse().find((x) => x.read);
+      bound = lastRead?.read.paneIdentity ?? null;
+    }
+    if (e.exec?.[0] === 'send-keys') {
+      // the read directly before, skipping only same-tick non-tmux bookkeeping
+      const prev = events[k - 1];
+      const s = prev?.read;
+      if (!s) violations.push({ at: k, why: 'Enter not directly preceded by a read' });
+      else if (s.captureOk === false) violations.push({ at: k, why: 'Enter after a failed capture' });
+      else if (s.paneIdentity !== bound) violations.push({ at: k, why: `Enter after a read of ${s.paneIdentity}, pasted into ${bound}` });
+      else if (s.modal) violations.push({ at: k, why: 'Enter after a read showing a modal' });
+    }
+  }
+  return violations;
+}
+
+const two = { paneIdentity: 'pane-two' };
+const failedCapture = { inputState: 'indeterminate', paneIdentity: null, captureOk: false, inProgressCapture: false,
+  usageOverlay: false, modal: null, promptVisible: false };
+
+describe('Enter is bound to the pasted pane (Astra #5)', () => {
+  it('reviewer case: the pane is replaced between the observed paste and Enter -> no Enter into the replacement', async () => {
+    const h = boundHarness([st('empty'), st('has_content'), st('empty', two), st('empty', two)]);
+    const result = await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:31' });
+    assert.deepEqual(enterViolations(h.events), []);
+    assert.notEqual(result, 'submitted');
+  });
+
+  it('a failed capture right before Enter means no Enter', async () => {
+    const h = boundHarness([st('empty'), st('has_content'), failedCapture, failedCapture]);
+    await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:32' });
+    assert.deepEqual(enterViolations(h.events), []);
+  });
+
+  it('resumed submission (observed, Enter not yet sent): a failed capture or a replacement pane gets no Enter', async () => {
+    for (const bad of [failedCapture, st('has_content', two)]) {
+      const calls = [];
+      const pending = { deliveryId: 'conversation:33', paneIdentity: 'pane-one', observed: true, enterSent: false };
+      const result = await submitAndVerify('claude-user-pan', { pending, readState: () => bad, sleepImpl: async () => {},
+        logImpl: () => {}, execFileSyncImpl: (command, args) => { calls.push(args); return ''; } });
+      assert.deepEqual(calls, [], `no tmux key for ${JSON.stringify(bad)}`);
+      assert.equal(result.verified, false);
+      assert.equal(pending.enterSent, false);
+    }
+  });
+
+  it('holds for a replacement or a failed capture injected at every read of a delivery and its retry', async () => {
+    const good = [st('empty'), st('has_content'), st('has_content'), st('has_content'), st('empty')];
+    for (let pos = 0; pos < good.length; pos++) {
+      for (const bad of [st('has_content', two), st('empty', two), failedCapture]) {
+        const states = good.slice();
+        states[pos] = bad;
+        const h = boundHarness(states);
+        const options = { ...h.options, deliveryId: `conversation:${40 + pos}` };
+        await sendToTmux('hello', options);
+        await sendToTmux('hello', options);
+        assert.deepEqual(enterViolations(h.events), [], `bad read at position ${pos}: ${JSON.stringify(bad)}`);
+      }
+    }
+  });
+});
+
+// ── D: with no modal on screen, delivery is byte-for-byte base ─────────────
+// fixtures/base-delivery-calls.d16221a.json was recorded by running the same
+// scenario drivers (fixtures/tmux-pane-model.js) against the base commit
+// d16221a4 (before the Fable guard). The check covers the whole tmux call
+// sequence, reads included; only the per-process buffer name is normalized.
+describe('no modal on screen: tmux calls identical to base d16221a4 (Astra #5, scope)', async () => {
+  const model = await import('./fixtures/tmux-pane-model.js');
+  const base = JSON.parse(fs.readFileSync(new URL('./fixtures/base-delivery-calls.d16221a.json', import.meta.url), 'utf8'));
+
+  for (const [name, scenario] of Object.entries(model.DELIVERY_SCENARIOS)) {
+    it(`single-session sendToTmux: ${name}`, async () => {
+      assert.ok(base.single[name], `base recording has scenario ${name}`);
+      assert.deepEqual(await model.runSingleScenario(sendToTmux, scenario), base.single[name]);
+    });
+  }
+
+  it('multi-session dispatcher: conversation delivery', async () => {
+    assert.deepEqual(await model.runMultiConversation(sendToTmux, processWithMultiSession), base.multi.conversation);
+  });
+
+  it('multi-session dispatcher: a raw key is the base key call, preceded by one pane read', async () => {
+    const got = await model.runMultiKeystroke(dispatcher, processWithMultiSession);
+    const isRead = (call) => call[1] === 'capture-pane';
+    assert.equal(got.delivered, true);
+    assert.deepEqual(got.calls.filter((call) => !isRead(call)), base.multi.keystroke.calls);
+    assert.deepEqual(got.calls.map(isRead), [true, false]);
+  });
+});
+
+// ── E: a limit dialog right after Enter -> explicit uncertain outcome ──────
+// The CLI shows the consent dialog when the submitted message is about to go
+// to the model. Whether it was sent depends on how the dialog is answered, so
+// the message is neither delivered nor failed: it is recorded `uncertain`
+// (message identity + dialog kind + pane), never replayed.
+describe('limit dialog right after a submission (Astra (h))', () => {
+  function uncertainHarness(states) {
+    const h = harness(states);
+    const records = [];
+    h.options.onUncertain = (info) => records.push(info);
+    h.options.recentSubmissions = new Map();
+    return { ...h, records };
+  }
+
+  it('Enter sent, then the verify read shows the limit dialog: uncertain, not deferred or delivered', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), modal()]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:51' }), 'uncertain');
+    assert.deepEqual(h.records.map(({ deliveryId, kind, sessionRef }) => ({ deliveryId, kind, sessionRef })),
+      [{ deliveryId: 'conversation:51', kind: 'fable_limit', sessionRef: 'pane-one' }]);
+    assert.equal(h.enters(), 1);
+    // No replay: the same row returns its receipt; no paste, no Enter, no second record.
+    h.useStates([st('empty')]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:51' }), 'uncertain');
+    assert.equal(h.pastes(), 1);
+    assert.equal(h.enters(), 1);
+    assert.equal(h.records.length, 1);
+  });
+
+  it('the dialog first seen on the next cycle still names the submitted row', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), st('has_content', { inProgressCapture: true })]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:52' }), 'verify_failed');
+    h.useStates([modal()]);
+    assert.equal(await sendToTmux('next', { ...h.options, deliveryId: 'conversation:53' }), 'modal_deferred');
+    assert.deepEqual(h.records.map((r) => r.deliveryId), ['conversation:52']);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:52' }), 'uncertain');
+    assert.equal(h.pastes(), 1);
+  });
+
+  it('a submission verified just before the dialog appeared is re-marked uncertain', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), st('empty')]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:54' }), 'submitted');
+    h.useStates([modal()]);
+    assert.equal(await sendToTmux('next', { ...h.options, deliveryId: 'conversation:55' }), 'modal_deferred');
+    assert.deepEqual(h.records.map(({ deliveryId, delivered }) => ({ deliveryId, delivered })),
+      [{ deliveryId: 'conversation:54', delivered: true }]);
+  });
+
+  it('a non-limit dialog after Enter (e.g. a permission prompt) is not an uncertain outcome', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), otherModal()]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:56' }), 'modal_deferred');
+    assert.deepEqual(h.records, []);
+  });
+
+  it('a limit dialog before any Enter defers (nothing was submitted)', async () => {
+    const h = uncertainHarness([st('empty'), modal()]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:57' }), 'modal_deferred');
+    assert.deepEqual(h.records, []);
+    assert.equal(h.enters(), 0);
+  });
+
+  it('multi-session: an uncertain row is neither delivered nor retried, and other rows are held', async () => {
+    const queue = rowQueue([{ id: 61, type: 'conversation', channel: 'feishu', target_instance: 'user-pan', content: 'hi' }]);
+    const h = uncertainHarness([st('empty'), st('has_content'), modal()]);
+    const send = (message, opts) => sendToTmux(message, { ...h.options, ...opts });
+    const res = await processWithMultiSession(multiHelpers(queue, { sendToTmux: send }));
+    assert.equal(res.delivered, false);
+    assert.deepEqual(queue.delivered, []);
+    assert.deepEqual(queue.notified, [], 'no delivery notification for an uncertain row');
+    assert.equal(queue.byId.get(61).retry_count, 0);
+    assert.equal(queue.byId.get(61).status, 'running', 'left to the uncertain record (no requeue, no replay)');
+    assert.deepEqual(h.records.map((r) => r.deliveryId), ['conversation:61']);
   });
 });
