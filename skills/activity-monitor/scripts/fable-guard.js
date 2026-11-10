@@ -26,6 +26,13 @@ import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 // comm-bridge owns the session identity (sessionRef = the dispatcher's paneIdentity).
 import { readSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { withFileLock } from '../../multi-session/file-lock.js';
+import {
+  claimExecution,
+  completeExecution,
+  deferExecution,
+  dropDeferredExecution,
+  listDeferredExecutions,
+} from './fable-exec-claim.js';
 
 const CLOCK_SKEW_MS = 30_000;
 const RESUME_GRACE_MS = 180_000;
@@ -415,7 +422,10 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, readi
   if (!launchServes(launch, status, nowMs) || !launchMatches(desired, launch)) {
     if (persona.verified?.model_at) delete persona.verified;
     if (policyOnlyChange(desired, launch) && launchServes(launch, status, nowMs)) {
-      if (status.state === 'idle') resume('policy_change');
+      // A restart issued for this commit is still landing (its relaunch has
+      // not written a launch record yet): never schedule another one on top.
+      const landing = (persona.attempts || 0) > 0 && nowMs - executedMs <= RESUME_GRACE_MS;
+      if (status.state === 'idle' && !landing) resume('policy_change');
       return;
     }
     if (nowMs - executedMs > RESUME_GRACE_MS) resume(launch ? 'stale_launch' : 'launch_unrecorded');
@@ -519,13 +529,19 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
 const IN_FLIGHT_MS = 30_000;
 
 /**
- * Cold-start restart of each committed transition, reusing the failover path
- * (switch signal → kill tmux → pm2 restart), or the safe stop of an exhausted
- * downgrade. Each item is fenced on its own, under the instances.json lock:
- * a superseded generation is skipped, and a newer commit for a persona whose
- * restart is still landing reuses that restart. The fence records
- * `executing` in the guard state and writes the switch signal before the lock
- * is released; the kill and pm2 calls run outside it.
+ * Execute guard-owned lifecycle effects: cold-start restarts of committed
+ * transitions (switch signal → kill tmux → pm2 restart), safe stops of an
+ * exhausted downgrade, and the account failover's restart or suspend of a
+ * guard-owned persona. Each item is fenced on its own:
+ *  - under instances.json.lock against the persona's committed generation (a
+ *    superseded one is skipped; a newer commit for a persona whose restart is
+ *    still landing reuses that restart);
+ *  - by the persona's execution claim (fable-exec-claim.js), shared with the
+ *    persona monitor's lease enforcement: no two effects overlap, and the same
+ *    operation (kind, generation, attempt, target) executes once.
+ * The fence records `executing` in the guard state and writes the switch
+ * signal before the lock is released; the kill and pm2 calls run outside it.
+ * `owner` names the caller in the claim (daemon, failover, reconcile).
  */
 export function executeFableRestarts({
   zylosDir,
@@ -534,65 +550,117 @@ export function executeFableRestarts({
   execFileSyncImpl = execFileSync,
   log = console.log,
   lock = withFileLock,
+  claimLock = withFileLock,
   writeSignal = writeRuntimeSwitchSignal,
+  owner = 'daemon',
 }) {
   const instancesFile = path.join(zylosDir, 'instances.json');
+  const stateFile = fableGuardStatePath(zylosDir);
   const executed = [];
   for (const item of restarts) {
-    let go = false;
+    const kind = item.kind || 'restart';
+    const op = { owner: item.owner || owner, kind, generation: item.generation ?? null, attempt: item.attempt ?? null,
+      profileId: item.profileId ?? null, suspendedAt: item.suspendedAt ?? null, reason: item.reason || null };
+    let claim = null;
     // The session this restart replaces, so the new monitor can fence C4 keys bound to it.
-    const sessionRef = item.kind === 'stop' ? null : readSessionRef(item.tmuxSession, { execFileSyncImpl });
+    const sessionRef = kind === 'restart' ? readSessionRef(item.tmuxSession, { execFileSyncImpl }) : null;
     try {
       lock(`${instancesFile}.lock`, () => {
-        const file = fableGuardStatePath(zylosDir);
-        const state = readJson(file, null);
+        const state = readJson(stateFile, null);
         const persona = state?.personas?.[item.instanceId];
-        const generation = persona?.desired?.generation;
-        if (generation !== item.generation) {
-          log(`[fable-guard] ${item.instanceId}: g${item.generation} superseded by g${generation}; restart skipped`);
+        if (kind === 'suspend') {
+          // The account failover's decision, valid while instances.json still records it.
+          const suspended = readJson(instancesFile, null)?.instances?.[item.instanceId]?.runtime_failover_suspended;
+          if (item.suspendedAt && suspended?.at !== item.suspendedAt) {
+            log(`[fable-guard] ${item.instanceId}: suspend of ${item.suspendedAt} no longer applies; skipped`);
+            dropDeferredExecution({ zylosDir, instanceId: item.instanceId, item: op, lock: claimLock });
+            return;
+          }
+        } else {
+          const generation = persona?.desired?.generation ?? null;
+          if (generation !== (item.generation ?? null)) {
+            log(`[fable-guard] ${item.instanceId}: g${item.generation} superseded by g${generation}; ${kind} skipped`);
+            return;
+          }
+          const prior = persona?.executing;
+          if (kind === 'restart' && prior?.kind === 'restart' && prior.generation < item.generation
+              && nowMs - ms(prior.at) < IN_FLIGHT_MS && !launchedSince(zylosDir, item.instanceId, readJson(instancesFile, null), ms(prior.at))) {
+            log(`[fable-guard] ${item.instanceId}: restart for g${prior.generation} still in flight; it launches g${item.generation}`);
+            return;
+          }
+        }
+        const claimed = claimExecution({ zylosDir, instanceId: item.instanceId, op, nowMs, lock: claimLock });
+        if (!claimed.ok) {
+          if (kind === 'suspend' && claimed.reason.startsWith('busy:')) {
+            deferExecution({ zylosDir, instanceId: item.instanceId, item: { ...item, ...op }, lock: claimLock });
+            log(`[fable-guard] ${item.instanceId}: suspend deferred (${claimed.reason}); it runs once the persona is free`);
+          } else {
+            if (kind === 'suspend') dropDeferredExecution({ zylosDir, instanceId: item.instanceId, item: op, lock: claimLock });
+            log(`[fable-guard] ${item.instanceId}: ${kind} g${item.generation} a${item.attempt} not executed (${claimed.reason})`);
+          }
           return;
         }
-        const prior = persona.executing;
-        if (item.kind !== 'stop' && prior?.kind === 'restart' && prior.generation < item.generation
-            && nowMs - ms(prior.at) < IN_FLIGHT_MS && !launchedSince(zylosDir, item.instanceId, readJson(instancesFile, null), ms(prior.at))) {
-          log(`[fable-guard] ${item.instanceId}: restart for g${prior.generation} still in flight; it launches g${item.generation}`);
-          return;
+        claim = claimed;
+        if (persona) {
+          persona.executing = { generation: item.generation ?? null, attempt: item.attempt ?? null, kind, owner: op.owner, at: iso(nowMs) };
+          writeJsonAtomic(stateFile, state);
         }
-        persona.executing = { generation, attempt: item.attempt ?? null, kind: item.kind || 'restart', at: iso(nowMs) };
-        writeJsonAtomic(file, state);
-        if (item.kind !== 'stop') {
-          writeSignal({ zylosDir, nowMs, change: { instanceId: item.instanceId, fromProfile: item.profileId,
-            toProfile: item.profileId, reason: `fable_guard:${item.mode}:g${item.generation}`, sessionRef } });
+        if (kind === 'restart') {
+          const change = item.signalChange
+            ? { ...item.signalChange, sessionRef }
+            : { instanceId: item.instanceId, fromProfile: item.profileId, toProfile: item.profileId,
+              reason: `fable_guard:${item.mode}:g${item.generation}`, sessionRef };
+          writeSignal({ zylosDir, nowMs, change });
         }
-        go = true;
       });
     } catch (err) {
-      log(`[fable-guard] ${item.instanceId}: g${item.generation} not started (${err.message}); resumed on a later pass`);
+      log(`[fable-guard] ${item.instanceId}: ${kind} g${item.generation} not started (${err.message}); resumed on a later pass`);
+      if (claim) completeExecution({ zylosDir, instanceId: item.instanceId, token: claim.token, outcome: 'failed',
+        detail: err.message, nowMs, lock: claimLock });
       continue;
     }
-    if (!go) continue;
-    if (item.kind === 'stop') {
+    if (!claim) continue;
+    const monitorName = item.monitorName || `activity-monitor-${item.instanceId}`;
+    let outcome = 'done';
+    let detail = null;
+    if (kind === 'stop') {
       // Safe end of an exhausted downgrade: the monitor first, so its Guardian cannot relaunch.
-      try { execFileSyncImpl('pm2', ['stop', `activity-monitor-${item.instanceId}`], { stdio: 'ignore', timeout: 30_000 }); } catch (err) {
+      try { execFileSyncImpl('pm2', ['stop', monitorName], { stdio: 'ignore', timeout: 30_000 }); } catch (err) {
         log(`[fable-guard] ${item.instanceId}: pm2 stop failed (${err.message})`);
       }
       try { execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 }); } catch { /* absent pane */ }
       log(`[fable-guard] ${item.instanceId}: STOPPED after g${item.generation} downgrade retries were exhausted (${item.reason})`);
-      executed.push(item);
-      continue;
+    } else {
+      try {
+        execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 });
+      } catch { /* absent pane is fine */ }
+      try {
+        execFileSyncImpl('pm2', kind === 'suspend' ? ['stop', monitorName] : ['restart', monitorName, '--update-env'],
+          { stdio: 'ignore', timeout: 30_000 });
+        log(kind === 'suspend'
+          ? `[fable-guard] ${item.instanceId}: SUSPENDED (${item.reason})`
+          : `[fable-guard] ${item.instanceId}: restart g${item.generation} -> ${item.mode} on ${item.profileId} (${item.reason})`);
+      } catch (err) {
+        outcome = 'failed';
+        detail = err.message;
+        log(`[fable-guard] ${item.instanceId}: ${kind} g${item.generation} failed (${err.message}); resumed on a later pass`);
+      }
     }
-    try {
-      execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 });
-    } catch { /* absent pane is fine */ }
-    try {
-      execFileSyncImpl('pm2', ['restart', `activity-monitor-${item.instanceId}`, '--update-env'], { stdio: 'ignore', timeout: 30_000 });
-      log(`[fable-guard] ${item.instanceId}: restart g${item.generation} -> ${item.mode} (${item.reason})`);
-    } catch (err) {
-      log(`[fable-guard] ${item.instanceId}: restart g${item.generation} failed (${err.message}); resumed on a later pass`);
-    }
+    completeExecution({ zylosDir, instanceId: item.instanceId, token: claim.token, outcome, detail, nowMs, lock: claimLock });
     executed.push(item);
   }
   return executed;
+}
+
+/**
+ * Run the deferred account-failover suspends of guard-owned personas whose
+ * execution claim is free again (daemon pass). No-op when nothing is deferred.
+ */
+export function drainDeferredFableEffects({ zylosDir, nowMs = Date.now(), execFileSyncImpl = execFileSync, log = console.log,
+  lock = withFileLock, claimLock = withFileLock } = {}) {
+  const deferred = listDeferredExecutions(zylosDir);
+  if (!deferred.length) return [];
+  return executeFableRestarts({ zylosDir, restarts: deferred, nowMs, execFileSyncImpl, log, lock, claimLock, owner: 'failover' });
 }
 
 function launchedSince(zylosDir, instanceId, document, sinceMs) {
@@ -631,7 +699,7 @@ export function reconcileFableGuardNow({
   });
   for (const event of plan.events) log(`[fable-guard] ${event}`);
   const executed = plan.restarts.length
-    ? executeFableRestarts({ zylosDir, restarts: plan.restarts, nowMs, execFileSyncImpl, log, lock })
+    ? executeFableRestarts({ zylosDir, restarts: plan.restarts, nowMs, execFileSyncImpl, log, lock, owner: 'reconcile' })
     : [];
   return { events: plan.events, planned: plan.restarts, executed };
 }

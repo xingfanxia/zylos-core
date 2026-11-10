@@ -9,7 +9,15 @@ import { withFileLock } from '../../multi-session/file-lock.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 import { processSwitchNotices } from './runtime-switch-notices.js';
 import { verifiedQuotaRecoveries, readCurrentSubscriptionAccountKeys, readSubscriptionRotationMarkers } from './codex-quota-recovery.js';
-import { executeFableRestarts, planFableGuardPass, scheduleFableProbes, writeJsonAtomic as writeGuardJson } from './fable-guard.js';
+import {
+  drainDeferredFableEffects,
+  executeFableRestarts,
+  fableGuardOwnsInstance,
+  planFableGuardPass,
+  readFableGuardState,
+  scheduleFableProbes,
+  writeJsonAtomic as writeGuardJson,
+} from './fable-guard.js';
 import { fableGuardStatePath } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -560,6 +568,11 @@ export function applyRuntimeFailover({
 } = {}) {
   let changes = [];
   let fableRestarts = [];
+  // Account-failover effects for personas the Fable guard owns go through the
+  // guard's executor (generation fence + per-persona execution claim), so the
+  // daemon's guard restarts, this failover and --apply never overlap on one
+  // persona. Every other persona keeps the direct path below, unchanged.
+  let ownedEffects = [];
   if (fs.existsSync(INSTANCES_FILE)) {
     withFileLock(`${INSTANCES_FILE}.lock`, () => {
       const document = readJson(INSTANCES_FILE, {});
@@ -587,6 +600,16 @@ export function applyRuntimeFailover({
         writeGuardJson(fableGuardStatePath(zylosDir), guard.state);
         for (const event of guard.events) log(`[fable-guard] ${event}`);
         fableRestarts = guard.restarts;
+      }
+      if (changes.length > 0) {
+        let guardState = guard?.state ?? null;
+        if (!guard) { try { guardState = readFableGuardState(zylosDir); } catch { guardState = null; } }
+        const owned = changes.filter(change => fableGuardOwnsInstance({ document: planned.document, state: guardState,
+          instanceId: change.instanceId }));
+        if (owned.length) {
+          changes = changes.filter(change => !owned.includes(change));
+          ownedEffects = owned.map(change => failoverEffect(change, guardState, planned.document));
+        }
       }
     });
   } else if (fs.existsSync(SINGLE_PROFILE_FILE)) {
@@ -643,8 +666,27 @@ export function applyRuntimeFailover({
     });
     log(`[runtime-failover] ${change.instanceId}: ${change.fromProfile} -> ${change.toProfile} (${change.reason})`);
   }
-  if (fableRestarts.length) executeFableRestarts({ zylosDir, restarts: fableRestarts, nowMs, execFileSyncImpl, log });
-  return changes;
+  for (const item of ownedEffects) log(`[runtime-failover] ${item.instanceId}: ${item.signalChange?.fromProfile ?? item.fromProfile} -> `
+    + `${item.profileId ?? 'suspended'} (${item.failoverReason}); executed by the Fable guard executor`);
+  const guardEffects = [...ownedEffects, ...fableRestarts];
+  if (guardEffects.length) executeFableRestarts({ zylosDir, restarts: guardEffects, nowMs, execFileSyncImpl, log });
+  try { drainDeferredFableEffects({ zylosDir, nowMs, execFileSyncImpl, log }); } catch (err) { log(`[fable-guard] deferred effects: ${err.message}`); }
+  return [...changes, ...ownedEffects.map(item => item.change)];
+}
+
+// The failover's restart/suspend of a guard-owned persona as an executor item.
+// A restart carries the guard's committed generation and attempt (the guard
+// commits with `attempts: 1` when the failover moves the persona in the same pass).
+function failoverEffect(change, guardState, document) {
+  const persona = guardState?.personas?.[change.instanceId];
+  const base = { instanceId: change.instanceId, owner: 'failover', generation: persona?.desired?.generation ?? null,
+    attempt: change.suspend ? null : (persona?.attempts || 1), tmuxSession: change.tmuxSession, monitorName: change.monitorName,
+    reason: `account_failover:${change.reason}`, failoverReason: change.reason, fromProfile: change.fromProfile, change };
+  if (change.suspend) {
+    return { ...base, kind: 'suspend', profileId: null,
+      suspendedAt: document?.instances?.[change.instanceId]?.runtime_failover_suspended?.at ?? null };
+  }
+  return { ...base, kind: 'restart', mode: persona?.desired?.mode ?? null, profileId: change.toProfile, signalChange: change };
 }
 
 export async function runDaemon({

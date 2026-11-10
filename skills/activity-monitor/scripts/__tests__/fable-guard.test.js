@@ -1060,3 +1060,194 @@ describe('Fable guard daemon integration', () => {
     }
   });
 });
+
+// ── Review #2 (astra-review-2.md): an attempt record is not a completion receipt ──
+function guardTemp(sim) {
+  const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-r2-'));
+  fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
+  const persist = () => {
+    fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(sim.document));
+    fs.writeFileSync(fableGuardStatePath(zylosDir), JSON.stringify(sim.state));
+    fs.writeFileSync(fableUsagePath(zylosDir), JSON.stringify(sim.usage));
+    for (const [id, record] of Object.entries(sim.launches)) {
+      fs.mkdirSync(path.join(zylosDir, 'activity-monitor', id), { recursive: true });
+      fs.writeFileSync(path.join(zylosDir, 'activity-monitor', id, 'fable-launch.json'), JSON.stringify(record));
+    }
+  };
+  const load = () => { sim.state = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8')); };
+  return { zylosDir, persist, load, cleanup: () => fs.rmSync(zylosDir, { recursive: true, force: true }) };
+}
+
+describe('Fable guard execution claim per generation/attempt (review-2 #4)', () => {
+  it('same-generation concurrent execution: the same generation/attempt executes once', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    const item = sim.pass().restarts.find(entry => entry.instanceId === 'user-pan');
+    const tmp = guardTemp(sim);
+    try {
+      tmp.persist();
+      const calls = [];
+      let nested = false;
+      const exec = (file, args) => {
+        if (args[0] === 'display-message' || args[0] === 'has-session') return '';
+        calls.push([file, ...args].join(' '));
+        // A second executor (--apply's reconcile, or a duplicate submission) runs the same item mid-flight.
+        if (file === 'tmux' && args[0] === 'kill-session' && !nested) {
+          nested = true;
+          executeFableRestarts({ zylosDir: tmp.zylosDir, restarts: [item], nowMs: sim.now, execFileSyncImpl: exec, log: () => {} });
+        }
+        return '';
+      };
+      executeFableRestarts({ zylosDir: tmp.zylosDir, restarts: [item], nowMs: sim.now, execFileSyncImpl: exec, log: () => {} });
+      executeFableRestarts({ zylosDir: tmp.zylosDir, restarts: [item], nowMs: sim.now + 1000, execFileSyncImpl: exec, log: () => {} });
+      assert.deepEqual(calls, ['tmux kill-session -t claude-user-pan', 'pm2 restart activity-monitor-user-pan --update-env']);
+    } finally { tmp.cleanup(); }
+  });
+
+  it('policy restart still landing: no further policy restart is scheduled within the landing grace', () => {
+    const sim = new Sim();
+    sim.launchAll(sim.pass().restarts); // both Fable personas on Opus with the subagent pin
+    sim.advance(MIN);
+    sim.pass();
+    sim.document.runtime_profiles[BACKUP].reasoning_effort = 'medium'; // Opus -> Opus policy change
+    sim.advance(MIN);
+    const first = sim.pass().restarts.filter(item => item.instanceId === 'user-pan');
+    assert.deepEqual(first.map(item => item.attempt), [1]);
+    // The restart is landing: the old launch record still describes its predecessor.
+    sim.advance(1000);
+    assert.deepEqual(sim.pass().restarts.filter(item => item.instanceId === 'user-pan'), [], 'no second attempt one second later');
+    sim.advance(MIN);
+    assert.deepEqual(sim.pass().restarts.filter(item => item.instanceId === 'user-pan'), []);
+    sim.advance(3 * MIN); // the restart never landed: resumed once the grace is over
+    assert.deepEqual(sim.pass().restarts.filter(item => item.instanceId === 'user-pan').map(item => item.attempt), [2]);
+  });
+});
+
+describe('daemon / account failover / --apply share one executor (review-2 #4)', () => {
+  async function failoverFixture() {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-owners-'));
+    const nowMs = Date.now();
+    const document = documentFixture();
+    document.runtime_failover = { enabled: true, chain: [BACKUP, CL], switch_threshold: 95, recover_threshold: 90, min_dwell_sec: 300 };
+    fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
+    fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(document, null, 2) + '\n', { mode: 0o640 });
+    const config = readFableGuardConfig(document);
+    let usage = {};
+    for (const account of [BACKUP, CL]) {
+      for (let i = 3; i >= 1; i--) {
+        usage = recordProbeResult(usage, { account, nowMs: nowMs - i * MIN, config, result: { outcome: 'valid',
+          observation: { account, utilization: 0.1, resets_at: iso(nowMs + 2 * 86_400_000), observed_at: iso(nowMs - i * MIN),
+            cli_version: '2.1.322', model: 'claude-fable-5-2', status: 'allowed' } } });
+      }
+    }
+    fs.writeFileSync(fableUsagePath(zylosDir), JSON.stringify(usage));
+    for (const id of PERSONAS) {
+      fs.mkdirSync(path.join(zylosDir, 'activity-monitor', id), { recursive: true });
+      fs.writeFileSync(path.join(zylosDir, 'activity-monitor', id, 'agent-status.json'), JSON.stringify({
+        state: 'idle', health: 'ok', active_tools: 0, last_check: Math.floor(nowMs / 1000), runtime_launch_at: nowMs - 3_600_000 }));
+    }
+    const saved = process.env.ZYLOS_DIR;
+    process.env.ZYLOS_DIR = zylosDir;
+    const { applyRuntimeFailover } = await import(`../runtime-failover.js?owners=${nowMs}-${Math.random()}`);
+    const restore = () => {
+      if (saved === undefined) delete process.env.ZYLOS_DIR; else process.env.ZYLOS_DIR = saved;
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    };
+    const exhausted = { providers: { [BACKUP]: { available: true, primary: { used_percent: 99 } },
+      [CL]: { available: true, primary: { used_percent: 10 } } } };
+    return { zylosDir, nowMs, applyRuntimeFailover, restore, exhausted };
+  }
+  const effects = (calls, id) => calls.filter(call => call.includes(`claude-${id}`) || call.includes(`activity-monitor-${id}`))
+    .filter(call => !/display-message|has-session/.test(call));
+
+  it('an account failover never kills/restarts a persona whose --apply guard restart is in flight', async () => {
+    const fx = await failoverFixture();
+    try {
+      const calls = [];
+      const inner = [];
+      let fired = false;
+      const exec = (file, args) => {
+        const call = [file, ...args].join(' ');
+        calls.push(call);
+        if (fired === false && call === 'tmux kill-session -t claude-user-pan') {
+          fired = true; // the daemon's account failover runs while --apply's restart of pan is mid-flight
+          fx.applyRuntimeFailover({ providerUsage: fx.exhausted, nowMs: fx.nowMs + 1000, log: () => {},
+            execFileSyncImpl: (f, a) => { inner.push([f, ...a].join(' ')); return exec(f, a); } });
+        }
+        if (args[0] === 'has-session') throw Object.assign(new Error('exit 1'), { stderr: "can't find session" });
+        return '';
+      };
+      reconcileFableGuardNow({ zylosDir: fx.zylosDir, nowMs: fx.nowMs, execFileSyncImpl: exec, log: () => {} });
+      assert.equal(fired, true);
+      assert.ok(effects(inner, 'admin').length > 0, 'the failover still restarts the personas the guard does not own');
+      assert.deepEqual(effects(inner, 'user-pan'), [], 'no overlapping kill/pm2 for pan');
+      assert.deepEqual(effects(calls, 'user-pan'), ['tmux kill-session -t claude-user-pan', 'pm2 restart activity-monitor-user-pan --update-env']);
+      assert.equal(effects(calls, 'user-elaine').filter(call => call.startsWith('tmux kill-session')).length, 1, 'elaine restarted once');
+    } finally { fx.restore(); }
+  });
+
+  it('--apply during an account failover restart of an owned persona does not restart it again', async () => {
+    const fx = await failoverFixture();
+    try {
+      // First pass: the guard upgrades both Fable personas (restarts land), so the next failover is the only change.
+      fx.applyRuntimeFailover({ providerUsage: { providers: { [BACKUP]: { available: true, primary: { used_percent: 10 } },
+        [CL]: { available: true, primary: { used_percent: 10 } } } }, nowMs: fx.nowMs, log: () => {},
+      execFileSyncImpl: (f, a) => (a[0] === 'has-session' ? (() => { throw Object.assign(new Error('x'), { stderr: "can't find session" }); })() : '') });
+      const calls = [];
+      let fired = false;
+      const exec = (file, args) => {
+        const call = [file, ...args].join(' ');
+        calls.push(call);
+        if (!fired && call === 'tmux kill-session -t claude-user-pan') {
+          fired = true;
+          reconcileFableGuardNow({ zylosDir: fx.zylosDir, nowMs: fx.nowMs + 31 * MIN, execFileSyncImpl: exec, log: () => {} });
+        }
+        return '';
+      };
+      fx.applyRuntimeFailover({ providerUsage: fx.exhausted, nowMs: fx.nowMs + 31 * MIN, log: () => {}, execFileSyncImpl: exec });
+      assert.equal(fired, true);
+      assert.equal(effects(calls, 'user-pan').filter(call => call.startsWith('tmux kill-session')).length, 1);
+      assert.equal(effects(calls, 'user-pan').filter(call => call.startsWith('pm2 restart')).length, 1);
+    } finally { fx.restore(); }
+  });
+
+  it('an account-failover suspend of an owned persona waits for the in-flight restart, then runs once', async () => {
+    // The failover suspends a persona only after a Codex model downshift with no usable tier; the
+    // executor item it builds for a guard-owned persona is driven here directly.
+    const fx = await failoverFixture();
+    try {
+      const { claimExecution, completeExecution } = await import('../fable-exec-claim.js');
+      const { drainDeferredFableEffects } = await import('../fable-guard.js');
+      const held = claimExecution({ zylosDir: fx.zylosDir, instanceId: 'user-pan', nowMs: fx.nowMs,
+        op: { owner: 'reconcile', kind: 'restart', generation: 99, attempt: 1 } });
+      assert.equal(held.ok, true);
+      const at = iso(fx.nowMs);
+      const doc = JSON.parse(fs.readFileSync(path.join(fx.zylosDir, 'instances.json'), 'utf8'));
+      doc.instances['user-pan'].runtime_failover_suspended = { reason: 'model_downshift:gpt-mini', profile: BACKUP, at };
+      fs.writeFileSync(path.join(fx.zylosDir, 'instances.json'), JSON.stringify(doc));
+      const suspend = { instanceId: 'user-pan', owner: 'failover', kind: 'suspend', generation: null, attempt: null, profileId: null,
+        suspendedAt: at, tmuxSession: 'claude-user-pan', reason: 'account_failover:model_downshift:gpt-mini' };
+      const calls = [];
+      const exec = (file, args) => { calls.push([file, ...args].join(' ')); return ''; };
+      executeFableRestarts({ zylosDir: fx.zylosDir, restarts: [suspend], nowMs: fx.nowMs + 1000, execFileSyncImpl: exec, log: () => {} });
+      assert.deepEqual(calls, [], 'not while the restart is in flight');
+      drainDeferredFableEffects({ zylosDir: fx.zylosDir, nowMs: fx.nowMs + 2000, execFileSyncImpl: exec, log: () => {} });
+      assert.deepEqual(calls, [], 'still deferred while the claim is held');
+      completeExecution({ zylosDir: fx.zylosDir, instanceId: 'user-pan', token: held.token, outcome: 'done', nowMs: fx.nowMs + 3000 });
+      drainDeferredFableEffects({ zylosDir: fx.zylosDir, nowMs: fx.nowMs + 4000, execFileSyncImpl: exec, log: () => {} });
+      assert.deepEqual(calls, ['tmux kill-session -t claude-user-pan', 'pm2 stop activity-monitor-user-pan']);
+      drainDeferredFableEffects({ zylosDir: fx.zylosDir, nowMs: fx.nowMs + 5000, execFileSyncImpl: exec, log: () => {} });
+      assert.equal(calls.length, 2, 'and only once');
+      // A deferred suspend the failover has since lifted is dropped, not run.
+      const lifted = { ...suspend, suspendedAt: iso(fx.nowMs + 60_000) };
+      const again = claimExecution({ zylosDir: fx.zylosDir, instanceId: 'user-pan', nowMs: fx.nowMs + 61_000,
+        op: { owner: 'reconcile', kind: 'restart', generation: 100, attempt: 1 } });
+      executeFableRestarts({ zylosDir: fx.zylosDir, restarts: [lifted], nowMs: fx.nowMs + 61_000, execFileSyncImpl: exec, log: () => {} });
+      completeExecution({ zylosDir: fx.zylosDir, instanceId: 'user-pan', token: again.token, outcome: 'done', nowMs: fx.nowMs + 62_000 });
+      drainDeferredFableEffects({ zylosDir: fx.zylosDir, nowMs: fx.nowMs + 63_000, execFileSyncImpl: exec, log: () => {} });
+      assert.equal(calls.length, 2, 'a suspend that no longer matches instances.json is not executed');
+    } finally { fx.restore(); }
+  });
+});
+
