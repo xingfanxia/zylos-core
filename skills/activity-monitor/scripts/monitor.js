@@ -156,7 +156,7 @@ import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tas
 // Fable guard (FG-4): the delivery side owns the limit-dialog classifier; a
 // named import so a renamed or removed export fails loudly at load.
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
-import { createFableMonitor } from './fable-monitor.js';
+import { createFableMonitor, parseModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
 import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession } from '../../comm-bridge/scripts/c4-db.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
@@ -840,6 +840,20 @@ function getTmuxPanePid(sessionName) {
   }
 }
 
+// Fable guard: the --model argument of the running Claude CLI in the pane, or
+// null when the process or its command line cannot be read.
+function readClaudeProcessModel(sessionName) {
+  const pid = getTmuxClaudePid(sessionName);
+  if (!pid) return null;
+  try {
+    const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 });
+    const model = parseModelArgument(args);
+    return model ? { model, pid } : null;
+  } catch {
+    return null;
+  }
+}
+
 function getTmuxClaudePid(sessionName) {
   const panePid = getTmuxPanePid(sessionName);
   if (!panePid) return 0;
@@ -1202,6 +1216,7 @@ function fableHealthDeps(activeAdapter) {
   fableMonitor = createFableMonitor({ zylosDir: ZYLOS_DIR, instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR, runtimeProfile,
     sessionName: activeAdapter.sessionName, classifyLimitDialog,
     // stopSession defaults to killing exactly the judged session (its tmux session id).
+    readProcessModel: () => readClaudeProcessModel(activeAdapter.sessionName),
     fenceReplacedSession, log, uncertainDeliveries: {
       list: () => getUncertainDeliveries({ instanceId: INSTANCE_ID, unnotifiedOnly: true, limit: 20 }),
       markNotified: id => markUncertainDeliveryNotified(id),
