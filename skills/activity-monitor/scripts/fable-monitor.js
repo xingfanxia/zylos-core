@@ -19,7 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { LIMIT_EVIDENCE_FILE, READINESS_FILE, SESSION_FAILURES_FILE } from './fable-guard.js';
+import { LIMIT_EVIDENCE_FILE, READINESS_FILE, readTmuxSessionRef, SESSION_FAILURES_FILE } from './fable-guard.js';
 import { runtimeSwitchSignalPath } from './runtime-switch-signal.js';
 import {
   FABLE_LAUNCH_FILE,
@@ -64,6 +64,9 @@ export function createFableMonitor({
   classifyLimitDialog = null,
   capturePane = session => execFileSync('tmux', ['capture-pane', '-p', '-t', session],
     { encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024 }),
+  // C4 key fence for the stopped session (comm-bridge supersedeControlsForSession).
+  readSessionRef = () => readTmuxSessionRef(sessionName),
+  fenceReplacedSession = () => {},
   now = () => Date.now(),
   log = () => {},
   graceMs = LEASE_ENFORCEMENT_GRACE_MS,
@@ -160,7 +163,11 @@ export function createFableMonitor({
     log(`Fable guard ALERT: Fable session ${launch.launch_id} no longer admitted (${reason}) and the guard daemon did not act `
       + `within ${Math.round(graceMs / 1000)}s; stopping it so the relaunch comes up on Opus`);
     plannedStop = 'lease_enforcement';
+    const sessionRef = readSessionRef();
     try { stopSession(); } catch (err) { log(`Fable guard lease enforcement stop failed: ${err.message}`); }
+    if (sessionRef) {
+      try { fenceReplacedSession(sessionRef); } catch (err) { log(`Fable guard key fence failed: ${err.message}`); }
+    }
     return record;
   }
 

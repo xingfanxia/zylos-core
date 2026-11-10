@@ -3,6 +3,9 @@ import path from 'node:path';
 
 const SIGNAL_MAX_AGE_MS = 10 * 60 * 1000;
 const VALID_SIGNAL_KEY = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+// tmux identity of the session a transition replaces (comm-bridge sessionRef):
+// session_id:session_created:pane_id:pane_pid.
+export const VALID_SESSION_REF = /^\$\d+:\d+:%\d+:\d+$/;
 
 function signalKey(instanceId) {
   const key = instanceId || 'single';
@@ -36,6 +39,7 @@ export function writeRuntimeSwitchSignal({
     reason: change.reason,
     switched_at: new Date(nowMs).toISOString(),
     grace_sec: graceSec,
+    ...(VALID_SESSION_REF.test(change.sessionRef || '') ? { session_ref: change.sessionRef } : {}),
   }, null, 2) + '\n', { mode: 0o600 });
   fs.renameSync(tmp, signalPath);
   return signalPath;

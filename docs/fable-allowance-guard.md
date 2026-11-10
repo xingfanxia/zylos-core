@@ -347,12 +347,19 @@ cooldown). If the guard has not acted within 15 minutes the ordinary recovery
 resumes. A bare keyword the classifier rejects, a permission prompt, or an
 unknown modal changes nothing here.
 
-A Fable guard relaunch keeps the tmux name. When the new monitor consumes a
-switch signal whose reason starts with `fable_guard:`, it supersedes the
-persona's still-pending `[KEYSTROKE]` controls (`last_error =
-FABLE_GUARD_RELAUNCH`), so a late watchdog Escape queued for the old session
-cannot interrupt the new one. Controls already claimed by the dispatcher are
-left alone.
+A Fable guard relaunch keeps the tmux name, so keys must be fenced by session,
+not by name. Just before the guard kills a session it reads that session's
+`sessionRef` (`tmux display-message -p -t <tmux_session>
+'#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'`, e.g.
+`$3:1762790000:%12:48211`) and stores it as `session_ref` in the switch
+signal. When the new monitor consumes a `fable_guard:` signal that carries one,
+it calls the C4 owning API `supersedeControlsForSession({ instanceId,
+sessionRef, reason: 'FABLE_GUARD_RELAUNCH' })` (`skills/comm-bridge/scripts/c4-db.js`),
+which supersedes the pending AND already-claimed `[KEYSTROKE]` controls bound
+to that old session and never those bound to the replacement. The monitor's
+lease enforcement does the same for the session it stops. The activity monitor
+never writes the control queue itself; if the API is absent the fence is
+skipped with a log line.
 
 Known limitation: if the CLI raises the limit dialog after Enter was already
 sent, the dispatcher records that message as delivered although the CLI sent

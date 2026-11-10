@@ -54,10 +54,11 @@ function fixture({ mode = 'fable', observedAt = T0 } = {}) {
 }
 
 function monitorFor(fx, clock, extra = {}) {
-  const calls = { stops: 0, logs: [] };
+  const calls = { stops: 0, logs: [], fenced: [] };
   const monitor = createFableMonitor({
     zylosDir: fx.zylosDir, instanceId: 'user-pan', monitorDir: fx.monitorDir, runtimeProfile: fx.profile,
-    stopSession: () => { calls.stops += 1; }, now: () => clock.now, log: message => calls.logs.push(message), ...extra,
+    stopSession: () => { calls.stops += 1; }, now: () => clock.now, log: message => calls.logs.push(message),
+    readSessionRef: () => '$3:1762790000:%12:48211', fenceReplacedSession: ref => calls.fenced.push(ref), ...extra,
   });
   return { monitor, calls };
 }
@@ -79,6 +80,7 @@ describe('Fable lease enforcement in the persona monitor (review #1)', () => {
     assert.equal(calls.stops, 1, 'the monitor forces the safe direction itself');
     const record = JSON.parse(fs.readFileSync(path.join(fx.monitorDir, LEASE_ENFORCEMENT_FILE), 'utf8'));
     assert.equal(record.reason, 'lease_expired');
+    assert.deepEqual(calls.fenced, ['$3:1762790000:%12:48211'], 'keys bound to the stopped session are fenced');
     assert.ok(calls.logs.some(line => line.includes('ALERT')));
     // Guardian relaunches the session through the cached profile: Opus.
     assert.equal(fx.launch(clock.now).model, OPUS);

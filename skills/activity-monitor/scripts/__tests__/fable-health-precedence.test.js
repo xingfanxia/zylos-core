@@ -5,8 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { HealthEngine } from '../health-engine.js';
-import { DatabaseSync } from 'node:sqlite';
-import { dropPendingKeystrokes, LIMIT_EVIDENCE_FILE, SESSION_FAILURES_FILE } from '../fable-guard.js';
+import { LIMIT_EVIDENCE_FILE, SESSION_FAILURES_FILE } from '../fable-guard.js';
 import { createFableMonitor } from '../fable-monitor.js';
 import { FABLE_LAUNCH_FILE } from '../../../multi-session/runtime-files.js';
 import { classifyLimitDialog, readTmuxInputState } from '../../../comm-bridge/scripts/tmux-input-state.js';
@@ -267,28 +266,5 @@ describe('Pane-read change that applies to every Claude persona (guard configure
       assert.equal(canTreatPaneAsRecovered(state), false, name);
     }
     assert.equal(paneState(dialogs.QUOTED_LIMIT_TEXT).modal, null, 'quoted limit text is not a modal');
-  });
-});
-
-describe('Fable guard relaunch keystroke cleanup', () => {
-  it('supersedes only pending keystroke controls of the relaunched persona', () => {
-    // node:sqlite shares better-sqlite3's prepare().run() -> { changes } surface.
-    const db = new DatabaseSync(':memory:');
-    db.exec(`CREATE TABLE control_queue (id INTEGER PRIMARY KEY, content TEXT, status TEXT, target_instance TEXT,
-      last_error TEXT, updated_at INTEGER)`);
-    const insert = db.prepare('INSERT INTO control_queue (content, status, target_instance) VALUES (?, ?, ?)');
-    insert.run('[KEYSTROKE]Escape', 'pending', 'user-pan');
-    insert.run('[KEYSTROKE]Escape', 'running', 'user-pan');
-    insert.run('[KEYSTROKE]Escape', 'pending', 'user-elaine');
-    insert.run('Heartbeat check. [phase=primary]', 'pending', 'user-pan');
-    assert.equal(dropPendingKeystrokes(db, 'user-pan', 42), 1);
-    assert.deepEqual(db.prepare('SELECT status, last_error FROM control_queue ORDER BY id').all().map(row => ({ ...row })), [
-      { status: 'superseded', last_error: 'FABLE_GUARD_RELAUNCH' },
-      { status: 'running', last_error: null },
-      { status: 'pending', last_error: null },
-      { status: 'pending', last_error: null },
-    ]);
-    assert.equal(dropPendingKeystrokes(db, null), 0);
-    db.close();
   });
 });

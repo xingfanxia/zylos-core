@@ -76,9 +76,11 @@ export class MonitorOrchestrator {
     });
     if (runtimeSwitchSignal) {
       adapter.getHeartbeatDeps?.()?.clearHeartbeatPending?.();
-      // A Fable guard relaunch keeps the tmux name: a watchdog interrupt
-      // queued for the old session must not reach the new one.
-      if (String(runtimeSwitchSignal.reason || '').startsWith('fable_guard:')) this.deps.dropStaleKeystrokes?.();
+      // A Fable guard relaunch keeps the tmux name: keys bound to the session
+      // the guard killed (signal.session_ref) must not reach the new one.
+      if (String(runtimeSwitchSignal.reason || '').startsWith('fable_guard:') && runtimeSwitchSignal.session_ref) {
+        this.deps.fenceReplacedSession?.(runtimeSwitchSignal.session_ref);
+      }
       engine.notifyColdStart(runtimeSwitchSignal.grace_sec);
       log(`Runtime switch to ${activeProfile}: cold-start grace ${runtimeSwitchSignal.grace_sec}s`);
     }
