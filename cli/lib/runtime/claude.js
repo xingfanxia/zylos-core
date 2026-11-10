@@ -54,6 +54,7 @@ const { getMonitorDir: _getMonitorDir } =
   await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
 
 import { upgradeStartupPrompt, shellArgument } from './upgrade-context.js';
+import { prepareFableLaunch } from '../../../skills/multi-session/runtime-files.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -394,7 +395,15 @@ export class ClaudeAdapter extends RuntimeAdapter {
   async launch(opts = {}) {
     const bypassPermissions = opts.bypassPermissions ?? DEFAULT_BYPASS;
     assertInstructionReady('claude');
-    const profile = this.config.runtimeProfile || {};
+    // Fable allowance guard: every launch (Guardian relaunches reuse the
+    // profile resolved when the monitor started) re-evaluates Fable admission
+    // and records the launch. Untracked personas get their profile unchanged.
+    const profile = prepareFableLaunch({
+      profile: this.config.runtimeProfile || {},
+      instanceId: process.env.ZYLOS_INSTANCE_ID || null,
+      zylosDir: ZYLOS_DIR,
+      monitorDir: process.env.ZYLOS_INSTANCE_ID && _getMonitorDir ? _getMonitorDir() : null,
+    }) || {};
     const reasoningEffort = profile.reasoningEffort || null;
     // Profile model/effort are validated by runtime-files.js (shell-safe
     // characters only). Flags pin the session even when settings.json differs.

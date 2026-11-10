@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { randomUUID } from 'node:crypto';
 
 const DEFAULT_ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const VALID_OS_USER = /^[a-z_][a-z0-9_-]{0,31}$/;
@@ -95,31 +96,170 @@ export function fableAccountSettingsFile(document, profileId) {
     ? raw.claude_settings_file : null;
 }
 
+const FABLE_CLOCK_SKEW_MS = 30_000;
+export const FABLE_LAUNCH_FILE = 'fable-launch.json';
+
+/** The account's last valid observation, unless the local clock says it is from the future. */
+export function fableLastObservation(entry, nowMs) {
+  const obs = entry?.last_valid;
+  const observedMs = Date.parse(obs?.observed_at || '');
+  if (!obs || !Number.isFinite(observedMs) || observedMs > nowMs + FABLE_CLOCK_SKEW_MS) return null;
+  if (!Number.isFinite(Number(obs.utilization)) || !Number.isFinite(Date.parse(obs.resets_at || ''))) return null;
+  return obs;
+}
+
+/** Lease: a valid observation younger than lease_sec whose window has not reset. */
+export function fableLeaseObservation(entry, nowMs, config) {
+  const obs = fableLastObservation(entry, nowMs);
+  if (!obs) return null;
+  return nowMs - Date.parse(obs.observed_at) < config.lease_sec * 1000 && Date.parse(obs.resets_at) > nowMs ? obs : null;
+}
+
 /**
- * Launch decision for one persona. null = feature inert for this persona (not
- * configured or not fable_enabled): the launch is byte-for-byte unchanged.
- * Fable is chosen only when the guard committed it for this exact account and
- * that account has no hold; anything else launches the profile's own model.
+ * Fable admission for one launch of one persona, re-evaluated on every launch
+ * and by the persona's monitor (lease enforcement). null = the feature is inert
+ * for this persona. Fable needs ALL of: an account with its own settings file,
+ * the guard's committed Fable for exactly this account, no hold, and a fresh
+ * lease below the threshold. The committed state alone is never enough: it
+ * can be arbitrarily old when the guard daemon is dead or hung.
  */
-export function resolveFableLaunch({ document, instanceId, profileId, guardState = null } = {}) {
+export function fableAdmission({ document, instanceId, profileId, guardState = null, usage = null, nowMs = Date.now() } = {}) {
   const config = readFableGuardConfig(document);
   const instance = instanceId ? document?.instances?.[instanceId] : null;
   if (!config || instance?.fable_enabled !== true) return null;
   const desired = guardState?.personas?.[instanceId]?.desired;
+  const generation = Number.isInteger(desired?.generation) ? desired.generation : null;
   const holds = guardState?.holds?.[profileId];
-  const fable = Boolean(fableAccountSettingsFile(document, profileId))
-    && desired?.mode === 'fable' && desired.account === profileId
-    && Number.isInteger(desired.generation)
-    && !(holds && typeof holds === 'object' && Object.keys(holds).length > 0);
+  const holdKinds = holds && typeof holds === 'object' ? Object.keys(holds).sort() : [];
+  const lease = fableLeaseObservation(usage?.accounts?.[profileId], nowMs, config);
+  let reason = 'admitted';
+  if (!fableAccountSettingsFile(document, profileId)) reason = 'unsupported_account';
+  else if (desired?.mode !== 'fable' || generation === null) reason = 'not_committed';
+  else if (desired.account !== profileId) reason = 'account_mismatch';
+  else if (holdKinds.length) reason = `hold:${holdKinds.join('+')}`;
+  else if (!lease) reason = 'lease_expired';
+  else if (!(Number(lease.utilization) < config.threshold)) reason = 'threshold';
+  return { admitted: reason === 'admitted', reason, generation, config };
+}
+
+/**
+ * Launch decision for one persona. null = feature inert for this persona (not
+ * configured or not fable_enabled): the launch is byte-for-byte unchanged.
+ */
+export function resolveFableLaunch({ document, instanceId, profileId, guardState = null, usage = null, nowMs = Date.now() } = {}) {
+  const admission = fableAdmission({ document, instanceId, profileId, guardState, usage, nowMs });
+  if (!admission) return null;
   return {
-    mode: fable ? 'fable' : 'opus',
-    model: fable ? config.fable_model : null,
-    generation: Number.isInteger(desired?.generation) ? desired.generation : null,
+    mode: admission.admitted ? 'fable' : 'opus',
+    model: admission.admitted ? admission.config.fable_model : null,
+    generation: admission.generation,
+    reason: admission.reason,
     env: {
-      CLAUDE_CODE_SUBAGENT_MODEL: config.subagent_model,
+      CLAUDE_CODE_SUBAGENT_MODEL: admission.config.subagent_model,
       CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1',
     },
   };
+}
+
+/**
+ * Identity of a launch policy: account, mode, main model, effort, settings
+ * file and the launch env. The launcher records it for every launch of a
+ * guard-tracked persona; the guard compares it with the committed policy.
+ */
+export function fableLaunchKey({ account = null, mode = 'opus', model = null, effort = null, settings = null, env = {} } = {}) {
+  const entries = Object.entries(env || {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify([account, mode, model, effort, settings, entries]);
+}
+
+function launchKeyOfProfile(profile) {
+  return fableLaunchKey({ account: profile.id || null, mode: profile.fable?.mode === 'fable' ? 'fable' : 'opus',
+    model: profile.model || null, effort: profile.reasoningEffort || null, settings: profile.claudeSettingsFile || null,
+    env: profile.launchEnv || {} });
+}
+
+/** The launch the guard expects for a persona in `mode` under the current document. */
+export function expectedFableLaunch({ document, instanceId, mode, homeDir = os.homedir() } = {}) {
+  const profile = resolveRuntimeProfile({ document, instanceId, homeDir });
+  const config = readFableGuardConfig(document);
+  const enabled = Boolean(profile.fable);
+  const model = mode === 'fable' && config ? config.fable_model : (profile.baseModel ?? profile.model);
+  const launched = { ...profile, model, fable: enabled ? { mode } : undefined, launchEnv: enabled ? profile.launchEnv : {} };
+  return { account: profile.id, mode, model, key: launchKeyOfProfile(launched) };
+}
+
+function instanceMonitorDir(zylosDir, instanceId, instance) {
+  if (typeof instance?.state_dir === 'string' && instance.state_dir) return instance.state_dir.replace(/^~/, os.homedir());
+  return path.join(zylosDir, 'activity-monitor', instanceId);
+}
+
+export function fableLaunchRecordPath({ zylosDir = DEFAULT_ZYLOS_DIR, instanceId, instance = null, monitorDir = null } = {}) {
+  return path.join(monitorDir || instanceMonitorDir(zylosDir, instanceId, instance), FABLE_LAUNCH_FILE);
+}
+
+/**
+ * Called by the Claude adapter on EVERY launch (including Guardian relaunches
+ * that reuse the profile resolved when the monitor started). For a persona the
+ * guard does not track it returns `profile` itself and writes nothing. For a
+ * tracked persona whose monitor started with a Fable decision it re-evaluates
+ * admission now; a stale lease, a new hold or a newer Opus commit launches the
+ * profile's own model (the safe direction only). It then records the launch
+ * (fable-launch.json in the persona's monitor dir) for the guard to verify.
+ */
+export function prepareFableLaunch({
+  profile,
+  instanceId = null,
+  zylosDir = DEFAULT_ZYLOS_DIR,
+  monitorDir = null,
+  nowMs = Date.now(),
+  readFileSync = fs.readFileSync,
+  writeRecord = writeLaunchRecord,
+} = {}) {
+  const id = instanceId || profile?.fable?.instanceId || null;
+  if (!profile || !id || (profile.runtime && profile.runtime !== 'claude')) return profile;
+  const document = readJsonSafe(path.join(zylosDir, 'instances.json'), readFileSync);
+  const config = readFableGuardConfig(document);
+  const guardState = readJsonSafe(fableGuardStatePath(zylosDir), readFileSync);
+  const tracked = Boolean(profile.fable)
+    || (Boolean(config) && document?.instances?.[id]?.fable_enabled === true)
+    || Boolean(guardState?.personas?.[id]);
+  if (!tracked) return profile;
+  let launched = profile;
+  if (profile.fable) {
+    const usage = config ? readJsonSafe(fableUsagePath(zylosDir), readFileSync) : null;
+    const decision = document
+      ? resolveFableLaunch({ document, instanceId: id, profileId: profile.id, guardState, usage, nowMs })
+      : null;
+    const { fable: _fable, launchEnv: _env, baseModel = profile.model, ...rest } = profile;
+    launched = decision
+      ? { ...rest, baseModel, model: decision.model || baseModel, launchEnv: decision.env,
+        fable: { mode: decision.mode, generation: decision.generation, reason: decision.reason, instanceId: id } }
+      : { ...rest, model: baseModel }; // disabled or unconfigured since the monitor started
+  }
+  const record = {
+    version: 1,
+    launch_id: randomUUID(),
+    instance_id: id,
+    launched_at_ms: nowMs,
+    runtime_profile: launched.id || null,
+    mode: launched.fable?.mode === 'fable' ? 'fable' : 'opus',
+    model: launched.model || null,
+    generation: Number.isInteger(guardState?.personas?.[id]?.desired?.generation)
+      ? guardState.personas[id].desired.generation : null,
+    reason: launched.fable?.reason || (launched.fable ? null : 'not_enabled'),
+    key: launchKeyOfProfile(launched),
+    pid: process.pid,
+  };
+  try {
+    writeRecord(fableLaunchRecordPath({ zylosDir, instanceId: id, instance: document?.instances?.[id], monitorDir }), record);
+  } catch { /* the guard treats a missing record as an unverified launch */ }
+  return launched;
+}
+
+function writeLaunchRecord(filePath, record) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = `${filePath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(record, null, 2) + '\n', { mode: 0o640 });
+  fs.renameSync(tmp, filePath);
 }
 
 function isInside(parent, child) {
@@ -142,6 +282,8 @@ export function resolveRuntimeProfile({
   homeDir = os.homedir(),
   configuredRuntime = 'claude',
   fableGuardState = null,
+  fableUsage = null,
+  nowMs = Date.now(),
 } = {}) {
   const instance = instanceId ? document?.instances?.[instanceId] || {} : {};
   const profileId = typeof instance.runtime_profile === 'string'
@@ -220,7 +362,7 @@ export function resolveRuntimeProfile({
   if (profileId && !raw) errors.push('unknown_runtime_profile');
 
   const fable = runtime === 'claude' && raw
-    ? resolveFableLaunch({ document, instanceId, profileId, guardState: fableGuardState })
+    ? resolveFableLaunch({ document, instanceId, profileId, guardState: fableGuardState, usage: fableUsage, nowMs })
     : null;
 
   return {
@@ -234,7 +376,8 @@ export function resolveRuntimeProfile({
     reasoningEffort,
     providerEnvKey,
     claudeSettingsFile,
-    ...(fable ? { fable: { mode: fable.mode, generation: fable.generation }, launchEnv: fable.env } : {}),
+    ...(fable ? { baseModel: model, launchEnv: fable.env,
+      fable: { mode: fable.mode, generation: fable.generation, reason: fable.reason, instanceId } } : {}),
     errors: [...new Set(errors)],
   };
 }
@@ -248,15 +391,14 @@ export function getInstanceRuntimeProfile({
   const configuredRuntime = getConfiguredRuntime({ zylosDir, readFileSync });
   const document = readJsonSafe(path.join(zylosDir, 'instances.json'), readFileSync);
   if (document || instanceId) {
-    const fableGuardState = readFableGuardConfig(document)
-      ? readJsonSafe(fableGuardStatePath(zylosDir), readFileSync)
-      : null;
+    const guarded = Boolean(readFableGuardConfig(document));
     return resolveRuntimeProfile({
       document: document || {},
       instanceId,
       homeDir,
       configuredRuntime,
-      fableGuardState,
+      fableGuardState: guarded ? readJsonSafe(fableGuardStatePath(zylosDir), readFileSync) : null,
+      fableUsage: guarded ? readJsonSafe(fableUsagePath(zylosDir), readFileSync) : null,
     });
   }
 

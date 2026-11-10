@@ -142,12 +142,29 @@ describe('Fable guard launch decision', () => {
     instances: { 'user-pan': { runtime_profile: 'claude-ax-backup', fable_enabled: true, ...extra } },
   });
   const state = (desired, holds = {}) => ({ version: 1, holds, personas: { 'user-pan': { desired } } });
-  const resolve = (doc, guardState) => resolveRuntimeProfile({ document: doc, instanceId: 'user-pan', fableGuardState: guardState });
+  const NOW = Date.parse('2026-11-10T08:00:00Z');
+  const usageAt = (ageMs, utilization = 0.1) => ({ version: 1, accounts: { 'claude-ax-backup': { last_valid: {
+    utilization, resets_at: '2026-11-13T06:00:00.000Z', observed_at: new Date(NOW - ageMs).toISOString() } } } });
+  const resolve = (doc, guardState, usage = usageAt(60_000)) => resolveRuntimeProfile({ document: doc, instanceId: 'user-pan',
+    fableGuardState: guardState, fableUsage: usage, nowMs: NOW });
   const fable = { account: 'claude-ax-backup', mode: 'fable', generation: 2 };
+
+  it('admits Fable only on a fresh lease below the threshold, whatever the committed state says (review #1)', () => {
+    for (const [name, usage] of [
+      ['no observation', null],
+      ['lease expired', usageAt(13 * 60_000)],
+      ['dated in the future', usageAt(-10 * 60_000)],
+      ['over the threshold', usageAt(60_000, 0.75)],
+    ]) {
+      const result = resolve(document(), state(fable), usage);
+      assert.equal(result.model, 'claude-opus-5-5[1m]', name);
+      assert.equal(result.fable.mode, 'opus', name);
+    }
+  });
 
   it('launches Fable only for the committed account without holds', () => {
     assert.equal(resolve(document(), state(fable)).model, 'claude-fable-5-2[1m]');
-    assert.deepEqual(resolve(document(), state(fable)).fable, { mode: 'fable', generation: 2 });
+    assert.deepEqual(resolve(document(), state(fable)).fable, { mode: 'fable', generation: 2, reason: 'admitted', instanceId: 'user-pan' });
     for (const [name, guardState] of [
       ['no state', null],
       ['opus committed', state({ ...fable, mode: 'opus' })],

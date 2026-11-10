@@ -89,7 +89,8 @@ class Sim {
   // A (re)launch reads the committed state through the real launcher decision.
   launch(id, { at = this.now, model = null } = {}) {
     const profileId = this.document.instances[id].runtime_profile;
-    const decision = resolveFableLaunch({ document: this.document, instanceId: id, profileId, guardState: this.state });
+    const decision = resolveFableLaunch({ document: this.document, instanceId: id, profileId, guardState: this.state,
+      usage: this.usage, nowMs: this.now });
     const launched = model || decision?.model || this.document.runtime_profiles[profileId].model;
     this.status[id] = { state: 'idle', health: 'ok', active_tools: 0, last_check: Math.floor(this.now / 1000), runtime_launch_at: at };
     this.models[id] = { model: baseModel(launched), observed_at_ms: at + 1000 };

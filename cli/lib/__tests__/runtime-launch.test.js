@@ -422,6 +422,14 @@ describe('Claude launch — Fable allowance guard policy', () => {
   const FABLE_PERSONAS = new Set(['user-pan', 'user-elaine']);
   const SUBAGENT_KEYS = ['CLAUDE_CODE_SUBAGENT_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE'];
 
+  // A valid probe observation `ageMs` old (the launch admits Fable only on a fresh lease).
+  function writeUsage({ ageMs = 60_000, utilization = 0.1 } = {}) {
+    const observedMs = Date.now() - ageMs;
+    fs.writeFileSync(path.join(fakeZylosDir, 'activity-monitor', 'fable-usage.json'), JSON.stringify({ version: 1, accounts: {
+      [BACKUP]: { last_valid: { account: BACKUP, utilization, resets_at: new Date(Date.now() + 2 * 86_400_000).toISOString(),
+        observed_at: new Date(observedMs).toISOString(), cli_version: '2.1.322', model: 'claude-fable-5-2' } } } }));
+  }
+
   function writeFleet(mode, { guard = true } = {}) {
     const document = {
       runtime_profiles: { [BACKUP]: { runtime: 'claude', usage_provider: BACKUP,
@@ -435,6 +443,7 @@ describe('Claude launch — Fable allowance guard policy', () => {
       version: 1, generation_seq: 9, holds: {},
       personas: Object.fromEntries([...FABLE_PERSONAS].map(id => [id, { desired: { account: BACKUP, mode, generation: 9 } }])),
     }));
+    writeUsage();
   }
 
   async function launchAs(id, { existing = false } = {}) {
@@ -480,6 +489,45 @@ describe('Claude launch — Fable allowance guard policy', () => {
       }
     });
   }
+
+  it('re-evaluates admission on every Guardian relaunch of the cached profile (review #1)', async () => {
+    writeFleet('fable');
+    const { getInstanceRuntimeProfile } = await import('../../../skills/multi-session/runtime-files.js');
+    const adapter = makeAdapter(ClaudeAdapter);
+    // Resolved once when the monitor started, then reused by every Guardian relaunch.
+    adapter.config.runtimeProfile = getInstanceRuntimeProfile({ zylosDir: fakeZylosDir, instanceId: 'user-pan' });
+    const relaunch = async () => {
+      tmuxSessionExists = false;
+      calls.execFileSync.length = 0;
+      await adapter.launch({ bypassPermissions: false });
+      return { args: readSpecArgs(), env: readSpecEnv() };
+    };
+    assert.equal((await relaunch()).args[3], FABLE, 'fresh lease, committed Fable');
+    writeUsage({ ageMs: 13 * 60_000 }); // the daemon died: no probe for 13 minutes
+    const stale = await relaunch();
+    assert.equal(stale.args[3], OPUS, 'an expired lease never relaunches Fable');
+    assert.equal(stale.env.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-opus-5-5');
+    writeUsage();
+    assert.equal((await relaunch()).args[3], FABLE);
+    writeUsage({ utilization: 0.8 });
+    assert.equal((await relaunch()).args[3], OPUS, 'a reading over the threshold before the daemon commits');
+    writeUsage();
+    const state = JSON.parse(fs.readFileSync(path.join(fakeZylosDir, 'activity-monitor', 'fable-guard.json'), 'utf8'));
+    state.holds = { [BACKUP]: { quota: { since: new Date().toISOString() } } };
+    fs.writeFileSync(path.join(fakeZylosDir, 'activity-monitor', 'fable-guard.json'), JSON.stringify(state));
+    assert.equal((await relaunch()).args[3], OPUS, 'a hold committed after the monitor started');
+    const record = JSON.parse(fs.readFileSync(path.join(fakeZylosDir, 'activity-monitor', 'user-pan', 'fable-launch.json'), 'utf8'));
+    assert.deepEqual([record.runtime_profile, record.mode, record.model, record.generation, record.reason],
+      [BACKUP, 'opus', OPUS, 9, 'hold:quota']);
+  });
+
+  it('records no launch file and changes nothing for the four other personas', async () => {
+    writeFleet('fable');
+    for (const id of ['admin', 'scheduler', 'group', 'user-sean']) {
+      await launchAs(id);
+      assert.equal(fs.existsSync(path.join(fakeZylosDir, 'activity-monitor', id, 'fable-launch.json')), false, id);
+    }
+  });
 
   it('is inert for every persona when fable_guard is not configured', async () => {
     writeFleet('fable', { guard: false });

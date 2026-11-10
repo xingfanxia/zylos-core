@@ -66,7 +66,8 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
   `--apply` without special handling. Enabling or disabling a persona is only
   the `fable_enabled` flag; the guard's next pass reconciles it.
 - `--apply` relaunching a moved persona is safe: the launcher refuses Fable
-  unless the guard committed Fable for that exact account.
+  unless the guard committed Fable for that exact account and the lease is
+  fresh.
 
 ## Components
 
@@ -74,7 +75,8 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
 |---|---|---|
 | Probe | `skills/activity-monitor/scripts/fable-probe.js` | `runtime-failover` daemon (background child process) |
 | Holds, desired launch, reconcile | `skills/activity-monitor/scripts/fable-guard.js` | `runtime-failover` daemon, under `instances.json.lock` |
-| Launch policy | `skills/multi-session/runtime-files.js` + `cli/lib/runtime/claude.js` | activity monitor (Guardian launch) |
+| Launch policy, admission, launch record | `skills/multi-session/runtime-files.js` + `cli/lib/runtime/claude.js` | activity monitor (every Guardian launch) |
+| Lease enforcement | `skills/activity-monitor/scripts/fable-monitor.js` | activity monitor of a tracked persona |
 | Limit-dialog precedence | `skills/activity-monitor/scripts/health-engine.js`, `monitor.js` | activity monitor of a Fable-mode persona |
 | Operator command | `skills/activity-monitor/scripts/fable-guard-cli.js` | operator shell |
 
@@ -193,12 +195,47 @@ commit `desired {account, mode, generation}` once → reconcile.
 For `fable_enabled` personas on a configured guard, in both modes, the launch
 env carries `CLAUDE_CODE_SUBAGENT_MODEL=<subagent_model>` and
 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` (new-session spec env and the
-existing-session `export`). `--model` is `fable_model` only when the guard
-committed Fable for the persona's current account and that account has no
-hold; otherwise it is the profile's model. All other personas launch exactly as
-before. `CLAUDE_CODE_NO_MODEL_FALLBACK` is never set. The adapter resolves the
-profile when the activity monitor starts, which is why every transition
-restarts the monitor.
+existing-session `export`). `--model` is `fable_model` only when **all** of
+these hold at the moment of the launch (`fableAdmission` in
+`runtime-files.js`): the account has its own settings file; the guard committed
+Fable for the persona's current account; that account has no hold; and
+`fable-usage.json` holds a lease (a valid observation younger than
+`lease_sec`, window not reset, below `threshold`). Otherwise it is the
+profile's model. The committed state alone never admits Fable: it can be
+arbitrarily old when the daemon is dead or hung. All other personas launch
+exactly as before. `CLAUDE_CODE_NO_MODEL_FALLBACK` is never set.
+
+The adapter resolves the profile when the activity monitor starts, and the
+Guardian reuses it for every relaunch. `ClaudeAdapter.launch()` therefore calls
+`prepareFableLaunch()` on every launch: for a persona the guard does not track
+it returns the profile unchanged and writes nothing; for a tracked persona it
+re-evaluates admission (it can only move a cached Fable decision to Opus,
+never the reverse) and writes the launch record
+`<monitor dir>/fable-launch.json`:
+
+```json
+{ "version": 1, "launch_id": "<uuid>", "instance_id": "user-pan", "launched_at_ms": 0,
+  "runtime_profile": "claude-ax-backup", "mode": "fable|opus", "model": "claude-fable-5-2[1m]",
+  "generation": 12, "reason": "admitted|lease_expired|hold:quota|not_committed|...", "key": "<launch key>", "pid": 0 }
+```
+
+`key` (`fableLaunchKey`) is the launch policy actually used: account, mode,
+main model, effort, settings file and launch env. A persona is tracked when its
+monitor started with a Fable decision, when it is `fable_enabled` on a
+configured guard, or when the guard state still lists it.
+
+### Lease enforcement without the daemon
+
+The persona's own activity monitor (`fable-monitor.js`, every 15 s) re-checks
+admission for a session whose launch record says `fable`. If admission has
+failed for longer than 120 s (one daemon poll plus its cold restart, so a live
+daemon always acts first), the monitor logs `Fable guard ALERT`, writes
+`<monitor dir>/fable-lease-enforcement.json`, and stops the session; the
+Guardian relaunch re-evaluates admission and comes up on Opus. The monitor only
+ever forces Opus. It never upgrades and never writes the guard state; the
+daemon stays the single transition owner. PM2 is not a lease enforcer: a
+running Fable session outlives a dead daemon only for the lease plus this
+grace (about 14 minutes with the defaults).
 
 ## Limit-dialog precedence (FG-4, health half)
 
@@ -258,7 +295,7 @@ weekly window.
 
 ## Deployment notes
 
-- Skills files to install: `activity-monitor/scripts/{fable-probe,fable-guard,fable-guard-cli,runtime-failover,health-engine,monitor,monitor-orchestrator}.js`,
+- Skills files to install: `activity-monitor/scripts/{fable-probe,fable-guard,fable-monitor,fable-guard-cli,runtime-failover,health-engine,monitor,monitor-orchestrator}.js`,
   `activity-monitor/scripts/adapters/runtime-components.js`,
   `multi-session/runtime-files.js`. `cli/lib/runtime/claude.js` loads from the
   checkout. Keep `chmod -R go-w` on `activity-monitor` after copying.
