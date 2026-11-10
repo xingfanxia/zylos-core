@@ -249,9 +249,23 @@ export function prepareFableLaunch({
     key: launchKeyOfProfile(launched),
     pid: process.pid,
   };
+  const recordPath = fableLaunchRecordPath({ zylosDir, instanceId: id, instance: document?.instances?.[id], monitorDir });
   try {
-    writeRecord(fableLaunchRecordPath({ zylosDir, instanceId: id, instance: document?.instances?.[id], monitorDir }), record);
-  } catch { /* the guard treats a missing record as an unverified launch */ }
+    writeRecord(recordPath, record);
+  } catch {
+    // The record is what the guard and the lease enforcement verify a Fable
+    // launch against: a Fable launch whose record cannot be committed is not
+    // admitted. Launch the profile's own model instead (the subagent pin
+    // stays); the monitor then judges the session by its process evidence.
+    if (record.mode === 'fable') {
+      launched = { ...launched, model: launched.baseModel ?? profile.baseModel ?? profile.model,
+        fable: { ...launched.fable, mode: 'opus', reason: 'launch_record_failed' } };
+      try {
+        writeRecord(recordPath, { ...record, launch_id: randomUUID(), mode: 'opus', model: launched.model || null,
+          reason: 'launch_record_failed', key: launchKeyOfProfile(launched) });
+      } catch { /* the guard treats a missing record as an unverified launch */ }
+    }
+  }
   return launched;
 }
 

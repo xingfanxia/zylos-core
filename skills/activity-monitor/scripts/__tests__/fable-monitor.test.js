@@ -299,3 +299,52 @@ describe('Fable lease enforcement: stop intent is not completion (review-2 #1)',
   });
 });
 
+describe('Fable launch record is intent, not proof (review-2 #2)', () => {
+  it('record write failure: a Fable decision whose launch record cannot be committed launches Opus', () => {
+    const fx = fixture();
+    const profile = prepareFableLaunch({ profile: fx.profile, instanceId: 'user-pan', zylosDir: fx.zylosDir, monitorDir: fx.monitorDir,
+      nowMs: T0, writeRecord: () => { throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }); } });
+    assert.equal(profile.model, OPUS);
+    assert.equal(profile.fable?.mode, 'opus');
+    assert.equal(profile.fable?.reason, 'launch_record_failed');
+    assert.equal(profile.launchEnv.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '1', 'the subagent pin stays');
+  });
+
+  it('a tracked session with no launch record is judged by the running process, not taken as safe', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    fs.rmSync(path.join(fx.monitorDir, 'fable-launch.json')); // the record is missing
+    const world = sessionWorld({ model: 'claude-fable-5-2' }); // the process runs --model claude-fable-5-2
+    const { monitor } = monitorInWorld(fx, clock, world);
+    clock.now = T0 + 13 * MIN;
+    monitor.tick();
+    clock.now += 3 * MIN;
+    monitor.tick();
+    assert.equal(world.stops.length, 1, 'a Fable process past its lease is stopped');
+  });
+
+  it('an old Opus record does not hide a Fable process; a process confirmed on Opus is left alone', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.writeState('opus', 4);
+    fx.launch(clock.now); // record: opus (intent)
+    const world = sessionWorld({ model: 'claude-fable-5-2' }); // but the running process is Fable
+    const { monitor } = monitorInWorld(fx, clock, world);
+    clock.now = T0 + MIN;
+    monitor.tick();
+    clock.now += 3 * MIN;
+    monitor.tick();
+    assert.equal(world.stops.length, 1);
+
+    const fx2 = fixture();
+    const clock2 = { now: T0 };
+    fx2.writeState('opus', 4);
+    fx2.launch(clock2.now);
+    const opus = sessionWorld({ model: 'claude-opus-5-5' });
+    const { monitor: monitor2 } = monitorInWorld(fx2, clock2, opus);
+    for (let i = 0; i < 30; i++) { clock2.now += 15_000; monitor2.tick(); }
+    assert.equal(opus.stops.length, 0);
+  });
+});
+
