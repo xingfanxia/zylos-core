@@ -387,6 +387,11 @@ export class ClaudeAdapter extends RuntimeAdapter {
       ...(model ? ['--model', model] : []),
       ...(reasoningEffort ? ['--effort', reasoningEffort] : []),
     ];
+    // Fable allowance guard: subagent pin for fable_enabled personas in both
+    // modes (values validated by runtime-files.js; absent for everyone else).
+    const launchEnv = Object.entries(profile.launchEnv || {})
+      .filter(([key, value]) => /^CLAUDE_CODE_SUBAGENT_MODEL(?:_FORCE)?$/.test(key)
+        && typeof value === 'string' && /^[A-Za-z0-9._:\[\]-]+$/.test(value));
 
     // Guardian has already built and validated the split instruction files.
     // Resolve the per-instance working directory for memory, token, and GitHub
@@ -454,6 +459,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         process.env.ZYLOS_INSTANCE_ID ? `export ZYLOS_INSTANCE_ID='${process.env.ZYLOS_INSTANCE_ID}'` : '',
         process.env.ZYLOS_TMUX_SESSION ? `export ZYLOS_TMUX_SESSION='${process.env.ZYLOS_TMUX_SESSION}'` : '',
         reasoningEffort ? `export CLAUDE_EFFORT='${reasoningEffort}'` : '',
+        ...launchEnv.map(([key, value]) => `export ${key}='${value}'`),
         ghConfigDir ? `export GH_CONFIG_DIR='${ghConfigDir}'` : '',
         ghConfigDir ? 'export GH_PROMPT_DISABLED=1' : '',
       ].filter(Boolean).join('; ');
@@ -473,6 +479,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       if (process.env.ZYLOS_TMUX_SESSION) env.ZYLOS_TMUX_SESSION = process.env.ZYLOS_TMUX_SESSION;
       if (ghConfigDir) env.GH_CONFIG_DIR = ghConfigDir;
       if (reasoningEffort) env.CLAUDE_EFFORT = reasoningEffort;
+      for (const [key, value] of launchEnv) env[key] = value;
 
       // os_user instances: the agent process gets the agent's own HOME so its
       // ~/zylos farm dir (per-instance .env + symlinks), credentials symlink,
