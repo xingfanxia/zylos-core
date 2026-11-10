@@ -1355,3 +1355,34 @@ describe('daemon / account failover / --apply share one executor (review-2 #4)',
   });
 });
 
+describe('Fable guard readiness accepts a late genuine ACK (review-2 #6)', () => {
+  it('late real ACK: ack_missing / no_probe_result move to ready when a real ACK from the launch arrives', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    sim.launchAll(sim.pass().restarts);
+    sim.advance(MIN);
+    sim.pass();
+    sim.readiness['user-pan'] = { launch_id: sim.launches['user-pan'].launch_id, outcome: 'missing', status: 'timeout', at: iso(sim.now) };
+    sim.advance(MIN);
+    sim.pass();
+    assert.equal(sim.state.personas['user-pan'].verified.readiness, 'ack_missing');
+    sim.readiness['user-pan'] = { launch_id: sim.launches['user-pan'].launch_id, outcome: 'ack', phase: 'post_restart', at: iso(sim.now) };
+    sim.advance(MIN);
+    const result = sim.pass();
+    assert.equal(sim.state.personas['user-pan'].verified.ready_at, iso(sim.now - MIN));
+    assert.equal(sim.state.personas['user-pan'].verified.readiness, undefined);
+    assert.ok(result.events.some(event => event.includes('user-pan') && /readiness recovered/.test(event)));
+
+    sim.advance(31 * MIN); // elaine never got a probe result
+    sim.pass();
+    assert.equal(sim.state.personas['user-elaine'].verified.readiness, 'no_probe_result');
+    sim.status['user-elaine'].functional_ack_at = sim.now;
+    sim.status['user-elaine'].functional_ack_phase = 'recovery';
+    sim.advance(MIN);
+    sim.pass();
+    assert.ok(sim.state.personas['user-elaine'].verified.ready_at);
+    assert.equal(sim.state.personas['user-elaine'].verified.readiness, undefined);
+  });
+});
+

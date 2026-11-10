@@ -200,7 +200,7 @@ describe('Fable session crash accounting in the persona monitor (review #6)', ()
 });
 
 describe('Uncertain deliveries are named, not timestamped (review h / delivery_uncertain)', () => {
-  it('alerts once per C4 delivery_uncertain record with the message preview and keeps it for status', () => {
+  it('alerts once per C4 delivery_uncertain record with the message preview and keeps it for status', async () => {
     const fx = fixture();
     const clock = { now: T0 };
     fx.launch(clock.now);
@@ -208,12 +208,17 @@ describe('Uncertain deliveries are named, not timestamped (review h / delivery_u
       endpoint_id: 'oc_1', session_ref: '$3:1762790000:%12:48211', dialog_kind: 'fable_limit', outcome: 'uncertain',
       detected_at: Math.floor(T0 / 1000), notified_at: null, preview: 'please send the Q3 report to Lin' }];
     const notified = [];
+    const sent = [];
     const { monitor, calls } = monitorFor(fx, clock, { uncertainDeliveries: {
-      list: () => rows.filter(row => !notified.includes(row.id)), markNotified: id => notified.push(id) } });
+      list: () => rows.filter(row => !notified.includes(row.id)), markNotified: id => notified.push(id) },
+    notifyOperator: async message => { sent.push(message); return { ok: true }; } });
     monitor.tick();
+    await monitor.flushNotifications();
     clock.now += 20_000;
     monitor.tick();
+    await monitor.flushNotifications();
     assert.deepEqual(notified, [7]);
+    assert.equal(sent.length, 1, 'one operator notification');
     const alerts = calls.logs.filter(line => line.includes('delivery uncertain'));
     assert.equal(alerts.length, 1, 'surfaced once');
     assert.match(alerts[0], /conversation #4012/);
@@ -399,3 +404,34 @@ describe('Fable lease enforcement shares the execution fence (review-2 #3)', () 
   });
 });
 
+describe('Uncertain-delivery notification needs a receipt (review-2 #6)', () => {
+  it('notification failure: a row stays unnotified until the operator notification succeeds, retried with a bound', async () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const rows = [{ id: 7, item_type: 'conversation', item_id: 4012, target_instance: 'user-pan', channel: 'feishu',
+      endpoint_id: 'oc_1', session_ref: '$3:1762790000:%12:48211', dialog_kind: 'fable_limit', outcome: 'uncertain',
+      detected_at: Math.floor(T0 / 1000), notified_at: null, preview: 'please send the Q3 report to Lin' }];
+    const notified = [];
+    const sent = [];
+    let failures = 2;
+    const world = sessionWorld({ model: 'claude-fable-5-2' });
+    const { monitor, logs } = monitorInWorld(fx, clock, world, {
+      uncertainDeliveries: { list: () => rows.filter(row => !notified.includes(row.id)), markNotified: id => notified.push(id) },
+      notifyOperator: async message => { sent.push(message); if (failures > 0) { failures -= 1; return { ok: false, output: 'feishu 503' }; } return { ok: true }; },
+    });
+    monitor.tick();
+    await monitor.flushNotifications?.();
+    assert.deepEqual(notified, [], 'a failed notification does not mark the row');
+    assert.ok(logs.some(line => /ALERT/.test(line) && /not notified/.test(line)));
+    clock.now += 15_000;
+    monitor.tick();
+    await monitor.flushNotifications?.();
+    assert.equal(sent.length, 1, 'retried only after a backoff, not every tick');
+    for (let i = 0; i < 40 && !notified.length; i++) { clock.now += 15_000; monitor.tick(); await monitor.flushNotifications?.(); }
+    assert.deepEqual(notified, [7], 'marked once the notification succeeded');
+    assert.equal(sent.length, 3);
+    assert.match(sent.at(-1), /4012/);
+    assert.match(sent.at(-1), /please send the Q3 report to Lin/);
+  });
+});

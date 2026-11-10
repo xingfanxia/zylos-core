@@ -144,7 +144,9 @@ function formatStatus({ config, accounts, personas }) {
       + (item.lease_enforcement ? ` lease-enforcement ${item.lease_enforcement.status || 'stopped'} ${item.lease_enforcement.at}`
         + (item.lease_enforcement.last_error && item.lease_enforcement.status === 'pending' ? ` (${item.lease_enforcement.last_error})` : '') : '')
       + item.uncertain_deliveries.map(entry => ` UNCERTAIN DELIVERY ${entry.item_type} #${entry.item_id}`
-        + `${entry.preview ? ` "${entry.preview}"` : ''} at ${entry.detected_at}`).join(''));
+        + `${entry.preview ? ` "${entry.preview}"` : ''} at ${entry.detected_at}`
+        + (entry.notified_at ? ` (operator notified ${entry.notified_at})`
+          : ` (operator NOT notified${entry.notify_attempts ? ` after ${entry.notify_attempts} attempts: ${entry.last_notify_error}` : ''})`)).join(''));
   }
   return lines.join('\n');
 }
