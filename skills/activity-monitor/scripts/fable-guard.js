@@ -288,7 +288,9 @@ export function planFableGuard({
     if (allowed) mode = priorMode === 'fable' || upgradeReady(persona, status, nowMs, config) ? 'fable' : 'opus';
     // An account without its own settings file (claude-ax-main) cannot be
     // probed, so it never runs Fable. That is a supported, final state.
-    if (enabled && !eligible) persona.unsupported = 'account_without_settings_file';
+    if (enabled && !eligible) {
+      persona.unsupported = claudeProfile(document, profileId) ? 'account_without_settings_file' : 'not_a_claude_profile';
+    }
     else delete persona.unsupported;
     const expected = expectedFableLaunch({ document, instanceId: id, mode });
     const launch = launchByInstance[id] || null;
@@ -305,7 +307,10 @@ export function planFableGuard({
       persona.executed_at = iso(nowMs);
       persona.attempts = 0;
       for (const key of ['verified', 'gave_up', 'restart_required', 'safe_stop', 'model_unknown_launch']) delete persona[key];
-      if (launchServes(launch, status, nowMs) && launch.key === expected.key && launch.runtime_profile === profileId) {
+      if (!claudeProfile(document, profileId)) {
+        // A non-Claude engine cannot run Fable and writes no launch record;
+        // the account failover owns its restart.
+      } else if (launchServes(launch, status, nowMs) && launch.key === expected.key && launch.runtime_profile === profileId) {
         // The running launch already uses exactly this policy: adopt it.
         persona.desired.adopted_launch_id = launch.launch_id;
       } else if (failoverInstanceIds.has(id)) {
@@ -320,6 +325,11 @@ export function planFableGuard({
       events.push(`${id}: commit g${generation} ${mode} on ${profileId} (${reason})`);
       continue;
     }
+    if (!claudeProfile(document, profileId)) {
+      persona.verified ||= { not_claude_at: iso(nowMs) };
+      if (!enabled) delete next.personas[id];
+      continue;
+    }
     reconcilePersona({ id, instance, persona, status, launch, actual: modelByInstance[id], readiness: readinessByInstance[id],
       config, nowMs, restarts, events,
       failureCount: () => sessionFailures(persona, failuresByInstance[id], profileId,
@@ -329,6 +339,10 @@ export function planFableGuard({
 
   const changed = JSON.stringify(next) !== before;
   return { state: next, restarts, events, changed };
+}
+
+function claudeProfile(document, profileId) {
+  return document?.runtime_profiles?.[profileId]?.runtime === 'claude';
 }
 
 function isRunning(status, nowMs) {
@@ -365,8 +379,10 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, readi
   if (persona.executed_generation !== desired.generation) return;
   const executedMs = ms(persona.executed_at);
   const tmuxSession = instance.tmux_session || `claude-${id}`;
-  // Fable may still be live: the last recorded launch, or the engine's own report, is Fable.
-  const fableMayRun = launch?.mode === 'fable' || baseModel(actual?.model) === baseModel(config?.fable_model);
+  // Fable may still be live: the record of the engine's CURRENT launch, or the
+  // engine's own latest report, is Fable (an older record says nothing).
+  const fableMayRun = (launch?.mode === 'fable' && Number(launch.launched_at_ms) >= (Number(status.runtime_launch_at) || 0) - LAUNCH_MATCH_SKEW_MS)
+    || baseModel(actual?.model) === baseModel(config?.fable_model);
   const resume = why => {
     if ((persona.attempts || 0) >= MAX_RESTART_ATTEMPTS) {
       if (!persona.gave_up) events.push(`${id}: ALERT g${desired.generation} not converged after ${persona.attempts} restarts (${why}); operator check needed`);
