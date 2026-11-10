@@ -135,7 +135,7 @@ export function fableAdmission({ document, instanceId, profileId, guardState = n
   let reason = 'admitted';
   if (!fableAccountSettingsFile(document, profileId)) reason = 'unsupported_account';
   else if (desired?.mode !== 'fable' || generation === null) reason = 'not_committed';
-  else if (desired.account !== profileId) reason = 'account_mismatch';
+  else if (desired.account !== profileId || instance.runtime_profile !== profileId) reason = 'account_mismatch';
   else if (holdKinds.length) reason = `hold:${holdKinds.join('+')}`;
   else if (!lease) reason = 'lease_expired';
   else if (!(Number(lease.utilization) < config.threshold)) reason = 'threshold';
