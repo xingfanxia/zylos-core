@@ -480,8 +480,9 @@ describe('Fable guard interleavings', () => {
       assert.equal(signal.session_ref, OLD, 'the session the guard is about to kill, for the C4 key fence');
       calls.length = 0;
       executeFableRestarts({ zylosDir, restarts: [{ ...restart(5), kind: 'stop' }], execFileSyncImpl: exec, log: () => {}, nowMs: T0 });
-      assert.deepEqual(calls, [['pm2', 'stop', 'activity-monitor-user-pan'], ['tmux', 'kill-session', '-t', 'claude-user-pan']],
-        'a safe stop stops the monitor before the pane');
+      assert.deepEqual(calls, [['pm2', 'stop', 'activity-monitor-user-pan'], ['tmux', 'kill-session', '-t', 'claude-user-pan'],
+        ['tmux', 'has-session', '-t', '=claude-user-pan']],
+      'a safe stop stops the monitor before the pane, then observes whether the session is gone');
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
@@ -633,7 +634,9 @@ describe('Fable guard interrupted restarts keep reconciling (review #3)', () => 
       sim.advance(4 * MIN);
       for (const item of sim.pass().restarts) reasons.push(`${item.instanceId}:${item.kind}:${item.reason}`);
     }
-    assert.deepEqual(reasons, ['user-pan:restart:resume:stale_launch', 'user-pan:restart:resume:stale_launch', 'user-pan:stop:safe_stop:stale_launch']);
+    // The stop is an intent: never confirmed here (nothing executes it), so it is planned again after its backoff.
+    assert.deepEqual(reasons.slice(0, 3), ['user-pan:restart:resume:stale_launch', 'user-pan:restart:resume:stale_launch', 'user-pan:stop:safe_stop:stale_launch']);
+    assert.ok(reasons.slice(3).every(reason => reason === 'user-pan:stop:safe_stop:stale_launch'), reasons.join(', '));
     const pan = sim.state.personas['user-pan'];
     assert.ok(pan.safe_stop.at);
     assert.ok(pan.gave_up);
@@ -1077,6 +1080,107 @@ function guardTemp(sim) {
   const load = () => { sim.state = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8')); };
   return { zylosDir, persist, load, cleanup: () => fs.rmSync(zylosDir, { recursive: true, force: true }) };
 }
+
+// Drive a downgrade whose restarts never land until the guard decides to stop pan.
+function toSafeStop(sim) {
+  sim.toFable();
+  sim.observe(BACKUP, 0.8);
+  sim.pass();
+  sim.launchAll([{ instanceId: 'user-elaine' }]);
+  for (let i = 0; i < 6; i++) {
+    sim.advance(4 * MIN);
+    const stop = sim.pass().restarts.find(item => item.kind === 'stop');
+    if (stop) return stop;
+  }
+  throw new Error('no safe stop planned');
+}
+
+// tmux/pm2 world for the executor: has-session tells whether the session still exists.
+function stopWorld({ pm2StopFails = 0, killLeavesSession = false } = {}) {
+  const world = { alive: new Set(PERSONAS.map(id => `claude-${id}`)), calls: [] };
+  world.exec = (file, args) => {
+    world.calls.push([file, ...args].join(' '));
+    if (file === 'pm2' && args[0] === 'stop' && pm2StopFails > 0) { pm2StopFails -= 1; throw new Error('pm2 stop: connect ECONNREFUSED'); }
+    if (file === 'tmux' && args[0] === 'kill-session' && !killLeavesSession) world.alive.delete(args[2].replace(/^=/, ''));
+    if (file === 'tmux' && args[0] === 'has-session' && !world.alive.has(args[2].replace(/^=/, ''))) {
+      throw Object.assign(new Error('exit 1'), { status: 1, stderr: `can't find session: ${args[2]}` });
+    }
+    return '';
+  };
+  return world;
+}
+
+describe('Fable guard safe stop is completed only by observed evidence (review-2 #1)', () => {
+  it('failed stop then retry: a failed pm2 stop is not reported STOPPED, stays pending and is retried until confirmed', () => {
+    const sim = new Sim();
+    const stop = toSafeStop(sim);
+    const tmp = guardTemp(sim);
+    try {
+      tmp.persist();
+      const logs = [];
+      const failing = stopWorld({ pm2StopFails: 1 });
+      executeFableRestarts({ zylosDir: tmp.zylosDir, restarts: [stop], nowMs: sim.now, execFileSyncImpl: failing.exec, log: line => logs.push(line) });
+      assert.ok(!logs.some(line => /: STOPPED/.test(line)), `not reported STOPPED: ${logs.join(' | ')}`);
+      assert.ok(logs.some(line => /ALERT/.test(line) && /not confirmed/.test(line)));
+      tmp.load();
+      assert.equal(sim.state.personas['user-pan'].safe_stop.confirmed_at, undefined);
+      sim.advance(2 * MIN);
+      const retry = sim.pass().restarts.filter(item => item.instanceId === 'user-pan');
+      assert.deepEqual(retry.map(item => [item.kind, item.attempt]), [['stop', 2]], 'the stop is retried');
+      tmp.persist();
+      const working = stopWorld();
+      logs.length = 0;
+      executeFableRestarts({ zylosDir: tmp.zylosDir, restarts: retry, nowMs: sim.now, execFileSyncImpl: working.exec, log: line => logs.push(line) });
+      assert.ok(logs.some(line => /: STOPPED/.test(line)));
+      tmp.load();
+      assert.ok(sim.state.personas['user-pan'].safe_stop.confirmed_at, 'confirmed by pm2 stop + the session being gone');
+      for (let i = 0; i < 5; i++) {
+        sim.advance(5 * MIN);
+        assert.deepEqual(sim.pass().restarts.filter(item => item.instanceId === 'user-pan'), [], 'a confirmed stop is final');
+      }
+    } finally { tmp.cleanup(); }
+  });
+
+  it('a kill that leaves the session running is not a stop', () => {
+    const sim = new Sim();
+    const stop = toSafeStop(sim);
+    const tmp = guardTemp(sim);
+    try {
+      tmp.persist();
+      const world = stopWorld({ killLeavesSession: true });
+      executeFableRestarts({ zylosDir: tmp.zylosDir, restarts: [stop], nowMs: sim.now, execFileSyncImpl: world.exec, log: () => {} });
+      tmp.load();
+      assert.equal(sim.state.personas['user-pan'].safe_stop.confirmed_at, undefined);
+      assert.ok(sim.state.personas['user-pan'].safe_stop.last_error);
+    } finally { tmp.cleanup(); }
+  });
+
+  it('crash after safe_stop commit: an interrupted stop is planned again after the daemon restarts', () => {
+    const sim = new Sim();
+    const stop = toSafeStop(sim);
+    assert.equal(stop.instanceId, 'user-pan');
+    // The daemon died after persisting safe_stop and before the stop effect ran.
+    const persisted = JSON.parse(JSON.stringify(sim.state));
+    sim.state = persisted;
+    sim.advance(10_000);
+    assert.deepEqual(sim.pass().restarts.filter(item => item.kind === 'stop'), [], 'backoff, not a hot loop');
+    sim.advance(2 * MIN);
+    const again = sim.pass().restarts.filter(item => item.kind === 'stop');
+    assert.deepEqual(again.map(item => item.instanceId), ['user-pan']);
+    assert.ok(sim.state.personas['user-pan'].safe_stop);
+  });
+
+  it('a session confirmed on Opus resolves a pending safe stop without stopping it', () => {
+    const sim = new Sim();
+    toSafeStop(sim);
+    sim.monitorStart('user-pan'); // the persona came back on Opus (launch + model report)
+    sim.advance(MIN);
+    sim.pass();
+    assert.ok(sim.state.personas['user-pan'].safe_stop.confirmed_at);
+    sim.advance(10 * MIN);
+    assert.deepEqual(sim.pass().restarts.filter(item => item.kind === 'stop'), []);
+  });
+});
 
 describe('Fable guard execution claim per generation/attempt (review-2 #4)', () => {
   it('same-generation concurrent execution: the same generation/attempt executes once', () => {

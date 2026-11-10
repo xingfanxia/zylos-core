@@ -40,6 +40,10 @@ const MODEL_EVIDENCE_TIMEOUT_MS = 600_000;
 // A launch record older than the engine's current launch is not that launch.
 const LAUNCH_MATCH_SKEW_MS = 5000;
 const MAX_RESTART_ATTEMPTS = 3;
+// A safe stop is retried until it is confirmed: 1, 2, 4, 8 ... minutes, at most 15.
+const SAFE_STOP_BACKOFF_MS = 60_000;
+const SAFE_STOP_BACKOFF_MAX_MS = 15 * 60_000;
+const safeStopBackoff = attempt => Math.min(SAFE_STOP_BACKOFF_MS * 2 ** Math.max(0, attempt - 1), SAFE_STOP_BACKOFF_MAX_MS);
 const STATUS_MAX_AGE_MS = 60_000;
 const EVIDENCE_MAX_AGE_MS = 3_600_000;
 const HOLD_KINDS = ['quota', 'crash', 'stale'];
@@ -396,11 +400,13 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, readi
       if (!persona.gave_up) events.push(`${id}: ALERT g${desired.generation} not converged after ${persona.attempts} restarts (${why}); operator check needed`);
       persona.gave_up = why;
       // A downgrade must never end with Fable left running: stop the persona.
+      // This is the stop INTENT; it stays pending until the stop is observed.
       if (desired.mode === 'opus' && fableMayRun && !persona.safe_stop) {
-        persona.safe_stop = { at: iso(nowMs), why, generation: desired.generation };
-        restarts.push({ instanceId: id, generation: desired.generation, attempt: persona.attempts, kind: 'stop',
+        persona.safe_stop = { at: iso(nowMs), why, generation: desired.generation, attempts: 1,
+          next_at: iso(nowMs + safeStopBackoff(1)) };
+        restarts.push({ instanceId: id, generation: desired.generation, attempt: 1, kind: 'stop',
           mode: desired.mode, profileId: desired.account, reason: `safe_stop:${why}`, tmuxSession });
-        events.push(`${id}: ALERT downgrade to Opus failed ${persona.attempts} times; persona STOPPED (pm2 stop + tmux kill) `
+        events.push(`${id}: ALERT downgrade to Opus failed ${persona.attempts} times; stopping the persona (pm2 stop + tmux kill) `
           + `so Fable does not keep running. After checking: pm2 start activity-monitor-${id} (the launch is admitted to Opus only)`);
       }
       return;
@@ -411,7 +417,10 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, readi
       mode: desired.mode, profileId: desired.account, reason: `resume:${why}`, tmuxSession });
     events.push(`${id}: resume g${desired.generation} (${why})`);
   };
-  if (persona.safe_stop?.generation === desired.generation) return;
+  if (persona.safe_stop?.generation === desired.generation) {
+    reconcileSafeStop({ id, persona, status, launch, actual, config, nowMs, restarts, events, tmuxSession });
+    return;
+  }
   if (!isRunning(status, nowMs)) {
     // A suspended persona launches through the admission gate when it wakes.
     if (status.state === 'suspended') { persona.verified ||= { not_running_at: iso(nowMs) }; return; }
@@ -464,6 +473,32 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, readi
   }
   if (!persona.verified?.model_at) persona.verified = { model_at: iso(nowMs), launch_id: launch.launch_id };
   verifyReadiness({ id, verified: persona.verified, launch, status, readiness, nowMs, events });
+}
+
+// A safe stop is complete only when it is observed: the executor confirmed
+// `pm2 stop` and the tmux session gone (safe_stop.confirmed_at), or the
+// persona's current launch is Opus and reports Opus. Until then the stop stays
+// pending: an interrupted or failed stop is planned again with backoff, with
+// an ALERT each time.
+function reconcileSafeStop({ id, persona, status, launch, actual, config, nowMs, restarts, events, tmuxSession }) {
+  const stop = persona.safe_stop;
+  const desired = persona.desired;
+  if (stop.confirmed_at) return;
+  const reported = baseModel(actual?.model);
+  if (launchServes(launch, status, nowMs) && launch.mode === 'opus' && launch.runtime_profile === desired.account
+      && reported && reported !== baseModel(config?.fable_model) && Number(actual.observed_at_ms) >= Number(launch.launched_at_ms)) {
+    stop.confirmed_at = iso(nowMs);
+    stop.confirmed_by = `opus_launch:${launch.launch_id}`;
+    events.push(`${id}: safe stop resolved: launch ${launch.launch_id} runs ${reported}`);
+    return;
+  }
+  if (Number.isFinite(ms(stop.next_at)) && nowMs < ms(stop.next_at)) return;
+  stop.attempts = (Number(stop.attempts) || 1) + 1;
+  stop.next_at = iso(nowMs + safeStopBackoff(stop.attempts));
+  restarts.push({ instanceId: id, generation: desired.generation, attempt: stop.attempts, kind: 'stop',
+    mode: desired.mode, profileId: desired.account, reason: `safe_stop:${stop.why}`, tmuxSession });
+  events.push(`${id}: ALERT safe stop of g${desired.generation} not confirmed`
+    + `${stop.last_error ? ` (${stop.last_error})` : ' (interrupted or not yet observed)'}; stop attempt ${stop.attempts}`);
 }
 
 // Readiness is separate from model convergence: a real ACK from this launch
@@ -528,6 +563,24 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
 // launch from the newest commit (the launcher re-reads the guard state).
 const IN_FLIGHT_MS = 30_000;
 
+// tmux answers a missing session (or no server) with this; anything else is
+// not evidence that the session is gone.
+const SESSION_GONE_RE = /can't find session|no server running|session not found/i;
+
+/**
+ * Is the tmux session still there? 'present' | 'gone' | 'unknown'. Only an
+ * explicit "no such session" answer counts as gone.
+ */
+export function probeTmuxSession(tmuxSession, { execFileSyncImpl = execFileSync } = {}) {
+  try {
+    execFileSyncImpl('tmux', ['has-session', '-t', `=${tmuxSession}`], { stdio: 'pipe', timeout: 5000 });
+    return 'present';
+  } catch (err) {
+    const text = `${err?.stderr || ''} ${err?.message || ''}`;
+    return SESSION_GONE_RE.test(text) ? 'gone' : 'unknown';
+  }
+}
+
 /**
  * Execute guard-owned lifecycle effects: cold-start restarts of committed
  * transitions (switch signal → kill tmux → pm2 restart), safe stops of an
@@ -541,6 +594,8 @@ const IN_FLIGHT_MS = 30_000;
  *    operation (kind, generation, attempt, target) executes once.
  * The fence records `executing` in the guard state and writes the switch
  * signal before the lock is released; the kill and pm2 calls run outside it.
+ * A stop is reported STOPPED only when it is observed (pm2 stop succeeded and
+ * the tmux session is gone); otherwise it stays pending for the planner.
  * `owner` names the caller in the claim (daemon, failover, reconcile).
  */
 export function executeFableRestarts({
@@ -582,6 +637,10 @@ export function executeFableRestarts({
             log(`[fable-guard] ${item.instanceId}: g${item.generation} superseded by g${generation}; ${kind} skipped`);
             return;
           }
+          if (kind === 'stop' && persona?.safe_stop?.confirmed_at) {
+            log(`[fable-guard] ${item.instanceId}: g${item.generation} safe stop already confirmed; skipped`);
+            return;
+          }
           const prior = persona?.executing;
           if (kind === 'restart' && prior?.kind === 'restart' && prior.generation < item.generation
               && nowMs - ms(prior.at) < IN_FLIGHT_MS && !launchedSince(zylosDir, item.instanceId, readJson(instancesFile, null), ms(prior.at))) {
@@ -603,6 +662,7 @@ export function executeFableRestarts({
         claim = claimed;
         if (persona) {
           persona.executing = { generation: item.generation ?? null, attempt: item.attempt ?? null, kind, owner: op.owner, at: iso(nowMs) };
+          if (kind === 'stop' && persona.safe_stop) persona.safe_stop.last_attempt_at = iso(nowMs);
           writeJsonAtomic(stateFile, state);
         }
         if (kind === 'restart') {
@@ -624,12 +684,28 @@ export function executeFableRestarts({
     let outcome = 'done';
     let detail = null;
     if (kind === 'stop') {
-      // Safe end of an exhausted downgrade: the monitor first, so its Guardian cannot relaunch.
-      try { execFileSyncImpl('pm2', ['stop', monitorName], { stdio: 'ignore', timeout: 30_000 }); } catch (err) {
-        log(`[fable-guard] ${item.instanceId}: pm2 stop failed (${err.message})`);
+      const result = executeSafeStop({ item, monitorName, execFileSyncImpl });
+      outcome = result.confirmed ? 'done' : 'failed';
+      detail = result.error;
+      try {
+        lock(`${instancesFile}.lock`, () => {
+          const state = readJson(stateFile, null);
+          const stop = state?.personas?.[item.instanceId]?.safe_stop;
+          if (!stop || stop.generation !== item.generation) return;
+          if (result.confirmed) { stop.confirmed_at = iso(nowMs); stop.confirmed_by = 'pm2_stop+session_gone'; delete stop.last_error; }
+          else stop.last_error = result.error;
+          writeJsonAtomic(stateFile, state);
+        });
+      } catch (err) {
+        log(`[fable-guard] ${item.instanceId}: safe stop result not recorded (${err.message})`);
       }
-      try { execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 }); } catch { /* absent pane */ }
-      log(`[fable-guard] ${item.instanceId}: STOPPED after g${item.generation} downgrade retries were exhausted (${item.reason})`);
+      if (result.confirmed) {
+        log(`[fable-guard] ${item.instanceId}: STOPPED after g${item.generation} downgrade retries were exhausted (${item.reason}); `
+          + 'pm2 stop succeeded and the tmux session is gone');
+      } else {
+        log(`[fable-guard] ${item.instanceId}: ALERT safe stop of g${item.generation} not confirmed (${result.error}); `
+          + 'Fable may still be running; the stop is retried');
+      }
     } else {
       try {
         execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 });
@@ -650,6 +726,21 @@ export function executeFableRestarts({
     executed.push(item);
   }
   return executed;
+}
+
+// Safe end of an exhausted downgrade: the monitor first, so its Guardian
+// cannot relaunch, then the session. Confirmed only by observation.
+function executeSafeStop({ item, monitorName, execFileSyncImpl }) {
+  let pm2Error = null;
+  try {
+    execFileSyncImpl('pm2', ['stop', monitorName], { stdio: 'ignore', timeout: 30_000 });
+  } catch (err) {
+    pm2Error = `pm2 stop failed: ${err.message}`;
+  }
+  try { execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 }); } catch { /* checked below */ }
+  const session = probeTmuxSession(item.tmuxSession, { execFileSyncImpl });
+  if (!pm2Error && session === 'gone') return { confirmed: true, error: null };
+  return { confirmed: false, error: [pm2Error, session === 'gone' ? null : `tmux session ${item.tmuxSession} ${session}`].filter(Boolean).join('; ') };
 }
 
 /**

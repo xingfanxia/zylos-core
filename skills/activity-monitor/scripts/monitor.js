@@ -1200,7 +1200,8 @@ function fableHealthDeps(activeAdapter) {
   if (!runtimeProfile?.fable) return {};
   log(`Fable guard: monitor started with mode=${runtimeProfile.fable.mode} generation=${runtimeProfile.fable.generation ?? 'none'}`);
   fableMonitor = createFableMonitor({ zylosDir: ZYLOS_DIR, instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR, runtimeProfile,
-    sessionName: activeAdapter.sessionName, classifyLimitDialog, stopSession: () => activeAdapter.stop(),
+    sessionName: activeAdapter.sessionName, classifyLimitDialog,
+    // stopSession defaults to killing exactly the judged session (its tmux session id).
     fenceReplacedSession, log, uncertainDeliveries: {
       list: () => getUncertainDeliveries({ instanceId: INSTANCE_ID, unnotifiedOnly: true, limit: 20 }),
       markNotified: id => markUncertainDeliveryNotified(id),

@@ -3,12 +3,15 @@
  * monitor of a guard-tracked persona and never depends on the
  * runtime-failover daemon being alive:
  *
- *  - lease enforcement: a session launched on Fable whose admission no longer
- *    holds (lease expired, hold, Opus committed, threshold) is stopped after a
- *    grace that lets a live daemon act first. The Guardian relaunch
- *    re-evaluates admission (prepareFableLaunch) and comes up on Opus. The
- *    monitor only ever forces this safe direction; every upgrade stays with
- *    the daemon, the single transition owner.
+ *  - lease enforcement: a session launched on Fable whose admission
+ *    no longer holds (lease expired, hold, Opus committed, threshold) is
+ *    stopped after a grace that lets a live daemon act first. The stop is
+ *    bound to that exact session (sessionRef). A
+ *    stop is done only when the session is observed gone; a failed or
+ *    unconfirmed stop is retried with backoff and an ALERT. The Guardian
+ *    relaunch re-evaluates admission (prepareFableLaunch) and comes up on Opus.
+ *    The monitor only ever forces this safe direction; every upgrade stays
+ *    with the daemon, the single transition owner.
  *  - evidence for the daemon, stamped with the CURRENT launch record (a
  *    Guardian relaunch can change the mode without a new monitor): classified
  *    limit dialogs, Fable-session failures (recovery kills and unexpected
@@ -38,8 +41,14 @@ const READINESS_PHASE = 'post_restart';
 // performs the transition and the monitor acts only when the daemon cannot.
 export const LEASE_ENFORCEMENT_GRACE_MS = 120_000;
 const CHECK_INTERVAL_MS = 15_000;
+// An unconfirmed stop is retried after 15 s, 30 s, 1 min ... at most 5 min.
+const STOP_RETRY_MS = 15_000;
+const STOP_RETRY_MAX_MS = 5 * 60_000;
+const SESSION_GONE_RE = /can't find session|no server running|session not found/i;
+const SESSION_REF_RE = /^\$\d+:\d+:%\d+:\d+$/;
 
 const iso = ms => new Date(ms).toISOString();
+const backoff = (attempt, base, max) => Math.min(base * 2 ** Math.max(0, attempt - 1), max);
 
 function readJson(filePath, fallback = null) {
   try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { return fallback; }
@@ -52,6 +61,25 @@ function writeJsonAtomic(filePath, value) {
   fs.renameSync(tmp, filePath);
 }
 
+/** Is exactly this tmux session (sessionRef) still there? 'present' | 'gone' | 'unknown'. */
+export function probeTmuxSessionRef(sessionRef, { execFileSyncImpl = execFileSync } = {}) {
+  if (!SESSION_REF_RE.test(sessionRef || '')) return 'unknown';
+  const [sessionId, created] = sessionRef.split(':');
+  try {
+    const out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', sessionId, '#{session_id}:#{session_created}'],
+      { encoding: 'utf8', stdio: 'pipe', timeout: 5000 })).trim();
+    return out === `${sessionId}:${created}` ? 'present' : 'gone';
+  } catch (err) {
+    return SESSION_GONE_RE.test(`${err?.stderr || ''} ${err?.message || ''}`) ? 'gone' : 'unknown';
+  }
+}
+
+/** Kill exactly the tmux session of `sessionRef` (its session id), never a session reusing the name. */
+export function killTmuxSessionRef(sessionRef, { execFileSyncImpl = execFileSync } = {}) {
+  if (!SESSION_REF_RE.test(sessionRef || '')) throw new Error(`invalid sessionRef ${sessionRef}`);
+  execFileSyncImpl('tmux', ['kill-session', '-t', sessionRef.split(':')[0]], { stdio: 'pipe', timeout: 10_000 });
+}
+
 /**
  * Monitor-side guard for one persona, or null when the monitor started
  * without a Fable decision (feature inert, persona not fable_enabled).
@@ -61,13 +89,15 @@ export function createFableMonitor({
   instanceId,
   monitorDir,
   runtimeProfile,
-  stopSession,
+  // Kills exactly the session identified by its sessionRef (not by name).
+  stopSession = sessionRef => killTmuxSessionRef(sessionRef),
   sessionName = null,
   classifyLimitDialog = null,
   capturePane = session => execFileSync('tmux', ['capture-pane', '-p', '-t', session],
     { encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024 }),
-  // C4 key fence for the stopped session (comm-bridge supersedeControlsForSession).
   readSessionRef = () => readTmuxSessionRef(sessionName),
+  probeSession = sessionRef => probeTmuxSessionRef(sessionRef),
+  // C4 key fence for the stopped session (comm-bridge supersedeControlsForSession).
   fenceReplacedSession = () => {},
   // C4 delivery_uncertain for this persona: { list() -> unnotified rows, markNotified(id) }.
   uncertainDeliveries = null,
@@ -81,9 +111,12 @@ export function createFableMonitor({
   const fableLaunch = () => { const launch = readLaunch(); return launch?.mode === 'fable' ? launch : null; };
   const stamp = launch => ({ at: iso(now()), runtime_profile: launch.runtime_profile, mode: launch.mode,
     generation: launch.generation ?? null, launch_id: launch.launch_id });
-  let unadmittedSince = 0;
+  const safe = (fn, fallback = null) => { try { return fn(); } catch { return fallback; } };
   let lastCheckAt = 0;
-  let enforcedLaunchId = null;
+  // Unadmitted since, bound to the session it was observed on.
+  let unadmitted = null;
+  // A stop decided for one exact session, kept until that session is observed gone.
+  let pending = null;
   // The next session exit is planned or already counted (recovery kill, lease enforcement).
   let plannedStop = null;
 
@@ -161,40 +194,67 @@ export function createFableMonitor({
     }
   }
 
+  // ── Lease enforcement ──────────────────────────────────────────────────────
+  function writeEnforcement(extra) {
+    try {
+      writeJsonAtomic(path.join(monitorDir, LEASE_ENFORCEMENT_FILE), { instance_id: instanceId, reason: pending?.reason || null,
+        launch_id: pending?.launchId ?? null, generation: pending?.generation ?? null, runtime_profile: pending?.profileId ?? null,
+        session_ref: pending?.sessionRef ?? null, evidence: pending?.evidence ?? null, decided_at: pending ? iso(pending.since) : null,
+        attempts: pending?.attempts ?? 0, ...extra });
+    } catch { /* evidence only */ }
+  }
+
+  function enforce(nowMs) {
+    if (nowMs < pending.nextAt) return null;
+    pending.attempts += 1;
+    plannedStop = 'lease_enforcement';
+    let error = null;
+    try { stopSession(pending.sessionRef); } catch (err) { error = err.message; }
+    const after = safe(() => probeSession(pending.sessionRef), 'unknown');
+    if (after === 'gone') {
+      const record = { at: iso(nowMs), status: 'confirmed', confirmed_at: iso(nowMs) };
+      writeEnforcement(record);
+      log(`Fable guard: lease enforcement stopped session ${pending.sessionRef} (attempt ${pending.attempts}); `
+        + 'the relaunch is admitted to Opus only');
+      try { fenceReplacedSession(pending.sessionRef); } catch (err) { log(`Fable guard key fence failed: ${err.message}`); }
+      const done = { ...pending, ...record };
+      pending = null;
+      return done;
+    }
+    plannedStop = null;
+    const detail = `${error ? `stop failed: ${error}; ` : ''}session ${after}`;
+    pending.nextAt = nowMs + backoff(pending.attempts, STOP_RETRY_MS, STOP_RETRY_MAX_MS);
+    writeEnforcement({ at: iso(nowMs), status: 'pending', last_error: detail, next_attempt_at: iso(pending.nextAt) });
+    log(`Fable guard ALERT: lease enforcement stop of session ${pending.sessionRef} not confirmed (attempt ${pending.attempts}: `
+      + `${detail}); Fable may still be running, retrying at ${iso(pending.nextAt)}`);
+    return { ...pending, status: 'pending', last_error: detail };
+  }
+
   function tick() {
     const nowMs = now();
     if (nowMs - lastCheckAt < checkIntervalMs) return null;
     lastCheckAt = nowMs;
     notifyUncertainDeliveries();
+    if (pending) return enforce(nowMs);
     const launch = readLaunch();
-    if (launch?.mode !== 'fable' || launch.launch_id === enforcedLaunchId) {
-      unadmittedSince = 0;
-      return null;
-    }
+    if (launch?.mode !== 'fable') { unadmitted = null; return null; }
+    const sessionRef = safe(readSessionRef);
+    // No session to stop right now; a relaunch is judged on its own.
+    if (!sessionRef || !SESSION_REF_RE.test(sessionRef)) return null;
     const document = readJson(path.join(zylosDir, 'instances.json'), null);
-    const admission = fableAdmission({ document, instanceId, profileId: launch.runtime_profile, nowMs,
+    const profileId = launch.runtime_profile;
+    const admission = fableAdmission({ document, instanceId, profileId, nowMs,
       guardState: readJson(fableGuardStatePath(zylosDir), null), usage: readJson(fableUsagePath(zylosDir), null) });
-    if (admission?.admitted) {
-      unadmittedSince = 0;
-      return null;
-    }
-    const reason = admission?.reason || 'not_enabled';
-    if (!unadmittedSince) unadmittedSince = nowMs;
-    if (nowMs - unadmittedSince < graceMs) return null;
-    enforcedLaunchId = launch.launch_id;
-    unadmittedSince = 0;
-    const record = { at: iso(nowMs), instance_id: instanceId, reason, launch_id: launch.launch_id,
-      generation: launch.generation ?? null, runtime_profile: launch.runtime_profile };
-    try { writeJsonAtomic(path.join(monitorDir, LEASE_ENFORCEMENT_FILE), record); } catch { /* evidence only */ }
-    log(`Fable guard ALERT: Fable session ${launch.launch_id} no longer admitted (${reason}) and the guard daemon did not act `
-      + `within ${Math.round(graceMs / 1000)}s; stopping it so the relaunch comes up on Opus`);
-    plannedStop = 'lease_enforcement';
-    const sessionRef = readSessionRef();
-    try { stopSession(); } catch (err) { log(`Fable guard lease enforcement stop failed: ${err.message}`); }
-    if (sessionRef) {
-      try { fenceReplacedSession(sessionRef); } catch (err) { log(`Fable guard key fence failed: ${err.message}`); }
-    }
-    return record;
+    if (admission?.admitted) { unadmitted = null; return null; }
+    if (!unadmitted || unadmitted.sessionRef !== sessionRef) unadmitted = { sessionRef, since: nowMs };
+    if (nowMs - unadmitted.since < graceMs) return null;
+    unadmitted = null;
+    pending = { sessionRef, launchId: launch.launch_id ?? null, generation: launch.generation ?? null, profileId,
+      reason: admission?.reason || 'not_enabled', evidence: 'launch_record', since: nowMs, attempts: 0, nextAt: nowMs };
+    writeEnforcement({ at: iso(nowMs), status: 'pending' });
+    log(`Fable guard ALERT: Fable session ${pending.launchId} (session ${sessionRef}) no longer admitted (${pending.reason}) `
+      + `and the guard daemon did not act within ${Math.round(graceMs / 1000)}s; stopping it so the relaunch comes up on Opus`);
+    return enforce(nowMs);
   }
 
   return { tick, readLaunch, healthDeps, guardianDeps };

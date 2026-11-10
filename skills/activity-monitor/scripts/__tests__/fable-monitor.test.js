@@ -53,14 +53,22 @@ function fixture({ mode = 'fable', observedAt = T0 } = {}) {
   return { zylosDir, monitorDir, profile, launch, writeState, writeUsage };
 }
 
+// The persona's tmux session as the monitor sees it: identity (sessionRef),
+// liveness and the CLI's --model argument. A relaunch is a new session.
 function monitorFor(fx, clock, extra = {}) {
   const calls = { stops: 0, logs: [], fenced: [] };
+  const session = { ref: '$3:1762790000:%12:48211', alive: true, model: 'claude-fable-5-2', seq: 12 };
+  session.relaunch = model => { session.seq += 1; session.ref = `$${session.seq}:1762791000:%${session.seq}:4${session.seq}00`;
+    session.alive = true; session.model = model; };
   const monitor = createFableMonitor({
     zylosDir: fx.zylosDir, instanceId: 'user-pan', monitorDir: fx.monitorDir, runtimeProfile: fx.profile,
-    stopSession: () => { calls.stops += 1; }, now: () => clock.now, log: message => calls.logs.push(message),
-    readSessionRef: () => '$3:1762790000:%12:48211', fenceReplacedSession: ref => calls.fenced.push(ref), ...extra,
+    stopSession: ref => { calls.stops += 1; if (ref === session.ref) session.alive = false; },
+    readSessionRef: () => (session.alive ? session.ref : null),
+    probeSession: ref => (session.alive && session.ref === ref ? 'present' : 'gone'),
+    readProcessModel: () => (session.alive ? { model: session.model } : null),
+    now: () => clock.now, log: message => calls.logs.push(message), fenceReplacedSession: ref => calls.fenced.push(ref), ...extra,
   });
-  return { monitor, calls };
+  return { monitor, calls, session };
 }
 
 describe('Fable lease enforcement in the persona monitor (review #1)', () => {
@@ -68,7 +76,7 @@ describe('Fable lease enforcement in the persona monitor (review #1)', () => {
     const fx = fixture();
     const clock = { now: T0 };
     assert.equal(fx.launch(clock.now).model, FABLE);
-    const { monitor, calls } = monitorFor(fx, clock);
+    const { monitor, calls, session } = monitorFor(fx, clock);
     clock.now = T0 + 5 * MIN;
     monitor.tick();
     assert.equal(calls.stops, 0, 'lease still fresh');
@@ -82,8 +90,10 @@ describe('Fable lease enforcement in the persona monitor (review #1)', () => {
     assert.equal(record.reason, 'lease_expired');
     assert.deepEqual(calls.fenced, ['$3:1762790000:%12:48211'], 'keys bound to the stopped session are fenced');
     assert.ok(calls.logs.some(line => line.includes('ALERT')));
+    assert.ok(JSON.parse(fs.readFileSync(path.join(fx.monitorDir, LEASE_ENFORCEMENT_FILE), 'utf8')).confirmed_at, 'observed gone');
     // Guardian relaunches the session through the cached profile: Opus.
     assert.equal(fx.launch(clock.now).model, OPUS);
+    session.relaunch('claude-opus-5-5');
     clock.now += 10 * MIN;
     monitor.tick();
     assert.equal(calls.stops, 1, 'an Opus session is never touched');
@@ -93,13 +103,14 @@ describe('Fable lease enforcement in the persona monitor (review #1)', () => {
     const fx = fixture();
     const clock = { now: T0 };
     fx.launch(clock.now);
-    const { monitor, calls } = monitorFor(fx, clock);
+    const { monitor, calls, session } = monitorFor(fx, clock);
     clock.now = T0 + 5 * MIN;
     fx.writeUsage(clock.now, 0.8); // the daemon reads 80% and commits Opus
     fx.writeState('opus', 4, { [BACKUP]: { quota: { since: new Date(clock.now).toISOString() } } });
     monitor.tick();
     clock.now += 20_000;
     fx.launch(clock.now); // its cold restart lands
+    session.relaunch('claude-opus-5-5');
     clock.now += 10 * MIN;
     monitor.tick();
     assert.equal(calls.stops, 0);
@@ -211,3 +222,80 @@ describe('Uncertain deliveries are named, not timestamped (review h / delivery_u
     assert.deepEqual(kept.map(item => [item.id, item.item_id, item.preview]), [[7, 4012, 'please send the Q3 report to Lin']]);
   });
 });
+
+// ── Review #2: an attempt record is not a completion receipt ─────────────────
+// A fake tmux world for the persona: the session the monitor would stop is
+// identified by its sessionRef; the process model is the running CLI's
+// --model argument.
+function sessionWorld({ model = 'claude-fable-5-2' } = {}) {
+  let seq = 12;
+  const world = { ref: `$3:1762790000:%${seq}:48211`, alive: true, model, stops: [], failStops: 0 };
+  world.replace = (nextModel) => { seq += 1; world.ref = `$${seq}:1762791000:%${seq}:4${seq}00`; world.alive = true; world.model = nextModel; };
+  world.deps = {
+    readSessionRef: () => (world.alive ? world.ref : null),
+    readProcessModel: () => (world.alive ? { model: world.model } : null),
+    probeSession: ref => (world.alive && world.ref === ref ? 'present' : 'gone'),
+    stopSession: ref => {
+      world.stops.push(ref);
+      if (world.failStops > 0) { world.failStops -= 1; throw new Error('injected kill failure'); }
+      if (world.alive && ref === world.ref) world.alive = false;
+    },
+  };
+  return world;
+}
+
+function monitorInWorld(fx, clock, world, extra = {}) {
+  const logs = [];
+  const fenced = [];
+  const monitor = createFableMonitor({
+    zylosDir: fx.zylosDir, instanceId: 'user-pan', monitorDir: fx.monitorDir, runtimeProfile: fx.profile,
+    now: () => clock.now, log: message => logs.push(message), fenceReplacedSession: ref => fenced.push(ref),
+    ...world.deps, ...extra,
+  });
+  return { monitor, logs, fenced };
+}
+
+describe('Fable lease enforcement: stop intent is not completion (review-2 #1)', () => {
+  it('failed stop then retry: a stop that did not take is retried with backoff and an ALERT until the session is gone', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const world = sessionWorld();
+    world.failStops = 2; // the first two kills fail; the Fable session keeps running
+    const { monitor, logs } = monitorInWorld(fx, clock, world);
+    clock.now = T0 + 13 * MIN;
+    monitor.tick(); // unadmitted from now
+    clock.now += 3 * MIN;
+    monitor.tick();
+    assert.equal(world.stops.length, 1, 'first attempt');
+    assert.equal(world.alive, true);
+    for (let i = 0; i < 40 && world.alive; i++) { clock.now += 15_000; monitor.tick(); }
+    assert.equal(world.alive, false, 'the unsafe session is eventually stopped');
+    assert.equal(world.stops.length, 3, 'two failed attempts, then the one that took');
+    assert.ok(logs.filter(line => /ALERT/.test(line) && /not confirmed/.test(line)).length >= 2, 'an ALERT while unresolved');
+    const record = JSON.parse(fs.readFileSync(path.join(fx.monitorDir, LEASE_ENFORCEMENT_FILE), 'utf8'));
+    assert.ok(record.confirmed_at, 'the receipt is the observed stop');
+    // The confirmed stop is not repeated.
+    const before = world.stops.length;
+    for (let i = 0; i < 10; i++) { clock.now += 15_000; monitor.tick(); }
+    assert.equal(world.stops.length, before);
+  });
+
+  it('a stop whose session is still there afterwards is not counted as done', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const world = sessionWorld();
+    // The kill call "succeeds" but the session survives (e.g. wrong target, tmux race).
+    const { monitor } = monitorInWorld(fx, clock, world, { stopSession: ref => { world.stops.push(ref); } });
+    clock.now = T0 + 13 * MIN;
+    monitor.tick();
+    clock.now += 3 * MIN;
+    monitor.tick();
+    for (let i = 0; i < 20; i++) { clock.now += 15_000; monitor.tick(); }
+    assert.ok(world.stops.length >= 2, `retried (${world.stops.length})`);
+    const record = JSON.parse(fs.readFileSync(path.join(fx.monitorDir, LEASE_ENFORCEMENT_FILE), 'utf8'));
+    assert.equal(record.confirmed_at ?? null, null);
+  });
+});
+
