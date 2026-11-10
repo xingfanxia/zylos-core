@@ -22,7 +22,9 @@ import {
   readFableGuardConfig,
 } from '../../multi-session/runtime-files.js';
 import { baseModel, probeDue, recordProbeResult, runFableProbe } from './fable-probe.js';
-import { VALID_SESSION_REF, writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+// comm-bridge owns the session identity (sessionRef = the dispatcher's paneIdentity).
+import { readSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { withFileLock } from '../../multi-session/file-lock.js';
 
 const CLOCK_SKEW_MS = 30_000;
@@ -248,11 +250,10 @@ export function planFableGuard({
         && typeof evidence.runtime_profile === 'string') {
       persona.evidence_seen_at = evidence.at;
       (evidenceByAccount[evidence.runtime_profile] ||= []).push({ persona: id, kind: evidence.kind });
-      // Known gap: a message submitted just before the dialog appeared is
-      // recorded as delivered although the CLI sent nothing. Never replay it
-      // (duplicate execution); flag it for the operator instead.
-      persona.possible_dropped_message = { at: evidence.at, kind: evidence.kind };
-      events.push(`${id}: ALERT limit dialog classified at ${evidence.at}; a message delivered just before it may not have been sent (not re-delivered)`);
+      // A message whose outcome the dialog made uncertain is recorded by C4
+      // (delivery_uncertain) and named by the persona's monitor; never replayed.
+      delete persona.possible_dropped_message;
+      events.push(`${id}: limit dialog classified at ${evidence.at} (${evidence.kind})`);
     }
     const profileId = instance.runtime_profile;
     const sinceMs = Math.max(nowMs - config.crash_window_sec * 1000, ms(persona.crash_counted_after) || 0);
@@ -540,7 +541,7 @@ export function executeFableRestarts({
   for (const item of restarts) {
     let go = false;
     // The session this restart replaces, so the new monitor can fence C4 keys bound to it.
-    const sessionRef = item.kind === 'stop' ? null : readTmuxSessionRef(item.tmuxSession, execFileSyncImpl);
+    const sessionRef = item.kind === 'stop' ? null : readSessionRef(item.tmuxSession, { execFileSyncImpl });
     try {
       lock(`${instancesFile}.lock`, () => {
         const file = fableGuardStatePath(zylosDir);
@@ -592,18 +593,6 @@ export function executeFableRestarts({
     executed.push(item);
   }
   return executed;
-}
-
-/** comm-bridge sessionRef of a live tmux session, or null. */
-export function readTmuxSessionRef(tmuxSession, execFileSyncImpl = execFileSync) {
-  if (!tmuxSession) return null;
-  try {
-    const out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', tmuxSession,
-      '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'], { encoding: 'utf8', stdio: 'pipe', timeout: 5000 })).trim();
-    return VALID_SESSION_REF.test(out) ? out : null;
-  } catch {
-    return null;
-  }
 }
 
 function launchedSince(zylosDir, instanceId, document, sinceMs) {

@@ -448,9 +448,10 @@ describe('Fable guard interleavings', () => {
     assert.deepEqual(sim.state.holds[BACKUP].quota.detail, { source: 'limit_ui', persona: 'user-pan', kind: 'fable_limit' });
     assert.equal(sim.state.holds[BACKUP].quota.reset_window, W1);
     assert.deepEqual(result.restarts.map(item => item.instanceId).sort(), ['user-elaine', 'user-pan']);
-    assert.ok(result.events.some(event => event.startsWith('user-pan: ALERT limit dialog classified')));
-    assert.equal(sim.state.personas['user-pan'].possible_dropped_message.kind, 'fable_limit');
-    assert.equal(sim.state.personas['user-elaine'].possible_dropped_message, undefined, 'stale evidence is ignored');
+    assert.ok(result.events.some(event => event.startsWith('user-pan: limit dialog classified')));
+    assert.equal(sim.state.personas['user-pan'].possible_dropped_message, undefined,
+      'message outcomes come from C4 delivery_uncertain, named by the monitor');
+    assert.equal(sim.state.personas['user-elaine'].evidence_seen_at, undefined, 'stale evidence is ignored');
     sim.launchAll(result.restarts);
     sim.state = clearFableHold(sim.state, { account: BACKUP, kind: 'quota', nowMs: sim.now }).state;
     sim.pass();

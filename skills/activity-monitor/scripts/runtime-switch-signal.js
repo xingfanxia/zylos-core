@@ -5,7 +5,7 @@ const SIGNAL_MAX_AGE_MS = 10 * 60 * 1000;
 const VALID_SIGNAL_KEY = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 // tmux identity of the session a transition replaces (comm-bridge sessionRef):
 // session_id:session_created:pane_id:pane_pid.
-export const VALID_SESSION_REF = /^\$\d+:\d+:%\d+:\d+$/;
+const VALID_SESSION_REF = /^\$\d+:\d+:%\d+:\d+$/;
 
 function signalKey(instanceId) {
   const key = instanceId || 'single';
