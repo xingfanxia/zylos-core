@@ -370,6 +370,8 @@ export function multiSessionDispatch(item, helpers) {
  * @param {(instanceIds: string[]) => object | null} helpers.getNextPendingControlForInstances
  * @param {(id: number) => void} helpers.markRejected
  * @param {(id: number) => void} helpers.markControlRejected
+ * @param {(session: string) => object | null} [helpers.readSessionModal] - modal owning the pane's keyboard
+ * @param {(modal: object) => boolean} [helpers.keystrokeBlockedByModal]
  * @returns {Promise<ProcessResult>}
  */
 export async function processWithMultiSession(helpers) {
@@ -401,6 +403,8 @@ export async function processWithMultiSession(helpers) {
     sendKeystroke,
     isKeystrokeControl,
     parseKeystrokeKey,
+    readSessionModal,
+    keystrokeBlockedByModal,
   } = helpers;
 
   // Reap idle non-primary instances before processing.
@@ -466,6 +470,14 @@ export async function processWithMultiSession(helpers) {
   // .state / .legacy — held / heldReasons are ignored by them.
   const summarize = (result) => ({ ...result, held: heldItems.length, heldReasons: { ...heldReasons } });
   const noteHeld = (category) => { heldReasons[category] = (heldReasons[category] || 0) + 1; };
+  // A modal owns that instance's keyboard: hold the row for this cycle (no
+  // retry consumed, never marked delivered) and keep serving other instances.
+  const holdForModal = (item, kind) => {
+    heldItems.push(item);
+    noteHeld('modal');
+    inFlight = null;
+    log(`Held ${item.type} id=${item.id} for ${item.target_instance || 'default'}: modal${kind ? `=${kind}` : ''} owns the keyboard`);
+  };
 
   try {
     for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
@@ -549,6 +561,11 @@ export async function processWithMultiSession(helpers) {
       // as literal chat text, so auto-approve Enter / watchdog keys never
       // functioned in multi-session mode.
       if (isKeystrokeControl && sendKeystroke && isKeystrokeControl(item)) {
+        const modal = readSessionModal ? readSessionModal(session) : null;
+        if (modal && keystrokeBlockedByModal(modal)) {
+          holdForModal(item, modal.kind);
+          continue;
+        }
         const key = parseKeystrokeKey(item.content || '');
         log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority}${targetInstance ? ` -> ${targetInstance}` : ''})`);
         try {
@@ -588,6 +605,11 @@ export async function processWithMultiSession(helpers) {
         statusFile,
         strictVerify: item.type === 'conversation',
       });
+
+      if (result === 'modal_deferred') {
+        holdForModal(item);
+        continue;
+      }
 
       if (result === 'submitted') {
         if (item.type === 'conversation') {
