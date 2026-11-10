@@ -89,6 +89,7 @@ describe('MonitorOrchestrator', () => {
       scheduleStaleRuntimeCleanup: (activeAdapter) => calls.push(['scheduleStaleRuntimeCleanup', activeAdapter]),
       log: overrides.log ?? ((message) => calls.push(['log', message])),
       nowMs: () => 1111,
+      ...(overrides.deps || {}),
     });
 
     return {
@@ -1469,5 +1470,71 @@ describe('MonitorOrchestrator', () => {
         apiActivity: null,
       }],
     ]);
+  });
+});
+
+describe('MonitorOrchestrator Fable guard hooks', () => {
+  function start({ reason, engine = {} }) {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fable-orchestrator-'));
+    const calls = [];
+    const orchestrator = new MonitorOrchestrator({
+      env: { ZYLOS_DIR: zylosDir, ZYLOS_INSTANCE_ID: 'user-pan' },
+      monitorDir: path.join(zylosDir, 'activity-monitor', 'user-pan'),
+      getActiveAdapter: () => ({ runtimeId: 'claude', displayName: 'Claude', sessionName: 'claude-user-pan',
+        config: { runtimeProfile: { id: 'claude-ax-backup' } },
+        getHeartbeatDeps: () => ({ clearHeartbeatPending: () => calls.push('clearHeartbeatPending') }) }),
+      readConfigObject: () => ({}),
+      createToolPipeline: () => ({ pipeline: { getRuleById: () => ({ watchdog: { enabled: true, maxRuntimeSec: 10,
+        interruptKey: 'Escape', interruptGraceSec: 5, cooldownSec: 30, escalation: 'guardian' } }) }, toolRules: {} }),
+      readWatchdogState: () => null,
+      createProcSampler: () => ({}),
+      loadInitialHealth: () => ({ health: 'ok', runtime_launch_at: 1 }),
+      createHealthEngine: () => ({ health: 'ok', start: () => {}, setRuntimeBusy: () => {},
+        notifyColdStart: () => calls.push('notifyColdStart'), triggerRecovery: () => calls.push('triggerRecovery'), ...engine }),
+      createGuardian: () => ({}),
+      startMessageRouterServer: () => {},
+      readDailyUpgradeEnabled: () => false,
+      createUsageMonitor: () => ({ initializeLastCheckAt: () => 0 }),
+      createTaskScheduler: () => ({}),
+      initializeUsageMonitor: () => {},
+      startContextMonitor: () => ({}),
+      scheduleStaleRuntimeCleanup: () => {},
+      dropStaleKeystrokes: () => calls.push('dropStaleKeystrokes'),
+      log: () => {},
+      nowMs: () => 1000,
+    });
+    if (reason) {
+      writeRuntimeSwitchSignal({ zylosDir, nowMs: 1000, change: { instanceId: 'user-pan', fromProfile: 'claude-ax-backup',
+        toProfile: 'claude-ax-backup', reason } });
+    }
+    orchestrator.start();
+    fs.rmSync(zylosDir, { recursive: true, force: true });
+    return { orchestrator, calls };
+  }
+
+  it('drops stale keystrokes only on a Fable guard relaunch', () => {
+    assert.ok(start({ reason: 'fable_guard:opus:g7' }).calls.includes('dropStaleKeystrokes'));
+    assert.ok(!start({ reason: 'usage_exhausted:claude-ax-backup' }).calls.includes('dropStaleKeystrokes'));
+    assert.ok(!start({}).calls.includes('dropStaleKeystrokes'));
+  });
+
+  it('does not queue a watchdog interrupt while a limit dialog is classified', () => {
+    const sources = [];
+    const { orchestrator } = start({ engine: { limitDialogActive: source => { sources.push(source); return true; } } });
+    const controls = [];
+    const phase = orchestrator.evaluateToolWatchdog({
+      nowMs: 20_000,
+      foregroundIdentity: { trusted: true, sessionId: 's', claudePid: 1 },
+      apiActivity: { watchdog_candidate_tool: { event_id: 'e', name: 'WebFetch', rule_id: 'web', started_at: 1000 } },
+      interactiveState: { kind: 'indeterminate' },
+      watchdogState: null,
+      canTreatPaneAsRecovered: () => false,
+      runC4Control: args => { controls.push(args); return { ok: true, output: '' }; },
+      clearWatchdogState: () => {},
+      writeWatchdogState: () => {},
+    });
+    assert.deepEqual(controls, []);
+    assert.deepEqual(sources, ['watchdog_interrupt']);
+    assert.equal(phase.watchdog_phase, 'interrupt_retry_wait');
   });
 });

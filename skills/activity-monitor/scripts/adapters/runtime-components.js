@@ -51,9 +51,11 @@ export function createHealthEngine(activeAdapter, initialStatus, {
   degradedProbeInterval,
   rateLimitProbeInterval,
   notifyDegraded,
+  extraDeps = {},
 }) {
   return new HealthEngine({
     ...(activeAdapter.getHeartbeatDeps() ?? {}),
+    ...extraDeps, // Fable guard evidence hooks (Fable-mode personas only)
     killTmuxSession: () => activeAdapter.stop(),
     checkAuth: (options) => activeAdapter.checkAuth
       ? activeAdapter.checkAuth(options)

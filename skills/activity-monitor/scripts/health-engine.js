@@ -57,6 +57,11 @@ const FLAP_WINDOW_SEC = 3600;
 // but no later than this after a (re)start, in case the turn itself is hung.
 const STARTUP_PROBE_GRACE_SEC = 20 * 60;
 
+// Fable allowance guard (FG-4): while a classified limit dialog is on screen
+// the guard daemon owns the restart (into Opus). Ordinary kill+restart would
+// relaunch into the same dialog, so it waits this long for the guard first.
+const LIMIT_DIALOG_DEFER_SEC = 15 * 60;
+
 function isUnavailableRecoveryState(health) {
   return health === 'unavailable' || health === 'recovering';
 }
@@ -84,6 +89,9 @@ export class HealthEngine {
    * @param {() => Promise<{status: 'success'|'failure'|'uncertain', reason?: string}>|{status: 'success'|'failure'|'uncertain', reason?: string}} [deps.checkAuth]
    * @param {(details: {cycleCount: number, windowSec: number, ceiling: number, probeIntervalSec: number, reason: string}) => void} [deps.notifyDegraded] - Out-of-band admin alert, fired exactly once per !degraded→degraded transition
    * @param {(ms: number) => Promise<void>} [deps.sleep]
+   * @param {() => ({kind: string, text?: string}|null)} [deps.detectLimitDialog] - Fable guard: live limit/credits dialog at the bottom of the pane (Fable-mode personas only)
+   * @param {(result: object) => void} [deps.onLimitDialog] - Fable guard: record limit-dialog evidence for the guard daemon
+   * @param {(reason: string) => void} [deps.onRecoveryRestart] - Fable guard: a failure-driven kill+restart is about to run
    * @param {object} [options]
    * @param {number} [options.downDegradeThreshold=3600] - Seconds of continuous failure before entering DOWN
    * @param {number} [options.downRetryInterval=3600] - Seconds between DOWN-state probes
@@ -169,6 +177,8 @@ export class HealthEngine {
     this.lastStickyErrorHitAt = 0;
     this.healthRevision = 0;
     this.probeFences = new Map();
+    this.lastFunctionalAckPhase = null;
+    this.limitDialogSince = 0;
   }
 
   get health() {
@@ -271,6 +281,44 @@ export class HealthEngine {
     this.readinessProbePending = true;
     this.setHealth('ok', `cold_start_grace_${seconds}s`);
     this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
+  }
+
+  /**
+   * Fable guard (FG-4): classify the live pane before any ordinary recovery.
+   * Only a structural dialog match counts; the classifier rejects quoted or
+   * scrolled-back text. Returns true while a dialog is on screen.
+   */
+  _checkLimitDialog(source) {
+    if (!this.deps.detectLimitDialog) return false;
+    let result = null;
+    try { result = this.deps.detectLimitDialog(); } catch { result = null; }
+    if (!result || (result.kind !== 'fable_limit' && result.kind !== 'credits_offer')) {
+      this.limitDialogSince = 0;
+      return false;
+    }
+    const nowSec = Math.floor(this.now() / 1000);
+    if (!this.limitDialogSince) {
+      this.limitDialogSince = nowSec;
+      this.deps.log(`Fable limit dialog on screen (${result.kind}, ${source}); restart deferred to the Fable guard`);
+    }
+    try { this.deps.onLimitDialog?.({ ...result, source }); } catch (err) {
+      this.deps.log(`Fable limit evidence write failed: ${err?.message || err}`);
+    }
+    return true;
+  }
+
+  /** Public precedence check for other recovery paths (tool watchdog). */
+  limitDialogActive(source) {
+    return this._checkLimitDialog(source);
+  }
+
+  _limitDialogDefersRecovery(source) {
+    if (!this._checkLimitDialog(source)) return false;
+    return Math.floor(this.now() / 1000) - this.limitDialogSince < LIMIT_DIALOG_DEFER_SEC;
+  }
+
+  _noteRecoveryRestart(reason) {
+    try { this.deps.onRecoveryRestart?.(reason); } catch { /* evidence only */ }
   }
 
   /**
@@ -409,9 +457,11 @@ export class HealthEngine {
         // periodically scan the tmux pane for fatal API errors (e.g. 400 from
         // corrupted image). Triggers immediate recovery instead of waiting for
         // the full ack_deadline timeout (120s). Scans at most once per 15s.
-        if (pendingAge > 30 && this.deps.detectApiError
+        if (pendingAge > 30 && (this.deps.detectApiError || this.deps.detectLimitDialog)
             && (currentTime - this._lastApiErrorScanAt) >= 15) {
           this._lastApiErrorScanAt = currentTime;
+          if (this._checkLimitDialog('pending_heartbeat')) return;
+          if (!this.deps.detectApiError) return;
           const apiError = this.deps.detectApiError();
           if (apiError.detected) {
             this.deps.log(`API error detected in tmux pane: ${apiError.pattern}. Triggering immediate recovery.`);
@@ -548,6 +598,8 @@ export class HealthEngine {
     if(this.evidence && (!pending || !this.validFence(this.probeFences.get(pending.control_id))))return false;
     if(!this.setHealth('ok',`heartbeat_ack phase=${phase}`,'recovery'))return false;
     this.lastFunctionalAckAt = this.now();
+    this.lastFunctionalAckPhase = phase;
+    this.limitDialogSince = 0;
     this.deps.clearHeartbeatPending();
     this.restartFailureCount = 0;
     this.recoveringStartedAt = 0;
@@ -594,6 +646,13 @@ export class HealthEngine {
       return;
     }
 
+    // Fable guard precedence also covers recovery requested by the tool
+    // watchdog: a limit dialog is the guard's relaunch, not a hang.
+    if (this._limitDialogDefersRecovery(`recovery_${reason}`)) {
+      this.deps.log(`Heartbeat recovery deferred to the Fable guard (${reason})`);
+      return;
+    }
+
     const now = Math.floor(this.now() / 1000);
 
     // Flap escalation ceiling: count kill-restart CYCLES in a rolling hour.
@@ -615,6 +674,7 @@ export class HealthEngine {
     this.lastRecoveryAt = now;
     this.evidence?.persistScheduling();
     this.deps.log(`Heartbeat recovery attempt ${this.restartFailureCount} (${reason}), next backoff ${this.getBackoffDelay()}s`);
+    this._noteRecoveryRestart(reason);
     this.deps.killTmuxSession();
 
     // Legacy DOWN is still accepted when restored from persisted state, but new
@@ -631,6 +691,13 @@ export class HealthEngine {
     const phase = pending.phase || 'primary';
     const now = Math.floor(Date.now() / 1000);
     this.deps.clearHeartbeatPending();
+
+    // Fable guard precedence: a live limit dialog is a quota signal for the
+    // guard, not a hang. Do not kill/count it while the guard takes over.
+    if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState) || this.healthState === 'rate_limited')
+        && this._limitDialogDefersRecovery(`heartbeat_${phase}_${status}`)) {
+      return;
+    }
 
     // Before triggering kill+restart recovery, check if the failure is due to
     // a rate limit. This is the "behavioral + text" dual-signal approach:
@@ -729,6 +796,7 @@ export class HealthEngine {
       await this._sleep(this.userMessageCheckDelayMs);
     }
     if (this.healthState !== 'ok' || !this.validFence(fence)) return;
+    if (this._checkLimitDialog('user_message')) return;
 
     const rateLimit = this.deps.detectRateLimit ? this.deps.detectRateLimit() : { detected: false };
     if (rateLimit.detected) {
@@ -775,6 +843,7 @@ export class HealthEngine {
         this.lastStickyErrorHitAt = 0;
         this.deps.log(`sticky error 2x: ${stickyError.pattern || 'unknown'}, killing session`);
         if(!this.setHealth('unavailable', 'sticky_context_restart'))return;
+        this._noteRecoveryRestart('sticky_context_restart');
         this.deps.killTmuxSession();
       }
       return;
