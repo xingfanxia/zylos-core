@@ -8,11 +8,14 @@ import { describe, it } from 'node:test';
 import {
   clearFableHold,
   executeFableRestarts,
+  fableGuardOwnsInstance,
   fableProbeAccounts,
   planFableGuard,
+  reconcileFableGuardNow,
   scheduleFableProbes,
 } from '../fable-guard.js';
 import { baseModel, recordProbeResult } from '../fable-probe.js';
+import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 import {
   FABLE_GUARD_DEFAULTS,
   fableGuardStatePath,
@@ -626,6 +629,181 @@ describe('Fable guard interrupted restarts keep reconciling (review #3)', () => 
   });
 });
 
+describe('Fable guard generation fencing and --apply protocol (review #4)', () => {
+  function tempZylos(sim) {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-fence-'));
+    fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
+    fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(sim.document));
+    return zylosDir;
+  }
+  const persist = (sim, zylosDir) => {
+    fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(sim.document));
+    fs.writeFileSync(fableGuardStatePath(zylosDir), JSON.stringify(sim.state));
+    fs.writeFileSync(fableUsagePath(zylosDir), JSON.stringify(sim.usage));
+    for (const [id, record] of Object.entries(sim.launches)) {
+      fs.mkdirSync(path.join(zylosDir, 'activity-monitor', id), { recursive: true });
+      fs.writeFileSync(path.join(zylosDir, 'activity-monitor', id, 'fable-launch.json'), JSON.stringify(record));
+    }
+  };
+  const load = (sim, zylosDir) => { sim.state = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8')); };
+
+  it('checks the generation per restart under the instances.json lock, not once per batch', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    const batch = sim.pass().restarts;
+    assert.equal(batch.length, 2);
+    const zylosDir = tempZylos(sim);
+    try {
+      persist(sim, zylosDir);
+      const locks = [];
+      const lock = (lockPath, fn) => { locks.push(lockPath); return fn(); };
+      const calls = [];
+      const exec = (file, args) => {
+        calls.push([file, ...args].join(' '));
+        // While the first persona restarts, another writer commits a newer generation for the second.
+        if (file === 'pm2' && args[1] === `activity-monitor-${batch[0].instanceId}`) {
+          const state = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8'));
+          state.personas[batch[1].instanceId].desired.generation += 10;
+          fs.writeFileSync(fableGuardStatePath(zylosDir), JSON.stringify(state));
+        }
+        return '';
+      };
+      const done = executeFableRestarts({ zylosDir, restarts: batch, nowMs: sim.now, execFileSyncImpl: exec, log: () => {}, lock });
+      assert.deepEqual(done.map(item => item.instanceId), [batch[0].instanceId]);
+      assert.equal(calls.filter(call => call.includes(batch[1].instanceId)).length, 0, 'the superseded restart never ran');
+      assert.deepEqual(locks, [path.join(zylosDir, 'instances.json.lock'), path.join(zylosDir, 'instances.json.lock')]);
+      const executing = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8')).personas[batch[0].instanceId].executing;
+      assert.equal(executing.generation, batch[0].generation);
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a newer commit for a persona whose restart is still landing reuses that restart', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    const first = sim.pass().restarts.find(item => item.instanceId === 'user-pan');
+    const zylosDir = tempZylos(sim);
+    try {
+      persist(sim, zylosDir);
+      const calls = [];
+      const exec = (file, args) => { calls.push(`${file} ${args[0]}`); return ''; };
+      executeFableRestarts({ zylosDir, restarts: [first], nowMs: sim.now, execFileSyncImpl: exec, log: () => {} });
+      load(sim, zylosDir);
+      // --apply moves pan to another account 5 s later, before the restarted monitor launched.
+      sim.advance(5000);
+      sim.document.instances['user-pan'].runtime_profile = CL;
+      const second = sim.pass().restarts.find(item => item.instanceId === 'user-pan');
+      assert.ok(second && second.generation > first.generation);
+      persist(sim, zylosDir);
+      const logs = [];
+      calls.length = 0;
+      executeFableRestarts({ zylosDir, restarts: [second], nowMs: sim.now, execFileSyncImpl: exec, log: line => logs.push(line) });
+      assert.deepEqual(calls, [], 'the in-flight restart launches from the newest commit');
+      assert.ok(logs.some(line => line.includes('in flight')));
+      load(sim, zylosDir);
+      sim.monitorStart('user-pan'); // the first restart's monitor comes up and reads the newest commit
+      sim.advance(MIN);
+      sim.pass();
+      assert.equal(sim.launches['user-pan'].runtime_profile, CL);
+      assert.ok(sim.state.personas['user-pan'].verified.model_at);
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  for (const boundary of ['signal', 'kill', 'pm2']) {
+    it(`converges to Opus when the restart fails at the ${boundary} boundary (real cached-adapter lifecycle)`, () => {
+      const sim = new Sim();
+      sim.toFable();
+      const zylosDir = tempZylos(sim);
+      try {
+        sim.observe(BACKUP, 0.8);
+        let failOnce = boundary;
+        const world = (file, args) => {
+          const step = file === 'tmux' ? 'kill' : 'pm2';
+          if (failOnce === step) { failOnce = null; throw new Error(`injected ${step} failure`); }
+          const id = file === 'tmux' ? args[2].replace(/^claude-/, '') : args[1].replace(/^activity-monitor-/, '');
+          if (step === 'kill') { sim.setState(id, 'offline'); sim.launch(id); } // the old monitor's Guardian relaunches
+          else sim.monitorStart(id);
+          return '';
+        };
+        const writeSignal = args => {
+          if (failOnce === 'signal') { failOnce = null; throw new Error('injected signal failure'); }
+          return writeRuntimeSwitchSignal(args);
+        };
+        for (let i = 0; i < 5; i++) {
+          const result = sim.pass();
+          persist(sim, zylosDir);
+          executeFableRestarts({ zylosDir, restarts: result.restarts, nowMs: sim.now, execFileSyncImpl: world, writeSignal, log: () => {} });
+          load(sim, zylosDir);
+          sim.advance(4 * MIN);
+          sim.observe(BACKUP, 0.8);
+        }
+        for (const id of ['user-pan', 'user-elaine']) {
+          assert.equal(sim.launches[id].mode, 'opus', id);
+          assert.ok(sim.state.personas[id].verified?.model_at, id);
+          assert.equal(sim.state.personas[id].safe_stop, undefined, id);
+        }
+      } finally {
+        fs.rmSync(zylosDir, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it('disabling a persona while it is on Opus drops the subagent pin through one restart', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.9);
+    sim.launchAll(sim.pass().restarts); // both on Opus, pinned
+    assert.match(sim.launches['user-pan'].key, /SUBAGENT/);
+    delete sim.document.instances['user-pan'].fable_enabled;
+    sim.setState('user-pan', 'busy');
+    assert.deepEqual(sim.pass().restarts, [], 'waits for idle');
+    sim.setState('user-pan', 'idle');
+    const off = sim.pass();
+    assert.deepEqual(off.restarts.map(item => [item.instanceId, item.reason]), [['user-pan', 'resume:policy_change']]);
+    sim.launchAll(off.restarts);
+    assert.doesNotMatch(sim.launches['user-pan'].key, /SUBAGENT/);
+    sim.advance(MIN);
+    sim.pass();
+    assert.equal(sim.state.personas['user-pan'], undefined, 'converged and released');
+  });
+
+  it('reconcileFableGuardNow is the generation-aware entry point --apply uses after writing instances.json', () => {
+    const sim = new Sim();
+    sim.toFable();
+    const zylosDir = tempZylos(sim);
+    try {
+      persist(sim, zylosDir);
+      const doc = JSON.parse(fs.readFileSync(path.join(zylosDir, 'instances.json'), 'utf8'));
+      assert.equal(fableGuardOwnsInstance({ document: doc, state: sim.state, instanceId: 'user-pan' }), true);
+      assert.equal(fableGuardOwnsInstance({ document: doc, state: sim.state, instanceId: 'admin' }), false);
+      // --apply: pan moves to ax-cl (no reading there yet) under the lock; it does NOT restart pan itself.
+      doc.instances['user-pan'].runtime_profile = CL;
+      fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(doc));
+      for (const id of PERSONAS) {
+        fs.mkdirSync(path.join(zylosDir, 'activity-monitor', id), { recursive: true });
+        fs.writeFileSync(path.join(zylosDir, 'activity-monitor', id, 'agent-status.json'), JSON.stringify({ ...sim.status[id],
+          last_check: Math.floor(sim.now / 1000), runtime_launch_at: sim.launches[id]?.launched_at_ms ?? 0 }));
+      }
+      const calls = [];
+      const exec = (file, args) => { calls.push([file, ...args].join(' ')); return ''; };
+      const first = reconcileFableGuardNow({ zylosDir, nowMs: sim.now, execFileSyncImpl: exec, log: () => {} });
+      assert.deepEqual(first.executed.map(item => [item.instanceId, item.profileId, item.mode]), [['user-pan', CL, 'opus']]);
+      assert.deepEqual(calls, ['tmux kill-session -t claude-user-pan', 'pm2 restart activity-monitor-user-pan --update-env']);
+      const again = reconcileFableGuardNow({ zylosDir, nowMs: sim.now + 1000, execFileSyncImpl: exec, log: () => {} });
+      assert.deepEqual(again.executed, [], 'a second call never restarts the same commit again');
+      const state = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8'));
+      assert.equal(state.personas['user-pan'].desired.account, CL);
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Fable guard daemon integration', () => {
   function writeFixture(zylosDir, document) {
     fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
@@ -741,6 +919,17 @@ describe('Fable guard daemon integration', () => {
         [['user-elaine', 'fable'], ['user-pan', 'fable']]);
       const bad = spawnSync(process.execPath, [cli, 'clear', BACKUP, 'bogus'], { env, encoding: 'utf8' });
       assert.equal(bad.status, 1);
+      // `reconcile` on an unconfigured directory is a no-op (never runs tmux/pm2 here).
+      const inert = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-cli-inert-'));
+      try {
+        fs.writeFileSync(path.join(inert, 'instances.json'), JSON.stringify({ instances: {} }));
+        const noop = spawnSync(process.execPath, [cli, 'reconcile', '--json'], { env: { ...env, ZYLOS_DIR: inert }, encoding: 'utf8' });
+        assert.equal(noop.status, 0, noop.stderr);
+        assert.deepEqual(JSON.parse(noop.stdout), { events: [], executed: [] });
+        assert.equal(fs.existsSync(fableGuardStatePath(inert)), false);
+      } finally {
+        fs.rmSync(inert, { recursive: true, force: true });
+      }
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }

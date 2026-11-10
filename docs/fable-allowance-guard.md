@@ -61,13 +61,37 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
   (profile ids); lease/cadence constants → the integer keys above, or omit them
   for the defaults; `FABLE_PERSONAS` → `fable_enabled: true` on exactly those
   instances and removal of the key everywhere else.
-- `--apply` must not read, write or delete `activity-monitor/fable-guard.json`
-  or `activity-monitor/fable-usage.json`. Holds live there, so they survive
-  `--apply` without special handling. Enabling or disabling a persona is only
-  the `fable_enabled` flag; the guard's next pass reconciles it.
-- `--apply` relaunching a moved persona is safe: the launcher refuses Fable
-  unless the guard committed Fable for that exact account and the lease is
-  fresh.
+- `--apply` must not write or delete `activity-monitor/fable-guard.json` or
+  `activity-monitor/fable-usage.json`. Holds live there, so they survive
+  `--apply` without special handling.
+- `--apply` must not kill or restart a guard-owned persona itself. The
+  protocol is "write the desired policy, let the guard execute it":
+  1. Under `instances.json.lock`, write the new `instances.json` (accounts,
+     `fable_enabled`, profile models, `fable_guard`), as today.
+  2. Release the lock.
+  3. For every moved instance, restart it yourself only if
+     `fableGuardOwnsInstance({ document, state, instanceId })` is false for
+     BOTH the document before and after the write (`state` = the current
+     `fable-guard.json`). Guard-owned instances are skipped.
+  4. Call `reconcileFableGuardNow({ zylosDir })` (import from
+     `activity-monitor/scripts/fable-guard.js`) or run
+     `node fable-guard-cli.js reconcile --json`. It runs one guard pass now:
+     plan and commit under the lock (any change of account, `fable_enabled`,
+     model or subagent env commits a new generation), then execute each
+     restart behind the per-restart generation fence. If the daemon is alive
+     it may run the same pass concurrently; the lock serializes the commits
+     and the fence prevents an obsolete or duplicate restart.
+
+  Exact instructions for `configure-ax-devbox-runtime.mjs`:
+  `azure-agents-infra/scratch/reports/fable52-main-mode/fg-apply-protocol.md`.
+- Restart fencing: each restart is checked on its own, under
+  `instances.json.lock`, against the persona's committed generation; a
+  superseded one is skipped. The check records `executing {generation, at}` and
+  writes the switch signal inside the lock; `tmux kill-session` and `pm2`
+  run after it. A newer commit for a persona whose restart was executed less
+  than 30 s ago and has not launched yet reuses that restart (the relaunch
+  re-reads the guard state), so an `--apply` interleaved with a guard restart
+  never causes an obsolete second restart.
 
 ## Components
 
@@ -316,6 +340,7 @@ node ~/zylos/.claude/skills/activity-monitor/scripts/fable-guard-cli.js status  
 node ~/zylos/.claude/skills/activity-monitor/scripts/fable-guard-cli.js status --json
 node ~/zylos/.claude/skills/activity-monitor/scripts/fable-guard-cli.js clear claude-ax-backup quota --reason "drill teardown"
 node ~/zylos/.claude/skills/activity-monitor/scripts/fable-guard-cli.js clear claude-ax-backup all
+node ~/zylos/.claude/skills/activity-monitor/scripts/fable-guard-cli.js reconcile --json  # one guard pass now (the --apply entry point)
 ```
 
 `clear` takes `instances.json.lock`, removes the named kind (`quota`, `stale`,

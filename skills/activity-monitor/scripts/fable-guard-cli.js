@@ -4,6 +4,7 @@
  *
  *   node fable-guard-cli.js status [--json]
  *   node fable-guard-cli.js clear <account> <quota|stale|crash|all> [--reason <text>]
+ *   node fable-guard-cli.js reconcile [--json]   # one guard pass now (used by --apply)
  *
  * `clear` edits only the guard state, under the same instances.json lock the
  * runtime-failover daemon holds. A hold whose cause is still present (for
@@ -15,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { fableGuardStatePath, fableUsagePath, readFableGuardConfig } from '../../multi-session/runtime-files.js';
-import { clearFableHold, writeJsonAtomic } from './fable-guard.js';
+import { clearFableHold, reconcileFableGuardNow, writeJsonAtomic } from './fable-guard.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 
@@ -86,7 +87,15 @@ function main(argv) {
     console.log(cleared.length ? `cleared ${account}: ${cleared.join(', ')}` : `no ${kind} hold on ${account}`);
     return 0;
   }
-  console.error('usage: fable-guard-cli.js status [--json] | clear <account> <kind|all> [--reason <text>]');
+  if (command === 'reconcile') {
+    const lines = [];
+    const result = reconcileFableGuardNow({ zylosDir: ZYLOS_DIR, log: line => lines.push(line) });
+    const summary = { events: result.events, executed: result.executed.map(({ instanceId, generation, kind, mode, profileId, reason }) =>
+      ({ instanceId, generation, kind, mode, profileId, reason })) };
+    console.log(rest.includes('--json') ? JSON.stringify(summary, null, 2) : lines.join('\n') || 'fable guard: nothing to do');
+    return 0;
+  }
+  console.error('usage: fable-guard-cli.js status [--json] | clear <account> <kind|all> [--reason <text>] | reconcile [--json]');
   return 2;
 }
 
