@@ -9,6 +9,8 @@ import { withFileLock } from '../../multi-session/file-lock.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 import { processSwitchNotices } from './runtime-switch-notices.js';
 import { verifiedQuotaRecoveries, readCurrentSubscriptionAccountKeys, readSubscriptionRotationMarkers } from './codex-quota-recovery.js';
+import { executeFableRestarts, planFableGuardPass, scheduleFableProbes, writeJsonAtomic as writeGuardJson } from './fable-guard.js';
+import { fableGuardStatePath } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -554,8 +556,10 @@ export function applyRuntimeFailover({
   nowMs = Date.now(),
   execFileSyncImpl = execFileSync,
   log = console.log,
+  zylosDir = ZYLOS_DIR,
 } = {}) {
   let changes = [];
+  let fableRestarts = [];
   if (fs.existsSync(INSTANCES_FILE)) {
     withFileLock(`${INSTANCES_FILE}.lock`, () => {
       const document = readJson(INSTANCES_FILE, {});
@@ -569,7 +573,21 @@ export function applyRuntimeFailover({
         nowMs,
       });
       changes = planned.changes;
+      // Fable guard (FG-2): same lock, after the account choice, so one
+      // restart carries both the account and the model of a persona.
+      let guard = null;
+      try {
+        guard = planFableGuardPass({ zylosDir, document: planned.document, nowMs,
+          failoverInstanceIds: new Set(changes.map(change => change.instanceId)) });
+      } catch (err) {
+        log(`[fable-guard] plan failed (${err.message}); account failover continues without it`);
+      }
       if (changes.length > 0 || planned.stateChanged) writeInstancesAtomic(planned.document);
+      if (guard?.changed) {
+        writeGuardJson(fableGuardStatePath(zylosDir), guard.state);
+        for (const event of guard.events) log(`[fable-guard] ${event}`);
+        fableRestarts = guard.restarts;
+      }
     });
   } else if (fs.existsSync(SINGLE_PROFILE_FILE)) {
     withFileLock(`${SINGLE_PROFILE_FILE}.lock`, () => {
@@ -625,18 +643,22 @@ export function applyRuntimeFailover({
     });
     log(`[runtime-failover] ${change.instanceId}: ${change.fromProfile} -> ${change.toProfile} (${change.reason})`);
   }
+  if (fableRestarts.length) executeFableRestarts({ zylosDir, restarts: fableRestarts, nowMs, execFileSyncImpl, log });
   return changes;
 }
 
 export async function runDaemon({
   pollMs = DEFAULT_POLL_MS,
   apply = applyRuntimeFailover,
+  probe = scheduleFableProbes,
   log = console.log,
   error = console.error,
 } = {}) {
   log(`[runtime-failover] daemon started (poll=${pollMs}ms)`);
   try { await processSwitchNotices({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[runtime-switch-notices] ${err.message}`); }
   while (true) {
+    // Fable probes run in the background; a slow probe never delays failover.
+    try { probe({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[fable-guard] ${err.message}`); }
     try { apply({ log }); } catch (err) { error(`[runtime-failover] ${err.message}`); }
     try { await processSwitchNotices({ zylosDir: ZYLOS_DIR, log }); } catch (err) { error(`[runtime-switch-notices] ${err.message}`); }
     await new Promise(resolve => setTimeout(resolve, pollMs));
