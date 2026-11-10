@@ -348,3 +348,54 @@ describe('Fable launch record is intent, not proof (review-2 #2)', () => {
   });
 });
 
+describe('Fable lease enforcement shares the execution fence (review-2 #3)', () => {
+  it('replacement during monitor enforcement: the daemon replaces the session after the admission check; the replacement Opus session is not stopped', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const world = sessionWorld();
+    let replaced = false;
+    // The daemon wins the per-persona execution claim just before the monitor
+    // acts: it relaunches the persona on Opus (new launch record, new session).
+    const lock = (lockPath, fn) => {
+      if (!replaced && lockPath.includes('fable-exec')) {
+        replaced = true;
+        fx.writeState('opus', 4);
+        fx.launch(clock.now);
+        world.replace('claude-opus-5-5');
+      }
+      return fn();
+    };
+    const { monitor, logs } = monitorInWorld(fx, clock, world, { lock });
+    clock.now = T0 + 13 * MIN;
+    monitor.tick();
+    clock.now += 3 * MIN;
+    monitor.tick();
+    assert.equal(replaced, true, 'the monitor claimed the same per-persona execution fence');
+    assert.deepEqual(world.stops, [], 'the replacement was never stopped');
+    assert.equal(world.alive, true);
+    assert.ok(logs.some(line => /superseded/.test(line)));
+  });
+
+  it('skips while the daemon holds the persona execution claim, then acts on the same session', async () => {
+    const { claimExecution, completeExecution } = await import('../fable-exec-claim.js');
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const world = sessionWorld();
+    const { monitor } = monitorInWorld(fx, clock, world);
+    const held = claimExecution({ zylosDir: fx.zylosDir, instanceId: 'user-pan', nowMs: T0 + 15 * MIN,
+      op: { owner: 'daemon', kind: 'restart', generation: 9, attempt: 1 } });
+    assert.equal(held.ok, true);
+    clock.now = T0 + 13 * MIN;
+    monitor.tick();
+    clock.now += 3 * MIN;
+    monitor.tick();
+    assert.deepEqual(world.stops, [], 'the daemon is executing for this persona');
+    completeExecution({ zylosDir: fx.zylosDir, instanceId: 'user-pan', token: held.token, outcome: 'failed', nowMs: clock.now });
+    clock.now += 15_000;
+    monitor.tick();
+    assert.equal(world.stops.length, 1);
+  });
+});
+

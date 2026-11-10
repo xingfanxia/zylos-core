@@ -8,7 +8,9 @@
  *    reports; the launch record is only the launch intent) and whose admission
  *    no longer holds (lease expired, hold, Opus committed, threshold) is
  *    stopped after a grace that lets a live daemon act first. The stop is
- *    bound to that exact session (sessionRef). A
+ *    bound to that exact session (sessionRef) and to the per-persona execution
+ *    claim the daemon's executor uses; it is revalidated at the moment of
+ *    acting, so a session the daemon replaced meanwhile is never stopped. A
  *    stop is done only when the session is observed gone; a failed or
  *    unconfirmed stop is retried with backoff and an ALERT. The Guardian
  *    relaunch re-evaluates admission (prepareFableLaunch) and comes up on Opus.
@@ -25,8 +27,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { LIMIT_EVIDENCE_FILE, READINESS_FILE, SESSION_FAILURES_FILE } from './fable-guard.js';
+import { claimExecution, completeExecution } from './fable-exec-claim.js';
 import { readSessionRef as readTmuxSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { runtimeSwitchSignalPath } from './runtime-switch-signal.js';
+import { withFileLock } from '../../multi-session/file-lock.js';
 import {
   FABLE_LAUNCH_FILE,
   fableAdmission,
@@ -126,6 +130,7 @@ export function createFableMonitor({
   fenceReplacedSession = () => {},
   // C4 delivery_uncertain for this persona: { list() -> unnotified rows, markNotified(id) }.
   uncertainDeliveries = null,
+  lock = withFileLock,
   now = () => Date.now(),
   log = () => {},
   graceMs = LEASE_ENFORCEMENT_GRACE_MS,
@@ -142,6 +147,7 @@ export function createFableMonitor({
   let unadmitted = null;
   // A stop decided for one exact session, kept until that session is observed gone.
   let pending = null;
+  let busyLogged = null;
   // The next session exit is planned or already counted (recovery kill, lease enforcement).
   let plannedStop = null;
 
@@ -253,28 +259,62 @@ export function createFableMonitor({
 
   function enforce(nowMs) {
     if (nowMs < pending.nextAt) return null;
-    pending.attempts += 1;
-    plannedStop = 'lease_enforcement';
-    let error = null;
-    try { stopSession(pending.sessionRef); } catch (err) { error = err.message; }
-    const after = safe(() => probeSession(pending.sessionRef), 'unknown');
-    if (after === 'gone') {
-      const record = { at: iso(nowMs), status: 'confirmed', confirmed_at: iso(nowMs) };
-      writeEnforcement(record);
-      log(`Fable guard: lease enforcement stopped session ${pending.sessionRef} (attempt ${pending.attempts}); `
-        + 'the relaunch is admitted to Opus only');
-      try { fenceReplacedSession(pending.sessionRef); } catch (err) { log(`Fable guard key fence failed: ${err.message}`); }
-      const done = { ...pending, ...record };
-      pending = null;
-      return done;
+    const op = { owner: 'monitor', kind: 'lease_stop', generation: pending.generation, attempt: pending.attempts + 1,
+      launchId: pending.launchId, sessionRef: pending.sessionRef };
+    let claim;
+    try {
+      claim = claimExecution({ zylosDir, instanceId, op, nowMs, lock });
+    } catch (err) {
+      log(`Fable guard lease enforcement: execution claim failed (${err.message}); retrying`);
+      return null;
     }
-    plannedStop = null;
-    const detail = `${error ? `stop failed: ${error}; ` : ''}session ${after}`;
-    pending.nextAt = nowMs + backoff(pending.attempts, STOP_RETRY_MS, STOP_RETRY_MAX_MS);
-    writeEnforcement({ at: iso(nowMs), status: 'pending', last_error: detail, next_attempt_at: iso(pending.nextAt) });
-    log(`Fable guard ALERT: lease enforcement stop of session ${pending.sessionRef} not confirmed (attempt ${pending.attempts}: `
-      + `${detail}); Fable may still be running, retrying at ${iso(pending.nextAt)}`);
-    return { ...pending, status: 'pending', last_error: detail };
+    if (!claim.ok) {
+      if (busyLogged !== claim.reason) log(`Fable guard lease enforcement waits: ${claim.reason} executing for ${instanceId}`);
+      busyLogged = claim.reason;
+      return null;
+    }
+    busyLogged = null;
+    let outcome = 'failed';
+    let detail = null;
+    try {
+      // Revalidate at the moment of acting: still the session and launch that were judged.
+      const sessionRef = safe(readSessionRef);
+      const launch = readLaunch();
+      if (sessionRef !== pending.sessionRef || (pending.launchId && launch?.launch_id !== pending.launchId)) {
+        outcome = 'done';
+        detail = 'superseded';
+        log(`Fable guard lease enforcement superseded: session ${pending.sessionRef} (launch ${pending.launchId || 'unrecorded'}) `
+          + `was replaced (now ${sessionRef || 'none'}, launch ${launch?.launch_id || 'none'}); nothing stopped`);
+        writeEnforcement({ at: iso(nowMs), status: 'superseded', superseded_by: sessionRef || null });
+        pending = null;
+        return null;
+      }
+      pending.attempts += 1;
+      plannedStop = 'lease_enforcement';
+      let error = null;
+      try { stopSession(pending.sessionRef); } catch (err) { error = err.message; }
+      const after = safe(() => probeSession(pending.sessionRef), 'unknown');
+      if (after === 'gone') {
+        outcome = 'done';
+        const record = { at: iso(nowMs), status: 'confirmed', confirmed_at: iso(nowMs) };
+        writeEnforcement(record);
+        log(`Fable guard: lease enforcement stopped session ${pending.sessionRef} (attempt ${pending.attempts}); `
+          + 'the relaunch is admitted to Opus only');
+        try { fenceReplacedSession(pending.sessionRef); } catch (err) { log(`Fable guard key fence failed: ${err.message}`); }
+        const done = { ...pending, ...record };
+        pending = null;
+        return done;
+      }
+      plannedStop = null;
+      detail = `${error ? `stop failed: ${error}; ` : ''}session ${after}`;
+      pending.nextAt = nowMs + backoff(pending.attempts, STOP_RETRY_MS, STOP_RETRY_MAX_MS);
+      writeEnforcement({ at: iso(nowMs), status: 'pending', last_error: detail, next_attempt_at: iso(pending.nextAt) });
+      log(`Fable guard ALERT: lease enforcement stop of session ${pending.sessionRef} not confirmed (attempt ${pending.attempts}: `
+        + `${detail}); Fable may still be running, retrying at ${iso(pending.nextAt)}`);
+      return { ...pending, status: 'pending', last_error: detail };
+    } finally {
+      try { completeExecution({ zylosDir, instanceId, token: claim.token, outcome, detail, nowMs, lock }); } catch { /* best effort */ }
+    }
   }
 
   function tick() {
