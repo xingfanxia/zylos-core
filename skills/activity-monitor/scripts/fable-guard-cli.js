@@ -136,9 +136,13 @@ function formatStatus({ config, accounts, personas }) {
       : verified.not_running_at ? 'not running' : 'converging';
     lines.push(`${head} launch=${item.launch ? `${item.launch.mode}@${item.launch.runtime_profile} g${item.launch.generation ?? '-'}` : '-'}`
       + ` state=${state}`
-      + (item.safe_stop ? ` SAFE-STOPPED (${item.safe_stop.why}); after checking: pm2 start activity-monitor-${id}` : '')
+      + (item.safe_stop?.confirmed_at
+        ? ` SAFE-STOPPED (${item.safe_stop.why}, confirmed ${item.safe_stop.confirmed_at}); after checking: pm2 start activity-monitor-${id}`
+        : item.safe_stop ? ` SAFE-STOP PENDING (${item.safe_stop.why}, attempt ${item.safe_stop.attempts || 1}`
+          + `${item.safe_stop.last_error ? `: ${item.safe_stop.last_error}` : ''}); Fable may still be running` : '')
       + (item.gave_up && !item.safe_stop ? ` GAVE UP (${item.gave_up})` : '')
-      + (item.lease_enforcement ? ` lease-enforced ${item.lease_enforcement.at}` : '')
+      + (item.lease_enforcement ? ` lease-enforcement ${item.lease_enforcement.status || 'stopped'} ${item.lease_enforcement.at}`
+        + (item.lease_enforcement.last_error && item.lease_enforcement.status === 'pending' ? ` (${item.lease_enforcement.last_error})` : '') : '')
       + item.uncertain_deliveries.map(entry => ` UNCERTAIN DELIVERY ${entry.item_type} #${entry.item_id}`
         + `${entry.preview ? ` "${entry.preview}"` : ''} at ${entry.detected_at}`).join(''));
   }
