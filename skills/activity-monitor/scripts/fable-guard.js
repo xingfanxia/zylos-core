@@ -286,14 +286,18 @@ export function planFableGuard({
     let mode = 'opus';
     const allowed = eligible && accountAllowsFable(next, usage, profileId, config, nowMs);
     if (allowed) mode = priorMode === 'fable' || upgradeReady(persona, status, nowMs, config) ? 'fable' : 'opus';
+    // An account without its own settings file (claude-ax-main) cannot be
+    // probed, so it never runs Fable. That is a supported, final state.
+    if (enabled && !eligible) persona.unsupported = 'account_without_settings_file';
+    else delete persona.unsupported;
     const expected = expectedFableLaunch({ document, instanceId: id, mode });
     const launch = launchByInstance[id] || null;
     const changed = !persona.desired || persona.desired.mode !== mode || persona.desired.account !== profileId
       || persona.desired.key !== expected.key;
     if (changed) {
       const generation = ++next.generation_seq;
-      const reason = !enabled ? 'fable_disabled' : mode === 'fable' ? 'fable_allowed' : allowed ? 'upgrade_pending'
-        : `fable_blocked:${Object.keys(next.holds[profileId] || {}).join('+') || (eligible ? 'no_lease' : 'unsupported_account')}`;
+      const reason = !enabled ? 'fable_disabled' : !eligible ? 'unsupported_account' : mode === 'fable' ? 'fable_allowed'
+        : allowed ? 'upgrade_pending' : `fable_blocked:${Object.keys(next.holds[profileId] || {}).join('+') || 'no_lease'}`;
       if (priorMode !== mode) persona.last_transition_at = iso(nowMs);
       persona.desired = { account: profileId, mode, generation, key: expected.key, model: baseModel(expected.model),
         committed_at: iso(nowMs), reason };

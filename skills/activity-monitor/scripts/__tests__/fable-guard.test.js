@@ -844,6 +844,41 @@ describe('Fable guard readiness and crash contracts (review #6)', () => {
   });
 });
 
+describe('Fable guard on an account without its own settings file (verdict e)', () => {
+  it('claude-ax-main is explicitly unsupported: always Opus, shown as such, never recovering', () => {
+    const sim = new Sim();
+    sim.document.instances['user-pan'].runtime_profile = 'claude-ax-main';
+    sim.cached['user-pan'] = null;
+    sim.monitorStart('user-pan');
+    sim.observe(BACKUP, 0.1);
+    sim.launchAll(sim.pass().restarts);
+    sim.advance(MIN);
+    sim.pass();
+    const pan = sim.state.personas['user-pan'];
+    assert.equal(pan.desired.mode, 'opus');
+    assert.equal(pan.desired.reason, 'unsupported_account');
+    assert.equal(pan.unsupported, 'account_without_settings_file');
+    assert.equal(sim.launches['user-pan'].reason, 'unsupported_account');
+    assert.ok(!fableProbeAccounts(sim.document).has('claude-ax-main'), 'never probed');
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-main-'));
+    try {
+      fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
+      fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(sim.document));
+      fs.writeFileSync(fableGuardStatePath(zylosDir), JSON.stringify(sim.state));
+      const cli = path.resolve(import.meta.dirname, '..', 'fable-guard-cli.js');
+      const env = { ...process.env, ZYLOS_DIR: zylosDir };
+      const text = spawnSync(process.execPath, [cli, 'status'], { env, encoding: 'utf8' }).stdout;
+      const line = text.split('\n').find(row => row.startsWith('persona user-pan'));
+      assert.match(line, /UNSUPPORTED account claude-ax-main: always Opus/);
+      assert.doesNotMatch(text, /recover/i);
+      const json = JSON.parse(spawnSync(process.execPath, [cli, 'status', '--json'], { env, encoding: 'utf8' }).stdout);
+      assert.equal(json.personas['user-pan'].unsupported, 'account_without_settings_file');
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('Fable guard daemon integration', () => {
   function writeFixture(zylosDir, document) {
     fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
