@@ -370,3 +370,23 @@ describe('Enter is bound to the pasted pane (Astra #5)', () => {
   });
 });
 
+// ── D: with no modal on screen, delivery is byte-for-byte base ─────────────
+// fixtures/base-delivery-calls.d16221a.json was recorded by running the same
+// scenario drivers (fixtures/tmux-pane-model.js) against the base commit
+// d16221a4 (before the Fable guard). The check covers the whole tmux call
+// sequence, reads included; only the per-process buffer name is normalized.
+describe('no modal on screen: tmux calls identical to base d16221a4 (Astra #5, scope)', async () => {
+  const model = await import('./fixtures/tmux-pane-model.js');
+  const base = JSON.parse(fs.readFileSync(new URL('./fixtures/base-delivery-calls.d16221a.json', import.meta.url), 'utf8'));
+
+  for (const [name, scenario] of Object.entries(model.DELIVERY_SCENARIOS)) {
+    it(`single-session sendToTmux: ${name}`, async () => {
+      assert.ok(base.single[name], `base recording has scenario ${name}`);
+      assert.deepEqual(await model.runSingleScenario(sendToTmux, scenario), base.single[name]);
+    });
+  }
+
+  it('multi-session dispatcher: conversation delivery', async () => {
+    assert.deepEqual(await model.runMultiConversation(sendToTmux, processWithMultiSession), base.multi.conversation);
+  });
+});
