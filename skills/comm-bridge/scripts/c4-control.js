@@ -3,7 +3,7 @@
  * C4 Communication Bridge - Control Queue Interface
  *
  * Commands:
- *   enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]
+ *   enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>] [--session-ref <ref>]
  *   get --id <control_id>
  *   ack --id <control_id>
  */
@@ -13,13 +13,15 @@ import {
   getControlById,
   ackControl,
   expireTimedOutControls,
+  assertSessionRef,
   close
 } from './c4-db.js';
 import { shouldUseBroker, brokerCall } from './c4-client.js';
 
 function usage() {
   console.error('Usage: c4-control.js <enqueue|get|ack> [options]');
-  console.error('  enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>]');
+  console.error('  enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>] [--session-ref <ref>]');
+  console.error('           --session-ref binds a [KEYSTROKE] control to one tmux session (session_id:session_created:pane_id:pane_pid)');
   console.error('           Legacy alias: --require-idle');
   console.error('  get --id <control_id>');
   console.error('  ack --id <control_id>');
@@ -93,6 +95,12 @@ async function handleEnqueue(args) {
   const requireIdle = hasFlag(args, '--block-queue-until-idle') || hasFlag(args, '--require-idle');
   const appendAckSuffix = !hasFlag(args, '--no-ack-suffix');
   const bypassState = hasFlag(args, '--bypass-state');
+  // A session binding only ever restricts delivery (a key for another session
+  // is superseded), so it is honored on both the broker and the admin path.
+  const sessionRef = parseStringArg(args, '--session-ref') || null;
+  if (sessionRef !== null) {
+    try { assertSessionRef(sessionRef); } catch (err) { errorExit(err.message); }
+  }
 
   // Isolated agents route through the broker, which forces target_instance to
   // the authenticated caller (an isolated agent cannot enqueue to another
@@ -100,6 +108,7 @@ async function handleEnqueue(args) {
   if (shouldUseBroker()) {
     const data = await brokerCall('enqueue', {
       content, priority: priority ?? 3, requireIdle, bypassState, appendAckSuffix, ackDeadlineAt, availableAt,
+      ...(sessionRef ? { sessionRef } : {}),
     });
     console.log(`OK: enqueued control ${data.id}`);
     if (data.superseded_count > 0) {
@@ -118,7 +127,8 @@ async function handleEnqueue(args) {
     appendAckSuffix,
     ackDeadlineAt,
     availableAt,
-    targetInstance
+    targetInstance,
+    sessionRef
   });
 
   console.log(`OK: enqueued control ${record.id}`);

@@ -17,7 +17,7 @@ Control messages are stored in the `control_queue` table in `~/zylos/comm-bridge
 Insert a new control message into the queue.
 
 ```bash
-c4-control.js enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix]
+c4-control.js enqueue --content "<text>" [--priority 3] [--block-queue-until-idle] [--bypass-state] [--ack-deadline <seconds>] [--available-in <seconds>] [--no-ack-suffix] [--target-instance <id>] [--session-ref <ref>]
 ```
 
 | Option | Description |
@@ -29,6 +29,8 @@ c4-control.js enqueue --content "<text>" [--priority 3] [--block-queue-until-idl
 | `--ack-deadline <seconds>` | Seconds from now until the control times out if unacknowledged |
 | `--available-in <seconds>` | Delay before the control becomes eligible for delivery |
 | `--no-ack-suffix` | Do not append `ack via` suffix; dispatcher marks done right after successful submit |
+| `--target-instance <id>` | Target instance (admin path; broker callers are forced to themselves) |
+| `--session-ref <ref>` | Bind a `[KEYSTROKE]` control to one tmux session (`session_id:session_created:pane_id:pane_pid`); a key for another session is superseded, never sent. See SKILL.md → Session fence |
 
 **Output:**
 
@@ -111,6 +113,7 @@ pending ──► running ──► done
                    └──► failed
 pending ──► timeout  (ack deadline exceeded)
 pending ──► superseded  (replaced by a newer equivalent pending control)
+pending/running ──► superseded  ([KEYSTROKE] fenced to a replaced session)
 ```
 
 - `pending`: Queued, waiting for delivery
@@ -118,7 +121,7 @@ pending ──► superseded  (replaced by a newer equivalent pending control)
 - `done`: Acknowledged successfully
 - `failed`: Delivery or processing failed
 - `timeout`: Ack deadline exceeded without acknowledgement
-- `superseded`: Older equivalent pending control replaced by a newer one; retained for audit only
+- `superseded`: Older equivalent pending control replaced by a newer one, or a `[KEYSTROKE]` control whose session was replaced (`last_error` = `SESSION_REPLACED`, `SESSION_PREDATES` or the reason passed to `supersedeControlsForSession`); final, never delivered; retained for audit only
 
 ## Examples
 

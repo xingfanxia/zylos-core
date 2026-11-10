@@ -419,8 +419,10 @@ export function insertControl(content, options = {}) {
     ackDeadlineAt = null,
     availableAt = null,
     appendAckSuffix = true,
-    targetInstance = null
+    targetInstance = null,
+    sessionRef = null
   } = options;
+  if (sessionRef !== null) assertSessionRef(sessionRef);
 
   const tx = database.transaction(() => {
     const current = nowSeconds();
@@ -464,19 +466,27 @@ export function insertControl(content, options = {}) {
       SET content = ?, updated_at = ?
       WHERE id = ?
     `).run(finalContent, current, id);
+    if (sessionRef !== null) {
+      database.prepare('UPDATE control_queue SET session_ref = ? WHERE id = ?').run(sessionRef, id);
+    }
 
+    // A keystroke only replaces an equivalent pending key for the SAME session
+    // binding: a late key of a replaced session must never discard the key
+    // queued for its replacement, nor the other way round.
+    const sameSession = content.startsWith(KEYSTROKE_PREFIX);
     const supersedeResult = database.prepare(`
       UPDATE control_queue
       SET status = 'superseded', updated_at = ?, last_error = NULL
       WHERE id != ?
         AND status = 'pending'
         AND raw_content = ?
-        AND target_instance IS ?
+        AND target_instance IS ?${sameSession ? '\n        AND session_ref IS ?' : ''}
     `).run(
       current,
       id,
       content,
-      targetInstance
+      targetInstance,
+      ...(sameSession ? [sessionRef] : [])
     );
 
     const row = database.prepare(`
@@ -488,11 +498,85 @@ export function insertControl(content, options = {}) {
 
     return {
       ...row,
+      session_ref: sessionRef,
       superseded_count: supersedeResult.changes || 0
     };
   });
 
   return tx();
+}
+
+// ── [KEYSTROKE] session fence ──────────────────────────────────────────────
+//
+// A keystroke control is a raw key for one particular Claude session. Its
+// binding (control_queue.session_ref) is the tmux pane identity
+// `${session_id}:${session_created}:${pane_id}:${pane_pid}` — the same string
+// readSessionRef() / readTmuxInputState().paneIdentity return. An enqueuer that
+// knows the session passes it (insertControl({ sessionRef }) or
+// `c4-control.js enqueue --session-ref`); otherwise the dispatcher binds the
+// key to the pane it reads when it claims the row. A key whose binding is not
+// the pane on screen is superseded, never delivered (see c4-dispatcher.js
+// fenceKeystrokeControl). Rows without a binding behave as before this column.
+
+const SESSION_REF_RE = /^\$\d+:\d+:%\d+:\d+$/;
+const KEYSTROKE_PREFIX = '[KEYSTROKE]';
+
+export function assertSessionRef(sessionRef) {
+  if (typeof sessionRef !== 'string' || !SESSION_REF_RE.test(sessionRef)) {
+    throw new Error(`invalid sessionRef ${JSON.stringify(sessionRef)}: expected session_id:session_created:pane_id:pane_pid`);
+  }
+}
+
+/**
+ * Bind a claimed control to a session unless it already has a binding.
+ * @returns {{ sessionRef: string|null, stamped: boolean }} the binding now on
+ *   the row; `stamped` is true when this call set it.
+ */
+export function bindControlSession(id, sessionRef) {
+  assertSessionRef(sessionRef);
+  const database = getDb();
+  return database.transaction(() => {
+    const row = database.prepare('SELECT session_ref FROM control_queue WHERE id = ?').get(id);
+    if (!row) return { sessionRef: null, stamped: false };
+    if (row.session_ref) return { sessionRef: row.session_ref, stamped: false };
+    const changed = database.prepare(`
+      UPDATE control_queue SET session_ref = ?, updated_at = ?
+      WHERE id = ? AND session_ref IS NULL AND status = 'running'
+    `).run(sessionRef, nowSeconds(), id).changes > 0;
+    return { sessionRef: changed ? sessionRef : null, stamped: changed };
+  })();
+}
+
+/** Supersede one pending or claimed control (final; never delivered). */
+export function supersedeControl(id, reason) {
+  return getDb().prepare(`
+    UPDATE control_queue
+    SET status = 'superseded', last_error = ?, updated_at = ?
+    WHERE id = ? AND status IN ('pending', 'running')
+  `).run(reason || 'SUPERSEDED', nowSeconds(), id).changes > 0;
+}
+
+/**
+ * Fence a replaced session: supersede every pending AND already-claimed
+ * [KEYSTROKE] control of `instanceId` bound to `sessionRef` (the OLD session).
+ * Controls bound to any other session — the replacement's included — and
+ * unbound controls are untouched; the dispatcher fences unbound ones at claim.
+ * A superseded row is final: requeue, ack, claim and orphan reset leave it be.
+ * @param {{ instanceId: string, sessionRef: string, reason?: string }} args
+ * @returns {{ superseded: number }}
+ */
+export function supersedeControlsForSession({ instanceId, sessionRef, reason } = {}) {
+  if (typeof instanceId !== 'string' || !instanceId) throw new Error('supersedeControlsForSession: instanceId is required');
+  assertSessionRef(sessionRef);
+  const changes = getDb().prepare(`
+    UPDATE control_queue
+    SET status = 'superseded', last_error = ?, updated_at = ?
+    WHERE target_instance = ? AND session_ref = ?
+      AND status IN ('pending', 'running')
+      AND substr(raw_content, 1, ?) = ?
+  `).run(reason || 'SESSION_SUPERSEDED', nowSeconds(), instanceId, sessionRef,
+    KEYSTROKE_PREFIX.length, KEYSTROKE_PREFIX).changes || 0;
+  return { superseded: changes };
 }
 
 /**

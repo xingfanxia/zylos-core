@@ -65,16 +65,10 @@ export async function runSingleScenario(sendToTmux, scenario) {
   return { results, calls: normalizeCalls(model.calls) };
 }
 
-export async function runMultiConversation(sendToTmux, processWithMultiSession, extraHelpers = {}) {
-  const model = paneModel();
-  const rows = [{ id: 42, type: 'conversation', channel: 'feishu', endpoint_id: 'chat-1', target_instance: 'user-pan',
-    content: 'hello from feishu', status: 'pending' }];
-  const delivered = [];
-  const submissions = new Map();
-  const receipts = new Map();
-  const helpers = {
+function multiHelpers(rows, delivered, extraHelpers) {
+  return {
     getAgentState: () => ({ state: 'idle', health: 'ok', idleSeconds: 10, healthy: true }),
-    isStatusFresh: () => true, isAgentStatusFresh: () => true, isBypassState: () => false,
+    isStatusFresh: () => true, isAgentStatusFresh: () => true, isBypassState: (item) => item.bypass_state === 1,
     shouldAutoAckHeartbeat: () => false, waitForRequireIdleSettlement: async () => {},
     readProcState: () => ({ alive: true }), isAgentConfirmedActive: () => false, log: () => {}, sleep: async () => {},
     nowSeconds: () => 0, getDeliveryContent: (item) => item.content, markRejected: () => {}, markControlRejected: () => {},
@@ -88,12 +82,52 @@ export async function runMultiConversation(sendToTmux, processWithMultiSession, 
     },
     releaseItem: (item) => { rows.find((r) => r.id === item.id).status = 'pending'; },
     markDelivered: (id) => { delivered.push(id); rows.find((r) => r.id === id).status = 'delivered'; },
-    ackControl: () => {}, handleConversationDeliveryFailure: async () => {}, handleControlDeliveryFailure: async () => {},
+    ackControl: (id) => { delivered.push(id); rows.find((r) => r.id === id).status = 'done'; },
+    handleConversationDeliveryFailure: async () => {}, handleControlDeliveryFailure: async () => {},
     notifyMessageDelivered: () => Promise.resolve(),
-    sendToTmux: (message, opts) => sendToTmux(message, { ...opts, runtime: 'claude', execFileSyncImpl: model.exec,
-      sleepImpl: async () => {}, pendingSubmissions: submissions, submissionReceipts: receipts }),
     ...extraHelpers,
   };
+}
+
+// A [KEYSTROKE] control through processWithMultiSession, wired with the given
+// dispatcher module's own helpers. sendKeystroke issues exactly the
+// dispatcher's call (`send-keys -t <session> <key>`). When the dispatcher
+// reads the pane before a key (readKeystrokeTarget), that read goes to the same
+// fake pane; the DB binding is stubbed as "bound to the pane on screen".
+export async function runMultiKeystroke(dispatcher, processWithMultiSession, { instance = 'user-pan', key = 'Escape' } = {}) {
+  const model = paneModel();
+  const rows = [{ id: 8, type: 'control', priority: 0, bypass_state: 1, target_instance: instance,
+    content: `[KEYSTROKE]${key}`, status: 'pending', created_at: 2000 }];
+  const delivered = [];
+  const fenced = typeof dispatcher.readKeystrokeTarget === 'function' ? {
+    readKeystrokeTarget: (session) => dispatcher.readKeystrokeTarget(session, { execFileSyncImpl: model.exec }),
+    fenceKeystrokeControl: (item, target) => dispatcher.fenceKeystrokeControl(item, target,
+      { bind: () => ({ sessionRef: target.sessionRef, stamped: false }) }),
+    supersedeControl: () => true,
+  } : {};
+  const helpers = multiHelpers(rows, delivered, {
+    isKeystrokeControl: dispatcher.isKeystrokeControl, parseKeystrokeKey: dispatcher.parseKeystrokeKey,
+    sendKeystroke: (target, k) => model.exec('tmux', ['send-keys', '-t', target, k]),
+    sendToTmux: async () => { throw new Error('a keystroke is never pasted'); },
+    ...fenced,
+  });
+  const result = await processWithMultiSession(helpers);
+  return { delivered: result.delivered, rows: delivered, calls: normalizeCalls(model.calls) };
+}
+
+export async function runMultiConversation(sendToTmux, processWithMultiSession, extraHelpers = {},
+  { instance = 'user-pan', runtime = 'claude' } = {}) {
+  const model = paneModel();
+  const rows = [{ id: 42, type: 'conversation', channel: 'feishu', endpoint_id: 'chat-1', target_instance: instance,
+    content: 'hello from feishu', status: 'pending' }];
+  const delivered = [];
+  const submissions = new Map();
+  const receipts = new Map();
+  const helpers = multiHelpers(rows, delivered, {
+    sendToTmux: (message, opts) => sendToTmux(message, { ...opts, ...(runtime ? { runtime } : {}), execFileSyncImpl: model.exec,
+      sleepImpl: async () => {}, pendingSubmissions: submissions, submissionReceipts: receipts }),
+    ...extraHelpers,
+  });
   const result = await processWithMultiSession(helpers);
   return { delivered: result.delivered, rows: delivered, calls: normalizeCalls(model.calls) };
 }
