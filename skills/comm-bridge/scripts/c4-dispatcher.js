@@ -508,19 +508,26 @@ function replacementResult(pending) {
   return { verified: !!(pending.shutdown && pending.observed && pending.enterSent), state: 'replaced' };
 }
 
+// The read that decides an Enter is the last tmux call before it: no await and
+// no other tmux call in between. It must have succeeded, show the pane the text
+// was pasted into (pane identity = session id, session start, pane id, pane
+// pid), and show no modal. A failed capture or another pane means no Enter.
+function enterAllowed(pending, state) {
+  if (!state || state.captureOk === false) return false;
+  if (pending.paneIdentity && state.paneIdentity !== pending.paneIdentity) return false;
+  return !state.modal;
+}
+
 export async function submitAndVerify(session, {
-  pending, readState, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
+  pending, readState, lastState = null, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
 } = {}) {
   const enter = () => execFileSyncImpl('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
   const deferred = () => { pending.modalDeferred = true; return { verified: false, state: 'modal' }; };
+  const unbound = () => ({ verified: false, state: 'capture_failed' });
   // A modal can open at any moment (a usage-credits consent dialog opens on its
-  // own). Every Enter therefore gets a fresh frame of its own, read right before
-  // the key, and is withheld while a modal owns the keyboard.
-  const enterUnlessModal = () => {
-    if (readState().modal) return false;
-    enter();
-    return true;
-  };
+  // own), and the pane can be replaced. Each Enter is therefore decided by the
+  // read directly before it (enterAllowed), never by an older frame.
+  let decisive = lastState;
   if (!pending.observed) {
     // Native bracketed paste is asynchronous. An old empty frame cannot prove
     // that the newly pasted message was consumed. Observe its populated
@@ -531,6 +538,7 @@ export async function submitAndVerify(session, {
       if (state.modal) return deferred();
       if (state.inputState === 'has_content' && !state.usageOverlay) {
         pending.observed = true;
+        decisive = state;
         break;
       }
       await sleepImpl(250);
@@ -538,7 +546,13 @@ export async function submitAndVerify(session, {
     if (!pending.observed) return { verified: false, state: 'paste_unobserved' };
   }
   if (!pending.enterSent) {
-    if (!enterUnlessModal()) return deferred();
+    // A resumed submission is decided by the caller's last read (passed as
+    // lastState with no tmux call after it), or by a fresh read.
+    const state = decisive || readState();
+    if (wasReplaced(pending, state)) return replacementResult(pending);
+    if (state.modal) return deferred();
+    if (!enterAllowed(pending, state)) return unbound();
+    enter();
     pending.enterSent = true;
   }
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
@@ -551,8 +565,9 @@ export async function submitAndVerify(session, {
     // could interrupt it. Keep the delivery pending until its composer clears.
     if (state.inProgressCapture) return { verified: false, state: 'working' };
     if (state.inputState === 'has_content' && !state.usageOverlay) {
+      if (!enterAllowed(pending, state)) return unbound();
       logImpl(`Enter verify attempt ${attempt + 1}: owned input remains, retrying Enter`);
-      if (!enterUnlessModal()) return deferred();
+      enter();
     }
   }
   return { verified: false, state: 'indeterminate' };
@@ -641,7 +656,9 @@ async function sendToTmux(message, options = {}) {
     await wait(getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8')));
   }
   let result = { verified: false, state: 'indeterminate' };
-  try { result = await submitAndVerify(session, { pending, readState, execFileSyncImpl: exec, sleepImpl: wait }); }
+  // `initial` is the last read when the paste already exists (no tmux call
+  // since); a fresh paste is observed, and so decided, inside submitAndVerify.
+  try { result = await submitAndVerify(session, { pending, readState, lastState: initial, execFileSyncImpl: exec, sleepImpl: wait }); }
   catch (err) { log(`Warning: Enter verification error: ${err.message}`); }
   if (result.verified) {
     submissions.delete(session);

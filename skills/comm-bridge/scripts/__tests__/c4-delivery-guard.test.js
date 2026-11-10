@@ -22,7 +22,7 @@ fs.writeFileSync(path.join(root, 'instances.json'), JSON.stringify({ version: 1,
 } }));
 
 const dispatcher = await import('../c4-dispatcher.js');
-const { sendToTmux, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey } = dispatcher;
+const { sendToTmux, submitAndVerify, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey } = dispatcher;
 const { processWithMultiSession } = await import('../c4-dispatcher-multi.js');
 const { detectModal } = await import('../tmux-input-state.js');
 const fx = await import('./fixtures/claude-dialogs.js');
@@ -32,6 +32,8 @@ const LIMIT = { kind: 'fable_limit', text: "You've reached your Fable limit" };
 const st = (inputState, extra = {}) => ({ inputState, paneIdentity: 'pane-one', inProgressCapture: false,
   usageOverlay: false, modal: null, ...extra });
 const modal = (extra = {}) => st('indeterminate', { modal: LIMIT, ...extra });
+// A non-limit dialog (e.g. a permission prompt or a future CLI dialog).
+const otherModal = (extra = {}) => st('indeterminate', { modal: { kind: 'unknown', text: 'Something new' }, ...extra });
 
 function harness(states) {
   let i = 0;
@@ -51,31 +53,32 @@ describe('sendToTmux delivery guard', () => {
     const h = harness([modal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.calls.length, 0);
-    h.useStates([st('empty'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('empty'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 1);
   });
 
   it('withholds the first Enter when the modal opens between paste and Enter', async () => {
-    // initial, observed paste, then the frame read right before Enter shows the dialog
-    const h = harness([st('empty'), st('has_content'), modal()]);
+    // initial, then the read that decides the first Enter (right after the
+    // paste, no tmux call in between) shows the dialog
+    const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 0);
     // Dialog dismissed, the composer shows the owned text again: Enter once, no second paste.
-    h.useStates([st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 1);
   });
 
   it('withholds a retried Enter when the modal opens after the first Enter', async () => {
-    // first Enter did not take (composer still holds text); the pre-retry frame shows the dialog
-    const h = harness([st('empty'), st('has_content'), st('has_content'), st('has_content'), modal()]);
+    // the read after the first Enter (the one that would decide a retry) shows a dialog
+    const h = harness([st('empty'), st('has_content'), otherModal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.enters(), 1);
-    h.useStates([st('has_content'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('has_content'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
     assert.equal(h.enters(), 2);
@@ -84,17 +87,17 @@ describe('sendToTmux delivery guard', () => {
   it('re-pastes once when the modal swallowed the paste (no Enter was ever sent)', async () => {
     const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
-    h.useStates([st('empty'), st('empty'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('empty'), st('empty'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 2);
     assert.equal(h.enters(), 1);
   });
 
   it('carries a held-back message into the replacement pane after a guard restart', async () => {
-    const h = harness([st('empty'), st('has_content'), modal()]);
+    const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:7' }), 'modal_deferred');
     const two = { paneIdentity: 'pane-two' };
-    h.useStates([st('empty', two), st('has_content', two), st('has_content', two), st('empty', two)]);
+    h.useStates([st('empty', two), st('has_content', two), st('empty', two)]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:7' }), 'submitted');
     assert.equal(h.pastes(), 2, 'one paste per pane');
     assert.equal(h.enters(), 1, 'Enter only in the replacement pane');
@@ -102,7 +105,7 @@ describe('sendToTmux delivery guard', () => {
   });
 
   it('never replays into a replacement pane once Enter was sent (no duplicate execution)', async () => {
-    const h = harness([st('empty'), st('has_content'), st('has_content'), st('has_content'), modal()]);
+    const h = harness([st('empty'), st('has_content'), otherModal()]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:8' }), 'modal_deferred');
     h.useStates([st('empty', { paneIdentity: 'pane-two' })]);
     assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:8' }), 'verify_failed');
@@ -111,7 +114,7 @@ describe('sendToTmux delivery guard', () => {
   });
 
   it('defers another row too, without pasting over the held-back text', async () => {
-    const h = harness([st('empty'), st('has_content'), modal()]);
+    const h = harness([st('empty'), modal()]);
     assert.equal(await sendToTmux('first', { ...h.options, deliveryId: 'conversation:1' }), 'modal_deferred');
     h.useStates([modal()]);
     assert.equal(await sendToTmux('second', { ...h.options, deliveryId: 'control:2' }), 'modal_deferred');
@@ -226,7 +229,7 @@ describe('multi-session delivery guard', () => {
     assert.deepEqual(queue.notified, [], 'no delivery notification (no false ACK path)');
     assert.equal(h.calls.length, 0);
 
-    h.useStates([st('empty'), st('has_content'), st('has_content'), st('empty')]);
+    h.useStates([st('empty'), st('has_content'), st('empty')]);
     const res = await processWithMultiSession(helpers);
     assert.equal(res.delivered, true);
     assert.deepEqual(queue.delivered, [42]);
@@ -283,3 +286,87 @@ describe('multi-session delivery guard', () => {
     assert.deepEqual(keys, ['Enter']);
   });
 });
+
+// ── A: every Enter is bound to the pasted pane (Astra #5) ──────────────────
+// Invariant checked on the interleaved log of reads and tmux calls: each
+// Enter directly follows (no other tmux call, no await in between) a read that
+// succeeded, shows the pane the text was pasted into, and shows no modal.
+function boundHarness(states) {
+  let i = 0;
+  const events = [];
+  const options = { session: 'claude-user-pan', pendingSubmissions: new Map(), submissionReceipts: new Map(),
+    sleepImpl: async () => { events.push({ sleep: true }); },
+    readInputStateImpl: () => { const s = states[Math.min(i++, states.length - 1)]; events.push({ read: s }); return s; },
+    execFileSyncImpl: (command, args) => { events.push({ exec: args }); return ''; } };
+  return { options, events, useStates: (next) => { states = next; i = 0; },
+    enters: () => events.filter((e) => e.exec && e.exec[0] === 'send-keys').length };
+}
+
+function enterViolations(events) {
+  const violations = [];
+  let bound = null;
+  for (let k = 0; k < events.length; k++) {
+    const e = events[k];
+    if (e.exec?.[0] === 'paste-buffer') {
+      const lastRead = [...events.slice(0, k)].reverse().find((x) => x.read);
+      bound = lastRead?.read.paneIdentity ?? null;
+    }
+    if (e.exec?.[0] === 'send-keys') {
+      // the read directly before, skipping only same-tick non-tmux bookkeeping
+      const prev = events[k - 1];
+      const s = prev?.read;
+      if (!s) violations.push({ at: k, why: 'Enter not directly preceded by a read' });
+      else if (s.captureOk === false) violations.push({ at: k, why: 'Enter after a failed capture' });
+      else if (s.paneIdentity !== bound) violations.push({ at: k, why: `Enter after a read of ${s.paneIdentity}, pasted into ${bound}` });
+      else if (s.modal) violations.push({ at: k, why: 'Enter after a read showing a modal' });
+    }
+  }
+  return violations;
+}
+
+const two = { paneIdentity: 'pane-two' };
+const failedCapture = { inputState: 'indeterminate', paneIdentity: null, captureOk: false, inProgressCapture: false,
+  usageOverlay: false, modal: null, promptVisible: false };
+
+describe('Enter is bound to the pasted pane (Astra #5)', () => {
+  it('reviewer case: the pane is replaced between the observed paste and Enter -> no Enter into the replacement', async () => {
+    const h = boundHarness([st('empty'), st('has_content'), st('empty', two), st('empty', two)]);
+    const result = await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:31' });
+    assert.deepEqual(enterViolations(h.events), []);
+    assert.notEqual(result, 'submitted');
+  });
+
+  it('a failed capture right before Enter means no Enter', async () => {
+    const h = boundHarness([st('empty'), st('has_content'), failedCapture, failedCapture]);
+    await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:32' });
+    assert.deepEqual(enterViolations(h.events), []);
+  });
+
+  it('resumed submission (observed, Enter not yet sent): a failed capture or a replacement pane gets no Enter', async () => {
+    for (const bad of [failedCapture, st('has_content', two)]) {
+      const calls = [];
+      const pending = { deliveryId: 'conversation:33', paneIdentity: 'pane-one', observed: true, enterSent: false };
+      const result = await submitAndVerify('claude-user-pan', { pending, readState: () => bad, sleepImpl: async () => {},
+        logImpl: () => {}, execFileSyncImpl: (command, args) => { calls.push(args); return ''; } });
+      assert.deepEqual(calls, [], `no tmux key for ${JSON.stringify(bad)}`);
+      assert.equal(result.verified, false);
+      assert.equal(pending.enterSent, false);
+    }
+  });
+
+  it('holds for a replacement or a failed capture injected at every read of a delivery and its retry', async () => {
+    const good = [st('empty'), st('has_content'), st('has_content'), st('has_content'), st('empty')];
+    for (let pos = 0; pos < good.length; pos++) {
+      for (const bad of [st('has_content', two), st('empty', two), failedCapture]) {
+        const states = good.slice();
+        states[pos] = bad;
+        const h = boundHarness(states);
+        const options = { ...h.options, deliveryId: `conversation:${40 + pos}` };
+        await sendToTmux('hello', options);
+        await sendToTmux('hello', options);
+        assert.deepEqual(enterViolations(h.events), [], `bad read at position ${pos}: ${JSON.stringify(bad)}`);
+      }
+    }
+  });
+});
+
