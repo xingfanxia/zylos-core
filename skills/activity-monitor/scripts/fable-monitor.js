@@ -19,7 +19,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { LIMIT_EVIDENCE_FILE, READINESS_FILE, readTmuxSessionRef, SESSION_FAILURES_FILE } from './fable-guard.js';
+import { LIMIT_EVIDENCE_FILE, READINESS_FILE, SESSION_FAILURES_FILE } from './fable-guard.js';
+import { readSessionRef as readTmuxSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { runtimeSwitchSignalPath } from './runtime-switch-signal.js';
 import {
   FABLE_LAUNCH_FILE,
@@ -30,6 +31,7 @@ import {
 
 export const LEASE_ENFORCEMENT_FILE = 'fable-lease-enforcement.json';
 export { READINESS_FILE };
+export const UNCERTAIN_DELIVERIES_FILE = 'fable-uncertain-deliveries.json';
 // End-to-end heartbeat phase: the dispatcher never auto-ACKs it.
 const READINESS_PHASE = 'post_restart';
 // Longer than one daemon poll plus its cold restart, so a live daemon always
@@ -67,6 +69,8 @@ export function createFableMonitor({
   // C4 key fence for the stopped session (comm-bridge supersedeControlsForSession).
   readSessionRef = () => readTmuxSessionRef(sessionName),
   fenceReplacedSession = () => {},
+  // C4 delivery_uncertain for this persona: { list() -> unnotified rows, markNotified(id) }.
+  uncertainDeliveries = null,
   now = () => Date.now(),
   log = () => {},
   graceMs = LEASE_ENFORCEMENT_GRACE_MS,
@@ -136,10 +140,32 @@ export function createFableMonitor({
     },
   };
 
+  // Name each message whose delivery a dialog made uncertain, once. It is
+  // never re-delivered (duplicate-execution risk); an operator decides.
+  function notifyUncertainDeliveries() {
+    let rows = [];
+    try { rows = uncertainDeliveries?.list() || []; } catch (err) { log(`Fable guard: uncertain deliveries unavailable (${err.message})`); }
+    for (const row of rows) {
+      const record = { id: row.id, item_type: row.item_type, item_id: row.item_id, channel: row.channel || null,
+        endpoint_id: row.endpoint_id || null, dialog_kind: row.dialog_kind, session_ref: row.session_ref || null,
+        preview: row.preview || null, detected_at: Number.isFinite(Number(row.detected_at)) ? iso(Number(row.detected_at) * 1000) : null };
+      log(`Fable guard ALERT: delivery uncertain on ${instanceId} (${row.dialog_kind}): ${row.item_type} #${row.item_id}`
+        + `${row.channel ? ` from ${row.channel}` : ''}${row.preview ? ` "${row.preview}"` : ''}; the CLI may not have received it. `
+        + 'Not re-delivered: resend by hand if needed.');
+      try {
+        const file = path.join(monitorDir, UNCERTAIN_DELIVERIES_FILE);
+        const prior = readJson(file, {});
+        writeJsonAtomic(file, { records: [...(Array.isArray(prior?.records) ? prior.records : []), record].slice(-20) });
+        uncertainDeliveries.markNotified(row.id);
+      } catch (err) { log(`Fable guard: uncertain delivery ${row.id} not recorded (${err.message})`); }
+    }
+  }
+
   function tick() {
     const nowMs = now();
     if (nowMs - lastCheckAt < checkIntervalMs) return null;
     lastCheckAt = nowMs;
+    notifyUncertainDeliveries();
     const launch = readLaunch();
     if (launch?.mode !== 'fable' || launch.launch_id === enforcedLaunchId) {
       unadmittedSince = 0;

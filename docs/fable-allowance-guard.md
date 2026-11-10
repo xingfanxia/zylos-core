@@ -360,20 +360,35 @@ it calls the C4 owning API `supersedeControlsForSession({ instanceId,
 sessionRef, reason: 'FABLE_GUARD_RELAUNCH' })` (`skills/comm-bridge/scripts/c4-db.js`),
 which supersedes the pending AND already-claimed `[KEYSTROKE]` controls bound
 to that old session and never those bound to the replacement. The monitor's
-lease enforcement does the same for the session it stops. The activity monitor
-never writes the control queue itself; if the API is absent the fence is
-skipped with a log line.
+lease enforcement does the same for the session it stops. The `sessionRef`
+is read with comm-bridge's `readSessionRef()` (the dispatcher's
+`paneIdentity`), and the activity monitor never writes the control queue
+itself.
 
-Known limitation: if the CLI raises the limit dialog after Enter was already
-sent, the dispatcher records that message as delivered although the CLI sent
-nothing. The guard never re-delivers it (duplicate-execution risk). When a
-classified dialog creates the hold, the daemon logs `ALERT limit dialog
-classified …` for the persona and records `possible_dropped_message` in its
-guard state, shown by `fable-guard-cli.js status`; an operator decides whether
-to resend. Guard restarts reuse the
-cold-start handling (pending heartbeat cleared, grace, busy-startup
-protection) in a fresh monitor process, so they never count as recovery
-restarts.
+Known limit of the session fence: a Claude relaunch inside the same surviving
+shell pane (no new tmux session) keeps the same `sessionRef`, so keys bound to
+the previous process are not told apart from the new one. Guard restarts and
+the lease enforcement kill the tmux session, so they always get a new
+`sessionRef`. Unbound keys are fenced by the dispatcher at claim time.
+
+**Uncertain deliveries.** If the CLI raises a Fable-limit / usage-credits
+dialog right after the dispatcher sent Enter, C4 records the message as
+uncertain (`c4.db` table `delivery_uncertain`, migration 004; see
+`skills/comm-bridge/SKILL.md`): it is neither delivered nor failed and is never
+replayed. The tracked persona's monitor reads unnotified rows every 15 s
+(`getUncertainDeliveries({ instanceId, unnotifiedOnly: true, limit: 20 })`),
+logs one `Fable guard ALERT: delivery uncertain …` per row naming the item
+(`conversation #<id> from <channel> "<preview>"`), keeps the last 20 in
+`<monitor dir>/fable-uncertain-deliveries.json` for `fable-guard-cli.js
+status` (`UNCERTAIN DELIVERY …`), and marks the row notified
+(`markUncertainDeliveryNotified(id)`). An operator decides whether to resend.
+Known blind spot: a dialog that appears with no later dispatcher read of that
+pane is not claimed by any message, so no row is recorded; the limit evidence
+still creates the `quota` hold.
+
+Guard restarts reuse the cold-start handling (pending heartbeat cleared,
+grace, busy-startup protection) in a fresh monitor process, so they never
+count as recovery restarts.
 
 ## What changes even when the guard is unconfigured
 
@@ -419,12 +434,40 @@ Threshold drill teardown: restore `threshold` to 0.75 **and** clear the drill's
 `quota` hold. Restoring the threshold alone keeps the latch until the next
 weekly window.
 
+## Rollback
+
+The delivery half adds two c4.db schema extensions: `control_queue.session_ref`
+(migration 003, nullable, default NULL) and the `delivery_uncertain` table
+(migration 004), both recorded in `_migrations`. Rolling the code back to the
+pre-guard release (d16221a) needs **no database action**. Checked against that
+release's `c4-schema.js` / `sqlite-schema.js` on a database built by the new
+migrations: its runtime open (`guardDatabase`) and its upgrade worker (owners
+wrapped as `strict: false, rejectUnsafeExtensions: true`) accept both and
+report them as extensions (`tables: [delivery_uncertain]`, `columns:
+[control_queue.session_ref]`); the old code never names the column in its
+INSERTs, and its migration runner applies only the files it ships and ignores
+the extra ledger rows. Only a direct `inspectSchema(db)` call with the default
+`strict: true` rejects the layout (`c4: unsupported columns
+control_queue.session_ref`); no runtime or upgrade path of that release makes
+that call.
+
+Do **not** drop the column or the table, or delete the `003`/`004` rows from
+`_migrations`, as part of a rollback: a later re-upgrade skips migrations whose
+ledger row exists, so removing only one side leaves a schema the new code
+cannot use. Remove the guard's runtime files instead if wanted
+(`activity-monitor/fable-guard.json`, `fable-usage.json`, and per persona
+`fable-launch.json`, `fable-readiness.json`, `fable-lease-enforcement.json`,
+`fable-uncertain-deliveries.json`, `fable-session-failures.json`,
+`fable-limit-evidence.json`); the old code ignores them.
+
 ## Deployment notes
 
 - Skills files to install: `activity-monitor/scripts/{fable-probe,fable-guard,fable-monitor,fable-guard-cli,runtime-failover,health-engine,monitor,monitor-orchestrator}.js`,
   `activity-monitor/scripts/adapters/runtime-components.js`,
-  `multi-session/runtime-files.js`. `cli/lib/runtime/claude.js` loads from the
-  checkout. Keep `chmod -R go-w` on `activity-monitor` after copying.
+  `multi-session/runtime-files.js`, `activity-monitor/scripts/{guardian,runtime-switch-signal}.js`,
+  and the comm-bridge files of the delivery half (`c4-db.js`,
+  `tmux-input-state.js`, migrations 003/004). `cli/lib/runtime/claude.js`
+  loads from the checkout. Keep `chmod -R go-w` on `activity-monitor` after copying.
 - Restart `runtime-failover` to start probing. A persona's monitor picks up the
   health and launch changes on its next restart, which the guard performs on
   every transition.

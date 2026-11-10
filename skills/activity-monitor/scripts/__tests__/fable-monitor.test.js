@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
-import { createFableMonitor, LEASE_ENFORCEMENT_FILE, READINESS_FILE } from '../fable-monitor.js';
+import { createFableMonitor, LEASE_ENFORCEMENT_FILE, READINESS_FILE, UNCERTAIN_DELIVERIES_FILE } from '../fable-monitor.js';
 import { SESSION_FAILURES_FILE } from '../fable-guard.js';
 import { Guardian } from '../guardian.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
@@ -185,5 +185,29 @@ describe('Fable session crash accounting in the persona monitor (review #6)', ()
     monitor.healthDeps.guardReadiness.onResult({ outcome: 'missing', status: 'timeout' });
     const record = JSON.parse(fs.readFileSync(path.join(fx.monitorDir, READINESS_FILE), 'utf8'));
     assert.deepEqual([record.launch_id, record.outcome, record.status], [monitor.readLaunch().launch_id, 'missing', 'timeout']);
+  });
+});
+
+describe('Uncertain deliveries are named, not timestamped (review h / delivery_uncertain)', () => {
+  it('alerts once per C4 delivery_uncertain record with the message preview and keeps it for status', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const rows = [{ id: 7, item_type: 'conversation', item_id: 4012, target_instance: 'user-pan', channel: 'feishu',
+      endpoint_id: 'oc_1', session_ref: '$3:1762790000:%12:48211', dialog_kind: 'fable_limit', outcome: 'uncertain',
+      detected_at: Math.floor(T0 / 1000), notified_at: null, preview: 'please send the Q3 report to Lin' }];
+    const notified = [];
+    const { monitor, calls } = monitorFor(fx, clock, { uncertainDeliveries: {
+      list: () => rows.filter(row => !notified.includes(row.id)), markNotified: id => notified.push(id) } });
+    monitor.tick();
+    clock.now += 20_000;
+    monitor.tick();
+    assert.deepEqual(notified, [7]);
+    const alerts = calls.logs.filter(line => line.includes('delivery uncertain'));
+    assert.equal(alerts.length, 1, 'surfaced once');
+    assert.match(alerts[0], /conversation #4012/);
+    assert.match(alerts[0], /please send the Q3 report to Lin/);
+    const kept = JSON.parse(fs.readFileSync(path.join(fx.monitorDir, UNCERTAIN_DELIVERIES_FILE), 'utf8')).records;
+    assert.deepEqual(kept.map(item => [item.id, item.item_id, item.preview]), [[7, 4012, 'please send the Q3 report to Lin']]);
   });
 });

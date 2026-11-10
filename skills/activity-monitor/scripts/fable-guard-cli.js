@@ -17,7 +17,7 @@ import path from 'node:path';
 import { withFileLock } from '../../multi-session/file-lock.js';
 import { fableGuardStatePath, fableUsagePath, readFableGuardConfig } from '../../multi-session/runtime-files.js';
 import { clearFableHold, reconcileFableGuardNow, writeJsonAtomic } from './fable-guard.js';
-import { LEASE_ENFORCEMENT_FILE } from './fable-monitor.js';
+import { LEASE_ENFORCEMENT_FILE, UNCERTAIN_DELIVERIES_FILE } from './fable-monitor.js';
 import { FABLE_LAUNCH_FILE } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
@@ -69,7 +69,7 @@ export function fableGuardStatus({ zylosDir = ZYLOS_DIR, nowMs = Date.now() } = 
       ...(persona.gave_up ? { gave_up: persona.gave_up } : {}),
       ...(persona.safe_stop ? { safe_stop: persona.safe_stop } : {}),
       ...(enforcement ? { lease_enforcement: enforcement } : {}),
-      ...(persona.possible_dropped_message ? { possible_dropped_message: persona.possible_dropped_message } : {}),
+      uncertain_deliveries: (readJson(path.join(monitorDir, UNCERTAIN_DELIVERIES_FILE), {})?.records || []).slice(-5),
     };
   }
   return { config: readFableGuardConfig(document), accounts, personas, manual_clears: state.manual_clears || [] };
@@ -139,7 +139,8 @@ function formatStatus({ config, accounts, personas }) {
       + (item.safe_stop ? ` SAFE-STOPPED (${item.safe_stop.why}); after checking: pm2 start activity-monitor-${id}` : '')
       + (item.gave_up && !item.safe_stop ? ` GAVE UP (${item.gave_up})` : '')
       + (item.lease_enforcement ? ` lease-enforced ${item.lease_enforcement.at}` : '')
-      + (item.possible_dropped_message ? ` POSSIBLE DROPPED MESSAGE near ${item.possible_dropped_message.at}` : ''));
+      + item.uncertain_deliveries.map(entry => ` UNCERTAIN DELIVERY ${entry.item_type} #${entry.item_id}`
+        + `${entry.preview ? ` "${entry.preview}"` : ''} at ${entry.detected_at}`).join(''));
   }
   return lines.join('\n');
 }

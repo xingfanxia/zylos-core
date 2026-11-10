@@ -157,9 +157,8 @@ import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tas
 // named import so a renamed or removed export fails loudly at load.
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { createFableMonitor } from './fable-monitor.js';
-// C4 owns its queue: the session fence is comm-bridge's API. Optional until
-// both halves of the Fable guard are deployed together (no-op if absent).
-import * as c4DbModule from '../../comm-bridge/scripts/c4-db.js';
+// C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
+import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession } from '../../comm-bridge/scripts/c4-db.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -1186,12 +1185,8 @@ function createToolPipeline(activeAdapter, config) {
 // session the guard (or the lease enforcement) replaced. Never touches keys
 // queued for the replacement session.
 function fenceReplacedSession(sessionRef) {
-  if (typeof c4DbModule.supersedeControlsForSession !== 'function') {
-    log('Fable guard: C4 supersedeControlsForSession unavailable; keys of the replaced session are not fenced');
-    return;
-  }
   try {
-    const { superseded } = c4DbModule.supersedeControlsForSession({ instanceId: INSTANCE_ID, sessionRef, reason: 'FABLE_GUARD_RELAUNCH' });
+    const { superseded } = supersedeControlsForSession({ instanceId: INSTANCE_ID, sessionRef, reason: 'FABLE_GUARD_RELAUNCH' });
     if (superseded) log(`Fable guard relaunch: superseded ${superseded} keystroke control(s) of session ${sessionRef}`);
   } catch (err) {
     log(`Fable guard relaunch: key fence failed (${err.message})`);
@@ -1206,7 +1201,10 @@ function fableHealthDeps(activeAdapter) {
   log(`Fable guard: monitor started with mode=${runtimeProfile.fable.mode} generation=${runtimeProfile.fable.generation ?? 'none'}`);
   fableMonitor = createFableMonitor({ zylosDir: ZYLOS_DIR, instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR, runtimeProfile,
     sessionName: activeAdapter.sessionName, classifyLimitDialog, stopSession: () => activeAdapter.stop(),
-    fenceReplacedSession, log });
+    fenceReplacedSession, log, uncertainDeliveries: {
+      list: () => getUncertainDeliveries({ instanceId: INSTANCE_ID, unnotifiedOnly: true, limit: 20 }),
+      markNotified: id => markUncertainDeliveryNotified(id),
+    } });
   return fableMonitor?.healthDeps || {};
 }
 
