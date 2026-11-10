@@ -527,7 +527,9 @@ const submissionReceipts = new Map();
 // Last verified submission per session, so a limit dialog read moments later
 // can still name the row whose Enter opened it (see settleUncertain).
 const recentSubmissions = new Map();
-const LIMIT_AFTER_SUBMIT_WINDOW_MS = 120_000;
+// Short on purpose: a mid-session limit dialog during a long agent turn must
+// not be pinned on a message that was submitted and running long before.
+const LIMIT_AFTER_SUBMIT_WINDOW_MS = 30_000;
 
 function isLimitModal(modal) {
   return !!modal && (modal.kind === 'fable_limit' || modal.kind === 'credits_offer');
