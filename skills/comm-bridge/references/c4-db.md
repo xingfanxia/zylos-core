@@ -114,4 +114,7 @@ When imported by other C4 scripts, `c4-db.js` exports:
 | `bindControlSession(id, sessionRef)` | Bind a claimed control to a session unless already bound → `{ sessionRef, stamped }` |
 | `supersedeControl(id, reason)` | Supersede one pending/claimed control (final) |
 | `supersedeControlsForSession({ instanceId, sessionRef, reason })` | Supersede the pending and claimed `[KEYSTROKE]` controls bound to a replaced session → `{ superseded }` |
+| `recordUncertainDelivery({ itemType, itemId, dialogKind, sessionRef })` | Record that a limit dialog followed this row's Enter; finalizes the row without replay (dispatcher) |
+| `getUncertainDeliveries({ instanceId, unnotifiedOnly = true, limit = 50 })` | Uncertain records (oldest first) with a 120-char conversation preview, for the operator notification |
+| `markUncertainDeliveryNotified(id)` | Mark an uncertain record as notified |
 | `close()` | Close database connection |

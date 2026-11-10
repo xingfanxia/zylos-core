@@ -760,6 +760,84 @@ export function cleanupControlQueue(cutoff) {
   return result.changes || 0;
 }
 
+// ── Uncertain delivery outcomes (Fable guard (h)) ─────────────────────────
+//
+// A limit / usage-credits dialog classified right after the dispatcher sent
+// Enter for a row: the message may or may not have reached the model. The row
+// is finalized without replay and a delivery_uncertain record names it:
+//   conversation          -> status 'uncertain' (also when it was already
+//                            marked delivered moments before the dialog)
+//   control, ack-mode     -> stays 'running' (its ack or ack deadline decides)
+//   control, no-ack       -> 'failed', last_error 'DELIVERY_UNCERTAIN:<kind>'
+// The activity monitor reads getUncertainDeliveries() to notify the operator
+// and marks each record notified.
+
+export const UNCERTAIN_DIALOG_KINDS = Object.freeze(['fable_limit', 'credits_offer']);
+
+/**
+ * @param {{ itemType: 'conversation'|'control', itemId: number, dialogKind: string,
+ *   sessionRef?: string|null, detectedAt?: number }} args
+ * @returns {{ recorded: boolean, id: number|null }}
+ */
+export function recordUncertainDelivery({ itemType, itemId, dialogKind, sessionRef = null, detectedAt = nowSeconds() }) {
+  if (itemType !== 'conversation' && itemType !== 'control') throw new Error(`invalid itemType: ${itemType}`);
+  if (!UNCERTAIN_DIALOG_KINDS.includes(dialogKind)) throw new Error(`invalid dialogKind: ${dialogKind}`);
+  const database = getDb();
+  return database.transaction(() => {
+    let source;
+    if (itemType === 'conversation') {
+      source = database.prepare('SELECT target_instance, channel, endpoint_id FROM conversations WHERE id = ?').get(itemId);
+      if (!source) return { recorded: false, id: null };
+      database.prepare(`UPDATE conversations SET status = 'uncertain'
+        WHERE id = ? AND direction = 'in' AND status IN ('pending', 'running', 'delivered')`).run(itemId);
+    } else {
+      const row = database.prepare('SELECT target_instance, content, status FROM control_queue WHERE id = ?').get(itemId);
+      if (!row) return { recorded: false, id: null };
+      source = { target_instance: row.target_instance, channel: null, endpoint_id: null };
+      if (!String(row.content || '').includes('---- ack via:')) {
+        database.prepare(`UPDATE control_queue SET status = 'failed', last_error = ?, updated_at = ?
+          WHERE id = ? AND status IN ('pending', 'running', 'done')`).run(`DELIVERY_UNCERTAIN:${dialogKind}`, nowSeconds(), itemId);
+      }
+    }
+    const result = database.prepare(`
+      INSERT OR IGNORE INTO delivery_uncertain
+        (item_type, item_id, target_instance, channel, endpoint_id, session_ref, dialog_kind, outcome, detected_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'uncertain', ?)
+    `).run(itemType, itemId, source.target_instance ?? null, source.channel ?? null, source.endpoint_id ?? null,
+      sessionRef, dialogKind, detectedAt);
+    return { recorded: result.changes > 0, id: result.changes > 0 ? Number(result.lastInsertRowid) : null };
+  })();
+}
+
+/**
+ * Uncertain delivery records, oldest first, with a short preview of the
+ * conversation text so a notification can name the message.
+ * @param {{ instanceId?: string|null, unnotifiedOnly?: boolean, limit?: number }} [options]
+ *   instanceId undefined = all instances; null = unattributed rows only.
+ */
+export function getUncertainDeliveries({ instanceId, unnotifiedOnly = true, limit = 50 } = {}) {
+  const n = Math.min(Math.max(Number.parseInt(limit, 10) || 50, 1), 500);
+  const where = [];
+  const params = [];
+  if (unnotifiedOnly) where.push('u.notified_at IS NULL');
+  if (instanceId !== undefined) { where.push('u.target_instance IS ?'); params.push(instanceId); }
+  return getDb().prepare(`
+    SELECT u.id, u.item_type, u.item_id, u.target_instance, u.channel, u.endpoint_id, u.session_ref,
+           u.dialog_kind, u.outcome, u.detected_at, u.notified_at,
+           CASE WHEN u.item_type = 'conversation' THEN substr(c.content, 1, 120) END AS preview
+    FROM delivery_uncertain u
+    LEFT JOIN conversations c ON u.item_type = 'conversation' AND c.id = u.item_id
+    ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+    ORDER BY u.id ASC LIMIT ?
+  `).all(...params, n);
+}
+
+/** Mark an uncertain record as notified to the operator. */
+export function markUncertainDeliveryNotified(id, at = nowSeconds()) {
+  return getDb().prepare('UPDATE delivery_uncertain SET notified_at = ? WHERE id = ? AND notified_at IS NULL')
+    .run(at, id).changes > 0;
+}
+
 /**
  * Create a checkpoint
  * @deprecated Writes an UNSCOPED (NULL target_instance) checkpoint row —

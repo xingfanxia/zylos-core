@@ -1,4 +1,5 @@
-// migrations/003 (control_queue.session_ref) on an existing, live database:
+// migrations/003 (control_queue.session_ref) and 004 (delivery_uncertain) on
+// an existing, live database:
 // additive, idempotent, safe with another connection open, and old rows keep
 // today's behavior (unbound, delivered as before).
 import assert from 'node:assert/strict';
@@ -24,12 +25,13 @@ function inChild(source) {
 }
 const db = (name) => `import * as db from ${JSON.stringify(path.join(SCRIPTS, name))};`;
 
-it('adds session_ref to a pre-003 database without touching existing rows', () => {
-  // A database as the previous release leaves it: everything but 003.
+it('adds session_ref and delivery_uncertain to a pre-003 database without touching existing rows', () => {
+  // A database as the previous release leaves it: everything but 003 and 004.
   inChild(`${db('c4-db.js')} db.getDb(); db.close();`);
   const old = new Database(dbPath);
   old.exec(`DROP INDEX idx_control_queue_session_ref; ALTER TABLE control_queue DROP COLUMN session_ref;
-    DELETE FROM _migrations WHERE name = '003-add-control-session-ref.sql';`);
+    DELETE FROM _migrations WHERE name = '003-add-control-session-ref.sql';
+    DROP TABLE delivery_uncertain; DELETE FROM _migrations WHERE name = '004-add-delivery-uncertain.sql';`);
   const now = Math.floor(Date.now() / 1000);
   old.prepare(`INSERT INTO control_queue (raw_content, content, priority, bypass_state, status, created_at, updated_at, target_instance)
     VALUES ('[KEYSTROKE]Enter', '[KEYSTROKE]Enter', 0, 1, 'pending', ?, ?, 'user-pan')`).run(now, now);
@@ -40,11 +42,13 @@ it('adds session_ref to a pre-003 database without touching existing rows', () =
     const d = db.getDb();
     const strict = schema.inspectSchema(d, { strict: true });
     const rows = d.prepare('SELECT id, session_ref, status FROM control_queue').all();
-    const applied = d.prepare("SELECT COUNT(*) AS n FROM _migrations WHERE name = '003-add-control-session-ref.sql'").get().n;
+    const applied = d.prepare("SELECT COUNT(*) AS n FROM _migrations WHERE name IN ('003-add-control-session-ref.sql', '004-add-delivery-uncertain.sql')").get().n;
+    const uncertain = db.getUncertainDeliveries();
     db.close();
-    console.log(JSON.stringify({ rows, applied, extensions: strict.extensions }));`);
+    console.log(JSON.stringify({ rows, applied, uncertain, extensions: strict.extensions }));`);
   assert.deepEqual(migrated.rows.map(({ session_ref, status }) => ({ session_ref, status })), [{ session_ref: null, status: 'pending' }]);
-  assert.equal(migrated.applied, 1);
+  assert.equal(migrated.applied, 2);
+  assert.deepEqual(migrated.uncertain, []);
   assert.deepEqual(migrated.extensions, { tables: [], columns: [] }, 'strict inspection accepts the fork column');
 
   // The connection that was open during the migration sees the new column.

@@ -58,9 +58,10 @@ export const MIGRATIONS = Object.freeze({
   0: Object.freeze({ to: 1, migrate: migrateSchema }),
 });
 // Fork: multi-session routing columns, the [KEYSTROKE] session fence
-// (control_queue.session_ref, migrations/003) and the fork migration ledger.
+// (control_queue.session_ref, migrations/003), uncertain delivery outcomes
+// (delivery_uncertain, migrations/004) and the fork migration ledger.
 export const FORK_EXTENSIONS = Object.freeze({
-  tables: ['_migrations'],
+  tables: ['_migrations', 'delivery_uncertain'],
   columns: { checkpoints: ['target_instance'], conversations: ['target_instance'], control_queue: ['target_instance', 'session_ref'] },
 });
 export function inspectSchema(db, { allowNew = false, strict = true, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions = strict } = {}) {
