@@ -639,6 +639,26 @@ describe('Fable guard interrupted restarts keep reconciling (review #3)', () => 
     assert.equal(sim.state.personas['user-elaine'].safe_stop, undefined);
   });
 
+  it('a Fable persona failed over to a Codex profile is never restarted or stopped by the guard', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.document.instances['user-pan'].runtime_profile = 'codex-subscription';
+    const hop = sim.pass({ failover: ['user-pan'] });
+    assert.deepEqual(hop.restarts, []);
+    // The Codex engine writes no Claude launch record; the old Fable record remains on disk.
+    sim.status['user-pan'] = { state: 'idle', health: 'ok', active_tools: 0, last_check: Math.floor(sim.now / 1000), runtime_launch_at: sim.now };
+    sim.models['user-pan'] = null;
+    const kinds = [];
+    for (let i = 0; i < 6; i++) {
+      sim.advance(4 * MIN);
+      sim.status['user-pan'].last_check = Math.floor(sim.now / 1000);
+      for (const item of sim.pass().restarts) if (item.instanceId === 'user-pan') kinds.push(item.kind);
+    }
+    assert.deepEqual(kinds, []);
+    assert.equal(sim.state.personas['user-pan'].safe_stop, undefined);
+    assert.equal(sim.state.personas['user-pan'].desired.reason, 'unsupported_account');
+  });
+
   it('an exhausted upgrade is only surfaced (the launch gate keeps any Fable launch admitted)', () => {
     const sim = new Sim();
     sim.toFable();

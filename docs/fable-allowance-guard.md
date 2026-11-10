@@ -61,7 +61,10 @@ launch reason are `unsupported_account`, the guard state marks it
 `unsupported: account_without_settings_file`, and `fable-guard-cli.js status`
 prints `UNSUPPORTED account …: always Opus`. It is never shown as converging
 or recovering, and nothing will move it to Fable until the account gets its
-own settings file.
+own settings file. A `fable_enabled` persona that the account failover moves
+to a non-Claude profile (Codex) is marked `not_a_claude_profile`; the guard
+neither restarts nor verifies it (that engine cannot run Fable and the
+failover owns its restart).
 
 For `azure-agents-infra` `devbox-runtime-policy.mjs`:
 
