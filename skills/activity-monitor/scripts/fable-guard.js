@@ -26,6 +26,7 @@ import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 
 const CLOCK_SKEW_MS = 30_000;
 const RESUME_GRACE_MS = 180_000;
+const MODEL_EVIDENCE_TIMEOUT_MS = 600_000;
 // A launch record older than the engine's current launch is not that launch.
 const LAUNCH_MATCH_SKEW_MS = 5000;
 const MAX_RESTART_ATTEMPTS = 3;
@@ -293,7 +294,7 @@ export function planFableGuard({
       persona.executed_generation = generation;
       persona.executed_at = iso(nowMs);
       persona.attempts = 0;
-      for (const key of ['verified', 'gave_up', 'restart_required']) delete persona[key];
+      for (const key of ['verified', 'gave_up', 'restart_required', 'safe_stop', 'model_unknown_launch']) delete persona[key];
       if (launchServes(launch, status, nowMs) && launch.key === expected.key && launch.runtime_profile === profileId) {
         // The running launch already uses exactly this policy: adopt it.
         persona.desired.adopted_launch_id = launch.launch_id;
@@ -352,21 +353,35 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, confi
   const desired = persona.desired;
   if (persona.executed_generation !== desired.generation) return;
   const executedMs = ms(persona.executed_at);
+  const tmuxSession = instance.tmux_session || `claude-${id}`;
+  // Fable may still be live: the last recorded launch, or the engine's own report, is Fable.
+  const fableMayRun = launch?.mode === 'fable' || baseModel(actual?.model) === baseModel(config?.fable_model);
   const resume = why => {
     if ((persona.attempts || 0) >= MAX_RESTART_ATTEMPTS) {
-      if (!persona.gave_up) events.push(`${id}: g${desired.generation} not converged after ${persona.attempts} restarts (${why}); operator check needed`);
+      if (!persona.gave_up) events.push(`${id}: ALERT g${desired.generation} not converged after ${persona.attempts} restarts (${why}); operator check needed`);
       persona.gave_up = why;
+      // A downgrade must never end with Fable left running: stop the persona.
+      if (desired.mode === 'opus' && fableMayRun && !persona.safe_stop) {
+        persona.safe_stop = { at: iso(nowMs), why, generation: desired.generation };
+        restarts.push({ instanceId: id, generation: desired.generation, attempt: persona.attempts, kind: 'stop',
+          mode: desired.mode, profileId: desired.account, reason: `safe_stop:${why}`, tmuxSession });
+        events.push(`${id}: ALERT downgrade to Opus failed ${persona.attempts} times; persona STOPPED (pm2 stop + tmux kill) `
+          + `so Fable does not keep running. After checking: pm2 start activity-monitor-${id} (the launch is admitted to Opus only)`);
+      }
       return;
     }
     persona.attempts = (persona.attempts || 0) + 1;
     persona.executed_at = iso(nowMs);
     restarts.push({ instanceId: id, generation: desired.generation, attempt: persona.attempts, kind: 'restart',
-      mode: desired.mode, profileId: desired.account, reason: `resume:${why}`, tmuxSession: instance.tmux_session || `claude-${id}` });
+      mode: desired.mode, profileId: desired.account, reason: `resume:${why}`, tmuxSession });
     events.push(`${id}: resume g${desired.generation} (${why})`);
   };
+  if (persona.safe_stop?.generation === desired.generation) return;
   if (!isRunning(status, nowMs)) {
-    // A stopped engine launches from the committed state next time.
-    if (status.state !== 'starting') persona.verified ||= { not_running_at: iso(nowMs) };
+    // A suspended persona launches through the admission gate when it wakes.
+    if (status.state === 'suspended') { persona.verified ||= { not_running_at: iso(nowMs) }; return; }
+    // Otherwise the restart (or the monitor) did not land: keep reconciling.
+    if (!persona.verified?.model_at && nowMs - executedMs > RESUME_GRACE_MS) resume(`not_running:${status.state || 'unknown'}`);
     return;
   }
   if (!launchServes(launch, status, nowMs) || !launchMatches(desired, launch)) {
@@ -381,7 +396,21 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, confi
   const launchMs = Number(launch.launched_at_ms);
   const expected = desired.model;
   const actualModel = baseModel(actual?.model);
-  if (!actualModel || !expected || !(Number(actual.observed_at_ms) >= launchMs)) return;
+  if (!actualModel || !expected || !(Number(actual.observed_at_ms) >= launchMs)) {
+    // No model report since this launch: bounded, never an endless wait.
+    if (nowMs - launchMs > MODEL_EVIDENCE_TIMEOUT_MS && persona.model_unknown_launch !== launch.launch_id) {
+      persona.model_unknown_launch = launch.launch_id;
+      if (desired.mode === 'fable') {
+        resume('model_unknown');
+      } else {
+        // The launcher passed the Opus model; Fable cannot be live. Surface it.
+        persona.verified = { ...(persona.verified || {}), model_unknown_at: iso(nowMs), launch_id: launch.launch_id };
+        events.push(`${id}: ALERT no model report from the Opus launch ${launch.launch_id} after `
+          + `${Math.round(MODEL_EVIDENCE_TIMEOUT_MS / 60_000)} min (statusline.json); not restarted`);
+      }
+    }
+    return;
+  }
   if (actualModel !== expected) {
     if (persona.verified?.mismatch_launch === launch.launch_id) return;
     persona.verified = { mismatch_launch: launch.launch_id };
@@ -453,11 +482,20 @@ export function executeFableRestarts({ zylosDir, restarts, nowMs = Date.now(), e
     log(`[fable-guard] ${item.instanceId}: g${item.generation} superseded by g${generation}; restart skipped`);
     return false;
   });
-  for (const item of live) {
+  for (const item of live.filter(entry => entry.kind !== 'stop')) {
     writeRuntimeSwitchSignal({ zylosDir, nowMs, change: { instanceId: item.instanceId, fromProfile: item.profileId,
       toProfile: item.profileId, reason: `fable_guard:${item.mode}:g${item.generation}` } });
   }
   for (const item of live) {
+    if (item.kind === 'stop') {
+      // Safe end of an exhausted downgrade: the monitor first, so its Guardian cannot relaunch.
+      try { execFileSyncImpl('pm2', ['stop', `activity-monitor-${item.instanceId}`], { stdio: 'ignore', timeout: 30_000 }); } catch (err) {
+        log(`[fable-guard] ${item.instanceId}: pm2 stop failed (${err.message})`);
+      }
+      try { execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 }); } catch { /* absent pane */ }
+      log(`[fable-guard] ${item.instanceId}: STOPPED after g${item.generation} downgrade retries were exhausted (${item.reason})`);
+      continue;
+    }
     try {
       execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 });
     } catch { /* absent pane is fine */ }

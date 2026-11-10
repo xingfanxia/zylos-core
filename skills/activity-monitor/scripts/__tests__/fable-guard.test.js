@@ -469,6 +469,10 @@ describe('Fable guard interleavings', () => {
       const signal = JSON.parse(fs.readFileSync(path.join(zylosDir, '.zylos', 'runtime-switches', 'user-pan.json'), 'utf8'));
       assert.equal(signal.to_profile, BACKUP, 'same profile: the monitor takes the cold-start path');
       assert.equal(signal.reason, 'fable_guard:opus:g5');
+      calls.length = 0;
+      executeFableRestarts({ zylosDir, restarts: [{ ...restart(5), kind: 'stop' }], execFileSyncImpl: exec, log: () => {}, nowMs: T0 });
+      assert.deepEqual(calls, [['pm2', 'stop', 'activity-monitor-user-pan'], ['tmux', 'kill-session', '-t', 'claude-user-pan']],
+        'a safe stop stops the monitor before the pane');
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
@@ -532,6 +536,93 @@ describe('Fable guard account + model + generation journal (review #2)', () => {
     sim.advance(MIN);
     sim.pass();
     assert.equal(sim.state.personas['user-pan'].verified?.model_at, undefined);
+  });
+});
+
+describe('Fable guard interrupted restarts keep reconciling (review #3)', () => {
+  it('an offline persona after a commit (kill landed, pm2 restart did not) is restarted again', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    assert.equal(sim.pass().restarts.length, 2);
+    sim.advance(10_000);
+    sim.setState('user-pan', 'offline'); // tmux killed; the monitor never came back
+    sim.launchAll([{ instanceId: 'user-elaine' }]);
+    sim.advance(4 * MIN);
+    const resumed = sim.pass();
+    assert.deepEqual(resumed.restarts.map(item => [item.instanceId, item.reason]), [['user-pan', 'resume:not_running:offline']]);
+    sim.launchAll(resumed.restarts);
+    sim.advance(MIN);
+    sim.pass();
+    assert.ok(sim.state.personas['user-pan'].verified.model_at);
+  });
+
+  it('a stale status (dead monitor) is not taken for a running engine', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    sim.pass();
+    sim.launchAll([{ instanceId: 'user-elaine' }]);
+    const frozen = sim.status['user-pan'].last_check;
+    sim.advance(4 * MIN);
+    sim.status['user-pan'].last_check = frozen; // monitor process gone; its last status still says idle
+    assert.deepEqual(sim.pass().restarts.map(item => [item.instanceId, item.reason]), [['user-pan', 'resume:not_running:idle']]);
+  });
+
+  it('missing model evidence is bounded: a Fable launch is restarted, an Opus launch is surfaced', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    const down = sim.pass();
+    sim.launchAll(down.restarts);
+    sim.models['user-pan'] = { model: 'claude-fable-5-2', observed_at_ms: sim.now - 60_000 }; // statusline never refreshed
+    sim.advance(11 * MIN);
+    const result = sim.pass();
+    assert.deepEqual(result.restarts.filter(item => item.instanceId === 'user-pan'), [], 'the launcher passed Opus');
+    assert.ok(sim.state.personas['user-pan'].verified.model_unknown_at);
+    assert.ok(result.events.some(event => event.includes('user-pan') && event.includes('ALERT') && event.includes('model')));
+
+    const up = new Sim();
+    up.toFable();
+    up.models['user-pan'] = { model: 'claude-fable-5-2', observed_at_ms: up.launches['user-pan'].launched_at_ms - 1 };
+    up.advance(11 * MIN);
+    up.observe(BACKUP, 0.1);
+    assert.deepEqual(up.pass().restarts.map(item => [item.instanceId, item.reason]), [['user-pan', 'resume:model_unknown']]);
+  });
+
+  it('downgrade retry exhaustion stops the Fable persona with an actionable alert instead of leaving it live', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    sim.pass();
+    sim.launchAll([{ instanceId: 'user-elaine' }]);
+    // Every restart of pan fails: its old Fable launch keeps running.
+    const reasons = [];
+    for (let i = 0; i < 6; i++) {
+      sim.advance(4 * MIN);
+      for (const item of sim.pass().restarts) reasons.push(`${item.instanceId}:${item.kind}:${item.reason}`);
+    }
+    assert.deepEqual(reasons, ['user-pan:restart:resume:stale_launch', 'user-pan:restart:resume:stale_launch', 'user-pan:stop:safe_stop:stale_launch']);
+    const pan = sim.state.personas['user-pan'];
+    assert.ok(pan.safe_stop.at);
+    assert.ok(pan.gave_up);
+    assert.equal(sim.state.personas['user-elaine'].safe_stop, undefined);
+  });
+
+  it('an exhausted upgrade is only surfaced (the launch gate keeps any Fable launch admitted)', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.launch('user-pan', { model: 'claude-opus-5-5' });
+    sim.document.fable_guard.crash_failures = 20;
+    const kinds = [];
+    for (let i = 0; i < 6; i++) {
+      sim.advance(4 * MIN);
+      sim.observe(BACKUP, 0.1);
+      const result = sim.pass();
+      for (const item of result.restarts) { kinds.push(item.kind); sim.launch(item.instanceId, { model: 'claude-opus-5-5' }); }
+    }
+    assert.ok(!kinds.includes('stop'));
+    assert.ok(sim.state.personas['user-pan'].gave_up);
   });
 });
 
