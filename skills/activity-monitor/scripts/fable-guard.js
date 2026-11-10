@@ -505,14 +505,22 @@ function reconcileSafeStop({ id, persona, status, launch, actual, config, nowMs,
 // (the monitor's end-to-end readiness probe, or another non-auto-ACKable
 // heartbeat). A missing ACK is surfaced once and never restarts a correct model.
 function verifyReadiness({ id, verified, launch, status, readiness, nowMs, events }) {
-  if (verified.ready_at || verified.readiness) return;
+  if (verified.ready_at) return;
   const launchMs = Number(launch.launched_at_ms);
   const ours = readiness?.launch_id === launch.launch_id ? readiness : null;
-  if (ours?.outcome === 'ack') {
-    verified.ready_at = ours.at;
-  } else if (Number(status.functional_ack_at) >= launchMs && READINESS_PHASES.has(status.functional_ack_phase)) {
-    verified.ready_at = iso(Number(status.functional_ack_at));
-  } else if (ours?.outcome === 'missing' || nowMs - launchMs > READINESS_TIMEOUT_MS) {
+  const readyAt = ours?.outcome === 'ack' ? ours.at
+    : Number(status.functional_ack_at) >= launchMs && READINESS_PHASES.has(status.functional_ack_phase)
+      ? iso(Number(status.functional_ack_at)) : null;
+  if (readyAt) {
+    // A genuine ACK also recovers a launch already surfaced as not ready.
+    const was = verified.readiness;
+    verified.ready_at = readyAt;
+    delete verified.readiness;
+    if (was) events.push(`${id}: readiness recovered (${was} -> real ACK from launch ${launch.launch_id} at ${readyAt})`);
+    return;
+  }
+  if (verified.readiness) return;
+  if (ours?.outcome === 'missing' || nowMs - launchMs > READINESS_TIMEOUT_MS) {
     verified.readiness = ours?.outcome === 'missing' ? 'ack_missing' : 'no_probe_result';
     events.push(`${id}: ALERT model ${launch.model} converged but readiness not verified (${verified.readiness}: `
       + `no real ACK from launch ${launch.launch_id}); not restarted, check the persona`);

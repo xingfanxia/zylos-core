@@ -20,6 +20,8 @@
  *    Guardian relaunch can change the mode without a new monitor): classified
  *    limit dialogs, Fable-session failures (recovery kills and unexpected
  *    foreground exits, never planned transitions) and the readiness probe.
+ *  - uncertain deliveries: each C4 delivery_uncertain row is sent to the
+ *    operator, and marked notified only after that notification succeeded.
  *
  * Contract: docs/fable-allowance-guard.md.
  */
@@ -51,6 +53,11 @@ const CHECK_INTERVAL_MS = 15_000;
 // An unconfirmed stop is retried after 15 s, 30 s, 1 min ... at most 5 min.
 const STOP_RETRY_MS = 15_000;
 const STOP_RETRY_MAX_MS = 5 * 60_000;
+// Operator notification of an uncertain delivery: 1, 2, 4 ... min, at most 30
+// min, for at most NOTIFY_MAX_ATTEMPTS attempts; the row stays unnotified.
+const NOTIFY_RETRY_MS = 60_000;
+const NOTIFY_RETRY_MAX_MS = 30 * 60_000;
+export const NOTIFY_MAX_ATTEMPTS = 12;
 // A launch record describes a session when it was written shortly before that
 // session was created (prepareFableLaunch runs right before the tmux launch).
 const RECORD_SESSION_WINDOW_MS = 120_000;
@@ -106,6 +113,18 @@ export function readStatuslineModel(monitorDir) {
   } catch { return null; }
 }
 
+/** Operator-facing text for one uncertain delivery (sent through the admin alert path). */
+export function formatUncertainDeliveryAlert(instanceId, row) {
+  const who = String(instanceId || 'primary').replace(/^user-/, '');
+  const source = row.channel ? `（${row.channel}）` : '';
+  return [
+    `⚠️ ${who} 的一条消息可能没有送达`,
+    `${row.item_type} #${row.item_id}${source}${row.preview ? `："${row.preview}"` : ''}`,
+    `发送后 Claude 弹出了额度对话框（${row.dialog_kind}），无法确认它是否收到了这条消息。`,
+    '系统不会自动重发，以免重复执行；如需要请手动重发。',
+  ].join('\n');
+}
+
 /**
  * Monitor-side guard for one persona, or null when the monitor started
  * without a Fable decision (feature inert, persona not fable_enabled).
@@ -130,6 +149,8 @@ export function createFableMonitor({
   fenceReplacedSession = () => {},
   // C4 delivery_uncertain for this persona: { list() -> unnotified rows, markNotified(id) }.
   uncertainDeliveries = null,
+  // Operator notification: async (message) -> { ok, output }. null = none configured.
+  notifyOperator = null,
   lock = withFileLock,
   now = () => Date.now(),
   log = () => {},
@@ -204,25 +225,69 @@ export function createFableMonitor({
     },
   };
 
-  // Name each message whose delivery a dialog made uncertain, once. It is
-  // never re-delivered (duplicate-execution risk); an operator decides.
-  function notifyUncertainDeliveries() {
+  // ── Uncertain deliveries: notified only on a notification receipt ──────────
+  let notifying = null;
+  const deliveriesFile = path.join(monitorDir, UNCERTAIN_DELIVERIES_FILE);
+  const readRecords = () => { const prior = readJson(deliveriesFile, {}); return Array.isArray(prior?.records) ? prior.records : []; };
+  function saveRecord(record) {
+    const records = readRecords().filter(item => item.id !== record.id);
+    writeJsonAtomic(deliveriesFile, { records: [...records, record].slice(-20) });
+  }
+
+  function notifyUncertainDeliveries(nowMs) {
+    if (notifying) return;
     let rows = [];
     try { rows = uncertainDeliveries?.list() || []; } catch (err) { log(`Fable guard: uncertain deliveries unavailable (${err.message})`); }
-    for (const row of rows) {
-      const record = { id: row.id, item_type: row.item_type, item_id: row.item_id, channel: row.channel || null,
-        endpoint_id: row.endpoint_id || null, dialog_kind: row.dialog_kind, session_ref: row.session_ref || null,
-        preview: row.preview || null, detected_at: Number.isFinite(Number(row.detected_at)) ? iso(Number(row.detected_at) * 1000) : null };
-      log(`Fable guard ALERT: delivery uncertain on ${instanceId} (${row.dialog_kind}): ${row.item_type} #${row.item_id}`
-        + `${row.channel ? ` from ${row.channel}` : ''}${row.preview ? ` "${row.preview}"` : ''}; the CLI may not have received it. `
-        + 'Not re-delivered: resend by hand if needed.');
-      try {
-        const file = path.join(monitorDir, UNCERTAIN_DELIVERIES_FILE);
-        const prior = readJson(file, {});
-        writeJsonAtomic(file, { records: [...(Array.isArray(prior?.records) ? prior.records : []), record].slice(-20) });
-        uncertainDeliveries.markNotified(row.id);
-      } catch (err) { log(`Fable guard: uncertain delivery ${row.id} not recorded (${err.message})`); }
-    }
+    if (!rows.length) return;
+    const known = new Map(readRecords().map(item => [item.id, item]));
+    const due = rows.filter(row => {
+      const prior = known.get(row.id);
+      return !prior || ((prior.notify_attempts || 0) < NOTIFY_MAX_ATTEMPTS && !(Date.parse(prior.next_notify_at || '') > nowMs));
+    });
+    if (!due.length) return;
+    notifying = (async () => {
+      for (const row of due) {
+        const prior = known.get(row.id);
+        const record = { ...(prior || {}), id: row.id, item_type: row.item_type, item_id: row.item_id, channel: row.channel || null,
+          endpoint_id: row.endpoint_id || null, dialog_kind: row.dialog_kind, session_ref: row.session_ref || null,
+          preview: row.preview || null,
+          detected_at: Number.isFinite(Number(row.detected_at)) ? iso(Number(row.detected_at) * 1000) : null };
+        if (!prior) {
+          log(`Fable guard ALERT: delivery uncertain on ${instanceId} (${row.dialog_kind}): ${row.item_type} #${row.item_id}`
+            + `${row.channel ? ` from ${row.channel}` : ''}${row.preview ? ` "${row.preview}"` : ''}; the CLI may not have received it. `
+            + 'Not re-delivered: resend by hand if needed.');
+        }
+        let result;
+        try {
+          result = notifyOperator ? await notifyOperator(formatUncertainDeliveryAlert(instanceId, row))
+            : { ok: false, output: 'no operator notification path configured' };
+        } catch (err) {
+          result = { ok: false, output: err.message };
+        }
+        const at = now();
+        if (result?.ok) {
+          try {
+            uncertainDeliveries.markNotified(row.id);
+            saveRecord({ ...record, notified_at: iso(at), last_notify_error: null, next_notify_at: null });
+            log(`Fable guard: operator notified of uncertain delivery ${row.item_type} #${row.item_id}`);
+          } catch (err) {
+            log(`Fable guard ALERT: uncertain delivery ${row.id} notified but not marked (${err.message}); it is sent again`);
+          }
+          continue;
+        }
+        const attempts = (record.notify_attempts || 0) + 1;
+        const exhausted = attempts >= NOTIFY_MAX_ATTEMPTS;
+        const next = at + backoff(attempts, NOTIFY_RETRY_MS, NOTIFY_RETRY_MAX_MS);
+        try {
+          saveRecord({ ...record, notify_attempts: attempts, last_notify_error: String(result?.output || 'failed').slice(0, 200),
+            next_notify_at: exhausted ? null : iso(next) });
+        } catch { /* the in-memory state below still bounds the retries */ }
+        log(`Fable guard ALERT: uncertain delivery ${row.item_type} #${row.item_id} not notified (attempt ${attempts}: `
+          + `${result?.output || 'failed'}); ${exhausted ? 'automatic retries exhausted, it stays unnotified (fable-guard-cli.js status)'
+            : `retry at ${iso(next)}`}`);
+      }
+    })().catch(err => log(`Fable guard: uncertain delivery notification failed (${err.message})`))
+      .finally(() => { notifying = null; });
   }
 
   // ── Lease enforcement ──────────────────────────────────────────────────────
@@ -321,7 +386,7 @@ export function createFableMonitor({
     const nowMs = now();
     if (nowMs - lastCheckAt < checkIntervalMs) return null;
     lastCheckAt = nowMs;
-    notifyUncertainDeliveries();
+    notifyUncertainDeliveries(nowMs);
     if (pending) return enforce(nowMs);
     const sessionRef = safe(readSessionRef);
     // No session to judge (or to stop) right now; a relaunch is judged on its own.
@@ -349,5 +414,5 @@ export function createFableMonitor({
     return enforce(nowMs);
   }
 
-  return { tick, readLaunch, healthDeps, guardianDeps };
+  return { tick, readLaunch, healthDeps, guardianDeps, flushNotifications: () => notifying || Promise.resolve() };
 }

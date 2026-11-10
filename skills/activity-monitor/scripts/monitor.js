@@ -1220,7 +1220,11 @@ function fableHealthDeps(activeAdapter) {
     fenceReplacedSession, log, uncertainDeliveries: {
       list: () => getUncertainDeliveries({ instanceId: INSTANCE_ID, unnotifiedOnly: true, limit: 20 }),
       markNotified: id => markUncertainDeliveryNotified(id),
-    } });
+    },
+    // The operator path of the degraded alert: a direct admin send whose exit code is the receipt.
+    notifyOperator: message => (ADMIN_CHAT_ID
+      ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
+      : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })) });
   return fableMonitor?.healthDeps || {};
 }
 
