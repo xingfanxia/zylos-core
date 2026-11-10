@@ -23,6 +23,7 @@ import {
 } from '../../multi-session/runtime-files.js';
 import { baseModel, probeDue, recordProbeResult, runFableProbe } from './fable-probe.js';
 import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import { withFileLock } from '../../multi-session/file-lock.js';
 
 const CLOCK_SKEW_MS = 30_000;
 const RESUME_GRACE_MS = 180_000;
@@ -470,23 +471,61 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
     failoverInstanceIds, nowMs, ...inputs });
 }
 
+// A restart executed this recently whose relaunch has not happened yet will
+// launch from the newest commit (the launcher re-reads the guard state).
+const IN_FLIGHT_MS = 30_000;
+
 /**
  * Cold-start restart of each committed transition, reusing the failover path
- * (switch signal → kill tmux → pm2 restart). A restart whose generation was
- * superseded before it ran is skipped.
+ * (switch signal → kill tmux → pm2 restart), or the safe stop of an exhausted
+ * downgrade. Each item is fenced on its own, under the instances.json lock:
+ * a superseded generation is skipped, and a newer commit for a persona whose
+ * restart is still landing reuses that restart. The fence records
+ * `executing` in the guard state and writes the switch signal before the lock
+ * is released; the kill and pm2 calls run outside it.
  */
-export function executeFableRestarts({ zylosDir, restarts, nowMs = Date.now(), execFileSyncImpl = execFileSync, log = console.log }) {
-  const live = restarts.filter(item => {
-    const generation = readFableGuardState(zylosDir)?.personas?.[item.instanceId]?.desired?.generation;
-    if (generation === item.generation) return true;
-    log(`[fable-guard] ${item.instanceId}: g${item.generation} superseded by g${generation}; restart skipped`);
-    return false;
-  });
-  for (const item of live.filter(entry => entry.kind !== 'stop')) {
-    writeRuntimeSwitchSignal({ zylosDir, nowMs, change: { instanceId: item.instanceId, fromProfile: item.profileId,
-      toProfile: item.profileId, reason: `fable_guard:${item.mode}:g${item.generation}` } });
-  }
-  for (const item of live) {
+export function executeFableRestarts({
+  zylosDir,
+  restarts,
+  nowMs = Date.now(),
+  execFileSyncImpl = execFileSync,
+  log = console.log,
+  lock = withFileLock,
+  writeSignal = writeRuntimeSwitchSignal,
+}) {
+  const instancesFile = path.join(zylosDir, 'instances.json');
+  const executed = [];
+  for (const item of restarts) {
+    let go = false;
+    try {
+      lock(`${instancesFile}.lock`, () => {
+        const file = fableGuardStatePath(zylosDir);
+        const state = readJson(file, null);
+        const persona = state?.personas?.[item.instanceId];
+        const generation = persona?.desired?.generation;
+        if (generation !== item.generation) {
+          log(`[fable-guard] ${item.instanceId}: g${item.generation} superseded by g${generation}; restart skipped`);
+          return;
+        }
+        const prior = persona.executing;
+        if (item.kind !== 'stop' && prior?.kind === 'restart' && prior.generation < item.generation
+            && nowMs - ms(prior.at) < IN_FLIGHT_MS && !launchedSince(zylosDir, item.instanceId, readJson(instancesFile, null), ms(prior.at))) {
+          log(`[fable-guard] ${item.instanceId}: restart for g${prior.generation} still in flight; it launches g${item.generation}`);
+          return;
+        }
+        persona.executing = { generation, attempt: item.attempt ?? null, kind: item.kind || 'restart', at: iso(nowMs) };
+        writeJsonAtomic(file, state);
+        if (item.kind !== 'stop') {
+          writeSignal({ zylosDir, nowMs, change: { instanceId: item.instanceId, fromProfile: item.profileId,
+            toProfile: item.profileId, reason: `fable_guard:${item.mode}:g${item.generation}` } });
+        }
+        go = true;
+      });
+    } catch (err) {
+      log(`[fable-guard] ${item.instanceId}: g${item.generation} not started (${err.message}); resumed on a later pass`);
+      continue;
+    }
+    if (!go) continue;
     if (item.kind === 'stop') {
       // Safe end of an exhausted downgrade: the monitor first, so its Guardian cannot relaunch.
       try { execFileSyncImpl('pm2', ['stop', `activity-monitor-${item.instanceId}`], { stdio: 'ignore', timeout: 30_000 }); } catch (err) {
@@ -494,6 +533,7 @@ export function executeFableRestarts({ zylosDir, restarts, nowMs = Date.now(), e
       }
       try { execFileSyncImpl('tmux', ['kill-session', '-t', item.tmuxSession], { stdio: 'ignore', timeout: 10_000 }); } catch { /* absent pane */ }
       log(`[fable-guard] ${item.instanceId}: STOPPED after g${item.generation} downgrade retries were exhausted (${item.reason})`);
+      executed.push(item);
       continue;
     }
     try {
@@ -505,8 +545,50 @@ export function executeFableRestarts({ zylosDir, restarts, nowMs = Date.now(), e
     } catch (err) {
       log(`[fable-guard] ${item.instanceId}: restart g${item.generation} failed (${err.message}); resumed on a later pass`);
     }
+    executed.push(item);
   }
-  return live;
+  return executed;
+}
+
+function launchedSince(zylosDir, instanceId, document, sinceMs) {
+  const launch = readJson(path.join(monitorDirFor(zylosDir, instanceId, document?.instances?.[instanceId]), FABLE_LAUNCH_FILE), null);
+  return Number(launch?.launched_at_ms) > sinceMs;
+}
+
+/** Instances whose launches the guard owns: --apply must not restart them itself. */
+export function fableGuardOwnsInstance({ document, state, instanceId }) {
+  return (Boolean(readFableGuardConfig(document)) && document?.instances?.[instanceId]?.fable_enabled === true)
+    || Boolean(state?.personas?.[instanceId]);
+}
+
+/**
+ * One guard pass now, outside the daemon's poll: plan and commit under the
+ * instances.json lock, then execute the fenced restarts. This is the entry
+ * point for any writer of the launch policy (configure-ax-devbox-runtime.mjs
+ * --apply): it writes instances.json under the lock, releases it, and calls
+ * this instead of killing or restarting guard-owned personas itself. The
+ * daemon may run the same pass concurrently; the lock serializes the commits
+ * and the per-restart fence prevents an obsolete or duplicate restart.
+ */
+export function reconcileFableGuardNow({
+  zylosDir,
+  nowMs = Date.now(),
+  execFileSyncImpl = execFileSync,
+  log = console.log,
+  lock = withFileLock,
+} = {}) {
+  const instancesFile = path.join(zylosDir, 'instances.json');
+  let plan = { events: [], restarts: [], changed: false };
+  lock(`${instancesFile}.lock`, () => {
+    const document = readJson(instancesFile, null);
+    plan = planFableGuardPass({ zylosDir, document, nowMs });
+    if (plan.changed) writeJsonAtomic(fableGuardStatePath(zylosDir), plan.state);
+  });
+  for (const event of plan.events) log(`[fable-guard] ${event}`);
+  const executed = plan.restarts.length
+    ? executeFableRestarts({ zylosDir, restarts: plan.restarts, nowMs, execFileSyncImpl, log, lock })
+    : [];
+  return { events: plan.events, planned: plan.restarts, executed };
 }
 
 // ── Probe scheduling (runtime-failover daemon, non-blocking) ───────────────
