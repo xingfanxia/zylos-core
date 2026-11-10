@@ -98,6 +98,14 @@ export function fableAccountSettingsFile(document, profileId) {
 
 const FABLE_CLOCK_SKEW_MS = 30_000;
 export const FABLE_LAUNCH_FILE = 'fable-launch.json';
+// Per persona, written by its monitor: unknown-evidence stops and the
+// "model observation unavailable" alert (docs/fable-allowance-guard.md).
+export const FABLE_OBSERVATION_FILE = 'fable-observation.json';
+
+/** While the monitor cannot observe the session's model, Fable is never admitted for the persona. */
+export function fableObservationBlocked(observation) {
+  return Boolean(observation?.alert?.since);
+}
 
 /** The account's last valid observation, unless the local clock says it is from the future. */
 export function fableLastObservation(entry, nowMs) {
@@ -223,12 +231,18 @@ export function prepareFableLaunch({
     || (Boolean(config) && document?.instances?.[id]?.fable_enabled === true)
     || Boolean(guardState?.personas?.[id]);
   if (!tracked) return profile;
+  const recordPath = fableLaunchRecordPath({ zylosDir, instanceId: id, instance: document?.instances?.[id], monitorDir });
   let launched = profile;
   if (profile.fable) {
     const usage = config ? readJsonSafe(fableUsagePath(zylosDir), readFileSync) : null;
-    const decision = document
+    let decision = document
       ? resolveFableLaunch({ document, instanceId: id, profileId: profile.id, guardState, usage, nowMs })
       : null;
+    // The monitor could not observe what its sessions run: no Fable until it can.
+    if (decision?.mode === 'fable'
+        && fableObservationBlocked(readJsonSafe(path.join(path.dirname(recordPath), FABLE_OBSERVATION_FILE), readFileSync))) {
+      decision = { ...decision, mode: 'opus', model: null, reason: 'observation_unavailable' };
+    }
     const { fable: _fable, launchEnv: _env, baseModel = profile.model, ...rest } = profile;
     launched = decision
       ? { ...rest, baseModel, model: decision.model || baseModel, launchEnv: decision.env,
@@ -249,7 +263,6 @@ export function prepareFableLaunch({
     key: launchKeyOfProfile(launched),
     pid: process.pid,
   };
-  const recordPath = fableLaunchRecordPath({ zylosDir, instanceId: id, instance: document?.instances?.[id], monitorDir });
   try {
     writeRecord(recordPath, record);
   } catch {

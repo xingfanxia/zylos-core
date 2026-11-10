@@ -156,7 +156,7 @@ import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tas
 // Fable guard (FG-4): the delivery side owns the limit-dialog classifier; a
 // named import so a renamed or removed export fails loudly at load.
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
-import { createFableMonitor, parseModelArgument } from './fable-monitor.js';
+import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
 import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession } from '../../comm-bridge/scripts/c4-db.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
@@ -841,17 +841,11 @@ function getTmuxPanePid(sessionName) {
 }
 
 // Fable guard: the --model argument of the running Claude CLI in the pane, or
-// null when the process or its command line cannot be read.
+// null when the process or its command line cannot be read. An isolated
+// persona's CLI runs as its own unix user (sudo -> sudo -> node -> claude);
+// its command line is world-readable through ps and /proc on the devbox.
 function readClaudeProcessModel(sessionName) {
-  const pid = getTmuxClaudePid(sessionName);
-  if (!pid) return null;
-  try {
-    const args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', timeout: 3000 });
-    const model = parseModelArgument(args);
-    return model ? { model, pid } : null;
-  } catch {
-    return null;
-  }
+  return readProcessModelArgument(getTmuxClaudePid(sessionName));
 }
 
 function getTmuxClaudePid(sessionName) {

@@ -2,9 +2,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, it } from 'node:test';
 
-import { createFableMonitor, LEASE_ENFORCEMENT_FILE, READINESS_FILE, UNCERTAIN_DELIVERIES_FILE } from '../fable-monitor.js';
+import { createFableMonitor, LEASE_ENFORCEMENT_FILE, READINESS_FILE, readProcessModelArgument, UNCERTAIN_DELIVERIES_FILE } from '../fable-monitor.js';
 import { SESSION_FAILURES_FILE } from '../fable-guard.js';
 import { Guardian } from '../guardian.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
@@ -433,5 +434,100 @@ describe('Uncertain-delivery notification needs a receipt (review-2 #6)', () => 
     assert.equal(sent.length, 3);
     assert.match(sent.at(-1), /4012/);
     assert.match(sent.at(-1), /please send the Q3 report to Lin/);
+  });
+});
+
+describe('Unknown model evidence cannot recycle a healthy Opus fallback (review-3 #2)', () => {
+  const CLI = new URL('../fable-guard-cli.js', import.meta.url).pathname;
+  const status = fx => spawnSync(process.execPath, [CLI, 'status'], { encoding: 'utf8',
+    env: { ...process.env, ZYLOS_DIR: fx.zylosDir } }).stdout;
+
+  it('Opus relaunches with both observations unavailable: one conservative stop, then a persistent ALERT; recovers when readable', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.writeState('opus', 4); // the guard wants Opus: the session is not admitted to Fable
+    fx.launch(clock.now); // Opus launch record (intent)
+    const world = sessionWorld({ model: 'claude-opus-5-5' });
+    const observation = { readable: false };
+    const { monitor, logs } = monitorInWorld(fx, clock, world, {
+      readProcessModel: () => (observation.readable && world.alive ? { model: world.model } : null),
+      readModelReport: () => null,
+    });
+    // Two hours of 15 s monitor ticks; the Guardian relaunches (on Opus) whatever is stopped.
+    const run = ticks => {
+      for (let i = 0; i < ticks; i++) {
+        clock.now += 15_000;
+        if (!world.alive) { fx.launch(clock.now); world.replace('claude-opus-5-5'); }
+        monitor.tick();
+      }
+    };
+    run(480);
+    assert.equal(world.stops.length, 1, `healthy Opus sessions were recycled ${world.stops.length} times`);
+    const alerts = logs.filter(line => /ALERT/.test(line) && /model observation unavailable/.test(line));
+    assert.equal(alerts.length, 1, 'one ALERT per incident, not one per tick');
+    assert.match(status(fx), /user-pan.*ALERT model observation unavailable/);
+
+    // While observation is unavailable, Fable is not admitted for this persona, even when everything else allows it.
+    fx.writeState('fable', 5);
+    fx.writeUsage(clock.now, 0.1);
+    const blocked = fx.launch(clock.now);
+    assert.equal(blocked.model, OPUS);
+    assert.equal(blocked.fable.reason, 'observation_unavailable');
+
+    // Evidence readable again: the alert clears by itself and Fable can be admitted again.
+    observation.readable = true;
+    fx.writeState('opus', 6);
+    run(4);
+    assert.doesNotMatch(status(fx), /ALERT model observation unavailable/);
+    assert.ok(logs.some(line => /model observation recovered/.test(line)));
+    fx.writeState('fable', 7);
+    fx.writeUsage(clock.now, 0.1);
+    assert.equal(fx.launch(clock.now).model, FABLE);
+    assert.equal(world.stops.length, 1);
+  });
+
+  it('a session launched to Fable is still stopped on unknown evidence after the budget is spent', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now); // Fable record: admitted at launch
+    const world = sessionWorld({ model: 'claude-fable-5-2' });
+    const { monitor } = monitorInWorld(fx, clock, world, { readProcessModel: () => null, readModelReport: () => null });
+    // An earlier unknown-evidence stop already spent the budget.
+    fs.writeFileSync(path.join(fx.monitorDir, 'fable-observation.json'), JSON.stringify({ version: 1,
+      unknown_stops: [{ at: new Date(T0 - MIN).toISOString(), session_ref: '$2:1762780000:%2:1', launch_mode: 'opus' }] }));
+    clock.now = T0 + 13 * MIN; // lease expired
+    monitor.tick();
+    clock.now += 3 * MIN;
+    monitor.tick();
+    assert.equal(world.stops.length, 1, 'a possibly-Fable session past its lease is not left running');
+  });
+
+  it('the guard does not commit Fable for a persona whose observation is unavailable', async () => {
+    const { planFableGuardPass } = await import('../fable-guard.js');
+    const fx = fixture();
+    fx.writeState('fable', 5);
+    fx.writeUsage(T0, 0.1);
+    fs.writeFileSync(path.join(fx.monitorDir, 'fable-observation.json'), JSON.stringify({ version: 1,
+      alert: { since: new Date(T0).toISOString(), reason: 'model_observation_unavailable' } }));
+    const document = JSON.parse(fs.readFileSync(path.join(fx.zylosDir, 'instances.json'), 'utf8'));
+    const plan = planFableGuardPass({ zylosDir: fx.zylosDir, document, nowMs: T0 + MIN });
+    assert.equal(plan.state.personas['user-pan'].desired.mode, 'opus');
+    assert.match(plan.state.personas['user-pan'].desired.reason, /observation_unavailable/);
+  });
+});
+
+describe('Process model observation as the monitor user sees it (review-3 #2)', () => {
+  const ARGS = 'claude --dangerously-skip-permissions --settings /home/zylos-shared/auth/claude-ax-backup.settings.json --model claude-opus-5-5[1m] --effort high';
+  it('reads --model from ps, and from /proc/<pid>/cmdline when ps fails', () => {
+    assert.deepEqual(readProcessModelArgument(4242, { execFileSyncImpl: () => `${ARGS}\n` }),
+      { model: 'claude-opus-5-5[1m]', pid: 4242, source: 'ps' });
+    const viaProc = readProcessModelArgument(4242, {
+      execFileSyncImpl: () => { throw new Error('ps timed out'); },
+      readFileSync: file => { assert.equal(file, '/proc/4242/cmdline'); return `${ARGS.split(' ').join('\0')}\0`; },
+    });
+    assert.deepEqual(viaProc, { model: 'claude-opus-5-5[1m]', pid: 4242, source: 'proc' });
+    assert.equal(readProcessModelArgument(4242, { execFileSyncImpl: () => { throw new Error('x'); },
+      readFileSync: () => { throw new Error('ENOENT'); } }), null);
+    assert.equal(readProcessModelArgument(0), null);
   });
 });
