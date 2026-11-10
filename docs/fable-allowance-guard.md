@@ -113,9 +113,24 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
   enforcement. At most one claim is `running` per persona, so these never
   overlap; an operation (kind, generation, attempt, target account / launch /
   session) that already ran is never executed again, so the same
-  generation/attempt submitted twice executes once. A `running` claim older
-  than 90 s (longer than the kill and pm2 timeouts) was interrupted and may be
-  recovered. A restart skipped because the claim is busy is picked up by the
+  generation/attempt submitted twice executes once.
+- Claim ownership is the executor process, never the claim's age. The claim
+  records `executor {pid, start, host}` (`start`: on Linux the boot id plus the
+  process start time from `/proc/<pid>/stat`, elsewhere `ps -o lstart` in UTC)
+  and is stamped with the time it was acquired, not the caller's pass time. A
+  `running` claim is taken over only when its executor provably cannot
+  continue: the pid no longer exists (executor crash), or it now belongs to a
+  different process (start identity differs: pid reuse, reboot), or the owner
+  is the claiming process itself and the operation is no longer executing in
+  it (its completion could not be recorded). A paused or slow executor keeps
+  its claim however long it takes; a claim recorded on another host is not
+  judged here (remove `activity-monitor/fable-exec/<id>.json` by hand only
+  after checking that no executor runs). A claim written before the
+  `executor` field existed keeps the old rule (recoverable after 90 s).
+  Every executor re-checks that it still holds the claim right before each
+  irreversible effect (`tmux kill-session`, `pm2 restart` / `pm2 stop`, the
+  monitor's session kill); one that lost it logs `ALERT … lost its execution
+  claim` and stops before acting. A restart skipped because the claim is busy is picked up by the
   level-triggered reconcile below; an account-failover suspend skipped that
   way is kept (`deferred`) and run by the next daemon pass, unless the
   failover has lifted that suspension meanwhile. The claim records execution,
