@@ -491,8 +491,9 @@ before that session's `session_created`; a same-second key is ambiguous and
 is fenced, not delivered. Every key, paste and Enter is then sent to the pane
 id (`%N`) of the read that decided it, never to the reusable session name, so
 a session replaced in between makes the send fail instead of receiving it.
-The periodic Enter nudge (`maybePeriodicEnter`) is not tied to a read and
-still targets the session name.
+This fork's dispatcher has no periodic Enter nudge: upstream's
+`periodic-enter.js` (`C4_PERIODIC_ENTER_*`) is not wired in, so no Enter is
+sent without a deciding read.
 
 **Uncertain deliveries.** If the CLI raises a Fable-limit / usage-credits
 dialog right after the dispatcher sent Enter, C4 records the message as

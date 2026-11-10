@@ -12,9 +12,8 @@ import {
   closeSync as fsCloseSync, unlinkSync as fsUnlinkSync,
 } from 'fs';
 import net from 'net';
-import { logDeliveryFailure, saveEnterCapture } from './c4-diagnostic.js';
+import { logDeliveryFailure } from './c4-diagnostic.js';
 import { sendTmuxKeys, tmuxFailureDetails } from './tmux-send-keys.js';
-import { PeriodicEnter } from './periodic-enter.js';
 import {
   getNextPending,
   claimConversation,
@@ -51,10 +50,6 @@ import {
   CONTROL_CLEANUP_INTERVAL_MS,
   ENTER_VERIFY_MAX_RETRIES,
   ENTER_VERIFY_WAIT_MS,
-  PERIODIC_ENTER_ENABLED,
-  PERIODIC_ENTER_INTERVAL_MS,
-  PERIODIC_ENTER_MAX_ATTEMPTS,
-  ENTER_CAPTURE_ENABLED,
   BRACKETED_PASTE_ENABLED,
   REQUIRE_IDLE_MIN_SECONDS,
   REQUIRE_IDLE_POST_SEND_HOLD_MS,
@@ -84,7 +79,6 @@ let pollInterval = POLL_INTERVAL_BASE;
 let tmuxMissingChecks = 0;
 let lastControlCleanupMs = 0;
 let deliveryTrace = {};
-let captureCapacityReported = false;
 // Observability state (WS-A). lastHeartbeatMs=0 → the first tick emits a
 // heartbeat immediately (a positive "alive" signal at startup), then every
 // HEARTBEAT_INTERVAL_MS. lastTickCompletedAt drives the stuck-tick watchdog and
@@ -113,59 +107,9 @@ function trace(event, metadata = {}) {
 
 // Fork: sendToTmux verifies submission through pending-submission ownership and
 // receipts, which already resume Enter for an unsubmitted paste. Upstream's
-// blind periodic Enter is therefore never armed here; the loop hook stays a no-op.
-const periodicEnter = new PeriodicEnter({
-  enabled: PERIODIC_ENTER_ENABLED,
-  intervalMs: PERIODIC_ENTER_INTERVAL_MS,
-  maxAttempts: PERIODIC_ENTER_MAX_ATTEMPTS,
-  emit: trace
-});
-
-function captureEnter(phase, metadata, session = TMUX_SESSION) {
-  if (!ENTER_CAPTURE_ENABLED) return;
-  try {
-    const capture = execFileSync('tmux', ['capture-pane', '-p', '-t', session], {
-      encoding: 'utf8', stdio: 'pipe', timeout: 500
-    });
-    const geometry = execFileSync('tmux', ['display-message', '-p', '-t', session, '#{cursor_x},#{cursor_y},#{pane_width},#{pane_height}'], {
-      encoding: 'utf8', stdio: 'pipe', timeout: 500
-    }).trim();
-    const result = saveEnterCapture(capture, phase, { ...deliveryTrace, ...metadata, geometry });
-    if (result === 'capacity' && !captureCapacityReported) {
-      captureCapacityReported = true;
-      trace('capture_skipped', { reason: 'capacity' });
-    } else if (result === 'failed') trace('capture_failed', { phase });
-  } catch { trace('capture_failed', { phase }); }
-}
-
-function sendEnter(kind, details = {}, session = TMUX_SESSION) {
-  const metadata = { kind, ...details };
-  trace('enter_attempt', metadata);
-  try {
-    sendTmuxKeys(session, ['Enter'], { stdio: 'pipe', timeout: 5000 });
-    if (session === TMUX_SESSION) periodicEnter.entered();
-    trace('enter_sent', metadata);
-  } catch (error) {
-    trace('enter_failed', { ...metadata, ...tmuxFailureDetails(error) });
-    log(`tmux send-keys failed action=enter: ${JSON.stringify(tmuxFailureDetails(error))}`);
-    throw error;
-  }
-}
-
-async function maybePeriodicEnter() {
-  const pending = periodicEnter.pending;
-  if (!PERIODIC_ENTER_ENABLED || !pending || pending.attempts >= PERIODIC_ENTER_MAX_ATTEMPTS) return;
-  await periodicEnter.tick({
-    eligible: !isShuttingDown,
-    send: async () => {
-      const metadata = { itemId: pending.itemId, itemType: pending.itemType, attempt: pending.attempts };
-      captureEnter('before', { kind: 'periodic', ...metadata });
-      sendEnter('periodic', metadata);
-      await sleep(ENTER_VERIFY_WAIT_MS);
-      captureEnter('after', { kind: 'periodic', ...metadata });
-    }
-  });
-}
+// blind periodic Enter (periodic-enter.js, C4_PERIODIC_ENTER_*) and its Enter
+// captures (C4_ENTER_CAPTURE_ENABLED) are not wired into this dispatcher:
+// every Enter is bound to the pane read that decided it.
 
 export function notifyMessageDelivered({ conversationId, channel, deliveredAt = Date.now(), socketPath = AM_SOCKET_PATH } = {}) {
   return new Promise((resolve) => {
@@ -1132,7 +1076,6 @@ async function processNextMessage() {
       await handleControlDeliveryFailure(item, fence.reason);
       return { delivered: false, state: agentState.state };
     }
-    periodicEnter.reset('keystroke_control');
     const key = parseKeystrokeKey(rawContent);
     log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority})`);
     try {
@@ -1259,8 +1202,6 @@ async function dispatcherLoop() {
   while (!isShuttingDown) {
     const { result, errored } = await runDispatcherTick();
     const { delivered, state } = result;
-    // One awaited loop serializes periodic keys with all paste/verify work.
-    await maybePeriodicEnter();
 
     // On error keep the prior poll interval and back off by it — unchanged from
     // the original catch-branch behavior (an erroring tick does not reset the
@@ -1340,8 +1281,7 @@ async function main() {
   }
   log('=== C4 Dispatcher Started ===');
   log(`Tmux session: ${TMUX_SESSION}`);
-  trace('delivery_config', { captureEnabled: ENTER_CAPTURE_ENABLED, bracketedPasteEnabled: BRACKETED_PASTE_ENABLED });
-  trace('periodic_config', { enabled: PERIODIC_ENTER_ENABLED, intervalMs: PERIODIC_ENTER_INTERVAL_MS, maxAttempts: PERIODIC_ENTER_MAX_ATTEMPTS });
+  trace('delivery_config', { bracketedPasteEnabled: BRACKETED_PASTE_ENABLED });
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);
 
   // Reclaim rows a previous dispatcher left in 'running' (killed mid-delivery).
