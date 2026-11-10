@@ -12,8 +12,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
+  expectedFableLaunch,
+  FABLE_LAUNCH_FILE,
   fableAccountSettingsFile,
   fableGuardStatePath,
+  fableLastObservation,
+  fableLeaseObservation,
   fableUsagePath,
   readFableGuardConfig,
 } from '../../multi-session/runtime-files.js';
@@ -22,6 +26,8 @@ import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 
 const CLOCK_SKEW_MS = 30_000;
 const RESUME_GRACE_MS = 180_000;
+// A launch record older than the engine's current launch is not that launch.
+const LAUNCH_MATCH_SKEW_MS = 5000;
 const MAX_RESTART_ATTEMPTS = 3;
 const STATUS_MAX_AGE_MS = 60_000;
 const EVIDENCE_MAX_AGE_MS = 3_600_000;
@@ -73,21 +79,8 @@ export function fableProbeAccounts(document, config = readFableGuardConfig(docum
   return accounts;
 }
 
-// The last valid observation, unless the local clock says it is from the future.
-function lastObservation(entry, nowMs) {
-  const obs = entry?.last_valid;
-  const observedMs = ms(obs?.observed_at);
-  if (!obs || !Number.isFinite(observedMs) || observedMs > nowMs + CLOCK_SKEW_MS) return null;
-  if (!Number.isFinite(Number(obs.utilization)) || !Number.isFinite(ms(obs.resets_at))) return null;
-  return obs;
-}
-
-// Lease: a valid observation younger than lease_sec whose window has not reset.
-function freshObservation(entry, nowMs, config) {
-  const obs = lastObservation(entry, nowMs);
-  if (!obs) return null;
-  return nowMs - ms(obs.observed_at) < config.lease_sec * 1000 && ms(obs.resets_at) > nowMs ? obs : null;
-}
+const lastObservation = fableLastObservation;
+const freshObservation = fableLeaseObservation;
 
 function laterWindow(obs, window) {
   return Number.isFinite(ms(window)) && ms(obs.resets_at) > ms(window);
@@ -220,6 +213,8 @@ export function planFableGuard({
   modelByInstance = {},
   evidenceByInstance = {},
   failuresByInstance = {},
+  launchByInstance = {},
+  readinessByInstance = {},
   failoverInstanceIds = new Set(),
   nowMs = Date.now(),
 } = {}) {
@@ -229,7 +224,6 @@ export function planFableGuard({
   const events = [];
   const before = JSON.stringify(next);
   const instances = document?.instances || {};
-  const profiles = document?.runtime_profiles || {};
   if (!config && !Object.keys(next.personas).length) {
     return { state: next, restarts, events, changed: false };
   }
@@ -283,61 +277,80 @@ export function planFableGuard({
     const eligible = enabled && Boolean(fableAccountSettingsFile(document, profileId));
     const priorMode = persona.desired?.mode || 'opus';
     let mode = 'opus';
-    if (eligible && accountAllowsFable(next, usage, profileId, config, nowMs)) {
-      mode = priorMode === 'fable' || upgradeReady(persona, status, nowMs, config) ? 'fable' : 'opus';
-    }
-    const changed = !persona.desired || persona.desired.mode !== mode || persona.desired.account !== profileId;
+    const allowed = eligible && accountAllowsFable(next, usage, profileId, config, nowMs);
+    if (allowed) mode = priorMode === 'fable' || upgradeReady(persona, status, nowMs, config) ? 'fable' : 'opus';
+    const expected = expectedFableLaunch({ document, instanceId: id, mode });
+    const launch = launchByInstance[id] || null;
+    const changed = !persona.desired || persona.desired.mode !== mode || persona.desired.account !== profileId
+      || persona.desired.key !== expected.key;
     if (changed) {
       const generation = ++next.generation_seq;
-      const modeChanged = priorMode !== mode;
-      const reason = !enabled ? 'fable_disabled' : mode === 'fable' ? 'fable_allowed'
-        : `fable_blocked:${Object.keys(next.holds[profileId] || {}).join('+') || (eligible ? 'no_lease' : 'ineligible_account')}`;
-      persona.desired = { account: profileId, mode, generation, committed_at: iso(nowMs), reason };
-      if (modeChanged) persona.last_transition_at = iso(nowMs);
+      const reason = !enabled ? 'fable_disabled' : mode === 'fable' ? 'fable_allowed' : allowed ? 'upgrade_pending'
+        : `fable_blocked:${Object.keys(next.holds[profileId] || {}).join('+') || (eligible ? 'no_lease' : 'unsupported_account')}`;
+      if (priorMode !== mode) persona.last_transition_at = iso(nowMs);
+      persona.desired = { account: profileId, mode, generation, key: expected.key, model: baseModel(expected.model),
+        committed_at: iso(nowMs), reason };
       persona.executed_generation = generation;
       persona.executed_at = iso(nowMs);
-      persona.restart_required = modeChanged;
       persona.attempts = 0;
-      delete persona.verified;
-      const alreadyRunning = runningModelMatches(status, modelByInstance[id],
-        mode === 'fable' ? config?.fable_model : profiles[profileId]?.model);
-      if (alreadyRunning) persona.restart_required = false;
-      if (modeChanged && !failoverInstanceIds.has(id) && !alreadyRunning) {
+      for (const key of ['verified', 'gave_up', 'restart_required']) delete persona[key];
+      if (launchServes(launch, status, nowMs) && launch.key === expected.key && launch.runtime_profile === profileId) {
+        // The running launch already uses exactly this policy: adopt it.
+        persona.desired.adopted_launch_id = launch.launch_id;
+      } else if (failoverInstanceIds.has(id)) {
+        persona.attempts = 1; // the account failover's cold restart carries this commit
+      } else if (policyOnlyChange(persona.desired, launch) && status.state !== 'idle') {
+        // Nothing here reduces Fable exposure: restart once the persona is idle.
+      } else if (status.state !== 'suspended') {
         persona.attempts = 1;
-        restarts.push({ instanceId: id, generation, mode, profileId, reason,
+        restarts.push({ instanceId: id, generation, attempt: 1, kind: 'restart', mode, profileId, reason,
           tmuxSession: instance.tmux_session || `claude-${id}` });
       }
       events.push(`${id}: commit g${generation} ${mode} on ${profileId} (${reason})`);
       continue;
     }
-    reconcilePersona({ id, instance, persona, status, actual: modelByInstance[id], profiles, config, nowMs, restarts, events,
+    reconcilePersona({ id, instance, persona, status, launch, actual: modelByInstance[id], config, nowMs, restarts, events,
       failureCount: () => sessionFailures(persona, failuresByInstance[id], profileId,
         Math.max(nowMs - (config?.crash_window_sec || 0) * 1000, ms(persona.crash_counted_after) || 0)).length });
-    if (!enabled && persona.desired.mode === 'opus' && persona.verified) delete next.personas[id];
+    if (!enabled && persona.desired.mode === 'opus' && persona.verified?.model_at) delete next.personas[id];
   }
 
   const changed = JSON.stringify(next) !== before;
   return { state: next, restarts, events, changed };
 }
 
-// Verify a committed generation against the running engine and resume an
-// interrupted transition. A committed opus with Fable still running is not done.
-function runningModelMatches(status, actual, model) {
-  const launchMs = Number(status?.runtime_launch_at) || 0;
-  return ['idle', 'busy'].includes(status?.state) && Boolean(baseModel(model))
-    && baseModel(actual?.model) === baseModel(model) && Number(actual?.observed_at_ms) >= launchMs;
+function isRunning(status, nowMs) {
+  const checkedMs = Number(status?.last_check) * 1000;
+  return ['idle', 'busy'].includes(status?.state) && Number.isFinite(checkedMs) && nowMs - checkedMs <= 2 * STATUS_MAX_AGE_MS;
 }
 
-function reconcilePersona({ id, instance, persona, status, actual, profiles, config, nowMs, restarts, events, failureCount }) {
+// The launch record describes the engine's current launch (not an older one).
+function launchServes(launch, status, nowMs) {
+  return Boolean(launch) && isRunning(status, nowMs)
+    && Number(launch.launched_at_ms) >= (Number(status.runtime_launch_at) || 0) - LAUNCH_MATCH_SKEW_MS;
+}
+
+// The launch was made for this commit: same account, mode and launch policy,
+// and either this generation or the launch adopted at commit time.
+function launchMatches(desired, launch) {
+  return Boolean(launch) && launch.key === desired.key && launch.runtime_profile === desired.account
+    && launch.mode === desired.mode
+    && (launch.generation === desired.generation || launch.launch_id === desired.adopted_launch_id);
+}
+
+// An Opus session on the right account whose launch policy (subagent env,
+// profile model or effort) changed: no Fable exposure is at stake, so the
+// restart waits for an idle persona instead of interrupting work.
+function policyOnlyChange(desired, launch) {
+  return desired.mode === 'opus' && launch?.mode === 'opus' && launch.runtime_profile === desired.account;
+}
+
+// Verify a committed generation against the running engine's launch record
+// (account, policy, generation) and its reported model, and resume an
+// interrupted transition. A committed opus with Fable still running is not done.
+function reconcilePersona({ id, instance, persona, status, launch, actual, config, nowMs, restarts, events, failureCount }) {
   const desired = persona.desired;
   if (persona.executed_generation !== desired.generation) return;
-  if (!['idle', 'busy'].includes(status.state)) {
-    // A stopped engine launches from the committed state next time.
-    if (status.state !== 'starting' && !persona.restart_required) persona.verified ||= { not_running_at: iso(nowMs) };
-    return;
-  }
-  const expected = desired.mode === 'fable' ? baseModel(config?.fable_model) : baseModel(profiles[desired.account]?.model);
-  const launchMs = Number(status.runtime_launch_at) || 0;
   const executedMs = ms(persona.executed_at);
   const resume = why => {
     if ((persona.attempts || 0) >= MAX_RESTART_ATTEMPTS) {
@@ -347,30 +360,42 @@ function reconcilePersona({ id, instance, persona, status, actual, profiles, con
     }
     persona.attempts = (persona.attempts || 0) + 1;
     persona.executed_at = iso(nowMs);
-    restarts.push({ instanceId: id, generation: desired.generation, mode: desired.mode, profileId: desired.account,
-      reason: `resume:${why}`, tmuxSession: instance.tmux_session || `claude-${id}` });
+    restarts.push({ instanceId: id, generation: desired.generation, attempt: persona.attempts, kind: 'restart',
+      mode: desired.mode, profileId: desired.account, reason: `resume:${why}`, tmuxSession: instance.tmux_session || `claude-${id}` });
     events.push(`${id}: resume g${desired.generation} (${why})`);
   };
-  if (persona.restart_required && launchMs < executedMs - 2000) {
-    if (nowMs - executedMs > RESUME_GRACE_MS) resume('no_new_launch');
+  if (!isRunning(status, nowMs)) {
+    // A stopped engine launches from the committed state next time.
+    if (status.state !== 'starting') persona.verified ||= { not_running_at: iso(nowMs) };
     return;
   }
+  if (!launchServes(launch, status, nowMs) || !launchMatches(desired, launch)) {
+    if (persona.verified?.model_at) delete persona.verified;
+    if (policyOnlyChange(desired, launch) && launchServes(launch, status, nowMs)) {
+      if (status.state === 'idle') resume('policy_change');
+      return;
+    }
+    if (nowMs - executedMs > RESUME_GRACE_MS) resume(launch ? 'stale_launch' : 'launch_unrecorded');
+    return;
+  }
+  const launchMs = Number(launch.launched_at_ms);
+  const expected = desired.model;
   const actualModel = baseModel(actual?.model);
   if (!actualModel || !expected || !(Number(actual.observed_at_ms) >= launchMs)) return;
   if (actualModel !== expected) {
-    if (persona.verified?.mismatch_launch === launchMs) return;
-    persona.verified = { mismatch_launch: launchMs };
-    // A session launched after this commit that is not on Fable is a Fable
+    if (persona.verified?.mismatch_launch === launch.launch_id) return;
+    persona.verified = { mismatch_launch: launch.launch_id };
+    // A session launched for this commit that is not on Fable is a Fable
     // session failure (e.g. the CLI's consent fallback). When it trips the
     // crash rule, the next pass commits Opus instead of relaunching Fable.
-    if (desired.mode === 'fable' && launchMs >= executedMs - 2000) {
+    if (desired.mode === 'fable') {
       persona.failures = [...(persona.failures || []), { at: iso(nowMs), reason: `model_mismatch:${actualModel}` }].slice(-10);
       if (failureCount() >= config.crash_failures) return;
     }
     resume(`model_mismatch:${actualModel}`);
     return;
   }
-  if (!persona.verified?.model_at) persona.verified = { model_at: iso(nowMs) };
+  if (!persona.verified?.model_at) persona.verified = { model_at: iso(nowMs), launch_id: launch.launch_id };
   if (!persona.verified.ack_at && Number(status.functional_ack_at) >= launchMs
       && typeof status.functional_ack_phase === 'string' && status.functional_ack_phase !== 'primary') {
     persona.verified.ack_at = iso(Number(status.functional_ack_at));
@@ -402,7 +427,7 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
   if (!readFableGuardConfig(document) && !Object.keys(state?.personas || {}).length) {
     return { state, restarts: [], events: [], changed: false };
   }
-  const inputs = { statusByInstance: {}, modelByInstance: {}, evidenceByInstance: {}, failuresByInstance: {} };
+  const inputs = { statusByInstance: {}, modelByInstance: {}, evidenceByInstance: {}, failuresByInstance: {}, launchByInstance: {} };
   for (const [id, instance] of Object.entries(document?.instances || {})) {
     if (instance?.fable_enabled !== true && !state?.personas?.[id]) continue;
     const dir = monitorDirFor(zylosDir, id, instance);
@@ -410,6 +435,7 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
     inputs.modelByInstance[id] = readActualModel(dir);
     inputs.evidenceByInstance[id] = readJson(path.join(dir, LIMIT_EVIDENCE_FILE), null);
     inputs.failuresByInstance[id] = readJson(path.join(dir, SESSION_FAILURES_FILE), null);
+    inputs.launchByInstance[id] = readJson(path.join(dir, FABLE_LAUNCH_FILE), null);
   }
   return planFableGuard({ document, state, usage: readJson(fableUsagePath(zylosDir), {}),
     failoverInstanceIds, nowMs, ...inputs });

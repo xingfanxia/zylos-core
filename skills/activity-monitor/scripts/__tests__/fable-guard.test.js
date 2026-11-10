@@ -17,8 +17,10 @@ import {
   FABLE_GUARD_DEFAULTS,
   fableGuardStatePath,
   fableUsagePath,
+  prepareFableLaunch,
   readFableGuardConfig,
   resolveFableLaunch,
+  resolveRuntimeProfile,
 } from '../../../multi-session/runtime-files.js';
 
 const MIN = 60_000;
@@ -55,9 +57,12 @@ class Sim {
     this.models = {};
     this.evidence = {};
     this.failures = {};
+    this.launches = {};
+    this.cached = {};
+    this.readiness = {};
     this.now = T0;
     this.restarts = [];
-    for (const id of PERSONAS) this.launch(id, { at: T0 - 3_600_000 });
+    for (const id of PERSONAS) this.monitorStart(id, { at: T0 - 3_600_000 });
   }
   get config() { return readFableGuardConfig(this.document); }
   observe(account, utilization, resetsAt = W1, at = this.now) {
@@ -80,28 +85,42 @@ class Sim {
     const result = planFableGuard({
       document: this.document, state: this.state, usage: this.usage, statusByInstance: this.status,
       modelByInstance: this.models, evidenceByInstance: this.evidence, failuresByInstance: this.failures,
+      launchByInstance: this.launches, readinessByInstance: this.readiness,
       failoverInstanceIds: new Set(failover), nowMs: this.now,
     });
     this.state = JSON.parse(JSON.stringify(result.state)); // what the daemon persists
     this.restarts.push(...result.restarts);
     return result;
   }
-  // A (re)launch reads the committed state through the real launcher decision.
+  // Files as the launcher reads them on the host.
+  read(file) {
+    if (file.endsWith('instances.json')) return JSON.stringify(this.document);
+    if (file.endsWith('fable-guard.json') && this.state) return JSON.stringify(this.state);
+    if (file.endsWith('fable-usage.json')) return JSON.stringify(this.usage);
+    throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+  }
+  // A cold restart (pm2 restart activity-monitor-<id>): the monitor resolves
+  // its profile once, then the Guardian launches it.
+  monitorStart(id, options = {}) {
+    this.cached[id] = resolveRuntimeProfile({ document: this.document, instanceId: id, fableGuardState: this.state,
+      fableUsage: this.usage, nowMs: this.now });
+    return this.launch(id, options);
+  }
+  // A Guardian relaunch: the real adapter path re-evaluates the CACHED profile.
   launch(id, { at = this.now, model = null } = {}) {
-    const profileId = this.document.instances[id].runtime_profile;
-    const decision = resolveFableLaunch({ document: this.document, instanceId: id, profileId, guardState: this.state,
-      usage: this.usage, nowMs: this.now });
-    const launched = model || decision?.model || this.document.runtime_profiles[profileId].model;
+    const profile = prepareFableLaunch({ profile: this.cached[id], instanceId: id, zylosDir: '/sim', nowMs: at,
+      readFileSync: file => this.read(file), writeRecord: (_file, record) => { this.launches[id] = record; } });
+    const launched = model || profile.model;
     this.status[id] = { state: 'idle', health: 'ok', active_tools: 0, last_check: Math.floor(this.now / 1000), runtime_launch_at: at };
     this.models[id] = { model: baseModel(launched), observed_at_ms: at + 1000 };
-    return { decision, launched };
+    return { decision: profile.fable || null, launched, profile };
   }
-  launchAll(restarts) { for (const item of restarts) this.launch(item.instanceId); }
+  launchAll(restarts) { for (const item of restarts) this.monitorStart(item.instanceId); }
   mode(id) { return this.state?.personas?.[id]?.desired?.mode; }
   holds(account = BACKUP) { return Object.keys(this.state?.holds?.[account] || {}).sort(); }
   // Enable both Fable personas and bring them onto Fable through the normal path.
   toFable() {
-    this.pass();
+    this.launchAll(this.pass().restarts); // commit the launch policy (subagent env) on Opus
     for (let i = 0; i < 3; i++) {
       this.advance(5 * MIN);
       this.observe(BACKUP, 0.1);
@@ -289,7 +308,7 @@ describe('Fable guard fake-clock sequences', () => {
     restarted.advance(3 * MIN);
     const resumed = restarted.pass();
     assert.deepEqual(resumed.restarts.map(item => [item.instanceId, item.mode, item.reason]).sort(),
-      [['user-elaine', 'opus', 'resume:no_new_launch'], ['user-pan', 'opus', 'resume:no_new_launch']]);
+      [['user-elaine', 'opus', 'resume:stale_launch'], ['user-pan', 'opus', 'resume:stale_launch']]);
     restarted.launchAll(resumed.restarts);
     restarted.advance(5 * MIN);
     assert.deepEqual(restarted.pass().restarts, []);
@@ -345,8 +364,15 @@ describe('Fable guard interleavings', () => {
     sim.document.instances['user-pan'].fable_enabled = true;
     sim.setState('user-pan', 'busy');
     sim.observe(BACKUP, 0.1);
-    assert.deepEqual(sim.pass().restarts, []);
+    assert.deepEqual(sim.pass().restarts, [], 'the subagent pin waits for an idle persona');
     assert.equal(sim.mode('user-pan'), 'opus');
+    sim.setState('user-pan', 'idle');
+    const on = sim.pass();
+    // Idle with a fresh lease and no dwell pending: one restart brings the pin and Fable together.
+    assert.deepEqual(on.restarts.map(item => [item.instanceId, item.mode, item.reason]), [['user-pan', 'fable', 'fable_allowed']]);
+    sim.launchAll(on.restarts);
+    assert.equal(sim.launches['user-pan'].mode, 'fable');
+    assert.match(sim.launches['user-pan'].key, /CLAUDE_CODE_SUBAGENT_MODEL_FORCE/);
   });
 
   it('a restart interrupted between kill and pm2 restart converges without an obsolete second restart', () => {
@@ -378,7 +404,8 @@ describe('Fable guard interleavings', () => {
     assert.deepEqual(sim.pass().restarts, [], 'second failure: no Fable relaunch');
     const tripped = sim.pass();
     assert.deepEqual(sim.holds(), ['crash']);
-    assert.deepEqual(tripped.restarts.map(item => item.instanceId), ['user-elaine'], 'pan already runs Opus');
+    // pan's engine fell back to Opus inside a Fable launch: it gets a clean Opus launch.
+    assert.deepEqual(tripped.restarts.map(item => item.instanceId).sort(), ['user-elaine', 'user-pan']);
     assert.equal(sim.mode('user-pan'), 'opus');
   });
 
@@ -445,6 +472,66 @@ describe('Fable guard interleavings', () => {
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Fable guard account + model + generation journal (review #2)', () => {
+  function onAccounts() {
+    const sim = new Sim();
+    sim.toFable();
+    sim.advance(MIN);
+    sim.observe(CL, 0.1); // account B is allowed Fable too: the mode does not change
+    sim.observe(BACKUP, 0.1);
+    return sim;
+  }
+
+  it('an account commit whose failover restart never ran is restarted, never verified on the old session', () => {
+    const sim = onAccounts();
+    sim.document.instances['user-pan'].runtime_profile = CL; // instances.json committed B
+    const hop = sim.pass({ failover: ['user-pan'] }); // ...and the failover's kill/pm2 restart never happened
+    assert.deepEqual(hop.restarts, []);
+    assert.equal(sim.state.personas['user-pan'].desired.account, CL);
+    // Account A's Fable process and status are still up.
+    sim.advance(MIN);
+    assert.deepEqual(sim.pass().restarts, []);
+    assert.equal(sim.state.personas['user-pan'].verified?.model_at, undefined, 'A\'s Fable session is not B');
+    sim.advance(3 * MIN);
+    const resumed = sim.pass();
+    assert.deepEqual(resumed.restarts.map(item => [item.instanceId, item.profileId, item.reason]),
+      [['user-pan', CL, 'resume:stale_launch']]);
+    sim.launchAll(resumed.restarts);
+    sim.advance(MIN);
+    sim.pass();
+    assert.ok(sim.state.personas['user-pan'].verified.model_at);
+    assert.equal(sim.launches['user-pan'].runtime_profile, CL);
+  });
+
+  it('a crash between the instances.json and guard-state commits still restarts the persona', () => {
+    const sim = onAccounts();
+    const before = JSON.parse(JSON.stringify(sim.state));
+    sim.document.instances['user-pan'].runtime_profile = CL;
+    sim.pass({ failover: ['user-pan'] });
+    sim.state = before; // the guard file write never landed; instances.json did
+    sim.advance(10_000);
+    const result = sim.pass(); // daemon restarted: the failover sees nothing left to do
+    assert.deepEqual(result.restarts.map(item => [item.instanceId, item.profileId]), [['user-pan', CL]]);
+    assert.equal(sim.state.personas['user-pan'].verified, undefined);
+  });
+
+  it('a Guardian relaunch that read the old generation does not verify the new one', () => {
+    const sim = onAccounts();
+    const old = JSON.parse(JSON.stringify(sim.state));
+    sim.observe(BACKUP, 0.9);
+    const committed = sim.pass();
+    assert.equal(committed.restarts.length, 2);
+    const realState = sim.state;
+    sim.state = old; // the relaunch read the guard file just before the commit
+    sim.launch('user-pan');
+    sim.state = realState;
+    assert.equal(sim.launches['user-pan'].generation, old.personas['user-pan'].desired.generation);
+    sim.advance(MIN);
+    sim.pass();
+    assert.equal(sim.state.personas['user-pan'].verified?.model_at, undefined);
   });
 });
 

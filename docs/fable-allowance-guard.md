@@ -144,8 +144,9 @@ derived from it.
   "holds": { "claude-ax-backup": { "quota": { "since": "...", "reset_window": "...", "detail": {} } } },
   "crash_trips": {}, "rejection_seen": {},
   "personas": { "user-pan": {
-    "desired": { "account": "claude-ax-backup", "mode": "fable|opus", "generation": 12, "committed_at": "...", "reason": "..." },
-    "executed_generation": 12, "executed_at": "...", "restart_required": true, "attempts": 1,
+    "desired": { "account": "claude-ax-backup", "mode": "fable|opus", "generation": 12, "key": "<launch key>",
+                 "model": "claude-fable-5-2", "committed_at": "...", "reason": "...", "adopted_launch_id": "<uuid, optional>" },
+    "executed_generation": 12, "executed_at": "...", "attempts": 1,
     "last_transition_at": "...", "verified": { "model_at": "...", "ack_at": "..." } } },
   "manual_clears": [] }
 ```
@@ -172,17 +173,36 @@ commit `desired {account, mode, generation}` once → reconcile.
 - Downgrade is immediate. Upgrade also needs `upgrade_min_dwell_sec` since the
   persona's last model transition and the persona idle (fresh status, `idle`,
   health ok, no active tools).
-- A mode change restarts the persona through the failover's cold-start path
+- The commit is the tuple `{account, mode, generation, key}`, where `key` is
+  the full launch policy the persona should run (`expectedFableLaunch`:
+  account, mode, main model, effort, settings file, subagent env). A new
+  generation is committed whenever any part of it changes: the guard's own
+  decision, the account failover moving the persona, or a policy change such
+  as `fable_enabled` or the profile's model.
+- A commit restarts the persona through the failover's cold-start path
   (runtime switch signal with an unchanged profile → `tmux kill-session` →
   `pm2 restart activity-monitor-<id>`), unless the account failover restarts it
-  in the same pass, or the engine already runs the new mode's model.
-- The commit is recorded before the restart runs; a restart whose generation
-  was superseded is skipped. A committed generation is converged when the
-  persona's newest launch (`agent-status.json` `runtime_launch_at`) runs the
-  expected model (`statusline.json` `model.id`). No new launch three minutes
-  after the commit, or the wrong model, resumes the restart, at most three
-  times per generation. After a daemon restart the same check resumes an
-  interrupted transition.
+  in the same pass, or the running launch record already has exactly this
+  `key` and account (it is then adopted as `adopted_launch_id`). An Opus →
+  Opus change of policy only (for example the subagent pin after enabling a
+  persona that is still on Opus) waits until the persona is idle.
+- **Convergence is level-triggered against the launch record**, not inferred
+  from what changed in a pass. A committed generation is converged only when
+  the engine's current launch (`fable-launch.json` no older than
+  `agent-status.json` `runtime_launch_at`) has the committed account, mode and
+  `key` **and** the committed generation (or the adopted launch id), and
+  `statusline.json` `model.id`, reported after that launch, is the expected
+  model. A running engine whose launch does not match is restarted again after
+  three minutes (`resume:stale_launch`), at most three times per generation.
+- Crash atomicity across `instances.json` (account, written by the account
+  failover) and `fable-guard.json` (the guard's tuple) is not obtained by a
+  cross-file transaction. The guard file is the single journal of the guard's
+  tuple, and both failure orders are safe and self-healing: the launcher admits
+  Fable only when the committed account equals the instance's current
+  `runtime_profile` (a torn state launches Opus), and the reconciler compares
+  the running launch with the journal on every pass, so a lost restart, a
+  restart that read the previous generation, or a crash between the two writes
+  is restarted on the next pass instead of being verified on the old session.
 - `verified.ack_at` records the first functional ACK after that launch whose
   phase is not the auto-ACKable cold-start `primary` probe. It is evidence for
   the operator, not a gate.
