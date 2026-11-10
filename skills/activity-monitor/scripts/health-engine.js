@@ -92,6 +92,7 @@ export class HealthEngine {
    * @param {() => ({kind: string, text?: string}|null)} [deps.detectLimitDialog] - Fable guard: live limit/credits dialog at the bottom of the pane (Fable-mode personas only)
    * @param {(result: object) => void} [deps.onLimitDialog] - Fable guard: record limit-dialog evidence for the guard daemon
    * @param {(reason: string) => void} [deps.onRecoveryRestart] - Fable guard: a failure-driven kill+restart is about to run
+   * @param {{phase: string, onResult: (result: object) => void}} [deps.guardReadiness] - Fable guard: the cold-start readiness probe is end-to-end (never auto-ACKed), waits out the startup busy turn, and only reports its result
    * @param {object} [options]
    * @param {number} [options.downDegradeThreshold=3600] - Seconds of continuous failure before entering DOWN
    * @param {number} [options.downRetryInterval=3600] - Seconds between DOWN-state probes
@@ -179,6 +180,8 @@ export class HealthEngine {
     this.probeFences = new Map();
     this.lastFunctionalAckPhase = null;
     this.limitDialogSince = 0;
+    this.guardReadinessControlId = null;
+    this.coldStartAt = 0;
   }
 
   get health() {
@@ -279,6 +282,7 @@ export class HealthEngine {
     // has no periodic primary probe (0.8.3), so arm one readiness probe for the
     // end of the grace period; its failure drives the next health-driven hop.
     this.readinessProbePending = true;
+    this.coldStartAt = nowSec;
     this.setHealth('ok', `cold_start_grace_${seconds}s`);
     this.deps.log(`Cold start: suppressing heartbeat for ${seconds}s`);
   }
@@ -536,6 +540,21 @@ export class HealthEngine {
       return;
     }
 
+    if (this.readinessProbePending && this.healthState === 'ok' && !this.deps.readHeartbeatPending()
+        && this.deps.guardReadiness) {
+      // Fable guard: a recovery-class phase is delivered end-to-end (the
+      // dispatcher never auto-ACKs it), so wait until the startup turn is no
+      // longer busy (bounded by STARTUP_PROBE_GRACE_SEC) and only report the
+      // result: a missing ACK of a correct model is surfaced, not restarted.
+      if (this.runtimeBusy && currentTime - (this.coldStartAt || 0) < STARTUP_PROBE_GRACE_SEC) return;
+      this.readinessProbePending = false;
+      this.deps.log(`Cold start grace ended: Fable guard readiness probe (phase=${this.deps.guardReadiness.phase})`);
+      if (this.enqueueHeartbeat(this.deps.guardReadiness.phase)) {
+        this.guardReadinessControlId = this.deps.readHeartbeatPending()?.control_id ?? null;
+      }
+      return;
+    }
+
     if (this.readinessProbePending && this.healthState === 'ok' && !this.deps.readHeartbeatPending()) {
       this.readinessProbePending = false;
       this.deps.log('Cold start grace ended: probing the new runtime once');
@@ -597,6 +616,10 @@ export class HealthEngine {
   onHeartbeatSuccess(phase,pending) {
     if(this.evidence && (!pending || !this.validFence(this.probeFences.get(pending.control_id))))return false;
     if(!this.setHealth('ok',`heartbeat_ack phase=${phase}`,'recovery'))return false;
+    if (pending && pending.control_id === this.guardReadinessControlId) {
+      this.guardReadinessControlId = null;
+      try { this.deps.guardReadiness?.onResult({ outcome: 'ack', phase, at: this.now() }); } catch { /* evidence only */ }
+    }
     this.lastFunctionalAckAt = this.now();
     this.lastFunctionalAckPhase = phase;
     this.limitDialogSince = 0;
@@ -696,6 +719,14 @@ export class HealthEngine {
     // guard, not a hang. Do not kill/count it while the guard takes over.
     if ((this.healthState === 'ok' || isUnavailableRecoveryState(this.healthState) || this.healthState === 'rate_limited')
         && this._limitDialogDefersRecovery(`heartbeat_${phase}_${status}`)) {
+      return;
+    }
+
+    // Fable guard readiness probe: report, never recover (see guardReadiness).
+    if (pending.control_id != null && pending.control_id === this.guardReadinessControlId) {
+      this.guardReadinessControlId = null;
+      this.deps.log(`Fable guard readiness probe got no ACK (${phase}_${status}); surfaced to the guard, no restart`);
+      try { this.deps.guardReadiness?.onResult({ outcome: 'missing', phase, status, at: this.now() }); } catch { /* evidence only */ }
       return;
     }
 

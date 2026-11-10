@@ -36,6 +36,11 @@ const EVIDENCE_MAX_AGE_MS = 3_600_000;
 const HOLD_KINDS = ['quota', 'crash', 'stale'];
 export const LIMIT_EVIDENCE_FILE = 'fable-limit-evidence.json';
 export const SESSION_FAILURES_FILE = 'fable-session-failures.json';
+export const READINESS_FILE = 'fable-readiness.json';
+// Readiness = a real (end-to-end) ACK from the launch; phases the dispatcher never auto-ACKs.
+const READINESS_PHASES = new Set(['post_restart', 'recovery']);
+// The readiness probe waits out a busy startup turn (STARTUP_PROBE_GRACE_SEC, 20 min).
+const READINESS_TIMEOUT_MS = 30 * 60_000;
 
 const iso = ms => new Date(ms).toISOString();
 const ms = value => Date.parse(value || '');
@@ -311,7 +316,8 @@ export function planFableGuard({
       events.push(`${id}: commit g${generation} ${mode} on ${profileId} (${reason})`);
       continue;
     }
-    reconcilePersona({ id, instance, persona, status, launch, actual: modelByInstance[id], config, nowMs, restarts, events,
+    reconcilePersona({ id, instance, persona, status, launch, actual: modelByInstance[id], readiness: readinessByInstance[id],
+      config, nowMs, restarts, events,
       failureCount: () => sessionFailures(persona, failuresByInstance[id], profileId,
         Math.max(nowMs - (config?.crash_window_sec || 0) * 1000, ms(persona.crash_counted_after) || 0)).length });
     if (!enabled && persona.desired.mode === 'opus' && persona.verified?.model_at) delete next.personas[id];
@@ -350,7 +356,7 @@ function policyOnlyChange(desired, launch) {
 // Verify a committed generation against the running engine's launch record
 // (account, policy, generation) and its reported model, and resume an
 // interrupted transition. A committed opus with Fable still running is not done.
-function reconcilePersona({ id, instance, persona, status, launch, actual, config, nowMs, restarts, events, failureCount }) {
+function reconcilePersona({ id, instance, persona, status, launch, actual, readiness, config, nowMs, restarts, events, failureCount }) {
   const desired = persona.desired;
   if (persona.executed_generation !== desired.generation) return;
   const executedMs = ms(persona.executed_at);
@@ -426,9 +432,24 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, confi
     return;
   }
   if (!persona.verified?.model_at) persona.verified = { model_at: iso(nowMs), launch_id: launch.launch_id };
-  if (!persona.verified.ack_at && Number(status.functional_ack_at) >= launchMs
-      && typeof status.functional_ack_phase === 'string' && status.functional_ack_phase !== 'primary') {
-    persona.verified.ack_at = iso(Number(status.functional_ack_at));
+  verifyReadiness({ id, verified: persona.verified, launch, status, readiness, nowMs, events });
+}
+
+// Readiness is separate from model convergence: a real ACK from this launch
+// (the monitor's end-to-end readiness probe, or another non-auto-ACKable
+// heartbeat). A missing ACK is surfaced once and never restarts a correct model.
+function verifyReadiness({ id, verified, launch, status, readiness, nowMs, events }) {
+  if (verified.ready_at || verified.readiness) return;
+  const launchMs = Number(launch.launched_at_ms);
+  const ours = readiness?.launch_id === launch.launch_id ? readiness : null;
+  if (ours?.outcome === 'ack') {
+    verified.ready_at = ours.at;
+  } else if (Number(status.functional_ack_at) >= launchMs && READINESS_PHASES.has(status.functional_ack_phase)) {
+    verified.ready_at = iso(Number(status.functional_ack_at));
+  } else if (ours?.outcome === 'missing' || nowMs - launchMs > READINESS_TIMEOUT_MS) {
+    verified.readiness = ours?.outcome === 'missing' ? 'ack_missing' : 'no_probe_result';
+    events.push(`${id}: ALERT model ${launch.model} converged but readiness not verified (${verified.readiness}: `
+      + `no real ACK from launch ${launch.launch_id}); not restarted, check the persona`);
   }
 }
 
@@ -457,7 +478,7 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
   if (!readFableGuardConfig(document) && !Object.keys(state?.personas || {}).length) {
     return { state, restarts: [], events: [], changed: false };
   }
-  const inputs = { statusByInstance: {}, modelByInstance: {}, evidenceByInstance: {}, failuresByInstance: {}, launchByInstance: {} };
+  const inputs = { statusByInstance: {}, modelByInstance: {}, evidenceByInstance: {}, failuresByInstance: {}, launchByInstance: {}, readinessByInstance: {} };
   for (const [id, instance] of Object.entries(document?.instances || {})) {
     if (instance?.fable_enabled !== true && !state?.personas?.[id]) continue;
     const dir = monitorDirFor(zylosDir, id, instance);
@@ -466,6 +487,7 @@ export function planFableGuardPass({ zylosDir, document, failoverInstanceIds = n
     inputs.evidenceByInstance[id] = readJson(path.join(dir, LIMIT_EVIDENCE_FILE), null);
     inputs.failuresByInstance[id] = readJson(path.join(dir, SESSION_FAILURES_FILE), null);
     inputs.launchByInstance[id] = readJson(path.join(dir, FABLE_LAUNCH_FILE), null);
+    inputs.readinessByInstance[id] = readJson(path.join(dir, READINESS_FILE), null);
   }
   return planFableGuard({ document, state, usage: readJson(fableUsagePath(zylosDir), {}),
     failoverInstanceIds, nowMs, ...inputs });
@@ -624,39 +646,6 @@ export function scheduleFableProbes({
     started.push(run);
   }
   return started;
-}
-
-// ── Monitor-side evidence (activity monitor of a Fable-mode persona) ───────
-
-/**
- * HealthEngine deps for a persona whose engine was launched on Fable. Other
- * personas get none, so their health handling is unchanged.
- */
-export function createFableMonitorDeps({ runtimeProfile, monitorDir, sessionName, classifyLimitDialog,
-  capturePane = session => execFileSync('tmux', ['capture-pane', '-p', '-t', session],
-    { encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024 }),
-  now = () => Date.now() } = {}) {
-  if (runtimeProfile?.fable?.mode !== 'fable') return {};
-  const stamp = () => ({ at: iso(now()), runtime_profile: runtimeProfile.id,
-    mode: 'fable', generation: runtimeProfile.fable.generation });
-  const onRecoveryRestart = reason => {
-    const file = path.join(monitorDir, SESSION_FAILURES_FILE);
-    const prior = readJson(file, {});
-    const failures = [...(Array.isArray(prior.failures) ? prior.failures : []), { ...stamp(), reason }].slice(-10);
-    writeJsonAtomic(file, { failures });
-  };
-  if (typeof classifyLimitDialog !== 'function') return { onRecoveryRestart };
-  return {
-    onRecoveryRestart,
-    detectLimitDialog: () => {
-      let text;
-      try { text = capturePane(sessionName); } catch { return null; }
-      const result = classifyLimitDialog(text);
-      return result && (result.kind === 'fable_limit' || result.kind === 'credits_offer') ? result : null;
-    },
-    onLimitDialog: result => writeJsonAtomic(path.join(monitorDir, LIMIT_EVIDENCE_FILE),
-      { ...stamp(), kind: result.kind, text: String(result.text || '').slice(0, 300), source: result.source || null }),
-  };
 }
 
 /**

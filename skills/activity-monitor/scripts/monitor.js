@@ -153,11 +153,10 @@ import {
   startContextMonitor as startRuntimeContextMonitor,
 } from './adapters/runtime-components.js';
 import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tasks.js';
-import { readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
-// Fable guard (FG-4): the delivery side owns the dialog classifier. Until it
-// exports classifyLimitDialog, no dialog is ever classified (no-op default).
-import * as tmuxInputStateModule from '../../comm-bridge/scripts/tmux-input-state.js';
-import { createFableMonitorDeps, dropPendingKeystrokes } from './fable-guard.js';
+// Fable guard (FG-4): the delivery side owns the limit-dialog classifier; a
+// named import so a renamed or removed export fails loudly at load.
+import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
+import { dropPendingKeystrokes } from './fable-guard.js';
 import { createFableMonitor } from './fable-monitor.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
@@ -1181,14 +1180,15 @@ function createToolPipeline(activeAdapter, config) {
   });
 }
 
+// Fable guard, persona-monitor half (fable-monitor.js): created with the
+// health engine, for guard-tracked personas only; null for everyone else.
 function fableHealthDeps(activeAdapter) {
   const runtimeProfile = activeAdapter.config?.runtimeProfile;
   if (!runtimeProfile?.fable) return {};
-  log(`Fable guard: launched mode=${runtimeProfile.fable.mode} generation=${runtimeProfile.fable.generation ?? 'none'}`);
-  const classify = typeof tmuxInputStateModule.classifyLimitDialog === 'function'
-    ? tmuxInputStateModule.classifyLimitDialog : null;
-  return createFableMonitorDeps({ runtimeProfile, monitorDir: MONITOR_DIR,
-    sessionName: activeAdapter.sessionName, classifyLimitDialog: classify });
+  log(`Fable guard: monitor started with mode=${runtimeProfile.fable.mode} generation=${runtimeProfile.fable.generation ?? 'none'}`);
+  fableMonitor = createFableMonitor({ zylosDir: ZYLOS_DIR, instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR, runtimeProfile,
+    sessionName: activeAdapter.sessionName, classifyLimitDialog, stopSession: () => activeAdapter.stop(), log });
+  return fableMonitor?.healthDeps || {};
 }
 
 function createHealthEngine(activeAdapter, initialStatus) {
@@ -1238,6 +1238,8 @@ function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchA
     // omitting it is exactly what left the gate dead in prod.
     monitorDir: monitorDir ?? MONITOR_DIR,
     signalTtlSec: SIGNAL_TTL_SEC,
+    // Fable guard crash accounting; fableMonitor exists only for tracked personas.
+    onAgentStart: fableMonitor ? info => fableMonitor.guardianDeps.onAgentStart(info) : undefined,
     log,
   });
 }
@@ -1322,8 +1324,6 @@ function init() {
     engine,
     contextMonitor,
   } = orchestrator.start());
-  fableMonitor = createFableMonitor({ zylosDir: ZYLOS_DIR, instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR,
-    runtimeProfile: adapter.config?.runtimeProfile, stopSession: () => adapter.stop(), log });
 }
 
 // REL-9b seam: gate the daemon side-effects (init, process handlers, schedule
