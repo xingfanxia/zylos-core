@@ -403,3 +403,77 @@ describe('no modal on screen: tmux calls identical to base d16221a4 (Astra #5, s
     assert.deepEqual(got.calls.map(isRead), [true, false]);
   });
 });
+
+// ── E: a limit dialog right after Enter -> explicit uncertain outcome ──────
+// The CLI shows the consent dialog when the submitted message is about to go
+// to the model. Whether it was sent depends on how the dialog is answered, so
+// the message is neither delivered nor failed: it is recorded `uncertain`
+// (message identity + dialog kind + pane), never replayed.
+describe('limit dialog right after a submission (Astra (h))', () => {
+  function uncertainHarness(states) {
+    const h = harness(states);
+    const records = [];
+    h.options.onUncertain = (info) => records.push(info);
+    h.options.recentSubmissions = new Map();
+    return { ...h, records };
+  }
+
+  it('Enter sent, then the verify read shows the limit dialog: uncertain, not deferred or delivered', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), modal()]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:51' }), 'uncertain');
+    assert.deepEqual(h.records.map(({ deliveryId, kind, sessionRef }) => ({ deliveryId, kind, sessionRef })),
+      [{ deliveryId: 'conversation:51', kind: 'fable_limit', sessionRef: 'pane-one' }]);
+    assert.equal(h.enters(), 1);
+    // No replay: the same row returns its receipt; no paste, no Enter, no second record.
+    h.useStates([st('empty')]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:51' }), 'uncertain');
+    assert.equal(h.pastes(), 1);
+    assert.equal(h.enters(), 1);
+    assert.equal(h.records.length, 1);
+  });
+
+  it('the dialog first seen on the next cycle still names the submitted row', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), st('has_content', { inProgressCapture: true })]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:52' }), 'verify_failed');
+    h.useStates([modal()]);
+    assert.equal(await sendToTmux('next', { ...h.options, deliveryId: 'conversation:53' }), 'modal_deferred');
+    assert.deepEqual(h.records.map((r) => r.deliveryId), ['conversation:52']);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:52' }), 'uncertain');
+    assert.equal(h.pastes(), 1);
+  });
+
+  it('a submission verified just before the dialog appeared is re-marked uncertain', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), st('empty')]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:54' }), 'submitted');
+    h.useStates([modal()]);
+    assert.equal(await sendToTmux('next', { ...h.options, deliveryId: 'conversation:55' }), 'modal_deferred');
+    assert.deepEqual(h.records.map(({ deliveryId, delivered }) => ({ deliveryId, delivered })),
+      [{ deliveryId: 'conversation:54', delivered: true }]);
+  });
+
+  it('a non-limit dialog after Enter (e.g. a permission prompt) is not an uncertain outcome', async () => {
+    const h = uncertainHarness([st('empty'), st('has_content'), otherModal()]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:56' }), 'modal_deferred');
+    assert.deepEqual(h.records, []);
+  });
+
+  it('a limit dialog before any Enter defers (nothing was submitted)', async () => {
+    const h = uncertainHarness([st('empty'), modal()]);
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:57' }), 'modal_deferred');
+    assert.deepEqual(h.records, []);
+    assert.equal(h.enters(), 0);
+  });
+
+  it('multi-session: an uncertain row is neither delivered nor retried, and other rows are held', async () => {
+    const queue = rowQueue([{ id: 61, type: 'conversation', channel: 'feishu', target_instance: 'user-pan', content: 'hi' }]);
+    const h = uncertainHarness([st('empty'), st('has_content'), modal()]);
+    const send = (message, opts) => sendToTmux(message, { ...h.options, ...opts });
+    const res = await processWithMultiSession(multiHelpers(queue, { sendToTmux: send }));
+    assert.equal(res.delivered, false);
+    assert.deepEqual(queue.delivered, []);
+    assert.deepEqual(queue.notified, [], 'no delivery notification for an uncertain row');
+    assert.equal(queue.byId.get(61).retry_count, 0);
+    assert.equal(queue.byId.get(61).status, 'running', 'left to the uncertain record (no requeue, no replay)');
+    assert.deepEqual(h.records.map((r) => r.deliveryId), ['conversation:61']);
+  });
+});

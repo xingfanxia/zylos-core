@@ -35,7 +35,8 @@ import {
   expireTimedOutControls,
   cleanupControlQueue,
   bindControlSession,
-  supersedeControl
+  supersedeControl,
+  recordUncertainDelivery
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -523,6 +524,30 @@ const pendingSubmissions = new Map();
 // Receipts exist only for reconciled/retired ambiguous deliveries, keyed by C4
 // row identity. A later retry cannot replay their old payload into a new pane.
 const submissionReceipts = new Map();
+// Last verified submission per session, so a limit dialog read moments later
+// can still name the row whose Enter opened it (see settleUncertain).
+const recentSubmissions = new Map();
+const LIMIT_AFTER_SUBMIT_WINDOW_MS = 120_000;
+
+function isLimitModal(modal) {
+  return !!modal && (modal.kind === 'fable_limit' || modal.kind === 'credits_offer');
+}
+
+/**
+ * Default uncertain-outcome sink: persist the record (c4-db
+ * recordUncertainDelivery) for a `<type>:<id>` delivery id. A DB error is
+ * logged; the in-memory receipt still prevents any replay.
+ */
+export function recordUncertainSubmission({ deliveryId, kind, sessionRef = null, delivered = false }) {
+  const match = /^(conversation|control):(\d+)$/.exec(String(deliveryId));
+  log(`UNCERTAIN: ${deliveryId} - ${kind} dialog right after its Enter (${delivered ? 'was marked delivered' : 'unverified'}); not replayed`);
+  if (!match) return;
+  try {
+    recordUncertainDelivery({ itemType: match[1], itemId: Number(match[2]), dialogKind: kind, sessionRef });
+  } catch (err) {
+    log(`UNCERTAIN: failed to record ${deliveryId}: ${err.message}`);
+  }
+}
 
 export function retireSubmission(deliveryId, { pendingSubmissions: submissions = pendingSubmissions,
   submissionReceipts: receipts = submissionReceipts } = {}) {
@@ -593,6 +618,9 @@ export async function submitAndVerify(session, {
     await sleepImpl(ENTER_VERIFY_WAIT_MS);
     const state = readState();
     if (wasReplaced(pending, state)) return replacementResult(pending);
+    // Enter is out: a limit dialog now means the message may or may not reach
+    // the model (it depends on the answer). That is an outcome, not a deferral.
+    if (isLimitModal(state.modal)) return { verified: false, state: 'uncertain', modal: state.modal, paneIdentity: state.paneIdentity };
     if (state.modal) return deferred();
     if (state.inputState === 'empty') return { verified: true, state: 'empty' };
     // A working model must never receive repeated Enter, nor an Escape that
@@ -616,6 +644,8 @@ async function sendToTmux(message, options = {}) {
   const submissions = options.pendingSubmissions || pendingSubmissions;
   const receipts = options.submissionReceipts || submissionReceipts;
   const statusFile = options.statusFile || AGENT_STATUS_FILE;
+  const onUncertain = options.onUncertain || recordUncertainSubmission;
+  const recent = options.recentSubmissions || recentSubmissions;
   const sanitized = sanitizeMessage(message);
   const deliveryId = options.deliveryId || sanitized;
   const receiptKey = `${session}\0${deliveryId}`;
@@ -634,6 +664,28 @@ async function sendToTmux(message, options = {}) {
     submissions.delete(session);
     pending = null;
     if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+  }
+  // A limit dialog right after a submission's Enter: that row's outcome is
+  // uncertain (record it, never replay it). Covers a still-unverified
+  // submission and one verified moments before the dialog was drawn.
+  const settleUncertain = (info) => {
+    receipts.set(`${session}\0${info.deliveryId}`, 'uncertain');
+    onUncertain({ ...info, session });
+  };
+  if (isLimitModal(initial.modal)) {
+    if (pending && pending.enterSent && !pending.terminal) {
+      submissions.delete(session);
+      recent.delete(session);
+      settleUncertain({ deliveryId: pending.deliveryId, kind: initial.modal.kind, sessionRef: initial.paneIdentity, delivered: false });
+      pending = null;
+      if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+    } else if (!pending) {
+      const last = recent.get(session);
+      if (last && last.paneIdentity === initial.paneIdentity && Date.now() - last.at <= LIMIT_AFTER_SUBMIT_WINDOW_MS) {
+        recent.delete(session);
+        settleUncertain({ deliveryId: last.deliveryId, kind: initial.modal.kind, sessionRef: initial.paneIdentity, delivered: true });
+      }
+    }
   }
   // Delivery guard: while a modal owns the keyboard nothing is pasted or
   // submitted. The row is deferred, not failed; ownership of any paste stays.
@@ -697,7 +749,14 @@ async function sendToTmux(message, options = {}) {
   if (result.verified) {
     submissions.delete(session);
     if (result.state === 'replaced') receipts.set(receiptKey, 'submitted');
+    else recent.set(session, { deliveryId, paneIdentity: pending.paneIdentity, at: Date.now() });
     return 'submitted';
+  }
+  if (result.state === 'uncertain') {
+    submissions.delete(session);
+    recent.delete(session);
+    settleUncertain({ deliveryId, kind: result.modal.kind, sessionRef: result.paneIdentity, delivered: false });
+    return 'uncertain';
   }
   if (result.state === 'modal') return 'modal_deferred';
   if (result.state === 'replaced' && pending.modalDeferred && !pending.enterSent) {
@@ -1079,6 +1138,13 @@ async function processNextMessage() {
     // retried once the modal is gone or the session has been replaced.
     log(`Deferred ${item.type} id=${item.id}: a modal owns the keyboard`);
     releaseItem(item, 'MODAL_DEFERRED');
+    return { delivered: false, state: agentState.state };
+  }
+
+  if (result === 'uncertain') {
+    // Enter went out and a limit dialog followed: recordUncertainSubmission
+    // finalized the row (status 'uncertain') and named it for the operator.
+    // Not delivered, not failed, never replayed.
     return { delivered: false, state: agentState.state };
   }
 

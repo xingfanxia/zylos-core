@@ -193,3 +193,36 @@ describe('single-session keystroke session fence (Astra #5)', () => {
     db.getDb().prepare("UPDATE control_queue SET status = 'failed' WHERE id = ?").run(blind.id);
   });
 });
+
+// ── E: the uncertain record, end to end through the real DB ───────────────
+describe('single-session: limit dialog right after Enter (Astra (h))', () => {
+  it('records the message identity as uncertain, never delivered or replayed, and exposes it', async () => {
+    resetLog();
+    screen(fx.PLAIN_COMPOSER, [2, promptY], {
+      onPaste: [fx.COMPOSER_WITH_TEXT, [19, promptY]],
+      onEnter: [fx.FABLE_LIMIT_LIVE, [2, 10]],
+    });
+    const { id } = db.insertConversation('in', 'feishu', 'chat-42', 'please run the report');
+    assert.equal((await tick()).delivered, false);
+    assert.equal(conversation(id).status, 'uncertain');
+    assert.equal(keys().length, 1);
+
+    const records = db.getUncertainDeliveries();
+    assert.equal(records.length, 1);
+    const [rec] = records;
+    assert.deepEqual({ item_type: rec.item_type, item_id: rec.item_id, channel: rec.channel, endpoint_id: rec.endpoint_id,
+      dialog_kind: rec.dialog_kind, outcome: rec.outcome, session_ref: rec.session_ref, notified_at: rec.notified_at },
+    { item_type: 'conversation', item_id: Number(id), channel: 'feishu', endpoint_id: 'chat-42',
+      dialog_kind: 'fable_limit', outcome: 'uncertain', session_ref: '$1:1000:%2:123', notified_at: null });
+    assert.match(rec.preview, /^please run the report/);
+
+    idleComposer();
+    for (let i = 0; i < 2; i++) await tick();
+    assert.equal(pastes().length, 1, 'never replayed');
+    assert.equal(conversation(id).status, 'uncertain');
+
+    assert.equal(db.markUncertainDeliveryNotified(rec.id), true);
+    assert.deepEqual(db.getUncertainDeliveries(), [], 'unnotified only by default');
+    assert.equal(db.getUncertainDeliveries({ unnotifiedOnly: false }).length, 1);
+  });
+});

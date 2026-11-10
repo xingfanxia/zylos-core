@@ -628,6 +628,14 @@ export async function processWithMultiSession(helpers) {
         continue;
       }
 
+      if (result === 'uncertain') {
+        // Enter went out and a limit dialog followed: the uncertain record
+        // owns the row now (not delivered, not failed, never replayed).
+        inFlight = null;
+        log(`Uncertain ${item.type} id=${item.id}${targetInstance ? ` -> ${targetInstance}` : ''}: limit dialog right after its Enter`);
+        return summarize({ delivered: false, state: claudeState.state });
+      }
+
       if (result === 'submitted') {
         if (item.type === 'conversation') {
           markDelivered(item.id);
