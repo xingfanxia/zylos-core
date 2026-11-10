@@ -21,6 +21,14 @@ verification or claim to establish the natural false-empty root cause.
 
 ## Bounded periodic recovery
 
+> **This fork:** the single-session dispatcher (`c4-dispatcher.js`) does not
+> wire `periodic-enter.js`. Its submission verification resumes Enter for an
+> unsubmitted paste, and every Enter is sent to the pane of the read that
+> decided it (see `docs/fable-allowance-guard.md`), so the
+> `C4_PERIODIC_ENTER_*` settings below, and the Enter captures of
+> `C4_ENTER_CAPTURE_ENABLED`, have no effect here. The section describes
+> upstream behavior.
+
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `C4_BRACKETED_PASTE_ENABLED` | off | Only `1` enables bracketed paste |
