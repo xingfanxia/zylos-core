@@ -194,6 +194,22 @@ commit `desired {account, mode, generation}` once → reconcile.
   `statusline.json` `model.id`, reported after that launch, is the expected
   model. A running engine whose launch does not match is restarted again after
   three minutes (`resume:stale_launch`), at most three times per generation.
+- Interrupted restarts keep reconciling. A persona that is not running (or
+  whose `agent-status.json` is older than two minutes, i.e. its monitor is
+  gone) three minutes after the commit is restarted again
+  (`resume:not_running:<state>`); a suspended persona is left alone because
+  its wake goes through the admission gate. Missing model evidence is bounded:
+  ten minutes after a launch without a `statusline.json` report, a Fable
+  launch is restarted (`resume:model_unknown`) and an Opus launch is surfaced
+  (`verified.model_unknown_at`, `ALERT` in the daemon log) without a restart.
+- Retry exhaustion: after three attempts the guard logs `ALERT … not
+  converged` and stops retrying that generation. If the commit was a
+  downgrade and the last launch record or the engine's model report is Fable,
+  the persona is **stopped** (`pm2 stop activity-monitor-<id>`, then `tmux
+  kill-session`) and `safe_stop` is recorded, so an unsafe Fable session is
+  never left running. Recovery: check the persona, then `pm2 start
+  activity-monitor-<id>`; its launch is admitted to Opus only, and any later
+  commit restarts it normally.
 - Crash atomicity across `instances.json` (account, written by the account
   failover) and `fable-guard.json` (the guard's tuple) is not obtained by a
   cross-file transaction. The guard file is the single journal of the guard's
