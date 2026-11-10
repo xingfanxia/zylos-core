@@ -64,6 +64,12 @@ function resetIso(seconds, nowMs) {
   return new Date(ms).toISOString();
 }
 
+function isFableRejection(info) {
+  return info.unifiedWindows?.[FABLE_WINDOW]?.status === 'rejected'
+    || (info.status === 'rejected' && info.rateLimitType === FABLE_WINDOW)
+    || info.isUsingOverage === true;
+}
+
 /**
  * Classify one probe run. Outcomes:
  *  - valid:        a usable observation (every validity rule in FG-1 holds)
@@ -82,9 +88,14 @@ export function classifyProbeOutput({
   settingsFile,
 } = {}) {
   const events = parseEvents(stdout);
-  const info = events.filter(event => event?.type === 'rate_limit_event' && event.rate_limit_info)
-    .at(-1)?.rate_limit_info || null;
-  const window = info?.unifiedWindows?.[FABLE_WINDOW] || null;
+  const infos = events.filter(event => event?.type === 'rate_limit_event' && event.rate_limit_info)
+    .map(event => event.rate_limit_info);
+  // The CLI can fall back after a Fable rejection and emit later allowed
+  // events and a successful non-Fable result. Rejection evidence anywhere in
+  // the stream wins; it keeps the window of the event that rejected.
+  const rejection = infos.find(item => isFableRejection(item)) || null;
+  const info = infos.at(-1) || null;
+  const window = infos.filter(item => item.unifiedWindows?.[FABLE_WINDOW]).at(-1)?.unifiedWindows[FABLE_WINDOW] || null;
   const result = events.filter(event => event?.type === 'result').at(-1) || null;
   const failed = exitCode !== 0 || result?.is_error === true;
   const errorText = failed
@@ -93,15 +104,14 @@ export function classifyProbeOutput({
     : '';
   const invalid = reason => ({ outcome: 'invalid', reason });
 
-  if (window?.status === 'rejected'
-      || (info?.status === 'rejected' && info.rateLimitType === FABLE_WINDOW)
-      || info?.isUsingOverage === true
-      || FABLE_REJECTION_TEXT.test(errorText)) {
-    const resetSeconds = window?.resetsAt ?? (info?.rateLimitType === FABLE_WINDOW ? info.resetsAt : null);
+  if (rejection || FABLE_REJECTION_TEXT.test(errorText)) {
+    const rejectedWindow = rejection?.unifiedWindows?.[FABLE_WINDOW] || null;
+    const resetSeconds = rejectedWindow?.resetsAt ?? (rejection?.rateLimitType === FABLE_WINDOW ? rejection.resetsAt : null);
     return {
       outcome: 'rejected',
-      reason: info?.isUsingOverage === true ? 'using_overage' : 'fable_rejected',
-      resets_at: resetIso(resetSeconds, nowMs),
+      reason: rejection?.isUsingOverage === true ? 'using_overage' : 'fable_rejected',
+      resets_at: resetIso(resetSeconds ?? window?.resetsAt, nowMs),
+      account: account || null,
     };
   }
   if (info?.status === 'rejected' || (failed && RATE_LIMIT_TEXT.test(errorText))) {
@@ -239,6 +249,8 @@ export function recordProbeResult(store, { account, result, nowMs, config }) {
   if (result.outcome === 'valid') {
     entry.last_valid = result.observation;
     entry.failures = 0;
+  } else if (result.outcome === 'rejected' && result.account && result.account !== account) {
+    entry.last_attempt.reason = `rejection_for_${result.account}`; // never attributed to another account
   } else if (result.outcome === 'rejected') {
     entry.rejection = { at, resets_at: result.resets_at || null, detail: result.reason || 'fable_rejected' };
     entry.failures = 0;

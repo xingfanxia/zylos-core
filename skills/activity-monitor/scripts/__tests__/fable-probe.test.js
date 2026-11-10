@@ -79,7 +79,22 @@ describe('Fable probe classification (FG-1 validity rules)', () => {
       fable: { utilization: 1, resetsAt: RESET, status: 'rejected' } }),
     { type: 'result', is_error: true, result: "You've reached your Fable limit." });
     const result = classifyProbeOutput({ ...base, stdout, exitCode: 1 });
-    assert.deepEqual(result, { outcome: 'rejected', reason: 'fable_rejected', resets_at: '2026-11-13T06:00:00.000Z' });
+    assert.deepEqual(result, { outcome: 'rejected', reason: 'fable_rejected', resets_at: '2026-11-13T06:00:00.000Z', account: 'claude-ax-backup' });
+  });
+
+  it('keeps an explicit Fable rejection when later fallback events and an Opus result follow (review #7)', () => {
+    const LATER = RESET + 7 * 86400 - 3600; // a different window on the fallback event
+    const rejection = rateLimitEvent({ status: 'rejected', rateLimitType: 'seven_day_overage_included',
+      fable: { utilization: 1, resetsAt: RESET, status: 'rejected' } });
+    const fallback = { type: 'rate_limit_event', rate_limit_info: { status: 'allowed', resetsAt: LATER, rateLimitType: 'seven_day',
+      isUsingOverage: false, unifiedWindows: { seven_day: { utilization: 0.1, resetsAt: LATER, status: 'allowed' } } } };
+    const result = classifyProbeOutput({ ...base, stdout: stream(init, rejection, fallback, opusResult) });
+    assert.deepEqual(result, { outcome: 'rejected', reason: 'fable_rejected', resets_at: '2026-11-13T06:00:00.000Z',
+      account: 'claude-ax-backup' });
+    const store = recordProbeResult({}, { account: 'claude-ax-backup', result, nowMs: NOW, config });
+    assert.deepEqual(store.accounts['claude-ax-backup'].rejection,
+      { at: new Date(NOW).toISOString(), resets_at: '2026-11-13T06:00:00.000Z', detail: 'fable_rejected' });
+    assert.equal(store.accounts['claude-ax-backup'].last_valid, undefined, 'the Opus answer is never an observation');
   });
 
   it('reads the limit-reached error text as a rejection without a window', () => {
