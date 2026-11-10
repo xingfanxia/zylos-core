@@ -29,7 +29,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { LIMIT_EVIDENCE_FILE, READINESS_FILE, SESSION_FAILURES_FILE } from './fable-guard.js';
-import { claimExecution, completeExecution } from './fable-exec-claim.js';
+import { claimExecution, completeExecution, holdsExecution } from './fable-exec-claim.js';
 import { readSessionRef as readTmuxSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { runtimeSwitchSignalPath } from './runtime-switch-signal.js';
 import { withFileLock } from '../../multi-session/file-lock.js';
@@ -328,7 +328,7 @@ export function createFableMonitor({
       launchId: pending.launchId, sessionRef: pending.sessionRef };
     let claim;
     try {
-      claim = claimExecution({ zylosDir, instanceId, op, nowMs, lock });
+      claim = claimExecution({ zylosDir, instanceId, op, now, lock });
     } catch (err) {
       log(`Fable guard lease enforcement: execution claim failed (${err.message}); retrying`);
       return null;
@@ -352,6 +352,17 @@ export function createFableMonitor({
           + `was replaced (now ${sessionRef || 'none'}, launch ${launch?.launch_id || 'none'}); nothing stopped`);
         writeEnforcement({ at: iso(nowMs), status: 'superseded', superseded_by: sessionRef || null });
         pending = null;
+        return null;
+      }
+      // Right before the kill: the claim must still be ours (an executor that
+      // lost it, e.g. after being judged gone, never acts).
+      let held = false;
+      try { held = holdsExecution({ zylosDir, instanceId, token: claim.token, lock }); } catch { held = false; }
+      if (!held) {
+        detail = 'claim_lost';
+        pending.nextAt = nowMs + STOP_RETRY_MS;
+        log(`Fable guard ALERT: lease enforcement lost its execution claim for ${instanceId} before stopping session `
+          + `${pending.sessionRef}; nothing stopped, re-judged at ${iso(pending.nextAt)}`);
         return null;
       }
       pending.attempts += 1;
@@ -378,7 +389,7 @@ export function createFableMonitor({
         + `${detail}); Fable may still be running, retrying at ${iso(pending.nextAt)}`);
       return { ...pending, status: 'pending', last_error: detail };
     } finally {
-      try { completeExecution({ zylosDir, instanceId, token: claim.token, outcome, detail, nowMs, lock }); } catch { /* best effort */ }
+      try { completeExecution({ zylosDir, instanceId, token: claim.token, outcome, detail, now, lock }); } catch { /* best effort */ }
     }
   }
 

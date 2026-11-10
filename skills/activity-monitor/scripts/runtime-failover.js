@@ -566,6 +566,10 @@ export function applyRuntimeFailover({
   log = console.log,
   zylosDir = ZYLOS_DIR,
 } = {}) {
+  // The pass time plus the time this pass has been running: the restarts below
+  // can take minutes, and the guard executor stamps its claims when it acts.
+  const passStartedAt = Date.now();
+  const clock = () => nowMs + (Date.now() - passStartedAt);
   let changes = [];
   let fableRestarts = [];
   // Account-failover effects for personas the Fable guard owns go through the
@@ -669,8 +673,8 @@ export function applyRuntimeFailover({
   for (const item of ownedEffects) log(`[runtime-failover] ${item.instanceId}: ${item.signalChange?.fromProfile ?? item.fromProfile} -> `
     + `${item.profileId ?? 'suspended'} (${item.failoverReason}); executed by the Fable guard executor`);
   const guardEffects = [...ownedEffects, ...fableRestarts];
-  if (guardEffects.length) executeFableRestarts({ zylosDir, restarts: guardEffects, nowMs, execFileSyncImpl, log });
-  try { drainDeferredFableEffects({ zylosDir, nowMs, execFileSyncImpl, log }); } catch (err) { log(`[fable-guard] deferred effects: ${err.message}`); }
+  if (guardEffects.length) executeFableRestarts({ zylosDir, restarts: guardEffects, nowMs, now: clock, execFileSyncImpl, log });
+  try { drainDeferredFableEffects({ zylosDir, nowMs, now: clock, execFileSyncImpl, log }); } catch (err) { log(`[fable-guard] deferred effects: ${err.message}`); }
   return [...changes, ...ownedEffects.map(item => item.change)];
 }
 
