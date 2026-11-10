@@ -30,6 +30,98 @@ export function getConfiguredRuntime({
   return cfg?.runtime === 'codex' ? 'codex' : 'claude';
 }
 
+// ── Fable allowance guard (FG) ──────────────────────────────────────────────
+// Contract: docs/fable-allowance-guard.md. Inert unless instances.json carries
+// `fable_guard.fable_model`; a persona opts in with `fable_enabled: true`. The
+// runtime-failover daemon owns the state file; launches only read it.
+export const FABLE_GUARD_DEFAULTS = Object.freeze({
+  threshold: 0.75,
+  subagent_model: 'claude-opus-5-5',
+  probe_interval_sec: 300,
+  lease_sec: 720,
+  probe_backoff_max_sec: 900,
+  upgrade_min_dwell_sec: 1800,
+  stale_clear_observations: 3,
+  crash_window_sec: 1800,
+  crash_failures: 2,
+  crash_probation_sec: 7200,
+});
+const FABLE_NUMERIC_BOUNDS = {
+  probe_interval_sec: [60, 3600],
+  lease_sec: [120, 7200],
+  probe_backoff_max_sec: [60, 3600],
+  upgrade_min_dwell_sec: [0, 86_400],
+  stale_clear_observations: [1, 20],
+  crash_window_sec: [60, 86_400],
+  crash_failures: [1, 20],
+  crash_probation_sec: [60, 7 * 86_400],
+};
+const VALID_PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+export function fableGuardStatePath(zylosDir = DEFAULT_ZYLOS_DIR) {
+  return path.join(zylosDir, 'activity-monitor', 'fable-guard.json');
+}
+
+export function fableUsagePath(zylosDir = DEFAULT_ZYLOS_DIR) {
+  return path.join(zylosDir, 'activity-monitor', 'fable-usage.json');
+}
+
+/** Normalized guard config, or null when the feature is not configured. */
+export function readFableGuardConfig(document) {
+  const raw = document?.fable_guard;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || raw.enabled === false) return null;
+  if (typeof raw.fable_model !== 'string' || !VALID_MODEL.test(raw.fable_model)) return null;
+  const config = { ...FABLE_GUARD_DEFAULTS, fable_model: raw.fable_model };
+  const threshold = Number(raw.threshold);
+  if (Number.isFinite(threshold) && threshold > 0 && threshold <= 1) config.threshold = threshold;
+  if (typeof raw.subagent_model === 'string' && VALID_MODEL.test(raw.subagent_model)) {
+    config.subagent_model = raw.subagent_model;
+  }
+  for (const [key, [min, max]] of Object.entries(FABLE_NUMERIC_BOUNDS)) {
+    const value = Number(raw[key]);
+    if (raw[key] != null && Number.isInteger(value) && value >= min && value <= max) config[key] = value;
+  }
+  config.probe_accounts = Array.isArray(raw.probe_accounts)
+    ? [...new Set(raw.probe_accounts.filter(id => typeof id === 'string' && VALID_PROFILE_ID.test(id)))]
+    : [];
+  return config;
+}
+
+/** Settings file of a probe-able Fable account (a Claude profile), else null. */
+export function fableAccountSettingsFile(document, profileId) {
+  const raw = document?.runtime_profiles?.[profileId];
+  if (raw?.runtime !== 'claude' || typeof raw.claude_settings_file !== 'string') return null;
+  return VALID_SETTINGS_FILE.test(raw.claude_settings_file) && !raw.claude_settings_file.split('/').includes('..')
+    ? raw.claude_settings_file : null;
+}
+
+/**
+ * Launch decision for one persona. null = feature inert for this persona (not
+ * configured or not fable_enabled): the launch is byte-for-byte unchanged.
+ * Fable is chosen only when the guard committed it for this exact account and
+ * that account has no hold; anything else launches the profile's own model.
+ */
+export function resolveFableLaunch({ document, instanceId, profileId, guardState = null } = {}) {
+  const config = readFableGuardConfig(document);
+  const instance = instanceId ? document?.instances?.[instanceId] : null;
+  if (!config || instance?.fable_enabled !== true) return null;
+  const desired = guardState?.personas?.[instanceId]?.desired;
+  const holds = guardState?.holds?.[profileId];
+  const fable = Boolean(fableAccountSettingsFile(document, profileId))
+    && desired?.mode === 'fable' && desired.account === profileId
+    && Number.isInteger(desired.generation)
+    && !(holds && typeof holds === 'object' && Object.keys(holds).length > 0);
+  return {
+    mode: fable ? 'fable' : 'opus',
+    model: fable ? config.fable_model : null,
+    generation: Number.isInteger(desired?.generation) ? desired.generation : null,
+    env: {
+      CLAUDE_CODE_SUBAGENT_MODEL: config.subagent_model,
+      CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1',
+    },
+  };
+}
+
 function isInside(parent, child) {
   const relative = path.relative(parent, child);
   return relative === '' || (!relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative));
@@ -49,6 +141,7 @@ export function resolveRuntimeProfile({
   instanceId = null,
   homeDir = os.homedir(),
   configuredRuntime = 'claude',
+  fableGuardState = null,
 } = {}) {
   const instance = instanceId ? document?.instances?.[instanceId] || {} : {};
   const profileId = typeof instance.runtime_profile === 'string'
@@ -126,6 +219,10 @@ export function resolveRuntimeProfile({
 
   if (profileId && !raw) errors.push('unknown_runtime_profile');
 
+  const fable = runtime === 'claude' && raw
+    ? resolveFableLaunch({ document, instanceId, profileId, guardState: fableGuardState })
+    : null;
+
   return {
     id: raw ? profileId : null,
     runtime,
@@ -133,10 +230,11 @@ export function resolveRuntimeProfile({
     codexHome,
     osUser,
     usageProvider,
-    model,
+    model: fable?.model || model,
     reasoningEffort,
     providerEnvKey,
     claudeSettingsFile,
+    ...(fable ? { fable: { mode: fable.mode, generation: fable.generation }, launchEnv: fable.env } : {}),
     errors: [...new Set(errors)],
   };
 }
@@ -150,11 +248,15 @@ export function getInstanceRuntimeProfile({
   const configuredRuntime = getConfiguredRuntime({ zylosDir, readFileSync });
   const document = readJsonSafe(path.join(zylosDir, 'instances.json'), readFileSync);
   if (document || instanceId) {
+    const fableGuardState = readFableGuardConfig(document)
+      ? readJsonSafe(fableGuardStatePath(zylosDir), readFileSync)
+      : null;
     return resolveRuntimeProfile({
       document: document || {},
       instanceId,
       homeDir,
       configuredRuntime,
+      fableGuardState,
     });
   }
 

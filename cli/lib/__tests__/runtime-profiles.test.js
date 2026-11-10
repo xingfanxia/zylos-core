@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 
 import {
   getInstanceRuntimeProfile,
+  readFableGuardConfig,
   resolveRuntimeProfile,
 } from '../../../skills/multi-session/runtime-files.js';
 
@@ -126,5 +127,66 @@ describe('runtime profile resolution', () => {
     for (const model of ["opus'; id #", 'opus[2m]', 'opus [1m]']) {
       assert.ok(resolve(model).errors.includes('invalid_model'), model);
     }
+  });
+});
+
+describe('Fable guard launch decision', () => {
+  const settings = '/home/zylos-shared/auth/claude-ax-backup.settings.json';
+  const document = (extra = {}) => ({
+    fable_guard: { fable_model: 'claude-fable-5-2[1m]' },
+    runtime_profiles: {
+      'claude-ax-backup': { runtime: 'claude', claude_settings_file: settings, model: 'claude-opus-5-5[1m]' },
+      'claude-ax-main': { runtime: 'claude', model: 'claude-opus-5-5[1m]' },
+      'codex-subscription': { runtime: 'codex', model: 'gpt-6-astra' },
+    },
+    instances: { 'user-pan': { runtime_profile: 'claude-ax-backup', fable_enabled: true, ...extra } },
+  });
+  const state = (desired, holds = {}) => ({ version: 1, holds, personas: { 'user-pan': { desired } } });
+  const resolve = (doc, guardState) => resolveRuntimeProfile({ document: doc, instanceId: 'user-pan', fableGuardState: guardState });
+  const fable = { account: 'claude-ax-backup', mode: 'fable', generation: 2 };
+
+  it('launches Fable only for the committed account without holds', () => {
+    assert.equal(resolve(document(), state(fable)).model, 'claude-fable-5-2[1m]');
+    assert.deepEqual(resolve(document(), state(fable)).fable, { mode: 'fable', generation: 2 });
+    for (const [name, guardState] of [
+      ['no state', null],
+      ['opus committed', state({ ...fable, mode: 'opus' })],
+      ['other account', state({ ...fable, account: 'claude-ax-cl' })],
+      ['bad generation', state({ ...fable, generation: '2' })],
+      ['account held', state(fable, { 'claude-ax-backup': { quota: { since: 'x' } } })],
+    ]) {
+      const result = resolve(document(), guardState);
+      assert.equal(result.model, 'claude-opus-5-5[1m]', name);
+      assert.equal(result.fable.mode, 'opus', name);
+      assert.equal(result.launchEnv.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '1', name);
+    }
+  });
+
+  it('never launches Fable on an account without its own settings file or on Codex', () => {
+    const main = document({ runtime_profile: 'claude-ax-main' });
+    assert.equal(resolve(main, state({ ...fable, account: 'claude-ax-main' })).model, 'claude-opus-5-5[1m]');
+    const codex = resolve(document({ runtime_profile: 'codex-subscription' }), state({ ...fable, account: 'codex-subscription' }));
+    assert.equal(codex.model, 'gpt-6-astra');
+    assert.equal(codex.launchEnv, undefined);
+  });
+
+  it('is inert without fable_enabled or without a valid config', () => {
+    const off = resolve(document({ fable_enabled: false }), state(fable));
+    assert.equal(off.fable, undefined);
+    assert.equal(off.launchEnv, undefined);
+    const doc = document();
+    doc.fable_guard.fable_model = 'claude fable';
+    assert.equal(resolve(doc, state(fable)).launchEnv, undefined);
+  });
+
+  it('applies documented defaults and bounds', () => {
+    const config = readFableGuardConfig({ fable_guard: { fable_model: 'claude-fable-5-2', threshold: 75, lease_sec: 30,
+      probe_accounts: ['claude-ax-backup', 'bad id', 7] } });
+    assert.equal(config.threshold, 0.75);
+    assert.equal(config.lease_sec, 720);
+    assert.equal(config.probe_interval_sec, 300);
+    assert.equal(config.subagent_model, 'claude-opus-5-5');
+    assert.deepEqual(config.probe_accounts, ['claude-ax-backup']);
+    assert.equal(readFableGuardConfig({ fable_guard: { fable_model: 'claude-fable-5-2', enabled: false } }), null);
   });
 });

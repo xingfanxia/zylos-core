@@ -414,6 +414,83 @@ describe('Claude launch — new session', () => {
   });
 });
 
+describe('Claude launch — Fable allowance guard policy', () => {
+  const BACKUP = 'claude-ax-backup';
+  const FABLE = 'claude-fable-5-2[1m]';
+  const OPUS = 'claude-opus-5-5[1m]';
+  const PERSONAS = ['admin', 'scheduler', 'user-pan', 'group', 'user-elaine', 'user-sean'];
+  const FABLE_PERSONAS = new Set(['user-pan', 'user-elaine']);
+  const SUBAGENT_KEYS = ['CLAUDE_CODE_SUBAGENT_MODEL', 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE'];
+
+  function writeFleet(mode, { guard = true } = {}) {
+    const document = {
+      runtime_profiles: { [BACKUP]: { runtime: 'claude', usage_provider: BACKUP,
+        claude_settings_file: '/home/zylos-shared/auth/claude-ax-backup.settings.json', model: OPUS, reasoning_effort: 'high' } },
+      instances: Object.fromEntries(PERSONAS.map(id => [id, { enabled: true, runtime: 'claude', runtime_profile: BACKUP,
+        ...(FABLE_PERSONAS.has(id) ? { fable_enabled: true } : {}) }])),
+      ...(guard ? { fable_guard: { fable_model: FABLE, threshold: 0.75 } } : {}),
+    };
+    fs.writeFileSync(path.join(fakeZylosDir, 'instances.json'), JSON.stringify(document));
+    fs.writeFileSync(path.join(fakeZylosDir, 'activity-monitor', 'fable-guard.json'), JSON.stringify({
+      version: 1, generation_seq: 9, holds: {},
+      personas: Object.fromEntries([...FABLE_PERSONAS].map(id => [id, { desired: { account: BACKUP, mode, generation: 9 } }])),
+    }));
+  }
+
+  async function launchAs(id, { existing = false } = {}) {
+    const { getInstanceRuntimeProfile } = await import('../../../skills/multi-session/runtime-files.js');
+    // The profile is resolved per persona here; leaving ZYLOS_INSTANCE_ID unset
+    // keeps instance-config's 10 s instances.json cache out of later tests.
+    tmuxSessionExists = existing;
+    const adapter = makeAdapter(ClaudeAdapter);
+    adapter.config.runtimeProfile = getInstanceRuntimeProfile({ zylosDir: fakeZylosDir, instanceId: id });
+    let sent = '';
+    adapter.sendMessage = async (text) => { sent = text; };
+    calls.execFileSync.length = 0;
+    await adapter.launch({ bypassPermissions: false });
+    return existing ? { sent } : { args: readSpecArgs(), env: readSpecEnv() };
+  }
+
+  for (const mode of ['fable', 'opus']) {
+    it(`launches main and subagent models for all six personas in ${mode} mode`, async () => {
+      writeFleet(mode);
+      for (const id of PERSONAS) {
+        const { args, env } = await launchAs(id);
+        const fable = FABLE_PERSONAS.has(id);
+        const model = fable && mode === 'fable' ? FABLE : OPUS;
+        assert.deepEqual(args, ['--settings', '/home/zylos-shared/auth/claude-ax-backup.settings.json', '--model', model, '--effort', 'high'], id);
+        if (fable) {
+          assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-opus-5-5', id);
+          assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE, '1', id);
+        } else {
+          for (const key of SUBAGENT_KEYS) assert.equal(env[key], undefined, `${id} ${key}`);
+        }
+        assert.equal(env.CLAUDE_CODE_NO_MODEL_FALLBACK, undefined, id);
+      }
+    });
+
+    it(`exports the same policy when reusing a session in ${mode} mode`, async () => {
+      writeFleet(mode);
+      for (const id of PERSONAS) {
+        const { sent } = await launchAs(id, { existing: true });
+        const fable = FABLE_PERSONAS.has(id);
+        assert.ok(sent.includes(` '--model' '${fable && mode === 'fable' ? FABLE : OPUS}'`), id);
+        assert.equal(sent.includes("export CLAUDE_CODE_SUBAGENT_MODEL='claude-opus-5-5'"), fable, id);
+        assert.equal(sent.includes("export CLAUDE_CODE_SUBAGENT_MODEL_FORCE='1'"), fable, id);
+      }
+    });
+  }
+
+  it('is inert for every persona when fable_guard is not configured', async () => {
+    writeFleet('fable', { guard: false });
+    for (const id of PERSONAS) {
+      const { args, env } = await launchAs(id);
+      assert.deepEqual(args, ['--settings', '/home/zylos-shared/auth/claude-ax-backup.settings.json', '--model', OPUS, '--effort', 'high'], id);
+      for (const key of SUBAGENT_KEYS) assert.equal(env[key], undefined, `${id} ${key}`);
+    }
+  });
+});
+
 describe('Claude launch — existing session', () => {
   it('does not create a new tmux session', async () => {
     tmuxSessionExists = true;
