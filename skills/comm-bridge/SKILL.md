@@ -111,6 +111,10 @@ When a control message content starts with `[KEYSTROKE]`, the dispatcher:
 
 Example: the permission auto-approve hook enqueues `[KEYSTROKE]Enter` at priority 0 with bypass-state to auto-confirm Claude Code's permission prompts.
 
+## Modal Delivery Guard
+
+While a Claude Code dialog or select list owns the pane's keyboard (`detectModal()` in `scripts/tmux-input-state.js`: the usage-credits / Fable-limit consent dialog, any other dialog, the `/usage` overlay), both dispatchers paste nothing and send no Enter (initial or retry) and no `[KEYSTROKE]` key. Each Enter is preceded by its own fresh pane read. The row is deferred: it is released back to pending without consuming a retry and is never recorded as delivered; multi-session holds it for the cycle (`heldReasons.modal`) and keeps serving other instances. It is delivered once the modal is gone, or into the replacement pane after a restart when the old pane never received Enter for it. The one exception is a recognized permission prompt, which `[KEYSTROKE]` may still answer (auto-approve). `classifyLimitDialog()` names a live limit dialog (`fable_limit` / `credits_offer`); its wording list tracks the CLI text, and a wording miss still blocks delivery as an `unknown` modal.
+
 Any process with access to `c4-control.js` can enqueue keystroke controls. This mirrors the existing reality that any process can call `tmux send-keys` directly — the C4 queue adds priority ordering and delivery guarantees, not access control.
 
 ## Service Management

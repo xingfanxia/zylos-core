@@ -430,7 +430,7 @@ export function runtimeForSession(session = TMUX_SESSION) {
 }
 
 function deliveryInputState(session, runtime, execFileSyncImpl = execFileSync) {
-  const state = readTmuxInputState({ sessionName: session, execFileSyncImpl });
+  const state = readTmuxInputState({ sessionName: session, execFileSyncImpl, detectModals: runtime === 'claude' });
   if (runtime === 'claude' && state.inputState === 'has_content') {
     const fallback = checkClaudeFallbackInputBox(state.capture);
     if (fallback !== 'indeterminate') return { ...state, inputState: fallback };
@@ -440,6 +440,17 @@ function deliveryInputState(session, runtime, execFileSyncImpl = execFileSync) {
 
 export function checkInputBox(session = TMUX_SESSION) {
   return deliveryInputState(session, runtimeForSession(session)).inputState;
+}
+
+/** The modal (dialog or select list) that owns the session's keyboard, or null. */
+export function readSessionModal(session = TMUX_SESSION) {
+  return deliveryInputState(session, runtimeForSession(session)).modal || null;
+}
+
+// Raw keys are withheld while a modal owns the keyboard. A permission prompt is
+// the exception: answering it is what the auto-approve [KEYSTROKE]Enter is for.
+export function keystrokeBlockedByModal(modal) {
+  return !!modal && modal.kind !== 'permission';
 }
 
 export function isUsageOverlayCapture(capture) {
@@ -501,6 +512,15 @@ export async function submitAndVerify(session, {
   pending, readState, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
 } = {}) {
   const enter = () => execFileSyncImpl('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+  const deferred = () => { pending.modalDeferred = true; return { verified: false, state: 'modal' }; };
+  // A modal can open at any moment (a usage-credits consent dialog opens on its
+  // own). Every Enter therefore gets a fresh frame of its own, read right before
+  // the key, and is withheld while a modal owns the keyboard.
+  const enterUnlessModal = () => {
+    if (readState().modal) return false;
+    enter();
+    return true;
+  };
   if (!pending.observed) {
     // Native bracketed paste is asynchronous. An old empty frame cannot prove
     // that the newly pasted message was consumed. Observe its populated
@@ -508,6 +528,7 @@ export async function submitAndVerify(session, {
     for (let attempt = 0; attempt < 20; attempt++) {
       const state = readState();
       if (wasReplaced(pending, state)) return replacementResult(pending);
+      if (state.modal) return deferred();
       if (state.inputState === 'has_content' && !state.usageOverlay) {
         pending.observed = true;
         break;
@@ -517,20 +538,21 @@ export async function submitAndVerify(session, {
     if (!pending.observed) return { verified: false, state: 'paste_unobserved' };
   }
   if (!pending.enterSent) {
-    enter();
+    if (!enterUnlessModal()) return deferred();
     pending.enterSent = true;
   }
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleepImpl(ENTER_VERIFY_WAIT_MS);
     const state = readState();
     if (wasReplaced(pending, state)) return replacementResult(pending);
+    if (state.modal) return deferred();
     if (state.inputState === 'empty') return { verified: true, state: 'empty' };
     // A working model must never receive repeated Enter, nor an Escape that
     // could interrupt it. Keep the delivery pending until its composer clears.
     if (state.inProgressCapture) return { verified: false, state: 'working' };
     if (state.inputState === 'has_content' && !state.usageOverlay) {
       logImpl(`Enter verify attempt ${attempt + 1}: owned input remains, retrying Enter`);
-      enter();
+      if (!enterUnlessModal()) return deferred();
     }
   }
   return { verified: false, state: 'indeterminate' };
@@ -551,12 +573,36 @@ async function sendToTmux(message, options = {}) {
   if (receipts.has(receiptKey)) return receipts.get(receiptKey);
   let pending = submissions.get(session);
   let initial = readState();
+  if (pending && wasReplaced(pending, initial) && pending.modalDeferred && !pending.enterSent) {
+    // The old pane never got Enter for this text (a modal held it back), so it
+    // cannot have run there; the replacement pane receives a fresh paste.
+    submissions.delete(session);
+    pending = null;
+  }
   if (pending && wasReplaced(pending, initial)) {
     const consumed = replacementResult(pending).verified;
     receipts.set(`${session}\0${pending.deliveryId}`, consumed ? 'submitted' : 'verify_failed');
     submissions.delete(session);
     pending = null;
     if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+  }
+  // Delivery guard: while a modal owns the keyboard nothing is pasted or
+  // submitted. The row is deferred, not failed; ownership of any paste stays.
+  if (initial.modal) {
+    if (pending) pending.modalDeferred = true;
+    return 'modal_deferred';
+  }
+  if (pending && pending.modalDeferred && !pending.enterSent && initial.inputState === 'empty') {
+    // The modal may have swallowed the paste. A confirmed empty composer (no
+    // Enter was ever sent) means the text is nowhere; release it for a re-paste.
+    await wait(100);
+    const confirmed = readState();
+    if (confirmed.modal) return 'modal_deferred';
+    if (confirmed.inputState === 'empty' || wasReplaced(pending, confirmed)) {
+      submissions.delete(session);
+      pending = null;
+    }
+    initial = confirmed;
   }
   if (pending && pending.deliveryId !== deliveryId) {
     // The old row may have exhausted retries or been manually submitted. Only
@@ -601,6 +647,12 @@ async function sendToTmux(message, options = {}) {
     submissions.delete(session);
     if (result.state === 'replaced') receipts.set(receiptKey, 'submitted');
     return 'submitted';
+  }
+  if (result.state === 'modal') return 'modal_deferred';
+  if (result.state === 'replaced' && pending.modalDeferred && !pending.enterSent) {
+    // Same rule as above: text a modal held back never ran in the old pane.
+    submissions.delete(session);
+    return 'modal_deferred';
   }
   if (result.state === 'replaced') {
     submissions.delete(session);
@@ -847,6 +899,7 @@ async function processNextMessage() {
         waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
         markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
         sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
+        readSessionModal, keystrokeBlockedByModal,
         getNextPendingForInstances: multi.getNextPendingForInstances,
         getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
         getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
@@ -923,6 +976,12 @@ async function processNextMessage() {
   // without buffer paste or "Meanwhile" prefix. Used for auto-approve permission prompts.
   const rawContent = item.content || '';
   if (isKeystrokeControl(item)) {
+    const modal = readSessionModal(TMUX_SESSION);
+    if (keystrokeBlockedByModal(modal)) {
+      log(`Deferred keystroke control id=${item.id}: modal=${modal.kind} owns the keyboard`);
+      releaseItem(item, 'MODAL_DEFERRED');
+      return { delivered: false, state: agentState.state };
+    }
     periodicEnter.reset('keystroke_control');
     const key = parseKeystrokeKey(rawContent);
     log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority})`);
@@ -950,6 +1009,14 @@ async function processNextMessage() {
       acceptShutdownAfterSubmit: isCodexExitLifecycleControl(item)
     });
   } finally { deliveryTrace = {}; }
+
+  if (result === 'modal_deferred') {
+    // Not delivered and not a failure: no retry is consumed; the row is
+    // retried once the modal is gone or the session has been replaced.
+    log(`Deferred ${item.type} id=${item.id}: a modal owns the keyboard`);
+    releaseItem(item, 'MODAL_DEFERRED');
+    return { delivered: false, state: agentState.state };
+  }
 
   if (result === 'submitted') {
     if (item.type === 'conversation') {
