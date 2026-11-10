@@ -92,7 +92,7 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
      model or subagent env commits a new generation), then execute each
      restart behind the per-restart generation fence. If the daemon is alive
      it may run the same pass concurrently; the lock serializes the commits
-     and the fence prevents an obsolete or duplicate restart.
+     and the generation fence plus the per-persona execution claim prevent an obsolete, duplicate or overlapping restart.
 
   Exact instructions for `configure-ax-devbox-runtime.mjs`:
   `azure-agents-infra/scratch/reports/fable52-main-mode/fg-apply-protocol.md`.
@@ -104,6 +104,24 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
   than 30 s ago and has not launched yet reuses that restart (the relaunch
   re-reads the guard state), so an `--apply` interleaved with a guard restart
   never causes an obsolete second restart.
+- Execution claim (`fable-exec-claim.js`). Every effect on a guard-owned
+  persona takes that persona's claim
+  (`<ZYLOS_DIR>/activity-monitor/fable-exec/<id>.json`, under its own `.lock`)
+  before it runs: the daemon's guard restarts and safe stops,
+  `reconcileFableGuardNow` (`--apply`), the account failover's restart or
+  suspend of a guard-owned persona, and the persona monitor's lease
+  enforcement. At most one claim is `running` per persona, so these never
+  overlap; an operation (kind, generation, attempt, target account / launch /
+  session) that already ran is never executed again, so the same
+  generation/attempt submitted twice executes once. A `running` claim older
+  than 90 s (longer than the kill and pm2 timeouts) was interrupted and may be
+  recovered. A restart skipped because the claim is busy is picked up by the
+  level-triggered reconcile below; an account-failover suspend skipped that
+  way is kept (`deferred`) and run by the next daemon pass, unless the
+  failover has lifted that suspension meanwhile. The claim records execution,
+  not completion: a stop is complete only when observed, a restart only when
+  the guard verifies the launch. Personas the guard does not own keep the
+  account failover's direct restart path unchanged.
 
 ## Components
 
@@ -113,6 +131,7 @@ For `azure-agents-infra` `devbox-runtime-policy.mjs`:
 | Holds, desired launch, reconcile | `skills/activity-monitor/scripts/fable-guard.js` | `runtime-failover` daemon, under `instances.json.lock` |
 | Launch policy, admission, launch record | `skills/multi-session/runtime-files.js` + `cli/lib/runtime/claude.js` | activity monitor (every Guardian launch) |
 | Lease enforcement | `skills/activity-monitor/scripts/fable-monitor.js` | activity monitor of a tracked persona |
+| Per-persona execution claim | `skills/activity-monitor/scripts/fable-exec-claim.js` | every executor of a guard-owned persona (daemon, account failover, `--apply`, monitor) |
 | Limit-dialog precedence | `skills/activity-monitor/scripts/health-engine.js`, `monitor.js` | activity monitor of a Fable-mode persona |
 | Operator command | `skills/activity-monitor/scripts/fable-guard-cli.js` | operator shell |
 
@@ -230,10 +249,13 @@ commit `desired {account, mode, generation}` once → reconcile.
 - A commit restarts the persona through the failover's cold-start path
   (runtime switch signal with an unchanged profile → `tmux kill-session` →
   `pm2 restart activity-monitor-<id>`), unless the account failover restarts it
-  in the same pass, or the running launch record already has exactly this
+  in the same pass (through the guard's executor, carrying this generation as
+  attempt 1), or the running launch record already has exactly this
   `key` and account (it is then adopted as `adopted_launch_id`). An Opus →
   Opus change of policy only (for example the subagent pin after enabling a
-  persona that is still on Opus) waits until the persona is idle.
+  persona that is still on Opus) waits until the persona is idle, and is never
+  restarted again while a restart issued for it is still landing (three
+  minutes after it was executed).
 - **Convergence is level-triggered against the launch record**, not inferred
   from what changed in a pass. A committed generation is converged only when
   the engine's current launch (`fable-launch.json` no older than
@@ -253,11 +275,18 @@ commit `desired {account, mode, generation}` once → reconcile.
 - Retry exhaustion: after three attempts the guard logs `ALERT … not
   converged` and stops retrying that generation. If the commit was a
   downgrade and the last launch record or the engine's model report is Fable,
-  the persona is **stopped** (`pm2 stop activity-monitor-<id>`, then `tmux
-  kill-session`) and `safe_stop` is recorded, so an unsafe Fable session is
-  never left running. Recovery: check the persona, then `pm2 start
-  activity-monitor-<id>`; its launch is admitted to Opus only, and any later
-  commit restarts it normally.
+  the guard records the stop **intent** `safe_stop {generation, attempts,
+  next_at}` and stops the persona (`pm2 stop activity-monitor-<id>`, then
+  `tmux kill-session`). The stop is complete only when it is observed:
+  `pm2 stop` succeeded **and** `tmux has-session` reports the session gone
+  (`safe_stop.confirmed_at`, log `STOPPED`), or the persona's current launch is
+  Opus and reports Opus. A failed `pm2 stop`, a session that survives the
+  kill, or a daemon that died after recording the intent leaves it pending
+  (`last_error`, log and status `ALERT … not confirmed` / `SAFE-STOP
+  PENDING`); the planner issues the stop again after 1, 2, 4 … minutes (at
+  most 15) until it is confirmed. Recovery after a confirmed stop: check the
+  persona, then `pm2 start activity-monitor-<id>`; its launch is admitted to
+  Opus only, and any later commit restarts it normally.
 - Crash atomicity across `instances.json` (account, written by the account
   failover) and `fable-guard.json` (the guard's tuple) is not obtained by a
   cross-file transaction. The guard file is the single journal of the guard's
@@ -278,7 +307,10 @@ commit `desired {account, mode, generation}` once → reconcile.
   missing ACK, or no result 30 minutes after the launch, sets
   `verified.readiness = ack_missing|no_probe_result` and logs one `ALERT`; it
   never restarts a persona that runs the correct model, and the readiness
-  probe failure never triggers HealthEngine recovery.
+  probe failure never triggers HealthEngine recovery. A genuine ACK from the
+  same launch that arrives later (an `ack` readiness result, or a
+  `post_restart`/`recovery` functional ACK after the launch) still moves it
+  to `verified.ready_at` and logs `readiness recovered`.
 - The guard never types into a pane, never writes
   `runtime_failover_blocked_profiles` or `runtime_profile`, and never reports
   `rate_limited`. `instances.json` is not written by the guard.
@@ -317,15 +349,43 @@ main model, effort, settings file and launch env. A persona is tracked when its
 monitor started with a Fable decision, when it is `fable_enabled` on a
 configured guard, or when the guard state still lists it.
 
+The record is written before the CLI starts, so it is the launch **intent**,
+not proof of what runs. Fable is admitted only when its record is committed:
+if writing a Fable record fails, the launch uses the profile's own model
+(`reason: launch_record_failed`, subagent pin kept) and an Opus record is
+attempted. The lease enforcement below judges a running session from the
+session itself, never from a missing or older record.
+
 ### Lease enforcement without the daemon
 
-The persona's own activity monitor (`fable-monitor.js`, every 15 s) re-checks
-admission for a session whose launch record says `fable`. If admission has
-failed for longer than 120 s (one daemon poll plus its cold restart, so a live
-daemon always acts first), the monitor logs `Fable guard ALERT`, writes
-`<monitor dir>/fable-lease-enforcement.json`, and stops the session; the
-Guardian relaunch re-evaluates admission and comes up on Opus. The monitor only
-ever forces Opus. It never upgrades and never writes the guard state; the
+The persona's own activity monitor (`fable-monitor.js`, every 15 s) judges the
+running session, identified by its `sessionRef`, from the session itself: the
+CLI process's `--model` argument (`ps` of the Claude process in the pane) and
+the model it reports in `statusline.json` after that session started. A
+session is safe only when that evidence says a non-Fable model; Fable **or no
+evidence** (record missing, older than the session, process unreadable) means
+it may be on Fable. Such a session is checked against admission (for the
+account of its launch record when the record belongs to this session, else
+the instance's current account). If admission has failed for longer than
+120 s (one daemon poll plus its cold restart, so a live daemon always acts
+first), the monitor logs `Fable guard ALERT`, writes
+`<monitor dir>/fable-lease-enforcement.json` (`status: pending`), and stops
+that session:
+
+- it takes the persona's execution claim (the daemon's executor holds the same
+  claim while it restarts or stops the persona; a busy claim makes the
+  monitor wait), then revalidates that the session (`sessionRef`) and launch
+  record are still the ones it judged. A session the daemon replaced
+  meanwhile is never stopped (`status: superseded`);
+- it kills exactly that tmux session by its session id (`tmux kill-session -t
+  $<id>`), never by the reusable name;
+- the stop is done only when the session is observed gone
+  (`status: confirmed`, `confirmed_at`); otherwise it stays pending and is
+  retried after 15 s, 30 s, 1 min … (at most 5 min) with an `ALERT … not
+  confirmed` each time.
+
+The Guardian relaunch re-evaluates admission and comes up on Opus. The monitor
+only ever forces Opus. It never upgrades and never writes the guard state; the
 daemon stays the single transition owner. PM2 is not a lease enforcer: a
 running Fable session outlives a dead daemon only for the lease plus this
 grace (about 14 minutes with the defaults).
@@ -369,7 +429,22 @@ Known limit of the session fence: a Claude relaunch inside the same surviving
 shell pane (no new tmux session) keeps the same `sessionRef`, so keys bound to
 the previous process are not told apart from the new one. Guard restarts and
 the lease enforcement kill the tmux session, so they always get a new
-`sessionRef`. Unbound keys are fenced by the dispatcher at claim time.
+`sessionRef`.
+
+The watchdog interrupt and the permission auto-approve Enter are enqueued
+bound: the watchdog reads the adapter session's ref (`readSessionRef`) right
+before the enqueue, and the auth-prompt hook reads its own pane with `tmux
+display-message -t "$TMUX_PANE"`; each passes it as `--session-ref`. A key
+whose identity cannot be read (no `TMUX_PANE`, or an os_user-isolated CLI that
+cannot reach the service user's tmux socket) is enqueued unbound. The
+dispatcher fences an unbound key at claim time: it is bound to the pane it
+reads then, and superseded (`SESSION_PREDATES`) when its `created_at` is at or
+before that session's `session_created`; a same-second key is ambiguous and
+is fenced, not delivered. Every key, paste and Enter is then sent to the pane
+id (`%N`) of the read that decided it, never to the reusable session name, so
+a session replaced in between makes the send fail instead of receiving it.
+The periodic Enter nudge (`maybePeriodicEnter`) is not tied to a read and
+still targets the session name.
 
 **Uncertain deliveries.** If the CLI raises a Fable-limit / usage-credits
 dialog right after the dispatcher sent Enter, C4 records the message as
@@ -378,10 +453,18 @@ uncertain (`c4.db` table `delivery_uncertain`, migration 004; see
 replayed. The tracked persona's monitor reads unnotified rows every 15 s
 (`getUncertainDeliveries({ instanceId, unnotifiedOnly: true, limit: 20 })`),
 logs one `Fable guard ALERT: delivery uncertain …` per row naming the item
-(`conversation #<id> from <channel> "<preview>"`), keeps the last 20 in
-`<monitor dir>/fable-uncertain-deliveries.json` for `fable-guard-cli.js
-status` (`UNCERTAIN DELIVERY …`), and marks the row notified
-(`markUncertainDeliveryNotified(id)`). An operator decides whether to resend.
+(`conversation #<id> from <channel> "<preview>"`), and sends the operator a
+notification through the same path as the degraded-persona admin alert
+(`c4-send.js` to the admin instance's first `chat_id`, delivery action
+`health-alert`). The row is marked notified
+(`markUncertainDeliveryNotified(id)`) only after that send exits 0; a log line
+is not a notification. A failed send (or no admin `chat_id`) keeps the row
+unnotified and is retried after 1, 2, 4 … minutes (at most 30), at most 12
+times; the monitor logs `ALERT … not notified` each time. The last 20 rows,
+with `notified_at` or `notify_attempts`/`last_notify_error`, are kept in
+`<monitor dir>/fable-uncertain-deliveries.json` for `fable-guard-cli.js status`
+(`UNCERTAIN DELIVERY … (operator notified …)` or `(operator NOT notified …)`).
+An operator decides whether to resend.
 Known blind spot: a dialog that appears with no later dispatcher read of that
 pane is not claimed by any message, so no row is recorded; the limit evidence
 still creates the `quota` hold.
@@ -455,14 +538,14 @@ Do **not** drop the column or the table, or delete the `003`/`004` rows from
 `_migrations`, as part of a rollback: a later re-upgrade skips migrations whose
 ledger row exists, so removing only one side leaves a schema the new code
 cannot use. Remove the guard's runtime files instead if wanted
-(`activity-monitor/fable-guard.json`, `fable-usage.json`, and per persona
+(`activity-monitor/fable-guard.json`, `fable-usage.json`, `activity-monitor/fable-exec/`, and per persona
 `fable-launch.json`, `fable-readiness.json`, `fable-lease-enforcement.json`,
 `fable-uncertain-deliveries.json`, `fable-session-failures.json`,
 `fable-limit-evidence.json`); the old code ignores them.
 
 ## Deployment notes
 
-- Skills files to install: `activity-monitor/scripts/{fable-probe,fable-guard,fable-monitor,fable-guard-cli,runtime-failover,health-engine,monitor,monitor-orchestrator}.js`,
+- Skills files to install: `activity-monitor/scripts/{fable-probe,fable-guard,fable-exec-claim,fable-monitor,fable-guard-cli,runtime-failover,health-engine,monitor,monitor-orchestrator,hook-auth-prompt}.js`,
   `activity-monitor/scripts/adapters/runtime-components.js`,
   `multi-session/runtime-files.js`, `activity-monitor/scripts/{guardian,runtime-switch-signal}.js`,
   and the comm-bridge files of the delivery half (`c4-db.js`,
