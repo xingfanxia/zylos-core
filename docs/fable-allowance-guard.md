@@ -109,7 +109,11 @@ last good one.
 
 - Explicit Fable rejection (the Fable window `rejected`, a `rejected` status
   naming that window, `isUsingOverage: true`, or Fable-limit wording on an
-  error result) is exhaustion evidence, even on a non-zero exit.
+  error result) is exhaustion evidence, even on a non-zero exit. Every
+  `rate_limit_event` in the stream is checked: a rejection followed by the
+  CLI's fallback events and a successful non-Fable answer is still a
+  rejection, with the reset window of the event that rejected. A rejection is
+  recorded only under the account that was probed.
 - A generic 429 is no observation and backs off 10, 15, 15 … minutes (ceiling
   `probe_backoff_max_sec`). The lease is measured from the last valid
   observation only, so backoff never extends it.
