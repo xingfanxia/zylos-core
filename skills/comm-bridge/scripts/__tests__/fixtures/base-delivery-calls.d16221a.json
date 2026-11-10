@@ -505,6 +505,21 @@
      "__ZYLOS_CURSOR__ #{cursor_x} #{cursor_y} #{session_id} #{session_created} #{pane_id} #{pane_pid}"
     ]
    ]
+  },
+  "keystroke": {
+   "delivered": true,
+   "rows": [
+    8
+   ],
+   "calls": [
+    [
+     "tmux",
+     "send-keys",
+     "-t",
+     "claude-user-pan",
+     "Escape"
+    ]
+   ]
   }
  }
 }

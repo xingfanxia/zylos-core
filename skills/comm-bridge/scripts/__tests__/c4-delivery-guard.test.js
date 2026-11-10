@@ -22,7 +22,7 @@ fs.writeFileSync(path.join(root, 'instances.json'), JSON.stringify({ version: 1,
 } }));
 
 const dispatcher = await import('../c4-dispatcher.js');
-const { sendToTmux, submitAndVerify, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey } = dispatcher;
+const { sendToTmux, submitAndVerify, keystrokeBlockedByModal, isKeystrokeControl, parseKeystrokeKey, fenceKeystrokeControl } = dispatcher;
 const { processWithMultiSession } = await import('../c4-dispatcher-multi.js');
 const { detectModal } = await import('../tmux-input-state.js');
 const fx = await import('./fixtures/claude-dialogs.js');
@@ -184,6 +184,9 @@ function rowQueue(rows) {
   };
 }
 
+const paneTarget = (modal, sessionRef = '$1:1000:%2:123') => ({ ok: true, sessionRef, modal, sessionCreatedAt: 1000 });
+const noBinding = () => ({ sessionRef: null, stamped: false });
+
 function multiHelpers(queue, overrides = {}) {
   return {
     getAgentState: () => ({ state: 'idle', health: 'ok', idleSeconds: 10, healthy: true }),
@@ -202,8 +205,10 @@ function multiHelpers(queue, overrides = {}) {
     getNextPendingForInstances: () => null,
     getPendingTargetInstancesNeedingWake: () => [],
     getNextPendingControlForInstances: () => null,
-    isKeystrokeControl, parseKeystrokeKey, keystrokeBlockedByModal,
-    readSessionModal: () => null,
+    isKeystrokeControl, parseKeystrokeKey,
+    readKeystrokeTarget: () => paneTarget(null),
+    fenceKeystrokeControl: (item, target) => fenceKeystrokeControl(item, target, { bind: noBinding }),
+    supersedeControl: () => true,
     sendKeystroke: () => { throw new Error('unexpected keystroke'); },
     ...queue,
     ...overrides,
@@ -257,7 +262,7 @@ describe('multi-session delivery guard', () => {
     const keys = [];
     let screenModal = LIMIT;
     const helpers = multiHelpers(queue, {
-      readSessionModal: () => screenModal,
+      readKeystrokeTarget: () => paneTarget(screenModal),
       sendKeystroke: (session, key) => keys.push({ session, key }),
       sendToTmux: async () => { throw new Error('keystroke must never be pasted'); },
     });
@@ -279,7 +284,7 @@ describe('multi-session delivery guard', () => {
     const queue = rowQueue([{ id: 9, type: 'control', priority: 0, bypass_state: 1, target_instance: 'user-pan', content: '[KEYSTROKE]Enter' }]);
     const keys = [];
     const res = await processWithMultiSession(multiHelpers(queue, {
-      readSessionModal: () => ({ kind: 'permission', text: 'Bash command' }),
+      readKeystrokeTarget: () => paneTarget({ kind: 'permission', text: 'Bash command' }),
       sendKeystroke: (session, key) => keys.push(key),
     }));
     assert.equal(res.delivered, true);
@@ -388,5 +393,13 @@ describe('no modal on screen: tmux calls identical to base d16221a4 (Astra #5, s
 
   it('multi-session dispatcher: conversation delivery', async () => {
     assert.deepEqual(await model.runMultiConversation(sendToTmux, processWithMultiSession), base.multi.conversation);
+  });
+
+  it('multi-session dispatcher: a raw key is the base key call, preceded by one pane read', async () => {
+    const got = await model.runMultiKeystroke(dispatcher, processWithMultiSession);
+    const isRead = (call) => call[1] === 'capture-pane';
+    assert.equal(got.delivered, true);
+    assert.deepEqual(got.calls.filter((call) => !isRead(call)), base.multi.keystroke.calls);
+    assert.deepEqual(got.calls.map(isRead), [true, false]);
   });
 });

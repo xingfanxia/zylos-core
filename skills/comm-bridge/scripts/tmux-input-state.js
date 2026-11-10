@@ -224,6 +224,27 @@ export function hasInProgressCapture(capture) {
   return recentLines.some((line) => IN_PROGRESS_CAPTURE_PATTERNS.some((pattern) => pattern.test(line)));
 }
 
+/**
+ * The session reference (`sessionRef`) of the pane a tmux target resolves to:
+ * `${session_id}:${session_created}:${pane_id}:${pane_pid}`, e.g.
+ * `$3:1762790000:%12:48211` — identical to readTmuxInputState().paneIdentity.
+ * A Guardian/Fable-guard relaunch kills the tmux session and creates a new one,
+ * so every relaunch gets a new sessionRef. Bind [KEYSTROKE] controls with it
+ * (insertControl({ sessionRef }), `c4-control.js enqueue --session-ref`) and
+ * fence a replaced session with c4-db supersedeControlsForSession().
+ * @returns {string|null} null when tmux cannot resolve the target
+ */
+export function readSessionRef(sessionName, { execFileSyncImpl = execFileSync } = {}) {
+  if (!sessionName) return null;
+  try {
+    const out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', sessionName,
+      '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'], { encoding: 'utf8', stdio: 'pipe', timeout: 5000 })).trim();
+    return /^\$\d+:\d+:%\d+:\d+$/.test(out) ? out : null;
+  } catch {
+    return null;
+  }
+}
+
 function readPaneSnapshot(sessionName, execFileSyncImpl) {
   try {
     // One tmux command queue captures matching geometry and text. Separate

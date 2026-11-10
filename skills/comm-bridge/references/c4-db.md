@@ -111,4 +111,7 @@ When imported by other C4 scripts, `c4-db.js` exports:
 | `getNextPendingControl()` | Get next pending control item |
 | `claimControl(id)` | Claim a control item for processing |
 | `ackControl(id)` | Mark a control item as done |
+| `bindControlSession(id, sessionRef)` | Bind a claimed control to a session unless already bound → `{ sessionRef, stamped }` |
+| `supersedeControl(id, reason)` | Supersede one pending/claimed control (final) |
+| `supersedeControlsForSession({ instanceId, sessionRef, reason })` | Supersede the pending and claimed `[KEYSTROKE]` controls bound to a replaced session → `{ superseded }` |
 | `close()` | Close database connection |

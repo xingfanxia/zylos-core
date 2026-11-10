@@ -33,7 +33,9 @@ import {
   retryOrFailControl,
   ackControl,
   expireTimedOutControls,
-  cleanupControlQueue
+  cleanupControlQueue,
+  bindControlSession,
+  supersedeControl
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -442,15 +444,47 @@ export function checkInputBox(session = TMUX_SESSION) {
   return deliveryInputState(session, runtimeForSession(session)).inputState;
 }
 
-/** The modal (dialog or select list) that owns the session's keyboard, or null. */
-export function readSessionModal(session = TMUX_SESSION) {
-  return deliveryInputState(session, runtimeForSession(session)).modal || null;
-}
-
 // Raw keys are withheld while a modal owns the keyboard. A permission prompt is
 // the exception: answering it is what the auto-approve [KEYSTROKE]Enter is for.
 export function keystrokeBlockedByModal(modal) {
   return !!modal && modal.kind !== 'permission';
+}
+
+/**
+ * One pane read for a [KEYSTROKE] control: the same capture as a delivery
+ * frame. `sessionRef` is the pane identity
+ * `${session_id}:${session_created}:${pane_id}:${pane_pid}`.
+ */
+export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl = execFileSync } = {}) {
+  const state = deliveryInputState(session, runtimeForSession(session), execFileSyncImpl);
+  const sessionRef = state.captureOk !== false && state.paneIdentity ? state.paneIdentity : null;
+  return { ok: !!sessionRef, sessionRef, modal: state.modal || null,
+    sessionCreatedAt: sessionRef ? Number(sessionRef.split(':')[1]) : null };
+}
+
+/**
+ * Decide a claimed [KEYSTROKE] control against the pane just read (no tmux
+ * call may follow before the key itself):
+ *   fail      - the pane could not be read: no key (a retry is consumed)
+ *   supersede - the key belongs to another session: bound to a different
+ *               sessionRef, or unbound and queued before this session started
+ *   defer     - a modal other than a permission prompt owns the keyboard
+ *   deliver   - send the key
+ * An unbound key is bound to the pane read here before any deferral, so a
+ * later requeue or orphan reset can never move it to a replacement session.
+ * @returns {{ action: 'fail'|'defer'|'supersede'|'deliver', reason?: string }}
+ */
+export function fenceKeystrokeControl(item, target, { bind = bindControlSession } = {}) {
+  if (!target?.ok) return { action: 'fail', reason: 'KEYSTROKE_PANE_UNREADABLE' };
+  // Bind first, so a key held back by a modal stays with this session.
+  const binding = bind(item.id, target.sessionRef);
+  if (binding.sessionRef && binding.sessionRef !== target.sessionRef) return { action: 'supersede', reason: 'SESSION_REPLACED' };
+  if (binding.stamped && Number.isFinite(item.created_at) && Number.isFinite(target.sessionCreatedAt)
+      && item.created_at < target.sessionCreatedAt) {
+    return { action: 'supersede', reason: 'SESSION_PREDATES' };
+  }
+  if (keystrokeBlockedByModal(target.modal)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
+  return { action: 'deliver' };
 }
 
 export function isUsageOverlayCapture(capture) {
@@ -916,7 +950,7 @@ async function processNextMessage() {
         waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
         markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
         sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
-        readSessionModal, keystrokeBlockedByModal,
+        readKeystrokeTarget, fenceKeystrokeControl, supersedeControl,
         getNextPendingForInstances: multi.getNextPendingForInstances,
         getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
         getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
@@ -993,10 +1027,23 @@ async function processNextMessage() {
   // without buffer paste or "Meanwhile" prefix. Used for auto-approve permission prompts.
   const rawContent = item.content || '';
   if (isKeystrokeControl(item)) {
-    const modal = readSessionModal(TMUX_SESSION);
-    if (keystrokeBlockedByModal(modal)) {
-      log(`Deferred keystroke control id=${item.id}: modal=${modal.kind} owns the keyboard`);
+    // One read of the target pane decides the key; nothing but DB bookkeeping
+    // runs between it and send-keys.
+    const target = readKeystrokeTarget(TMUX_SESSION);
+    const fence = fenceKeystrokeControl(item, target);
+    if (fence.action === 'defer') {
+      log(`Deferred keystroke control id=${item.id}: modal=${target.modal.kind} owns the keyboard`);
       releaseItem(item, 'MODAL_DEFERRED');
+      return { delivered: false, state: agentState.state };
+    }
+    if (fence.action === 'supersede') {
+      supersedeControl(item.id, fence.reason);
+      log(`Superseded keystroke control id=${item.id}: ${fence.reason} (pane ${target.sessionRef})`);
+      return { delivered: false, state: agentState.state };
+    }
+    if (fence.action === 'fail') {
+      log(`Keystroke control id=${item.id} not sent: ${fence.reason}`);
+      await handleControlDeliveryFailure(item, fence.reason);
       return { delivered: false, state: agentState.state };
     }
     periodicEnter.reset('keystroke_control');

@@ -104,7 +104,8 @@ test('dispatcher keystroke control executes shared gate and logs failure metadat
   const context = vm.createContext({ item: { id: 1, priority: 1, content: '[KEYSTROKE] Enter' },
     TMUX_SESSION: 'agent', agentState: { state: 'idle' }, periodicEnter: { reset() {} },
     isKeystrokeControl: () => true, parseKeystrokeKey: () => 'Enter', log: s => logs.push(s),
-    readSessionModal: () => null, keystrokeBlockedByModal: () => false, releaseItem() {},
+    readKeystrokeTarget: () => ({ ok: true, sessionRef: '$1:1:%1:1', modal: null }),
+    fenceKeystrokeControl: () => ({ action: 'deliver' }), supersedeControl() {}, releaseItem() {},
     ackControl: () => { ack = true; }, tmuxFailureDetails,
     handleControlDeliveryFailure: async () => {} });
   context.sendTmuxKeys = createTmuxSender({ exec: (bin, args) => { if (args[0] === '-V') return 'tmux 3.7c'; argv = args; } }).sendKeys;
