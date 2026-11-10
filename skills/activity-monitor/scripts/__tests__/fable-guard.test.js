@@ -1386,3 +1386,40 @@ describe('Fable guard readiness accepts a late genuine ACK (review-2 #6)', () =>
   });
 });
 
+describe('Fable persona returning from Codex to a Claude profile (verdict C)', () => {
+  it('re-evaluates admission on the return and converges without a stale-record loop', () => {
+    const sim = new Sim();
+    sim.toFable();
+    const fableRecord = sim.launches['user-pan'];
+    sim.document.instances['user-pan'].runtime_profile = 'codex-subscription';
+    assert.deepEqual(sim.pass({ failover: ['user-pan'] }).restarts, []);
+    // On Codex: the monitor runs a Codex engine; the old Fable record stays on disk.
+    sim.status['user-pan'] = { state: 'idle', health: 'ok', active_tools: 0, last_check: Math.floor(sim.now / 1000), runtime_launch_at: sim.now };
+    sim.models['user-pan'] = null;
+    sim.advance(20 * MIN);
+    sim.observe(BACKUP, 0.1);
+    assert.deepEqual(sim.pass().restarts.filter(item => item.instanceId === 'user-pan'), []);
+    assert.equal(sim.launches['user-pan'], fableRecord);
+    // The failover moves pan back to the Claude account and cold-restarts it.
+    sim.document.instances['user-pan'].runtime_profile = BACKUP;
+    const back = sim.pass({ failover: ['user-pan'] });
+    assert.deepEqual(back.restarts.filter(item => item.instanceId === 'user-pan'), [], 'the failover restart carries the commit');
+    const pan = sim.state.personas['user-pan'];
+    assert.equal(pan.unsupported, undefined);
+    assert.equal(pan.desired.account, BACKUP);
+    const relaunch = sim.monitorStart('user-pan'); // admission is evaluated afresh at the launch
+    assert.equal(relaunch.decision.mode, pan.desired.mode);
+    assert.notEqual(sim.launches['user-pan'].launch_id, fableRecord.launch_id);
+    const restarts = [];
+    for (let i = 0; i < 12; i++) {
+      sim.advance(5 * MIN);
+      sim.observe(BACKUP, 0.1);
+      const result = sim.pass();
+      for (const item of result.restarts.filter(entry => entry.instanceId === 'user-pan')) { restarts.push(item.reason); sim.monitorStart('user-pan'); }
+    }
+    assert.equal(sim.mode('user-pan'), 'fable', 'back on Fable after the dwell');
+    assert.equal(sim.launches['user-pan'].mode, 'fable');
+    assert.ok(sim.state.personas['user-pan'].verified?.model_at);
+    assert.ok(restarts.length <= 1, `no restart loop: ${restarts.join(', ')}`);
+  });
+});
