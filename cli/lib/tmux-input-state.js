@@ -1,4 +1,6 @@
 export {
+  classifyLimitDialog,
+  detectModal,
   findPromptY,
   hasInProgressCapture,
   isUsageOverlayCapture,
