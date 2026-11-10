@@ -154,6 +154,10 @@ import {
 } from './adapters/runtime-components.js';
 import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tasks.js';
 import { readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
+// Fable guard (FG-4): the delivery side owns the dialog classifier. Until it
+// exports classifyLimitDialog, no dialog is ever classified (no-op default).
+import * as tmuxInputStateModule from '../../comm-bridge/scripts/tmux-input-state.js';
+import { createFableMonitorDeps, dropPendingKeystrokes } from './fable-guard.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -464,6 +468,7 @@ function writeStatusFile(statusObj) {
       // before this process launch cannot prove a pending switch is ready.
       runtime_profile: adapter.config?.runtimeProfile?.id || null,
       functional_ack_at: engine.lastFunctionalAckAt || 0,
+      functional_ack_phase: engine.lastFunctionalAckPhase || null,
     },
     healthEngine: engine,
   });
@@ -1174,6 +1179,16 @@ function createToolPipeline(activeAdapter, config) {
   });
 }
 
+function fableHealthDeps(activeAdapter) {
+  const runtimeProfile = activeAdapter.config?.runtimeProfile;
+  if (!runtimeProfile?.fable) return {};
+  log(`Fable guard: launched mode=${runtimeProfile.fable.mode} generation=${runtimeProfile.fable.generation ?? 'none'}`);
+  const classify = typeof tmuxInputStateModule.classifyLimitDialog === 'function'
+    ? tmuxInputStateModule.classifyLimitDialog : null;
+  return createFableMonitorDeps({ runtimeProfile, monitorDir: MONITOR_DIR,
+    sessionName: activeAdapter.sessionName, classifyLimitDialog: classify });
+}
+
 function createHealthEngine(activeAdapter, initialStatus) {
   const activeEngine = createRuntimeHealthEngine(activeAdapter, initialStatus, {
     log,
@@ -1183,6 +1198,7 @@ function createHealthEngine(activeAdapter, initialStatus) {
     degradedProbeInterval: DEGRADED_PROBE_INTERVAL,
     rateLimitProbeInterval: RATE_LIMIT_PROBE_INTERVAL,
     notifyDegraded: notifyDegradedAdmin,
+    extraDeps: fableHealthDeps(activeAdapter),
   });
   if(activeAdapter.runtimeId==='claude' && RUNTIME_HEALTH_EVIDENCE) {
     const identity=()=>readDeliveryIdentity({zylosDir:ZYLOS_DIR,session:activeAdapter.sessionName});
@@ -1284,6 +1300,14 @@ function init() {
     },
     startContextMonitor,
     scheduleStaleRuntimeCleanup,
+    dropStaleKeystrokes: () => {
+      try {
+        const dropped = dropPendingKeystrokes(getHealthDatabase(), INSTANCE_ID);
+        if (dropped) log(`Fable guard relaunch: dropped ${dropped} pending keystroke control(s) of the previous session`);
+      } catch (err) {
+        log(`Fable guard relaunch: pending keystroke cleanup failed (${err.message})`);
+      }
+    },
     log,
   });
 

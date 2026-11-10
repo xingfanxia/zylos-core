@@ -76,6 +76,9 @@ export class MonitorOrchestrator {
     });
     if (runtimeSwitchSignal) {
       adapter.getHeartbeatDeps?.()?.clearHeartbeatPending?.();
+      // A Fable guard relaunch keeps the tmux name: a watchdog interrupt
+      // queued for the old session must not reach the new one.
+      if (String(runtimeSwitchSignal.reason || '').startsWith('fable_guard:')) this.deps.dropStaleKeystrokes?.();
       engine.notifyColdStart(runtimeSwitchSignal.grace_sec);
       log(`Runtime switch to ${activeProfile}: cold-start grace ${runtimeSwitchSignal.grace_sec}s`);
     }
@@ -525,7 +528,10 @@ export class MonitorOrchestrator {
         applySyntheticClearHint: (sessionId, pid, reason, eventNowMs) => {
           toolPipeline.applySyntheticClearHint(sessionId, pid, reason, eventNowMs);
         },
-        enqueueInterrupt: (interruptKey) => runC4Control([
+        // A live limit dialog belongs to the Fable guard; the watchdog retries later.
+        enqueueInterrupt: (interruptKey) => engine.limitDialogActive?.('watchdog_interrupt')
+          ? { ok: false, output: 'fable_limit_dialog' }
+          : runC4Control([
           'enqueue',
           '--content', `[KEYSTROKE]${interruptKey}`,
           '--priority', '0',
