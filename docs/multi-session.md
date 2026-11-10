@@ -95,6 +95,13 @@ instance cwd and automatically trusts only the shared Zylos-managed hook file.
 Heartbeat controls always include `target_instance`, and equivalent controls
 supersede only within that persona, preventing cross-persona health timeouts.
 
+The same daemon also hosts the optional Fable allowance guard: per account it
+probes the weekly Fable window and switches opted-in personas
+(`fable_enabled: true`) between a Fable main model and the profile's own model
+without changing their profile. It is inert unless `instances.json` has a
+`fable_guard` section. Contract, state files and operator commands:
+[fable-allowance-guard.md](fable-allowance-guard.md).
+
 ## Key Components
 
 ### Instance Config (`skills/multi-session/instance-config.js`)
@@ -317,7 +324,7 @@ The ecosystem config (`templates/pm2/ecosystem.config.cjs`) manages:
 | activity-monitor-\<id\> | One per enabled instance (generated dynamically) |
 | token-cache-updater | Daemon: merges Claude `ccusage` and pinned `ccusage codex` history |
 | provider-usage-updater | Daemon: refreshes top runtime usage cards |
-| runtime-failover | Daemon: switches opted-in personas across the configured profile chain |
+| runtime-failover | Daemon: switches opted-in personas across the configured profile chain; hosts the Fable allowance guard |
 | caddy | Reverse proxy (if configured) |
 | zylos-telegram | Telegram bot connector |
 | zylos-feishu | Feishu bot connector |
