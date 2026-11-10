@@ -804,6 +804,46 @@ describe('Fable guard generation fencing and --apply protocol (review #4)', () =
   });
 });
 
+describe('Fable guard readiness and crash contracts (review #6)', () => {
+  it('model convergence and verified readiness are separate; an auto-ACKable ACK is not readiness', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.observe(BACKUP, 0.8);
+    sim.launchAll(sim.pass().restarts);
+    sim.status['user-pan'].functional_ack_at = sim.now + 2000;
+    sim.status['user-pan'].functional_ack_phase = 'primary';
+    sim.advance(MIN);
+    sim.pass();
+    const pan = () => sim.state.personas['user-pan'].verified;
+    assert.ok(pan().model_at, 'model converged');
+    assert.equal(pan().ready_at, undefined, 'the auto-ACKable primary probe is not readiness');
+    sim.readiness['user-pan'] = { launch_id: sim.launches['user-pan'].launch_id, outcome: 'ack', phase: 'post_restart', at: iso(sim.now) };
+    sim.readiness['user-elaine'] = { launch_id: sim.launches['user-elaine'].launch_id, outcome: 'missing', status: 'timeout', at: iso(sim.now) };
+    sim.advance(MIN);
+    const result = sim.pass();
+    assert.equal(pan().ready_at, iso(sim.now - MIN));
+    assert.equal(sim.state.personas['user-elaine'].verified.readiness, 'ack_missing');
+    assert.ok(result.events.some(event => event.startsWith('user-elaine: ALERT') && event.includes('ACK')));
+    assert.deepEqual(result.restarts, [], 'a correct model is never restarted for a missing ACK');
+    sim.advance(MIN);
+    assert.equal(sim.pass().events.filter(event => event.includes('ACK')).length, 0, 'surfaced once');
+  });
+
+  it('two unexpected foreground exits of a Fable session within 30 min trip the crash hold', () => {
+    const sim = new Sim();
+    sim.toFable();
+    const exit = minutesAgo => ({ at: iso(sim.now - minutesAgo * MIN), reason: 'unexpected_exit', mode: 'fable',
+      runtime_profile: BACKUP, launch_id: sim.launches['user-pan'].launch_id });
+    sim.failures['user-pan'] = { failures: [exit(10)] };
+    sim.pass();
+    assert.deepEqual(sim.holds(), []);
+    sim.failures['user-pan'].failures.push(exit(1));
+    sim.launchAll(sim.pass().restarts);
+    assert.deepEqual(sim.holds(), ['crash']);
+    assert.equal(sim.mode('user-pan'), 'opus');
+  });
+});
+
 describe('Fable guard daemon integration', () => {
   function writeFixture(zylosDir, document) {
     fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });

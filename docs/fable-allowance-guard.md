@@ -185,10 +185,22 @@ below threshold). Unknown quota on an account ⇒ Opus.
 | `stale` | the account is probed and has no valid lease | `stale_clear_observations` consecutive valid readings below threshold made after the hold |
 | `crash` | `crash_failures` Fable-session failures of one persona within `crash_window_sec` | trip 1: after `crash_probation_sec` (one retry). Trip 2 in the same window: a later-window reading below threshold |
 
-Fable-session failures are HealthEngine failure-driven kill+restarts of a
-Fable-mode session and guard-observed launches that came up on a non-Fable
-model (for example the CLI's consent fallback). Guard restarts and planned
-restarts are not failures.
+Fable-session failures (`<monitor dir>/fable-session-failures.json`, stamped
+with the launch record of the session that failed) are:
+
+- HealthEngine failure-driven kill+restarts of a Fable session;
+- unexpected foreground exits: the Guardian is about to relaunch a session it
+  had seen running in this monitor process, with no planned cause. Planned
+  causes are excluded: a runtime switch signal is pending (guard, account
+  failover and `--apply` restarts write it before their kill), a wake from
+  suspend, a running maintenance script, the monitor's own lease enforcement,
+  or a recovery kill already counted above; the first launch of a monitor
+  process is never counted;
+- guard-observed launches that came up on a non-Fable model (for example the
+  CLI's consent fallback).
+
+Only failures of sessions launched on Fable count; an Opus session's exits
+never feed the crash rule.
 
 Each daemon pass, under `instances.json.lock` and after the account failover
 has chosen the account: derive holds → derive the persona's mode →
@@ -243,9 +255,18 @@ commit `desired {account, mode, generation}` once → reconcile.
   the running launch with the journal on every pass, so a lost restart, a
   restart that read the previous generation, or a crash between the two writes
   is restarted on the next pass instead of being verified on the old session.
-- `verified.ack_at` records the first functional ACK after that launch whose
-  phase is not the auto-ACKable cold-start `primary` probe. It is evidence for
-  the operator, not a gate.
+- Model convergence and readiness are separate states. `verified.model_at`
+  means the converged launch reports the expected model. Readiness
+  (`verified.ready_at`) needs a real ACK from that launch: the guard-relaunched
+  monitor's HealthEngine sends its cold-start readiness probe with the
+  end-to-end phase `post_restart` (the dispatcher never auto-ACKs it) instead of
+  the auto-ACKable `primary`, and only once the startup turn is no longer busy
+  (bounded by the 20-minute startup grace). The monitor writes the result to
+  `<monitor dir>/fable-readiness.json` `{launch_id, outcome: ack|missing}`. A
+  missing ACK, or no result 30 minutes after the launch, sets
+  `verified.readiness = ack_missing|no_probe_result` and logs one `ALERT`; it
+  never restarts a persona that runs the correct model, and the readiness
+  probe failure never triggers HealthEngine recovery.
 - The guard never types into a pane, never writes
   `runtime_failover_blocked_profiles` or `runtime_profile`, and never reports
   `rate_limited`. `instances.json` is not written by the guard.
@@ -299,8 +320,12 @@ grace (about 14 minutes with the defaults).
 
 ## Limit-dialog precedence (FG-4, health half)
 
-Only the monitor of a persona launched in Fable mode gets the dialog hooks.
-On a heartbeat failure, before rate-limit/auth handling and ordinary
+Only the monitor of a guard-tracked persona gets the dialog hooks
+(`fable-monitor.js`), and they act only while the current launch record says
+`fable` (a Guardian relaunch can change the mode without a new monitor). The
+classifier is the real `classifyLimitDialog` export of the delivery side,
+imported by name in `monitor.js`, so a renamed export fails the monitor at
+load instead of silently disabling detection. On a heartbeat failure, before rate-limit/auth handling and ordinary
 kill+restart, the HealthEngine captures the pane and asks
 `classifyLimitDialog`. A classified `fable_limit` / `credits_offer` dialog
 writes `<monitor dir>/fable-limit-evidence.json`, is not killed and is not
@@ -330,6 +355,27 @@ to resend. Guard restarts reuse the
 cold-start handling (pending heartbeat cleared, grace, busy-startup
 protection) in a fresh monitor process, so they never count as recovery
 restarts.
+
+## What changes even when the guard is unconfigured
+
+The guard's own logic is inert without `fable_guard`, but these shared changes
+reach every Claude persona:
+
+- `agent-status.json` carries `functional_ack_phase` (the phase of the last
+  functional ACK) next to `functional_ack_at`, for every persona.
+- Pane reads (`readTmuxInputState`, delivery side): while a modal (dialog or
+  select list) owns the bottom of the pane, `modal` is set and
+  `promptVisible` is false, so `canTreatPaneAsRecovered` is false. The tool
+  watchdog therefore never treats a permission prompt or other dialog as a
+  recovered pane. The delivery guard's paste/Enter/raw-key deferral is likewise
+  global; its contract is in `skills/comm-bridge/SKILL.md`.
+- `ClaudeAdapter.launch()` reads `instances.json` and
+  `activity-monitor/fable-guard.json` on every launch (`prepareFableLaunch`).
+  For an untracked persona that is the only effect: launch args, env and the
+  profile object are unchanged and no file is written.
+- `Guardian` calls an optional `onAgentStart` hook before each launch and
+  `HealthEngine` accepts optional `guardReadiness` / limit-dialog deps; both
+  are wired only for guard-tracked personas.
 
 ## Operator commands
 

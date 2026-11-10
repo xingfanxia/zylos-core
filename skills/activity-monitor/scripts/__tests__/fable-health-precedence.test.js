@@ -6,7 +6,12 @@ import { describe, it } from 'node:test';
 
 import { HealthEngine } from '../health-engine.js';
 import { DatabaseSync } from 'node:sqlite';
-import { createFableMonitorDeps, dropPendingKeystrokes, LIMIT_EVIDENCE_FILE, SESSION_FAILURES_FILE } from '../fable-guard.js';
+import { dropPendingKeystrokes, LIMIT_EVIDENCE_FILE, SESSION_FAILURES_FILE } from '../fable-guard.js';
+import { createFableMonitor } from '../fable-monitor.js';
+import { FABLE_LAUNCH_FILE } from '../../../multi-session/runtime-files.js';
+import { classifyLimitDialog, readTmuxInputState } from '../../../comm-bridge/scripts/tmux-input-state.js';
+import { canTreatPaneAsRecovered } from '../tool-pipeline.js';
+import * as dialogs from '../../../comm-bridge/scripts/__tests__/fixtures/claude-dialogs.js';
 
 function engineWith(extra = {}, options = {}) {
   const calls = { kill: 0, limit: [], restarts: [], log: [] };
@@ -107,47 +112,161 @@ describe('Fable limit dialog precedence over ordinary recovery (FG-4)', () => {
   });
 });
 
-describe('Fable monitor deps', () => {
-  it('are absent for personas not launched on Fable', () => {
-    assert.deepEqual(createFableMonitorDeps({ runtimeProfile: { id: 'claude-ax-backup' } }), {});
-    assert.deepEqual(createFableMonitorDeps({ runtimeProfile: { id: 'claude-ax-backup', fable: { mode: 'opus' } },
-      classifyLimitDialog: () => DIALOG }), {});
+describe('Fable guard readiness probe (review #6)', () => {
+  function readinessEngine() {
+    const results = [];
+    const enqueued = [];
+    let id = 0;
+    const harness = engineWith({
+      guardReadiness: { phase: 'post_restart', onResult: result => results.push(result) },
+      enqueueHeartbeat: phase => { enqueued.push(phase); harness.deps._pending = { control_id: ++id, phase, created_at: harness.nowSec() }; return true; },
+    });
+    return { ...harness, results, enqueued };
+  }
+
+  it('waits out the startup busy turn, then sends one end-to-end (non-auto-ACK) probe', () => {
+    const { engine, enqueued, advance, nowSec } = readinessEngine();
+    engine.notifyColdStart(30);
+    advance(31);
+    engine.setRuntimeBusy(true); // the startup turn is still running
+    engine.runMaintenanceCycle(true, nowSec());
+    assert.deepEqual(enqueued, [], 'never probed while the startup turn is busy');
+    advance(60);
+    engine.setRuntimeBusy(false);
+    engine.runMaintenanceCycle(true, nowSec());
+    assert.deepEqual(enqueued, ['post_restart'], 'recovery-class phases are never dispatcher auto-ACKed');
+    engine.runMaintenanceCycle(true, nowSec());
+    assert.equal(enqueued.length, 1, 'one probe per cold start');
   });
 
-  it('record crash evidence even before the delivery side ships its classifier', () => {
+  it('is bounded by the startup grace even when the session stays busy', () => {
+    const { engine, enqueued, advance, nowSec } = readinessEngine();
+    engine.notifyColdStart(30);
+    engine.setRuntimeBusy(true);
+    advance(21 * 60);
+    engine.runMaintenanceCycle(true, nowSec());
+    assert.deepEqual(enqueued, ['post_restart']);
+  });
+
+  it('reports a real ACK, and a missing ACK without killing or restarting the session', () => {
+    const ok = readinessEngine();
+    ok.engine.notifyColdStart(30);
+    ok.advance(31);
+    ok.engine.runMaintenanceCycle(true, ok.nowSec());
+    ok.deps._status = 'done';
+    ok.engine.runMaintenanceCycle(true, ok.nowSec());
+    assert.deepEqual(ok.results.map(item => [item.outcome, item.phase]), [['ack', 'post_restart']]);
+
+    const missing = readinessEngine();
+    missing.engine.notifyColdStart(30);
+    missing.advance(31);
+    missing.engine.runMaintenanceCycle(true, missing.nowSec());
+    missing.deps._status = 'timeout';
+    missing.engine.runMaintenanceCycle(true, missing.nowSec());
+    assert.deepEqual(missing.results.map(item => [item.outcome, item.status]), [['missing', 'timeout']]);
+    assert.equal(missing.calls.kill, 0, 'a correct model is not restarted for a missing ACK');
+    assert.equal(missing.engine.health, 'ok');
+    assert.ok(missing.calls.log.some(line => line.includes('readiness')));
+  });
+
+  it('keeps the auto-ACKable primary probe for everyone else', () => {
+    const enqueued = [];
+    const { engine, advance, nowSec } = engineWith({ enqueueHeartbeat: phase => { enqueued.push(phase); return true; } });
+    engine.notifyColdStart(30);
+    advance(31);
+    engine.setRuntimeBusy(true);
+    engine.runMaintenanceCycle(true, nowSec());
+    assert.deepEqual(enqueued, ['primary']);
+  });
+});
+
+describe('Fable monitor health deps', () => {
+  function monitorWith({ mode = 'fable', capture = () => '', classify = classifyLimitDialog } = {}) {
     const monitorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-monitor-deps-'));
+    fs.writeFileSync(path.join(monitorDir, FABLE_LAUNCH_FILE), JSON.stringify({ launch_id: 'L1', mode, generation: 4,
+      runtime_profile: 'claude-ax-backup' }));
+    const monitor = createFableMonitor({ zylosDir: monitorDir, instanceId: 'user-pan', monitorDir, sessionName: 'claude-user-pan',
+      runtimeProfile: { id: 'claude-ax-backup', fable: { mode: 'fable', generation: 4 } }, stopSession: () => {},
+      capturePane: capture, classifyLimitDialog: classify, now: () => Date.parse('2026-11-10T08:00:00Z') });
+    return { monitor, monitorDir };
+  }
+
+  it('are absent for personas the guard does not track', () => {
+    assert.equal(createFableMonitor({ zylosDir: '/x', instanceId: 'admin', monitorDir: '/x', runtimeProfile: { id: 'claude-ax-backup' } }), null);
+  });
+
+  it('record failures stamped with the current Fable launch only', () => {
+    const { monitor, monitorDir } = monitorWith();
     try {
-      const deps = createFableMonitorDeps({ runtimeProfile: { id: 'claude-ax-backup', fable: { mode: 'fable', generation: 4 } },
-        monitorDir, sessionName: 'claude-user-pan', now: () => Date.parse('2026-11-10T08:00:00Z') });
-      assert.deepEqual(Object.keys(deps), ['onRecoveryRestart']);
-      deps.onRecoveryRestart('heartbeat_primary_timeout');
+      monitor.healthDeps.onRecoveryRestart('heartbeat_primary_timeout');
       const failures = JSON.parse(fs.readFileSync(path.join(monitorDir, SESSION_FAILURES_FILE), 'utf8')).failures;
       assert.deepEqual(failures, [{ at: '2026-11-10T08:00:00.000Z', runtime_profile: 'claude-ax-backup', mode: 'fable',
-        generation: 4, reason: 'heartbeat_primary_timeout' }]);
+        generation: 4, launch_id: 'L1', reason: 'heartbeat_primary_timeout' }]);
+    } finally {
+      fs.rmSync(monitorDir, { recursive: true, force: true });
+    }
+    const opus = monitorWith({ mode: 'opus' });
+    try {
+      opus.monitor.healthDeps.onRecoveryRestart('heartbeat_primary_timeout');
+      assert.equal(fs.existsSync(path.join(opus.monitorDir, SESSION_FAILURES_FILE)), false, 'an Opus relaunch is not a Fable failure');
+      assert.equal(opus.monitor.healthDeps.detectLimitDialog(), null);
+    } finally {
+      fs.rmSync(opus.monitorDir, { recursive: true, force: true });
+    }
+  });
+
+  it('classify live panes with the REAL comm-bridge classifier (delivery fixtures)', () => {
+    let pane = '';
+    const { monitor, monitorDir } = monitorWith({ capture: () => pane });
+    try {
+      for (const [name, text, kind] of [
+        ['live Fable limit', dialogs.FABLE_LIMIT_LIVE, 'fable_limit'],
+        ['limit above composer', dialogs.FABLE_LIMIT_ABOVE_COMPOSER, 'fable_limit'],
+        ['credits offer', dialogs.CREDITS_OFFER_LIVE, 'credits_offer'],
+        ['quoted limit text', dialogs.QUOTED_LIMIT_TEXT, null],
+        ['scrolled past', dialogs.SCROLLED_PAST_DIALOG, null],
+        ['permission prompt', dialogs.PERMISSION_PROMPT_LIVE, null],
+        ['plain composer', dialogs.PLAIN_COMPOSER, null],
+      ]) {
+        pane = text;
+        assert.equal(monitor.healthDeps.detectLimitDialog()?.kind ?? null, kind, name);
+      }
+      pane = dialogs.FABLE_LIMIT_LIVE;
+      monitor.healthDeps.onLimitDialog({ ...monitor.healthDeps.detectLimitDialog(), source: 'heartbeat' });
+      const evidence = JSON.parse(fs.readFileSync(path.join(monitorDir, LIMIT_EVIDENCE_FILE), 'utf8'));
+      assert.deepEqual([evidence.kind, evidence.runtime_profile, evidence.launch_id], ['fable_limit', 'claude-ax-backup', 'L1']);
     } finally {
       fs.rmSync(monitorDir, { recursive: true, force: true });
     }
   });
 
-  it('classify the captured pane with the injected classifier and write limit evidence', () => {
-    const monitorDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-monitor-deps-'));
-    try {
-      const panes = [];
-      const deps = createFableMonitorDeps({ runtimeProfile: { id: 'claude-ax-backup', fable: { mode: 'fable', generation: 4 } },
-        monitorDir, sessionName: 'claude-user-pan', capturePane: session => { panes.push(session); return 'pane'; },
-        classifyLimitDialog: text => (text === 'pane' ? { kind: 'credits_offer', text: 'Continue with usage credits' } : null) });
-      const result = deps.detectLimitDialog();
-      assert.deepEqual(panes, ['claude-user-pan']);
-      deps.onLimitDialog({ ...result, source: 'heartbeat' });
-      const evidence = JSON.parse(fs.readFileSync(path.join(monitorDir, LIMIT_EVIDENCE_FILE), 'utf8'));
-      assert.equal(evidence.kind, 'credits_offer');
-      assert.equal(evidence.runtime_profile, 'claude-ax-backup');
-      const other = createFableMonitorDeps({ runtimeProfile: { id: 'x', fable: { mode: 'fable' } }, monitorDir,
-        capturePane: () => 'pane', classifyLimitDialog: () => ({ kind: 'something_else' }) });
-      assert.equal(other.detectLimitDialog(), null);
-    } finally {
-      fs.rmSync(monitorDir, { recursive: true, force: true });
+  it('monitor.js imports the classifier by name (a missing export fails at load)', () => {
+    const source = fs.readFileSync(path.join(import.meta.dirname, '..', 'monitor.js'), 'utf8');
+    assert.match(source, /import \{ classifyLimitDialog, readTmuxInputState \} from '\.\.\/\.\.\/comm-bridge\/scripts\/tmux-input-state\.js';/);
+    assert.doesNotMatch(source, /tmuxInputStateModule/);
+    assert.match(source, /createFableMonitor\(\{[^}]*classifyLimitDialog,/);
+  });
+});
+
+describe('Pane-read change that applies to every Claude persona (guard configured or not)', () => {
+  // The real tmux snapshot shape: capture text, then the display-message cursor line.
+  const paneState = (capture, x = 2, y = dialogs.PLAIN_COMPOSER_PROMPT_Y) => readTmuxInputState({
+    sessionName: 'claude-admin', execFileSyncImpl: () => `${capture}\n${dialogs.cursorLine(x, y)}\n` });
+
+  it('a live modal is never a recovered pane, so the tool watchdog does not treat it as one', () => {
+    assert.equal(canTreatPaneAsRecovered(paneState(dialogs.PLAIN_COMPOSER)), true, 'baseline: an empty composer');
+    for (const [name, capture] of [
+      ['permission prompt', dialogs.PERMISSION_PROMPT_LIVE],
+      ['unknown dialog', dialogs.UNKNOWN_DIALOG_LIVE],
+      ['Fable limit', dialogs.FABLE_LIMIT_LIVE],
+      ['limit above the composer', dialogs.FABLE_LIMIT_ABOVE_COMPOSER],
+    ]) {
+      const state = paneState(capture);
+      assert.ok(state.modal, name);
+      assert.equal(state.promptVisible, false, name);
+      assert.equal(canTreatPaneAsRecovered(state), false, name);
     }
+    assert.equal(paneState(dialogs.QUOTED_LIMIT_TEXT).modal, null, 'quoted limit text is not a modal');
   });
 });
 

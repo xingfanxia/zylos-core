@@ -78,10 +78,12 @@ export function createGuardian(activeAdapter, activeToolPipeline, initialRuntime
   hookStateFile,
   monitorDir,
   signalTtlSec,
+  onAgentStart,
   log,
 }) {
   return new Guardian(activeAdapter, {
     log,
+    ...(onAgentStart ? { onAgentStart } : {}), // Fable guard crash accounting (tracked personas only)
     monitorDir, // ZY-LIFE-1: enables the auto-suspend gate
     signalTtlSec, // REL-6: orphaned suspend/wake signals are ignored + deleted
     initialRuntimeLaunchAtMs,

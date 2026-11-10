@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
-import { createFableMonitor, LEASE_ENFORCEMENT_FILE } from '../fable-monitor.js';
+import { createFableMonitor, LEASE_ENFORCEMENT_FILE, READINESS_FILE } from '../fable-monitor.js';
+import { SESSION_FAILURES_FILE } from '../fable-guard.js';
+import { Guardian } from '../guardian.js';
+import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 import {
   fableGuardStatePath,
   fableUsagePath,
@@ -105,5 +108,80 @@ describe('Fable lease enforcement in the persona monitor (review #1)', () => {
     const admin = resolveRuntimeProfile({ document: JSON.parse(fs.readFileSync(path.join(fx.zylosDir, 'instances.json'), 'utf8')),
       instanceId: 'admin' });
     assert.equal(createFableMonitor({ zylosDir: fx.zylosDir, instanceId: 'admin', monitorDir: fx.monitorDir, runtimeProfile: admin }), null);
+  });
+});
+
+describe('Fable session crash accounting in the persona monitor (review #6)', () => {
+  // A real Guardian over a fake pane: `alive` toggles what tmux/isRunning report.
+  function guardianFor(fx, clock, monitor) {
+    const pane = { alive: true, launches: 0 };
+    const adapter = { sessionName: 'claude-user-pan', displayName: 'Claude',
+      isRunning: async () => pane.alive,
+      launch: () => { pane.launches += 1; pane.alive = true; fx.launch(clock.now); } };
+    const guardian = new Guardian(adapter, { log: () => {}, nowMs: () => clock.now,
+      execSyncImpl: cmd => { if (/has-session/.test(cmd) && !pane.alive) throw new Error('no session'); if (/pgrep/.test(cmd)) throw new Error('none'); return ''; },
+      onAgentStart: info => monitor.guardianDeps.onAgentStart(info) });
+    const run = async (ticks = 1) => { for (let i = 0; i < ticks; i++) { await guardian.tick({ currentTime: Math.floor(clock.now / 1000) }); clock.now += 1000; } };
+    return { guardian, pane, run };
+  }
+  const failures = fx => (JSON.parse(fs.readFileSync(path.join(fx.monitorDir, SESSION_FAILURES_FILE), 'utf8')).failures || []);
+
+  it('counts an unexpected exit of a Fable session, never planned or already-counted relaunches', async () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const { monitor } = monitorFor(fx, clock);
+    const { pane, run } = guardianFor(fx, clock, monitor);
+    await run(); // running
+    pane.alive = false; // the CLI process died on its own
+    await run(70);
+    assert.equal(pane.launches, 1);
+    assert.deepEqual(failures(fx).map(item => [item.reason, item.mode, item.runtime_profile]), [['unexpected_exit', 'fable', BACKUP]]);
+
+    // A HealthEngine recovery kill is counted once (onRecoveryRestart), not again at the relaunch.
+    await run(5);
+    monitor.healthDeps.onRecoveryRestart('heartbeat_recovery_timeout');
+    pane.alive = false;
+    await run(70);
+    assert.deepEqual(failures(fx).map(item => item.reason), ['unexpected_exit', 'heartbeat_recovery_timeout']);
+
+    // A guard / failover / --apply transition writes a switch signal before its kill: planned.
+    await run(5);
+    writeRuntimeSwitchSignal({ zylosDir: fx.zylosDir, nowMs: clock.now, change: { instanceId: 'user-pan',
+      fromProfile: BACKUP, toProfile: BACKUP, reason: 'fable_guard:opus:g4' } });
+    pane.alive = false;
+    await run(70);
+    assert.equal(failures(fx).length, 2, 'planned transitions are excluded');
+  });
+
+  it('does not count an Opus session or the lease-enforcement stop', async () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const { monitor } = monitorFor(fx, clock);
+    const { pane, run } = guardianFor(fx, clock, monitor);
+    await run();
+    clock.now = T0 + 15 * MIN;
+    monitor.tick(); // lease expired: unadmitted from now
+    clock.now += 3 * MIN;
+    assert.ok(monitor.tick(), 'enforcement stops the session');
+    pane.alive = false;
+    await run(70);
+    assert.equal(fs.existsSync(path.join(fx.monitorDir, SESSION_FAILURES_FILE)), false);
+    assert.equal(monitor.readLaunch().mode, 'opus');
+    pane.alive = false; // the Opus session dies
+    await run(70);
+    assert.equal(fs.existsSync(path.join(fx.monitorDir, SESSION_FAILURES_FILE)), false, 'Opus exits are not Fable failures');
+  });
+
+  it('records the readiness probe result for the current launch', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const { monitor } = monitorFor(fx, clock);
+    assert.equal(monitor.healthDeps.guardReadiness.phase, 'post_restart');
+    monitor.healthDeps.guardReadiness.onResult({ outcome: 'missing', status: 'timeout' });
+    const record = JSON.parse(fs.readFileSync(path.join(fx.monitorDir, READINESS_FILE), 'utf8'));
+    assert.deepEqual([record.launch_id, record.outcome, record.status], [monitor.readLaunch().launch_id, 'missing', 'timeout']);
   });
 });

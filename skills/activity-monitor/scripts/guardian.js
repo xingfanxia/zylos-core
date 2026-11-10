@@ -95,6 +95,10 @@ export class Guardian {
     this.startAgentInProgress = false;
     this.runtimeLaunchAtMs = this.deps.initialRuntimeLaunchAtMs;
     this.lastGateLog = { reason: null, at: 0 };
+    // Fable guard crash accounting (deps.onAgentStart): was the agent seen
+    // running in this process since the last start, and did a wake cause it?
+    this.sawRunningSinceStart = false;
+    this.wokeSinceStart = false;
   }
 
   getState() {
@@ -150,6 +154,7 @@ export class Guardian {
 
     this.startupGrace = 0;
     this.notRunningCount = 0;
+    this.sawRunningSinceStart = true;
 
     if (this.consecutiveRestarts > 0) {
       if (this.stableRunningSince === 0) {
@@ -241,6 +246,7 @@ export class Guardian {
       if (this._hasFreshSignal('wake-signal')) {
         const wake = this._signalPath('wake-signal');
         fs.unlinkSync(wake);
+        this.wokeSinceStart = true;
         const sus = this._signalPath('suspend-signal');
         try { if (sus && fs.existsSync(sus)) fs.unlinkSync(sus); } catch { /* ignore */ }
         this._clearSuspendedStatus();
@@ -337,7 +343,13 @@ export class Guardian {
     this.startAgentInProgress = true;
 
     try {
-      if (getRunningMaintenance({ execSyncImpl: this.deps.execSyncImpl })) {
+      const maintenance = Boolean(getRunningMaintenance({ execSyncImpl: this.deps.execSyncImpl }));
+      try {
+        this.deps.onAgentStart?.({ previouslyRunning: this.sawRunningSinceStart, woke: this.wokeSinceStart, maintenance });
+      } catch { /* accounting only */ }
+      this.sawRunningSinceStart = false;
+      this.wokeSinceStart = false;
+      if (maintenance) {
         this.deps.log('Guardian: Maintenance script detected, waiting for completion...');
         waitForMaintenance({
           log: this.deps.log,
