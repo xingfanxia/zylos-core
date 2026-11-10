@@ -1474,7 +1474,7 @@ describe('MonitorOrchestrator', () => {
 });
 
 describe('MonitorOrchestrator Fable guard hooks', () => {
-  function start({ reason, engine = {} }) {
+  function start({ reason, sessionRef, engine = {} }) {
     const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fable-orchestrator-'));
     const calls = [];
     const orchestrator = new MonitorOrchestrator({
@@ -1499,23 +1499,26 @@ describe('MonitorOrchestrator Fable guard hooks', () => {
       initializeUsageMonitor: () => {},
       startContextMonitor: () => ({}),
       scheduleStaleRuntimeCleanup: () => {},
-      dropStaleKeystrokes: () => calls.push('dropStaleKeystrokes'),
+      fenceReplacedSession: ref => calls.push(`fence:${ref}`),
       log: () => {},
       nowMs: () => 1000,
     });
     if (reason) {
       writeRuntimeSwitchSignal({ zylosDir, nowMs: 1000, change: { instanceId: 'user-pan', fromProfile: 'claude-ax-backup',
-        toProfile: 'claude-ax-backup', reason } });
+        toProfile: 'claude-ax-backup', reason, sessionRef } });
     }
     orchestrator.start();
     fs.rmSync(zylosDir, { recursive: true, force: true });
     return { orchestrator, calls };
   }
 
-  it('drops stale keystrokes only on a Fable guard relaunch', () => {
-    assert.ok(start({ reason: 'fable_guard:opus:g7' }).calls.includes('dropStaleKeystrokes'));
-    assert.ok(!start({ reason: 'usage_exhausted:claude-ax-backup' }).calls.includes('dropStaleKeystrokes'));
-    assert.ok(!start({}).calls.includes('dropStaleKeystrokes'));
+  it('fences the replaced session named by a Fable guard relaunch signal, and nothing else', () => {
+    const OLD = '$3:1762790000:%12:48211';
+    assert.ok(start({ reason: 'fable_guard:opus:g7', sessionRef: OLD }).calls.includes(`fence:${OLD}`));
+    const fences = calls => calls.filter(call => String(call).startsWith('fence:'));
+    assert.deepEqual(fences(start({ reason: 'fable_guard:opus:g7' }).calls), [], 'no session to fence');
+    assert.deepEqual(fences(start({ reason: 'usage_exhausted:claude-ax-backup', sessionRef: OLD }).calls), []);
+    assert.deepEqual(fences(start({}).calls), []);
   });
 
   it('does not queue a watchdog interrupt while a limit dialog is classified', () => {

@@ -22,7 +22,7 @@ import {
   readFableGuardConfig,
 } from '../../multi-session/runtime-files.js';
 import { baseModel, probeDue, recordProbeResult, runFableProbe } from './fable-probe.js';
-import { writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
+import { VALID_SESSION_REF, writeRuntimeSwitchSignal } from './runtime-switch-signal.js';
 import { withFileLock } from '../../multi-session/file-lock.js';
 
 const CLOCK_SKEW_MS = 30_000;
@@ -523,6 +523,8 @@ export function executeFableRestarts({
   const executed = [];
   for (const item of restarts) {
     let go = false;
+    // The session this restart replaces, so the new monitor can fence C4 keys bound to it.
+    const sessionRef = item.kind === 'stop' ? null : readTmuxSessionRef(item.tmuxSession, execFileSyncImpl);
     try {
       lock(`${instancesFile}.lock`, () => {
         const file = fableGuardStatePath(zylosDir);
@@ -543,7 +545,7 @@ export function executeFableRestarts({
         writeJsonAtomic(file, state);
         if (item.kind !== 'stop') {
           writeSignal({ zylosDir, nowMs, change: { instanceId: item.instanceId, fromProfile: item.profileId,
-            toProfile: item.profileId, reason: `fable_guard:${item.mode}:g${item.generation}` } });
+            toProfile: item.profileId, reason: `fable_guard:${item.mode}:g${item.generation}`, sessionRef } });
         }
         go = true;
       });
@@ -574,6 +576,18 @@ export function executeFableRestarts({
     executed.push(item);
   }
   return executed;
+}
+
+/** comm-bridge sessionRef of a live tmux session, or null. */
+export function readTmuxSessionRef(tmuxSession, execFileSyncImpl = execFileSync) {
+  if (!tmuxSession) return null;
+  try {
+    const out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', tmuxSession,
+      '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'], { encoding: 'utf8', stdio: 'pipe', timeout: 5000 })).trim();
+    return VALID_SESSION_REF.test(out) ? out : null;
+  } catch {
+    return null;
+  }
 }
 
 function launchedSince(zylosDir, instanceId, document, sinceMs) {
@@ -650,20 +664,6 @@ export function scheduleFableProbes({
     started.push(run);
   }
   return started;
-}
-
-/**
- * Supersede pending [KEYSTROKE] controls (watchdog interrupts, auto-approve
- * Enter) aimed at this persona's previous session. Claimed/running rows are
- * left to the dispatcher. Returns the number of rows superseded.
- */
-export function dropPendingKeystrokes(database, instanceId, nowSec = Math.floor(Date.now() / 1000)) {
-  if (!database || !instanceId) return 0;
-  return database.prepare(`
-    UPDATE control_queue
-    SET status = 'superseded', last_error = 'FABLE_GUARD_RELAUNCH', updated_at = ?
-    WHERE status = 'pending' AND target_instance = ? AND content LIKE '[KEYSTROKE]%'
-  `).run(nowSec, instanceId).changes || 0;
 }
 
 // ── Operator commands ──────────────────────────────────────────────────────

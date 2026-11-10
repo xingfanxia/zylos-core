@@ -463,15 +463,20 @@ describe('Fable guard interleavings', () => {
       fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
       fs.writeFileSync(fableGuardStatePath(zylosDir), JSON.stringify({ version: 1, personas: { 'user-pan': { desired: { generation: 5 } } } }));
       const calls = [];
-      const exec = (file, args) => { calls.push([file, ...args]); return ''; };
+      const OLD = '$3:1762790000:%12:48211';
+      const exec = (file, args) => { calls.push([file, ...args]); return file === 'tmux' && args[0] === 'display-message' ? `${OLD}\n` : ''; };
       const restart = generation => ({ instanceId: 'user-pan', generation, mode: 'opus', profileId: BACKUP, reason: 'x', tmuxSession: 'claude-user-pan' });
       assert.deepEqual(executeFableRestarts({ zylosDir, restarts: [restart(4)], execFileSyncImpl: exec, log: () => {} }), []);
-      assert.deepEqual(calls, []);
+      assert.deepEqual(calls.filter(([, verb]) => verb !== 'display-message'), []);
+      calls.length = 0;
       executeFableRestarts({ zylosDir, restarts: [restart(5)], execFileSyncImpl: exec, log: () => {}, nowMs: T0 });
-      assert.deepEqual(calls, [['tmux', 'kill-session', '-t', 'claude-user-pan'], ['pm2', 'restart', 'activity-monitor-user-pan', '--update-env']]);
+      assert.deepEqual(calls, [
+        ['tmux', 'display-message', '-p', '-t', 'claude-user-pan', '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'],
+        ['tmux', 'kill-session', '-t', 'claude-user-pan'], ['pm2', 'restart', 'activity-monitor-user-pan', '--update-env']]);
       const signal = JSON.parse(fs.readFileSync(path.join(zylosDir, '.zylos', 'runtime-switches', 'user-pan.json'), 'utf8'));
       assert.equal(signal.to_profile, BACKUP, 'same profile: the monitor takes the cold-start path');
       assert.equal(signal.reason, 'fable_guard:opus:g5');
+      assert.equal(signal.session_ref, OLD, 'the session the guard is about to kill, for the C4 key fence');
       calls.length = 0;
       executeFableRestarts({ zylosDir, restarts: [{ ...restart(5), kind: 'stop' }], execFileSyncImpl: exec, log: () => {}, nowMs: T0 });
       assert.deepEqual(calls, [['pm2', 'stop', 'activity-monitor-user-pan'], ['tmux', 'kill-session', '-t', 'claude-user-pan']],
@@ -671,7 +676,8 @@ describe('Fable guard generation fencing and --apply protocol (review #4)', () =
       };
       const done = executeFableRestarts({ zylosDir, restarts: batch, nowMs: sim.now, execFileSyncImpl: exec, log: () => {}, lock });
       assert.deepEqual(done.map(item => item.instanceId), [batch[0].instanceId]);
-      assert.equal(calls.filter(call => call.includes(batch[1].instanceId)).length, 0, 'the superseded restart never ran');
+      assert.equal(calls.filter(call => call.includes(batch[1].instanceId) && !call.includes('display-message')).length, 0,
+        'the superseded restart never ran');
       assert.deepEqual(locks, [path.join(zylosDir, 'instances.json.lock'), path.join(zylosDir, 'instances.json.lock')]);
       const executing = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8')).personas[batch[0].instanceId].executing;
       assert.equal(executing.generation, batch[0].generation);
@@ -689,7 +695,7 @@ describe('Fable guard generation fencing and --apply protocol (review #4)', () =
     try {
       persist(sim, zylosDir);
       const calls = [];
-      const exec = (file, args) => { calls.push(`${file} ${args[0]}`); return ''; };
+      const exec = (file, args) => { if (args[0] !== 'display-message') calls.push(`${file} ${args[0]}`); return ''; };
       executeFableRestarts({ zylosDir, restarts: [first], nowMs: sim.now, execFileSyncImpl: exec, log: () => {} });
       load(sim, zylosDir);
       // --apply moves pan to another account 5 s later, before the restarted monitor launched.
@@ -790,7 +796,7 @@ describe('Fable guard generation fencing and --apply protocol (review #4)', () =
           last_check: Math.floor(sim.now / 1000), runtime_launch_at: sim.launches[id]?.launched_at_ms ?? 0 }));
       }
       const calls = [];
-      const exec = (file, args) => { calls.push([file, ...args].join(' ')); return ''; };
+      const exec = (file, args) => { if (args[0] !== 'display-message') calls.push([file, ...args].join(' ')); return ''; };
       const first = reconcileFableGuardNow({ zylosDir, nowMs: sim.now, execFileSyncImpl: exec, log: () => {} });
       assert.deepEqual(first.executed.map(item => [item.instanceId, item.profileId, item.mode]), [['user-pan', CL, 'opus']]);
       assert.deepEqual(calls, ['tmux kill-session -t claude-user-pan', 'pm2 restart activity-monitor-user-pan --update-env']);
@@ -943,7 +949,8 @@ describe('Fable guard daemon integration', () => {
       const providerUsage = { providers: { [BACKUP]: { available: true, primary: { used_percent: 10 } },
         [CL]: { available: true, primary: { used_percent: 10 } } } };
       // A fresh lease and idle personas: the first pass upgrades both Fable personas.
-      applyRuntimeFailover({ providerUsage, nowMs, execFileSyncImpl: (...args) => { calls.push(args); return ''; }, log: () => {} });
+      applyRuntimeFailover({ providerUsage, nowMs, log: () => {},
+        execFileSyncImpl: (...args) => { if (args[1]?.[0] !== 'display-message') calls.push(args); return ''; } });
       const state = JSON.parse(fs.readFileSync(fableGuardStatePath(zylosDir), 'utf8'));
       assert.deepEqual(Object.keys(state.personas).sort(), ['user-elaine', 'user-pan']);
       assert.deepEqual(calls.map(([file, args]) => [file, ...args]).sort(), [
