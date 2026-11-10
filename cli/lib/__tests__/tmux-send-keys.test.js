@@ -108,11 +108,15 @@ test('dispatcher keystroke control executes shared gate and logs failure metadat
     fenceKeystrokeControl: () => ({ action: 'deliver' }), supersedeControl() {}, releaseItem() {},
     ackControl: () => { ack = true; }, tmuxFailureDetails,
     handleControlDeliveryFailure: async () => {} });
+  // The dispatcher's own sendTarget (pane id of the deciding read), from the same source.
+  const targetStart = source.indexOf('export function sendTarget(');
+  vm.runInContext(source.slice(targetStart + 'export '.length, source.indexOf('\n}\n', targetStart) + 3), context);
   context.sendTmuxKeys = createTmuxSender({ exec: (bin, args) => { if (args[0] === '-V') return 'tmux 3.7c'; argv = args; } }).sendKeys;
   const execute = () => vm.runInContext(`(async () => {${source.slice(start, end)}})()`, context);
   assert.equal((await execute()).delivered, true);
   assert.equal(ack, true);
-  assert.deepEqual(argv, ['send-keys', '-c', 'zylos-no-client', '-t', 'agent', 'Enter']);
+  // The key goes to the pane id of the read that decided it ($1:1:%1:1 -> %1), not the session name.
+  assert.deepEqual(argv, ['send-keys', '-c', 'zylos-no-client', '-t', '%1', 'Enter']);
   context.sendTmuxKeys = () => { throw Object.assign(new Error('PRIVATE_INPUT'), { status: 1, stderr: 'client is read-only' }); };
   assert.equal((await execute()).delivered, false);
   assert.ok(logs.some(s => s.includes('client is read-only')));

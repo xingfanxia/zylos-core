@@ -89,6 +89,7 @@ describe('MonitorOrchestrator', () => {
       scheduleStaleRuntimeCleanup: (activeAdapter) => calls.push(['scheduleStaleRuntimeCleanup', activeAdapter]),
       log: overrides.log ?? ((message) => calls.push(['log', message])),
       nowMs: () => 1111,
+      readSessionRef: () => null, // no tmux in unit tests: interrupt keys are enqueued unbound
       ...(overrides.deps || {}),
     });
 
@@ -773,6 +774,8 @@ describe('MonitorOrchestrator', () => {
     assert.equal(persistedWatchdogState.episode_key, 'event-1');
     assert.deepEqual(calls, [
       ['toolPipeline.getRuleById', 'web'],
+      // the harness reads no session ref (no tmux), so the key is enqueued unbound and that is logged
+      ['log', 'Tool watchdog: no session ref for tmux session codex-main; interrupt key enqueued unbound'],
       ['runC4Control', [
         'enqueue',
         '--content',
@@ -1474,7 +1477,7 @@ describe('MonitorOrchestrator', () => {
 });
 
 describe('MonitorOrchestrator Fable guard hooks', () => {
-  function start({ reason, sessionRef, engine = {} }) {
+  function start({ reason, sessionRef, engine = {}, deps = {} }) {
     const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-fable-orchestrator-'));
     const calls = [];
     const orchestrator = new MonitorOrchestrator({
@@ -1502,6 +1505,7 @@ describe('MonitorOrchestrator Fable guard hooks', () => {
       fenceReplacedSession: ref => calls.push(`fence:${ref}`),
       log: () => {},
       nowMs: () => 1000,
+      ...deps,
     });
     if (reason) {
       writeRuntimeSwitchSignal({ zylosDir, nowMs: 1000, change: { instanceId: 'user-pan', fromProfile: 'claude-ax-backup',
@@ -1539,5 +1543,41 @@ describe('MonitorOrchestrator Fable guard hooks', () => {
     assert.deepEqual(controls, []);
     assert.deepEqual(sources, ['watchdog_interrupt']);
     assert.equal(phase.watchdog_phase, 'interrupt_retry_wait');
+  });
+  // finding 5: the interrupt key is bound to the session the watchdog judged,
+  // read right before the enqueue, so it can never reach a replacement.
+  function interrupt(orchestrator, controls) {
+    return orchestrator.evaluateToolWatchdog({
+      nowMs: 20_000,
+      foregroundIdentity: { trusted: true, sessionId: 's', claudePid: 1 },
+      apiActivity: { watchdog_candidate_tool: { event_id: 'e', name: 'WebFetch', rule_id: 'web', started_at: 1000 } },
+      interactiveState: { kind: 'busy' },
+      watchdogState: null,
+      canTreatPaneAsRecovered: () => false,
+      runC4Control: args => { controls.push(args); return { ok: true, output: '' }; },
+      clearWatchdogState: () => {},
+      writeWatchdogState: () => {},
+    });
+  }
+
+  it('binds the watchdog interrupt key to the session ref read for the adapter session', () => {
+    const REF = '$3:1762790000:%12:48211';
+    const reads = [];
+    const { orchestrator } = start({ deps: { readSessionRef: (session) => { reads.push(session); return REF; } } });
+    const controls = [];
+    assert.equal(interrupt(orchestrator, controls).watchdog_phase, 'interrupt_sent');
+    assert.deepEqual(reads, ['claude-user-pan']);
+    assert.deepEqual(controls, [['enqueue', '--content', '[KEYSTROKE]Escape', '--priority', '0', '--bypass-state',
+      '--available-in', '1', '--no-ack-suffix', '--session-ref', REF]]);
+  });
+
+  it('enqueues the interrupt unbound, and logs it, when the session ref cannot be read', () => {
+    const logs = [];
+    const { orchestrator } = start({ deps: { readSessionRef: () => null, log: (m) => logs.push(m) } });
+    const controls = [];
+    assert.equal(interrupt(orchestrator, controls).watchdog_phase, 'interrupt_sent');
+    assert.deepEqual(controls, [['enqueue', '--content', '[KEYSTROKE]Escape', '--priority', '0', '--bypass-state',
+      '--available-in', '1', '--no-ack-suffix']]);
+    assert.ok(logs.some((m) => /unbound/.test(m) && m.includes('claude-user-pan')), 'the unbound enqueue is logged');
   });
 });

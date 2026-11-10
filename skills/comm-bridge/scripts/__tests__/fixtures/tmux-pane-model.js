@@ -40,6 +40,62 @@ export function paneModel({
   return { exec, calls, sessionRef: `${sessionId}:${created}:${pane}:${pid}` };
 }
 
+// A fake tmux server for session-replacement tests: the session name resolves
+// to whichever pane currently owns it, a pane id (`%N`) only while that pane
+// exists (tmux: "can't find pane"). `replaceWhen(pane)` is checked after each
+// read of the old pane; when it returns true the session is replaced under the
+// same name right after that read (old pane gone, new pane %9 owns the name),
+// i.e. between the deciding read and the next send.
+export function replaceableServer({ session = 'claude-user-pan', replaceWhen = () => false } = {}) {
+  const pane = (id, sessionId, created, pid) => ({ id, identity: `${sessionId}:${created}:${id}:${pid}`,
+    sessionId, created, pid, composer: '', received: [], alive: true });
+  const old = pane('%2', '$1', 1000, 123);
+  const replacement = pane('%9', '$7', 2000, 777);
+  let owner = old;
+  let buffer = '';
+  const calls = [];
+  const resolve = (target) => (target === session ? owner : [old, replacement].find((p) => p.id === target && p.alive));
+  const exec = (command, args) => {
+    calls.push([command, ...args]);
+    if (args[0] === 'set-buffer') { buffer = args[args.length - 1]; return ''; }
+    if (args[0] === 'delete-buffer') return '';
+    const target = args[args.indexOf('-t') + 1];
+    const p = resolve(target);
+    if (!p) {
+      throw Object.assign(new Error(`can't find pane: ${target}`), { status: 1, stderr: `can't find pane: ${target}` });
+    }
+    if (args[0] === 'capture-pane') {
+      const lines = [...TRANSCRIPT, RULE, `❯ ${p.composer}`, RULE, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'];
+      const out = `${lines.join('\n')}\n__ZYLOS_CURSOR__ ${2 + Array.from(p.composer).length} ${TRANSCRIPT.length + 1} `
+        + `${p.sessionId} ${p.created} ${p.id} ${p.pid}\n`;
+      if (p === old && owner === old && replaceWhen(p)) { old.alive = false; owner = replacement; }
+      return out;
+    }
+    if (args[0] === 'paste-buffer') { p.composer = buffer; p.received.push('paste'); }
+    if (args[0] === 'send-keys') {
+      const key = args[args.length - 1];
+      p.received.push(key);
+      if (key === 'Enter') p.composer = '';
+    }
+    return '';
+  };
+  return { exec, calls, old, replacement };
+}
+
+// The base recording (d16221a4) sent to the tmux session NAME. Delivery now
+// sends to the pane id of the deciding read (finding 5): this rewrites exactly
+// the `-t` argument of send-keys and paste-buffer calls from `session` to
+// `pane` and leaves every other byte of the recording (reads included) as is.
+export function baseWithPaneTargets(recording, session, pane) {
+  const sends = new Set(['send-keys', 'paste-buffer']);
+  const mapCalls = (calls) => calls.map((call) => (!sends.has(call[1]) ? call
+    : call.map((arg, i) => (call[i - 1] === '-t' && arg === session ? pane : arg))));
+  const mapRun = (run) => ({ ...run, calls: mapCalls(run.calls) });
+  return { ...recording,
+    single: Object.fromEntries(Object.entries(recording.single).map(([name, run]) => [name, mapRun(run)])),
+    multi: Object.fromEntries(Object.entries(recording.multi).map(([name, run]) => [name, mapRun(run)])) };
+}
+
 // Buffer names carry the pid and a timestamp; everything else is compared as is.
 export function normalizeCalls(calls) {
   return calls.map((call) => call.map((arg) => String(arg).replace(/^c4-msg-\d+-\d+$/, 'c4-msg-<pid>-<ms>')));
@@ -91,7 +147,8 @@ function multiHelpers(rows, delivered, extraHelpers) {
 
 // A [KEYSTROKE] control through processWithMultiSession, wired with the given
 // dispatcher module's own helpers. sendKeystroke issues exactly the
-// dispatcher's call (`send-keys -t <session> <key>`). When the dispatcher
+// dispatcher's call (`send-keys -t <target> <key>`) with the target it is
+// given (the pane id of the deciding read, or the session name without one). When the dispatcher
 // reads the pane before a key (readKeystrokeTarget), that read goes to the same
 // fake pane; the DB binding is stubbed as "bound to the pane on screen".
 export async function runMultiKeystroke(dispatcher, processWithMultiSession, { instance = 'user-pan', key = 'Escape' } = {}) {
@@ -107,7 +164,7 @@ export async function runMultiKeystroke(dispatcher, processWithMultiSession, { i
   } : {};
   const helpers = multiHelpers(rows, delivered, {
     isKeystrokeControl: dispatcher.isKeystrokeControl, parseKeystrokeKey: dispatcher.parseKeystrokeKey,
-    sendKeystroke: (target, k) => model.exec('tmux', ['send-keys', '-t', target, k]),
+    sendKeystroke: (target, k) => model.exec('tmux', ['send-keys', '-t', target, k]), // records the given target
     sendToTmux: async () => { throw new Error('a keystroke is never pasted'); },
     ...fenced,
   });

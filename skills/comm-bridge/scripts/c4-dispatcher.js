@@ -445,6 +445,24 @@ export function checkInputBox(session = TMUX_SESSION) {
   return deliveryInputState(session, runtimeForSession(session)).inputState;
 }
 
+/**
+ * The tmux target for a send (paste, Enter, raw key): the immutable pane id
+ * (`%N`) of the identity `${session_id}:${session_created}:${pane_id}:${pane_pid}`
+ * that the deciding read returned. The session NAME is reusable: a session
+ * replaced under the same name between that read and the send would receive
+ * the key. A pane id is never reused within one tmux server, so a send to a
+ * pane that is gone fails (tmux: can't find pane) and is handled as a failed
+ * send, never redirected. Every read and send here runs the same `tmux` client
+ * with the same environment (no -L/-S anywhere), i.e. the same server; a server
+ * restart between read and send cannot be mistaken for the old pane because
+ * every read compares the full identity (session_created, pane_pid included).
+ * Only when no identity was read does the send fall back to the session name.
+ */
+export function sendTarget(paneIdentity, session) {
+  const match = /^\$\d+:\d+:(%\d+):\d+$/.exec(String(paneIdentity ?? ''));
+  return match ? match[1] : session;
+}
+
 // Raw keys are withheld while a modal owns the keyboard. A permission prompt is
 // the exception: answering it is what the auto-approve [KEYSTROKE]Enter is for.
 export function keystrokeBlockedByModal(modal) {
@@ -469,6 +487,8 @@ export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl =
  *   fail      - the pane could not be read: no key (a retry is consumed)
  *   supersede - the key belongs to another session: bound to a different
  *               sessionRef, or unbound and queued before this session started
+ *               or in the same second (created_at and session_created are
+ *               whole seconds, so a same-second key is ambiguous and fenced)
  *   defer     - a modal other than a permission prompt owns the keyboard
  *   deliver   - send the key
  * An unbound key is bound to the pane read here before any deferral, so a
@@ -481,7 +501,7 @@ export function fenceKeystrokeControl(item, target, { bind = bindControlSession 
   const binding = bind(item.id, target.sessionRef);
   if (binding.sessionRef && binding.sessionRef !== target.sessionRef) return { action: 'supersede', reason: 'SESSION_REPLACED' };
   if (binding.stamped && Number.isFinite(item.created_at) && Number.isFinite(target.sessionCreatedAt)
-      && item.created_at < target.sessionCreatedAt) {
+      && item.created_at <= target.sessionCreatedAt) {
     return { action: 'supersede', reason: 'SESSION_PREDATES' };
   }
   if (keystrokeBlockedByModal(target.modal)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
@@ -582,7 +602,9 @@ function enterAllowed(pending, state) {
 export async function submitAndVerify(session, {
   pending, readState, lastState = null, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
 } = {}) {
-  const enter = () => execFileSyncImpl('tmux', ['send-keys', '-t', session, 'Enter'], { stdio: 'pipe', timeout: 5000 });
+  // Enter goes to the pane of the read that decided it (see sendTarget).
+  const enter = (decidedBy) => execFileSyncImpl('tmux', ['send-keys', '-t', sendTarget(decidedBy.paneIdentity, session), 'Enter'],
+    { stdio: 'pipe', timeout: 5000 });
   const deferred = () => { pending.modalDeferred = true; return { verified: false, state: 'modal' }; };
   const unbound = () => ({ verified: false, state: 'capture_failed' });
   // A modal can open at any moment (a usage-credits consent dialog opens on its
@@ -613,7 +635,7 @@ export async function submitAndVerify(session, {
     if (wasReplaced(pending, state)) return replacementResult(pending);
     if (state.modal) return deferred();
     if (!enterAllowed(pending, state)) return unbound();
-    enter();
+    enter(state);
     pending.enterSent = true;
   }
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
@@ -631,7 +653,7 @@ export async function submitAndVerify(session, {
     if (state.inputState === 'has_content' && !state.usageOverlay) {
       if (!enterAllowed(pending, state)) return unbound();
       logImpl(`Enter verify attempt ${attempt + 1}: owned input remains, retrying Enter`);
-      enter();
+      enter(state);
     }
   }
   return { verified: false, state: 'indeterminate' };
@@ -728,7 +750,9 @@ async function sendToTmux(message, options = {}) {
       // -p uses the native bracketed-paste protocol; -r preserves newlines.
       // Without these, tmux changes LF to Enter and Codex's paste-burst parser
       // may split one message into several inputs or swallow the submit key.
-      exec('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', session], { stdio: 'pipe', timeout: 5000 });
+      // The paste belongs to the pane `initial` was read from (see sendTarget).
+      exec('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', sendTarget(initial.paneIdentity, session)],
+        { stdio: 'pipe', timeout: 5000 });
       pending = { deliveryId, message: sanitized, paneIdentity: initial.paneIdentity,
         observed: false, enterSent: false, terminal: false,
         shutdown: options.acceptShutdownAfterSubmit || (runtime === 'codex' && sanitized.trim() === '/exit') };
@@ -803,11 +827,12 @@ export function parseKeystrokeKey(content) {
  * Send a raw key to a tmux session (no buffer paste, no verify). Used for
  * [KEYSTROKE] controls (auto-approve Enter, watchdog interrupts). Injected into
  * the multi-session path so per-instance sessions get real keypresses too.
- * @param {string} session - tmux session name
+ * @param {string} target - the pane id of the deciding read (sendTarget), or
+ *   the tmux session name when no identity was read
  * @param {string} key - tmux send-keys key name (e.g. 'Enter', 'Escape')
  */
-export function sendKeystroke(session, key) {
-  execFileSync('tmux', ['send-keys', '-t', session, key], { stdio: 'pipe', timeout: 5000 });
+export function sendKeystroke(target, key) {
+  execFileSync('tmux', ['send-keys', '-t', target, key], { stdio: 'pipe', timeout: 5000 });
 }
 
 export function isCodexExitLifecycleControl(item, activeRuntime = ACTIVE_RUNTIME) {
@@ -1111,7 +1136,8 @@ async function processNextMessage() {
     const key = parseKeystrokeKey(rawContent);
     log(`Delivering keystroke key=${key} (control id=${item.id} priority=${item.priority})`);
     try {
-      sendTmuxKeys(TMUX_SESSION, [key], { stdio: 'pipe', timeout: 5000 });
+      // The pane the fence read saw; a replaced session makes this send fail.
+      sendTmuxKeys(sendTarget(target.sessionRef, TMUX_SESSION), [key], { stdio: 'pipe', timeout: 5000 });
       ackControl(item.id);
       log(`Keystroke delivered: key=${key} (control id=${item.id})`);
       return { delivered: true, state: agentState.state };

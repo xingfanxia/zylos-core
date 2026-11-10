@@ -10,6 +10,10 @@
  * Auto-approve: when config.auto_approve_permission is true (default),
  * enqueues a [KEYSTROKE]Enter control at priority 0 with bypass-state
  * and 1s delay. The C4 dispatcher sends the Enter key to auto-confirm.
+ * The key is bound (--session-ref) to the pane this hook runs in, read via
+ * $TMUX_PANE, so it is superseded instead of reaching a session that replaced
+ * this one. Without TMUX_PANE, or when the read fails (e.g. an os_user-isolated
+ * CLI cannot reach the service user's tmux socket), it is enqueued unbound.
  *
  * Log file: ~/zylos/activity-monitor/hook-timing.log (shared with other hooks)
  */
@@ -18,6 +22,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execFileSync } from 'child_process';
+import { readSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 
 const ZYLOS_DIR = path.join(os.homedir(), 'zylos');
 const LOG_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'hook-timing.log');
@@ -64,6 +69,9 @@ async function main() {
   const runtime = config.runtime || 'claude';
 
   if (autoApprove && runtime === 'claude') {
+    // `display-message -p -t $TMUX_PANE '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'`,
+    // validated as ^\$\d+:\d+:%\d+:\d+$; null when unset or unreadable.
+    const sessionRef = process.env.TMUX_PANE ? readSessionRef(process.env.TMUX_PANE) : null;
     try {
       execFileSync('node', [
         C4_CONTROL, 'enqueue',
@@ -71,7 +79,8 @@ async function main() {
         '--priority', '0',
         '--bypass-state',
         '--available-in', String(AUTO_APPROVE_AVAILABLE_IN_SEC),
-        '--no-ack-suffix'
+        '--no-ack-suffix',
+        ...(sessionRef ? ['--session-ref', sessionRef] : []),
       ], { stdio: 'pipe', timeout: 5000 });
     } catch {
       // best-effort — don't block permission flow

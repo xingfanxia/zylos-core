@@ -189,8 +189,8 @@ When Claude Code shows a permission prompt (PermissionRequest event), the `hook-
 
 1. Claude Code fires a PermissionRequest hook when a tool call requires user approval
 2. `hook-auth-prompt.js` logs the event to `hook-timing.log`
-3. If `auto_approve_permission` is true (default), it enqueues a `[KEYSTROKE]Enter` control at priority 0 with bypass-state and 1-second delay
-4. The C4 dispatcher delivers the Enter keystroke to the tmux session, auto-confirming the prompt
+3. If `auto_approve_permission` is true (default), it enqueues a `[KEYSTROKE]Enter` control at priority 0 with bypass-state and 1-second delay. When `TMUX_PANE` is set it reads its own pane identity (`tmux display-message -t "$TMUX_PANE"`) and binds the key with `--session-ref`; if that read fails the key is enqueued unbound, as before
+4. The C4 dispatcher delivers the Enter keystroke to the pane id of the read that decided it (a bound key for a replaced session is superseded, never sent to the replacement), auto-confirming the prompt
 
 ### Configuration
 

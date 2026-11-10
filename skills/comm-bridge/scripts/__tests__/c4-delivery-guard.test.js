@@ -263,7 +263,7 @@ describe('multi-session delivery guard', () => {
     let screenModal = LIMIT;
     const helpers = multiHelpers(queue, {
       readKeystrokeTarget: () => paneTarget(screenModal),
-      sendKeystroke: (session, key) => keys.push({ session, key }),
+      sendKeystroke: (target, key) => keys.push({ target, key }),
       sendToTmux: async () => { throw new Error('keystroke must never be pasted'); },
     });
     const held = await processWithMultiSession(helpers);
@@ -276,7 +276,7 @@ describe('multi-session delivery guard', () => {
     screenModal = null;
     const sent = await processWithMultiSession(helpers);
     assert.equal(sent.delivered, true);
-    assert.deepEqual(keys, [{ session: 'claude-user-pan', key: 'Escape' }]);
+    assert.deepEqual(keys, [{ target: '%2', key: 'Escape' }], 'the pane id of the read, not the session name');
     assert.deepEqual(queue.acked, [8]);
   });
 
@@ -380,9 +380,14 @@ describe('Enter is bound to the pasted pane (Astra #5)', () => {
 // scenario drivers (fixtures/tmux-pane-model.js) against the base commit
 // d16221a4 (before the Fable guard). The check covers the whole tmux call
 // sequence, reads included; only the per-process buffer name is normalized.
+// The ONE intended difference from base: the target argument of send-keys and
+// paste-buffer is the pane id the deciding read returned (`%2` in the pane
+// model) instead of the session name (finding 5). The recording stays as
+// recorded; the mapping below rewrites exactly that argument and nothing else.
 describe('no modal on screen: tmux calls identical to base d16221a4 (Astra #5, scope)', async () => {
   const model = await import('./fixtures/tmux-pane-model.js');
-  const base = JSON.parse(fs.readFileSync(new URL('./fixtures/base-delivery-calls.d16221a.json', import.meta.url), 'utf8'));
+  const recorded = JSON.parse(fs.readFileSync(new URL('./fixtures/base-delivery-calls.d16221a.json', import.meta.url), 'utf8'));
+  const base = model.baseWithPaneTargets(recorded, 'claude-user-pan', '%2');
 
   for (const [name, scenario] of Object.entries(model.DELIVERY_SCENARIOS)) {
     it(`single-session sendToTmux: ${name}`, async () => {
@@ -475,5 +480,40 @@ describe('limit dialog right after a submission (Astra (h))', () => {
     assert.equal(queue.byId.get(61).retry_count, 0);
     assert.equal(queue.byId.get(61).status, 'running', 'left to the uncertain record (no requeue, no replay)');
     assert.deepEqual(h.records.map((r) => r.deliveryId), ['conversation:61']);
+  });
+});
+
+// ── F: sends go to the pane the deciding read saw (finding 5) ──────────────
+// The reads resolve the reusable session name; the paste and every Enter go to
+// the immutable pane id (`%N`) of the identity that read returned. A session
+// replaced under the same name in between makes the send fail (tmux: can't
+// find pane) instead of landing in the replacement.
+describe('session replaced between the deciding read and the send', async () => {
+  const { replaceableServer } = await import('./fixtures/tmux-pane-model.js');
+  const send = (server, id = 'conversation:71') => sendToTmux('hello from feishu', { session: 'claude-user-pan',
+    runtime: 'claude', deliveryId: id, execFileSyncImpl: server.exec, sleepImpl: async () => {},
+    pendingSubmissions: server.submissions, submissionReceipts: server.receipts, recentSubmissions: new Map() });
+  const make = (replaceWhen) => Object.assign(replaceableServer({ replaceWhen }),
+    { submissions: new Map(), receipts: new Map() });
+
+  it('Enter: the replacement never receives the Enter decided for the old pane', async () => {
+    // The read that observes the pasted text decides the Enter; the session is
+    // replaced right after it.
+    const server = make((pane) => pane.composer !== '');
+    assert.equal(await send(server), 'verify_failed');
+    assert.deepEqual(server.replacement.received, [], 'no key reaches the replacement session');
+    const enters = server.calls.filter((call) => call[1] === 'send-keys');
+    assert.deepEqual(enters, [['tmux', 'send-keys', '-t', '%2', 'Enter']], 'Enter targets the old pane id');
+    // The retry sees the replacement: never re-pasted, never delivered there.
+    assert.equal(await send(server), 'verify_failed');
+    assert.deepEqual(server.replacement.received, []);
+  });
+
+  it('paste: the replacement never receives text pasted for the old pane', async () => {
+    // The initial read (empty composer) owns the paste; the session is replaced right after it.
+    const server = make(() => true);
+    assert.equal(await send(server, 'conversation:72'), 'paste_error');
+    assert.deepEqual(server.replacement.received, [], 'no text reaches the replacement session');
+    assert.deepEqual(server.calls.filter((call) => call[1] === 'paste-buffer').map((call) => call[call.length - 1]), ['%2']);
   });
 });

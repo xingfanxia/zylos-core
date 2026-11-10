@@ -33,6 +33,7 @@ const UNKNOWN = { kind: 'unknown', text: 'Something new' };
 
 const panes = { 'claude-user-pan': { sessionRef: A, modal: null } };
 const sent = [];
+let afterRead = null; // runs right after a pane read (a session replaced in between)
 const helpers = {
   getAgentState: () => ({ state: 'idle', health: 'ok', idleSeconds: 30, healthy: true }),
   isStatusFresh: () => true, isAgentStatusFresh: () => true,
@@ -52,11 +53,14 @@ const helpers = {
   // production wiring: c4-dispatcher.js passes these three
   readKeystrokeTarget: (session) => {
     const pane = panes[session];
-    return { ok: true, sessionRef: pane.sessionRef, modal: pane.modal, sessionCreatedAt: Number(pane.sessionRef.split(':')[1]) };
+    const target = { ok: true, sessionRef: pane.sessionRef, modal: pane.modal, sessionCreatedAt: Number(pane.sessionRef.split(':')[1]) };
+    afterRead?.();
+    return target;
   },
   fenceKeystrokeControl: dispatcher.fenceKeystrokeControl,
   supersedeControl: db.supersedeControl,
-  sendKeystroke: (session, key) => sent.push({ session, key, pane: panes[session].sessionRef }),
+  // The dispatcher sends to the pane id of its read; record it with the pane that owns the name.
+  sendKeystroke: (target, key) => sent.push({ target, key, pane: panes['claude-user-pan'].sessionRef }),
 };
 const row = (id) => db.getDb().prepare('SELECT status, last_error, session_ref FROM control_queue WHERE id = ?').get(id);
 const enqueue = (key, extra = {}) => db.insertControl(`[KEYSTROKE]${key}`,
@@ -96,7 +100,7 @@ describe('multi-session: --apply restart interleaved with claimed keys', () => {
     dispatcher.releaseItem({ id: hookKey.id, type: 'control' }, 'MODAL_DEFERRED');
 
     await drain();
-    assert.deepEqual(sent, [{ session: 'claude-user-pan', key: 'Escape', pane: B }]);
+    assert.deepEqual(sent, [{ target: '%8', key: 'Escape', pane: B }]);
     assert.equal(row(replacementKey.id).status, 'done');
     for (const id of [watchdog.id, hookKey.id, lateOld.id]) assert.equal(row(id).status, 'superseded');
     assert.deepEqual(row(leftover.id), { status: 'superseded', last_error: 'SESSION_PREDATES', session_ref: B });
@@ -109,5 +113,57 @@ describe('multi-session: --apply restart interleaved with claimed keys', () => {
     await drain();
     assert.deepEqual(sent, []);
     assert.deepEqual(row(stray.id), { status: 'superseded', last_error: 'SESSION_REPLACED', session_ref: A });
+  });
+});
+
+describe('multi-session: the key goes to the pane id the deciding read saw (finding 5)', () => {
+  it('a session replaced between the read and the key: the key targets the old pane, the replacement gets nothing', async () => {
+    sent.length = 0;
+    panes['claude-user-pan'] = { sessionRef: A, modal: null };
+    // A real tmux send to a pane id that no longer exists fails; the name would resolve to B.
+    const real = helpers.sendKeystroke;
+    const targets = [];
+    helpers.sendKeystroke = (target, key) => {
+      targets.push(target);
+      const owner = panes['claude-user-pan'].sessionRef;
+      if (target.startsWith('%') && target !== owner.split(':')[2]) throw new Error(`can't find pane: ${target}`);
+      sent.push({ key, pane: owner });
+    };
+    afterRead = () => { panes['claude-user-pan'] = { sessionRef: B, modal: null }; afterRead = null; };
+    try {
+      const key = enqueue('Escape');
+      await processWithMultiSession(helpers);
+      assert.deepEqual(targets, ['%7'], 'the key names pane %7 of the read, not the session name');
+      assert.deepEqual(sent, [], 'nothing reaches the replacement session');
+      assert.notEqual(row(key.id).status, 'done', 'a failed send is not a delivery');
+      db.getDb().prepare("UPDATE control_queue SET status = 'failed' WHERE id = ?").run(key.id);
+    } finally {
+      helpers.sendKeystroke = real;
+      afterRead = null;
+    }
+  });
+});
+
+describe('same-second unbound keys (finding 5)', () => {
+  it('an unbound key queued in the same second the replacement session was created is superseded', async () => {
+    sent.length = 0;
+    panes['claude-user-pan'] = { sessionRef: B, modal: null };
+    const key = enqueue('Escape');
+    db.getDb().prepare('UPDATE control_queue SET created_at = ? WHERE id = ?').run(Number(B.split(':')[1]), key.id);
+    await drain();
+    assert.deepEqual(sent, []);
+    assert.deepEqual(row(key.id), { status: 'superseded', last_error: 'SESSION_PREDATES', session_ref: B });
+  });
+
+  it('fenceKeystrokeControl: created_at equal to session_created is ambiguous and fenced; a later second is delivered', () => {
+    const target = { ok: true, sessionRef: B, modal: null, sessionCreatedAt: Number(B.split(':')[1]) };
+    const bind = () => ({ sessionRef: B, stamped: true });
+    assert.deepEqual(dispatcher.fenceKeystrokeControl({ id: 1, created_at: target.sessionCreatedAt }, target, { bind }),
+      { action: 'supersede', reason: 'SESSION_PREDATES' });
+    assert.deepEqual(dispatcher.fenceKeystrokeControl({ id: 2, created_at: target.sessionCreatedAt + 1 }, target, { bind }),
+      { action: 'deliver' });
+    // A key bound to this session at enqueue time is never fenced by the clock.
+    assert.deepEqual(dispatcher.fenceKeystrokeControl({ id: 3, created_at: target.sessionCreatedAt },
+      target, { bind: () => ({ sessionRef: B, stamped: false }) }), { action: 'deliver' });
   });
 });
