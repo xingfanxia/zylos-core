@@ -159,6 +159,7 @@ import { readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.j
 // exports classifyLimitDialog, no dialog is ever classified (no-op default).
 import * as tmuxInputStateModule from '../../comm-bridge/scripts/tmux-input-state.js';
 import { createFableMonitorDeps, dropPendingKeystrokes } from './fable-guard.js';
+import { createFableMonitor } from './fable-monitor.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -350,6 +351,7 @@ let toolPipeline;    // initialized in init()
 let orchestrator;    // initialized in init()
 let messageRouterServer; // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
+let fableMonitor = null; // Fable guard lease enforcement (guard-tracked personas only)
 
 // Timezone: reuse scheduler's tz.js (.env TZ → process.env.TZ → UTC)
 import { loadTimezone } from '../../scheduler/scripts/tz.js';
@@ -1242,6 +1244,7 @@ async function monitorLoop() {
   lastState = tickState.lastState;
   idleSince = tickState.idleSince;
   watchdogState = tickState.watchdogState;
+  try { fableMonitor?.tick(); } catch (err) { log(`Fable guard monitor tick failed: ${err.message}`); }
 }
 
 function init() {
@@ -1286,6 +1289,8 @@ function init() {
     engine,
     contextMonitor,
   } = orchestrator.start());
+  fableMonitor = createFableMonitor({ zylosDir: ZYLOS_DIR, instanceId: INSTANCE_ID, monitorDir: MONITOR_DIR,
+    runtimeProfile: adapter.config?.runtimeProfile, stopSession: () => adapter.stop(), log });
 }
 
 // REL-9b seam: gate the daemon side-effects (init, process handlers, schedule
