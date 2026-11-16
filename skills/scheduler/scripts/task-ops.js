@@ -49,9 +49,23 @@ export function resolveTaskByPrefix(db, prefix, { scope = null, status = null } 
     params.push(status);
   }
   const tasks = db.prepare(sql).all(...params);
-  if (tasks.length === 0) return { ok: false, error: 'not_found' };
+  if (tasks.length === 0) {
+    // A status-filtered miss stays 'not_found'; `status` names the current
+    // status of a task the prefix does match, so callers can report it.
+    if (status) {
+      const other = db.prepare(`SELECT status FROM tasks WHERE id LIKE ? ESCAPE '!'` + scopeSql(scope))
+        .get(escapeLike(prefix) + '%', ...scopeParams(scope));
+      if (other) return { ok: false, error: 'not_found', status: other.status };
+    }
+    return { ok: false, error: 'not_found' };
+  }
   if (tasks.length > 1) return { ok: false, error: 'ambiguous', matches: tasks.map(t => t.id) };
   return { ok: true, task: tasks[0] };
+}
+
+/** Resolve one task (read-only). Same result shape as resolveTaskByPrefix. */
+export function getTask(db, prefix, { scope = null } = {}) {
+  return resolveTaskByPrefix(db, prefix, { scope });
 }
 
 /** Active tasks (same predicate the CLI list has always used). */
@@ -104,28 +118,31 @@ export function completeTask(db, prefix, { scope = null } = {}) {
   const task = resolved.task;
   const currentTime = nowSec();
 
-  db.prepare(`
-    UPDATE tasks
-    SET status = 'completed', last_run_at = ?, updated_at = ?, last_error = NULL
-    WHERE id = ?
-  `).run(currentTime, currentTime, task.id);
-
-  const historyEntry = db.prepare(`
-    SELECT id, executed_at FROM task_history
-    WHERE task_id = ? AND status = 'started'
-    ORDER BY executed_at DESC LIMIT 1
-  `).get(task.id);
-
-  if (historyEntry) {
-    const durationMs = (currentTime - historyEntry.executed_at) * 1000;
+  // One transaction: a failed history write leaves the task unchanged too.
+  db.transaction(() => {
     db.prepare(`
-      UPDATE task_history
-      SET status = 'success', completed_at = ?, duration_ms = ?
+      UPDATE tasks
+      SET status = 'completed', last_run_at = ?, updated_at = ?, last_error = NULL
       WHERE id = ?
-    `).run(currentTime, durationMs, historyEntry.id);
-  }
+    `).run(currentTime, currentTime, task.id);
 
-  return { ok: true, task };
+    const historyEntry = db.prepare(`
+      SELECT id, executed_at FROM task_history
+      WHERE task_id = ? AND status = 'started'
+      ORDER BY executed_at DESC LIMIT 1
+    `).get(task.id);
+
+    if (historyEntry) {
+      const durationMs = (currentTime - historyEntry.executed_at) * 1000;
+      db.prepare(`
+        UPDATE task_history
+        SET status = 'success', completed_at = ?, duration_ms = ?
+        WHERE id = ?
+      `).run(currentTime, durationMs, historyEntry.id);
+    }
+  })();
+
+  return { ok: true, task: readTask(db, task.id) };
 }
 
 /** @returns {{ok:true, task:object} | {ok:false, error, matches?}} */
@@ -136,13 +153,17 @@ export function removeTask(db, prefix, { scope = null } = {}) {
   return { ok: true, task: resolved.task };
 }
 
+function readTask(db, id) {
+  return db.prepare('SELECT * FROM tasks WHERE id = ?').get(id);
+}
+
 /** Pause a pending task. @returns {{ok:true, task} | {ok:false, error, matches?}} */
 export function pauseTask(db, prefix, { scope = null } = {}) {
   const resolved = resolveTaskByPrefix(db, prefix, { scope, status: 'pending' });
   if (!resolved.ok) return resolved;
   db.prepare(`UPDATE tasks SET status = 'paused', updated_at = ? WHERE id = ?`)
     .run(nowSec(), resolved.task.id);
-  return { ok: true, task: resolved.task };
+  return { ok: true, task: readTask(db, resolved.task.id) };
 }
 
 /** Resume a paused task. @returns {{ok:true, task} | {ok:false, error, matches?}} */
@@ -151,14 +172,15 @@ export function resumeTask(db, prefix, { scope = null } = {}) {
   if (!resolved.ok) return resolved;
   db.prepare(`UPDATE tasks SET status = 'pending', updated_at = ? WHERE id = ?`)
     .run(nowSec(), resolved.task.id);
-  return { ok: true, task: resolved.task };
+  return { ok: true, task: readTask(db, resolved.task.id) };
 }
 
 /**
- * Execution history (latest 20), optionally narrowed by task-id prefix.
+ * Execution history (latest `limit`, default 20), optionally narrowed by
+ * task-id prefix. Rows with the same executed_at are ordered newest id first.
  * @returns {{entries:object[], prefixMatches:string[]}}
  */
-export function taskHistory(db, { scope = null, prefix = null } = {}) {
+export function taskHistory(db, { scope = null, prefix = null, limit = 20 } = {}) {
   let sql = `
     SELECT h.*, t.name, t.prompt
     FROM task_history h
@@ -176,7 +198,8 @@ export function taskHistory(db, { scope = null, prefix = null } = {}) {
     ).all(escapeLike(prefix) + '%', ...scopeParams(scope)).map(t => t.id);
   }
 
-  sql += ' ORDER BY h.executed_at DESC LIMIT 20';
+  sql += ' ORDER BY h.executed_at DESC, h.id DESC LIMIT ?';
+  params.push(limit);
   return { entries: db.prepare(sql).all(...params), prefixMatches };
 }
 
@@ -210,9 +233,14 @@ export function runningTasks(db, { scope = null } = {}) {
  * Apply a validated updates object to a task.
  * With allowRetarget=false (broker path), target_instance changes are
  * rejected — retargeting would be a cross-instance message primitive.
- * @returns {{ok:true, task} | {ok:false, error:'not_found'|'ambiguous'|'invalid_field'|'retarget_forbidden'|'no_updates', matches?, field?}}
+ * status is never an update field. reenableFailed (a rescheduled failed
+ * one-time task) is the only way an update sets it: only when the resolved
+ * task is a failed one-time task and the new next_run_at is in the future,
+ * it becomes pending with its failure details cleared. Otherwise the flag is
+ * ignored.
+ * @returns {{ok:true, task} | {ok:false, error:'not_found'|'ambiguous'|'invalid_field'|'retarget_forbidden'|'no_updates'|'reschedule_not_future', matches?, field?}}
  */
-export function applyTaskUpdates(db, prefix, updates, { scope = null, allowRetarget = true } = {}) {
+export function applyTaskUpdates(db, prefix, updates, { scope = null, allowRetarget = true, reenableFailed = false } = {}) {
   const resolved = resolveTaskByPrefix(db, prefix, { scope });
   if (!resolved.ok) return resolved;
 
@@ -228,6 +256,11 @@ export function applyTaskUpdates(db, prefix, updates, { scope = null, allowRetar
   }
 
   const merged = { ...updates, updated_at: nowSec() };
+  const task = resolved.task;
+  if (reenableFailed && task.type === 'one-time' && task.status === 'failed') {
+    if (!(Number(updates.next_run_at) > nowSec())) return { ok: false, error: 'reschedule_not_future' };
+    Object.assign(merged, { status: 'pending', last_error: null, failed_at: null });
+  }
   const setClauses = Object.keys(merged).map(key => `${key} = ?`).join(', ');
   db.prepare(`UPDATE tasks SET ${setClauses} WHERE id = ?`)
     .run(...Object.values(merged), resolved.task.id);

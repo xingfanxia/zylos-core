@@ -85,6 +85,15 @@ selected pane. It never changes a message's recorded delivery status.
 
 ## Disputed empty verdict
 
+> **This fork:** neither `disputed_empty` nor the extra `dispute_retry` Enter
+> exists here. The fork dispatcher never re-pastes (a retry resumes Enter on
+> the owned paste), so the duplicate-input reason for accepting a dispute does
+> not apply, and an Enter needs a pane read that decided it. Still open: the
+> fork accepts the first `empty` read after Enter, including a parser override
+> of a cursor `has_content`, so the #795 false `empty` can mark a message
+> submitted while it stays in the composer. A later delivery then finds an
+> occupied composer it does not own and is retried, not pasted.
+
 For Claude, the cursor detector runs first and the text parser can override a
 cursor `has_content`. The parser only reads the first 10 characters of the
 input box's first line, so a multi-line draft can make it report `empty`

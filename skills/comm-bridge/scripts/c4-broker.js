@@ -698,7 +698,7 @@ function opScheduler(p, caller) {
     return { ok: false, error: `scheduler_db_unavailable:${e.message}` };
   }
 
-  const needsPrefix = new Set(['done', 'remove', 'pause', 'resume', 'update']);
+  const needsPrefix = new Set(['get', 'done', 'remove', 'pause', 'resume', 'update']);
   if (needsPrefix.has(action) && (typeof p.prefix !== 'string' || p.prefix.length === 0)) {
     return { ok: false, error: 'prefix_required' };
   }
@@ -711,7 +711,12 @@ function opScheduler(p, caller) {
     }) };
     case 'next':    return { ok: true, data: taskOps.nextTasks(sdb, scoped) };
     case 'running': return { ok: true, data: taskOps.runningTasks(sdb, scoped) };
-    case 'history': return { ok: true, data: taskOps.taskHistory(sdb, { scope: caller, prefix: typeof p.prefix === 'string' && p.prefix ? p.prefix : null }) };
+    case 'history': return { ok: true, data: taskOps.taskHistory(sdb, {
+      scope: caller,
+      prefix: typeof p.prefix === 'string' && p.prefix ? p.prefix : null,
+      limit: Number.isInteger(p.limit) && p.limit >= 1 && p.limit <= 1000 ? p.limit : 20,
+    }) };
+    case 'get':     return { ok: true, data: taskOps.getTask(sdb, p.prefix, scoped) };
     case 'done':    return { ok: true, data: taskOps.completeTask(sdb, p.prefix, scoped) };
     case 'remove':  return { ok: true, data: taskOps.removeTask(sdb, p.prefix, scoped) };
     case 'pause':   return { ok: true, data: taskOps.pauseTask(sdb, p.prefix, scoped) };
@@ -720,7 +725,9 @@ function opScheduler(p, caller) {
       const updates = (p.updates && typeof p.updates === 'object' && !Array.isArray(p.updates)) ? p.updates : {};
       const replyErr = validateReplyTarget(updates, caller);
       if (replyErr) return { ok: false, error: replyErr };
-      return { ok: true, data: taskOps.applyTaskUpdates(sdb, p.prefix, updates, { scope: caller, allowRetarget: false }) };
+      return { ok: true, data: taskOps.applyTaskUpdates(sdb, p.prefix, updates, {
+        scope: caller, allowRetarget: false, reenableFailed: p.reenableFailed === true,
+      }) };
     }
     case 'add': {
       const spec = (p.spec && typeof p.spec === 'object' && !Array.isArray(p.spec)) ? { ...p.spec } : null;

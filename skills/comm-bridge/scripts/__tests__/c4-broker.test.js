@@ -965,6 +965,48 @@ describe('broker scheduler op', () => {
     assert.equal(res.data.error, 'retarget_forbidden');
   });
 
+  it('get is scoped to the caller', async () => {
+    const added = await broker.handleRequest({ op: 'scheduler', params: { action: 'add', spec: specFor('readable task') } }, 'inst-a');
+    const id = added.data.task.id;
+    const own = await broker.handleRequest({ op: 'scheduler', params: { action: 'get', prefix: id } }, 'inst-a');
+    assert.equal(own.data.ok, true);
+    assert.equal(own.data.task.id, id);
+    const cross = await broker.handleRequest({ op: 'scheduler', params: { action: 'get', prefix: id } }, 'inst-b');
+    assert.equal(cross.data.ok, false);
+    assert.equal(cross.data.error, 'not_found');
+  });
+
+  it('reenableFailed only re-enables the caller\'s failed one-time task; status stays no update field', async () => {
+    const { getDb } = await import('../../../scheduler/scripts/database.js');
+    const sdb = getDb();
+    const future = Math.floor(Date.now() / 1000) + 7200;
+    const add = async (prompt, overrides) => (await broker.handleRequest({
+      op: 'scheduler', params: { action: 'add', spec: specFor(prompt, overrides) },
+    }, 'inst-a')).data.task.id;
+    const update = (id, updates, caller = 'inst-a') => broker.handleRequest({
+      op: 'scheduler', params: { action: 'update', prefix: id, updates, reenableFailed: true },
+    }, caller);
+
+    const oneTime = await add('failed one-time');
+    sdb.prepare("UPDATE tasks SET status='failed', last_error='boom', failed_at=1 WHERE id=?").run(oneTime);
+    assert.equal((await update(oneTime, { next_run_at: future }, 'inst-b')).data.error, 'not_found');
+    assert.equal((await update(oneTime, { next_run_at: 1 })).data.error, 'reschedule_not_future');
+    const reenabled = (await update(oneTime, { next_run_at: future })).data.task;
+    assert.equal(reenabled.status, 'pending');
+    assert.equal(reenabled.last_error, null);
+    assert.equal(reenabled.failed_at, null);
+
+    const recurring = await add('failed recurring', { type: 'recurring', cron_expression: '0 9 * * *' });
+    sdb.prepare("UPDATE tasks SET status='failed', last_error='boom', failed_at=1 WHERE id=?").run(recurring);
+    const kept = (await update(recurring, { next_run_at: future })).data.task;
+    assert.equal(kept.status, 'failed');
+    assert.equal(kept.last_error, 'boom');
+
+    const direct = await update(oneTime, { status: 'running' });
+    assert.equal(direct.data.ok, false);
+    assert.equal(direct.data.error, 'invalid_field');
+  });
+
   it('mutating actions require a prefix', async () => {
     const res = await broker.handleRequest({ op: 'scheduler', params: { action: 'done' } }, 'inst-a');
     assert.equal(res.ok, false);

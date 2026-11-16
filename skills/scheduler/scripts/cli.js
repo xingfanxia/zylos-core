@@ -10,7 +10,7 @@ import { parseTime, parseDuration, formatTime, getRelativeTime } from './time-ut
 import { loadTimezone } from './tz.js';
 import {
   listTasks, insertTask, completeTask, removeTask, pauseTask, resumeTask,
-  taskHistory, nextTasks, runningTasks, applyTaskUpdates,
+  taskHistory, nextTasks, runningTasks, applyTaskUpdates, getTask,
 } from './task-ops.js';
 import { shouldUseBroker, brokerCall } from '../../comm-bridge/scripts/c4-client.js';
 
@@ -25,30 +25,75 @@ function dbh() {
   return _db;
 }
 
+const WRITE_ACTIONS = new Set(['add', 'update', 'done', 'remove', 'pause', 'resume']);
+
 async function schedOp(action, params, direct) {
   if (shouldUseBroker()) {
     return await brokerCall('scheduler', { action, ...params });
   }
-  return direct(dbh());
+  const db = dbh();
+  if (!WRITE_ACTIONS.has(action)) return direct(db);
+  try { return direct(db); }
+  catch (error) {
+    error.code = 'DB_WRITE_FAILED';
+    throw error;
+  }
 }
 
-/** Shared error formatting for task-ops {ok:false} results. */
-function printTaskError(res, taskId, noun = 'task') {
-  if (res.error === 'ambiguous') {
-    console.error(`Error: Ambiguous task ID prefix '${taskId}' matches multiple ${noun}s:`);
-    (res.matches || []).forEach(id => console.error(`  - ${id}`));
-    console.error('Please provide a more specific prefix.');
-  } else if (res.error === 'not_found') {
-    console.error(`Error: ${noun.charAt(0).toUpperCase() + noun.slice(1)} not found: ${taskId}`);
-  } else if (res.error === 'invalid_field') {
-    console.error(`Error: Invalid update field: ${res.field}`);
-  } else if (res.error === 'no_updates') {
-    console.error('Error: No updates provided');
-    console.log('Use --help to see available options');
-  } else if (res.error === 'retarget_forbidden') {
-    console.error('Error: isolated instances cannot change a task\'s target instance');
+// --json on write and history commands: one-line {ok,data} / {ok:false,error}
+// envelope; errors exit 1. Text output and exit codes stay as before.
+let jsonOutput = false;
+const has = (options, key) => Object.hasOwn(options, key);
+
+function success(data) {
+  if (!jsonOutput) return false;
+  console.log(JSON.stringify({ ok: true, data }));
+  return true;
+}
+
+function fail(code, message, details = {}, textLines = [], textExitCode = 0) {
+  if (jsonOutput) {
+    console.log(JSON.stringify({ ok: false, error: { code, message, ...details } }));
+    process.exitCode = 1;
   } else {
-    console.error(`Error: ${res.error}`);
+    console.error(`Error: ${message}`);
+    for (const line of textLines) console.error(line);
+    process.exitCode = textExitCode;
+  }
+}
+
+function replyPair(channel, endpoint) {
+  return typeof channel === 'string' && channel.trim().length > 0
+    && typeof endpoint === 'string' && endpoint.trim().length > 0;
+}
+
+/**
+ * Report a task-ops {ok:false} result. `status` is the status filter of the
+ * lookup (pause: pending, resume: paused), for the "Pending task" wording.
+ */
+function failTask(res, taskId, status = null) {
+  const qualifier = status === 'pending' ? 'Pending ' : status === 'paused' ? 'Paused ' : '';
+  switch (res.error) {
+    case 'ambiguous': {
+      const matches = res.matches || [];
+      return fail('TASK_AMBIGUOUS', `Ambiguous task ID prefix '${taskId}' matches multiple${status ? ` ${status}` : ''} tasks:`,
+        { matches }, [...matches.map(id => `  - ${id}`), 'Please provide a more specific prefix.']);
+    }
+    case 'not_found':
+      if (status && res.status) return fail('TASK_WRONG_STATUS', `${qualifier}task not found: ${taskId}`, { status: res.status });
+      return fail('TASK_NOT_FOUND', `${status ? qualifier + 'task' : 'Task'} not found: ${taskId}`);
+    case 'invalid_field':
+      return fail('INVALID_ARGS', `Invalid update field: ${res.field}`);
+    case 'no_updates':
+      fail('NO_UPDATES', 'No updates provided');
+      if (!jsonOutput) console.log('Use --help to see available options');
+      return;
+    case 'retarget_forbidden':
+      return fail('RETARGET_FORBIDDEN', 'isolated instances cannot change a task\'s target instance');
+    case 'reschedule_not_future':
+      return fail('RESCHEDULE_NOT_FUTURE', 'A failed task must be rescheduled to a future time', {}, [], 1);
+    default:
+      return fail('INTERNAL_ERROR', String(res.error));
   }
 }
 
@@ -97,6 +142,15 @@ Update Options (same as Add, plus):
                           Legacy alias: --no-require-idle
   --clear-reply           Clear reply configuration
   --target-instance <id>  Set target instance (empty string clears it)
+
+Update timing:
+  --in / --at             Change only the next run of recurring/interval tasks;
+                          preserve cadence and saved timezone
+  --cron / --every        Replace the schedule and use the current timezone
+
+Write and History Options:
+  --json                  Single-line success/error envelope; errors exit 1
+  --limit <1-1000>        History maximum rows (default=20)
 
 Examples:
   ~/zylos/.claude/skills/scheduler/scripts/cli.js add "Say hello" --in "30 minutes"
@@ -200,8 +254,8 @@ async function cmdAdd(args, options) {
   const prompt = args.join(' ');
 
   if (!prompt) {
-    console.error('Error: Prompt is required');
-    console.log('Usage: cli.js add "<prompt>" [options]');
+    fail('INVALID_ARGS', 'Prompt is required');
+    if (!jsonOutput) console.log('Usage: cli.js add "<prompt>" [options]');
     return;
   }
 
@@ -212,7 +266,7 @@ async function cmdAdd(args, options) {
     type = 'one-time';
     const seconds = parseDuration(options.in);
     if (!seconds) {
-      console.error(`Error: Invalid duration "${options.in}"`);
+      fail('INVALID_ARGS', `Invalid duration "${options.in}"`);
       return;
     }
     nextRunAt = now() + seconds;
@@ -220,14 +274,14 @@ async function cmdAdd(args, options) {
     type = 'one-time';
     nextRunAt = parseTime(options.at);
     if (!nextRunAt) {
-      console.error(`Error: Could not parse time "${options.at}"`);
+      fail('INVALID_ARGS', `Could not parse time "${options.at}"`);
       return;
     }
   } else if (options.cron) {
     type = 'recurring';
     cronExpression = options.cron;
     if (!isValidCron(cronExpression)) {
-      console.error(`Error: Invalid cron expression "${cronExpression}"`);
+      fail('INVALID_ARGS', `Invalid cron expression "${cronExpression}"`);
       return;
     }
     nextRunAt = getNextRun(cronExpression);
@@ -235,19 +289,19 @@ async function cmdAdd(args, options) {
     type = 'interval';
     intervalSeconds = parseDuration(options.every);
     if (!intervalSeconds) {
-      console.error(`Error: Invalid interval "${options.every}"`);
+      fail('INVALID_ARGS', `Invalid interval "${options.every}"`);
       return;
     }
     nextRunAt = now() + intervalSeconds;
   } else {
-    console.error('Error: Must specify timing (--in, --at, --cron, or --every)');
-    console.log(HELP);
+    fail('INVALID_ARGS', 'Must specify timing (--in, --at, --cron, or --every)');
+    if (!jsonOutput) console.log(HELP);
     return;
   }
 
   const priority = options.priority ? parseInt(options.priority, 10) : 3;
   if (!Number.isInteger(priority) || priority < 1 || priority > 3) {
-    console.error('Error: Priority must be 1-3 (1=urgent, 2=high, 3=normal)');
+    fail('INVALID_ARGS', 'Priority must be 1-3 (1=urgent, 2=high, 3=normal)');
     return;
   }
 
@@ -257,13 +311,17 @@ async function cmdAdd(args, options) {
   // Parse reply-channel and reply-endpoint
   const replyChannel = options['reply-channel'] || null;
   const replyEndpoint = options['reply-endpoint'] || null;
+  if ((has(options, 'reply-channel') || has(options, 'reply-endpoint')) && !replyPair(replyChannel, replyEndpoint)) {
+    fail('INVALID_ARGS', '--reply-channel and --reply-endpoint must both be nonempty', {}, [], 1);
+    return;
+  }
 
   // Parse miss-threshold
   const missThreshold = options['miss-threshold']
     ? parseInt(options['miss-threshold'], 10)
     : 300;  // Default 5 minutes
   if (!Number.isInteger(missThreshold) || missThreshold < 0) {
-    console.error('Error: miss-threshold must be a positive integer');
+    fail('INVALID_ARGS', 'miss-threshold must be a positive integer');
     return;
   }
 
@@ -294,9 +352,10 @@ async function cmdAdd(args, options) {
   // (target is always forced to this instance — agents cannot schedule work
   // onto another instance).
   const res = await schedOp('add', { spec }, (db) => insertTask(db, spec));
-  if (!res.ok) return printTaskError(res, spec.id);
+  if (!res.ok) return failTask(res, spec.id);
   const taskId = res.task.id;
 
+  if (success({ task: res.task })) return;
   console.log(`\nTask created: ${taskId}`);
   console.log(`  Type: ${type}`);
   console.log(`  Priority: ${priority}`);
@@ -310,23 +369,25 @@ async function cmdAdd(args, options) {
 
 async function cmdRemove(taskId) {
   if (!taskId) {
-    console.error('Error: Task ID is required');
+    fail('INVALID_ARGS', 'Task ID is required');
     return;
   }
 
   const res = await schedOp('remove', { prefix: taskId }, (db) => removeTask(db, taskId));
-  if (!res.ok) return printTaskError(res, taskId);
+  if (!res.ok) return failTask(res, taskId);
+  if (success({ id: res.task.id })) return;
   console.log(`Removed task: ${res.task.id}`);
 }
 
 async function cmdDone(taskId) {
   if (!taskId) {
-    console.error('Error: Task ID is required');
+    fail('INVALID_ARGS', 'Task ID is required');
     return;
   }
 
   const res = await schedOp('done', { prefix: taskId }, (db) => completeTask(db, taskId));
-  if (!res.ok) return printTaskError(res, taskId);
+  if (!res.ok) return failTask(res, taskId);
+  if (success({ task: res.task })) return;
 
   console.log(`Completed task: ${res.task.id}`);
 
@@ -338,35 +399,48 @@ async function cmdDone(taskId) {
 
 async function cmdPause(taskId) {
   if (!taskId) {
-    console.error('Error: Task ID is required');
+    fail('INVALID_ARGS', 'Task ID is required');
     return;
   }
 
   const res = await schedOp('pause', { prefix: taskId }, (db) => pauseTask(db, taskId));
-  if (!res.ok) return printTaskError(res, taskId, 'pending task');
+  if (!res.ok) return failTask(res, taskId, 'pending');
+  if (success({ task: res.task })) return;
   console.log(`Paused task: ${res.task.id}`);
 }
 
 async function cmdResume(taskId) {
   if (!taskId) {
-    console.error('Error: Task ID is required');
+    fail('INVALID_ARGS', 'Task ID is required');
     return;
   }
 
   const res = await schedOp('resume', { prefix: taskId }, (db) => resumeTask(db, taskId));
-  if (!res.ok) return printTaskError(res, taskId, 'paused task');
+  if (!res.ok) return failTask(res, taskId, 'paused');
+  if (success({ task: res.task })) return;
   console.log(`Resumed task: ${res.task.id}`);
 }
 
-async function cmdHistory(taskId) {
-  const { entries: history, prefixMatches } = await schedOp(
-    'history', { prefix: taskId || null },
-    (db) => taskHistory(db, { prefix: taskId || null })
-  );
+async function cmdHistory(taskId, options = {}) {
+  const rawLimit = has(options, 'limit') ? options.limit : '20';
+  const limit = typeof rawLimit === 'string' && /^\d+$/.test(rawLimit) ? Number(rawLimit) : NaN;
+  if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+    fail('INVALID_ARGS', '--limit must be an integer between 1 and 1000');
+    process.exitCode = 1;
+    return;
+  }
 
-  if (taskId && prefixMatches.length > 1) {
-    console.log(`\n  ⚠ Warning: Prefix '${taskId}' matches ${prefixMatches.length} tasks:`);
-    prefixMatches.forEach(id => console.log(`    - ${id}`));
+  const { entries: history, prefixMatches } = await schedOp(
+    'history', { prefix: taskId || null, limit },
+    (db) => taskHistory(db, { prefix: taskId || null, limit })
+  );
+  const ambiguousPrefix = taskId && prefixMatches.length > 1 ? prefixMatches : [];
+
+  if (success({ rows: history.map(({ prompt, ...entry }) => entry), ambiguousPrefix })) return;
+
+  if (ambiguousPrefix.length) {
+    console.log(`\n  ⚠ Warning: Prefix '${taskId}' matches ${ambiguousPrefix.length} tasks:`);
+    ambiguousPrefix.forEach(id => console.log(`    - ${id}`));
     console.log();
   }
 
@@ -431,9 +505,15 @@ async function cmdRunning() {
 
 async function cmdUpdate(taskId, options) {
   if (!taskId) {
-    console.error('Error: Task ID is required');
+    fail('INVALID_ARGS', 'Task ID is required');
     return;
   }
+
+  // The update depends on the task's current type, status and reply address
+  // (next-run override, failed-task reschedule, merged reply validation).
+  const found = await schedOp('get', { prefix: taskId }, (db) => getTask(db, taskId));
+  if (!found.ok) return failTask(found, taskId);
+  const task = found.task;
 
   const updates = {};
   const updatedFields = [];
@@ -454,7 +534,7 @@ async function cmdUpdate(taskId, options) {
   if (options.priority) {
     const priority = parseInt(options.priority, 10);
     if (!Number.isInteger(priority) || priority < 1 || priority > 3) {
-      console.error('Error: Priority must be 1-3');
+      fail('INVALID_ARGS', 'Priority must be 1-3');
       return;
     }
     updates.priority = priority;
@@ -470,20 +550,20 @@ async function cmdUpdate(taskId, options) {
     updatedFields.push('require_idle');
   }
 
-  // Update reply configuration
+  // Validate the merged reply address before writing any task fields.
   if (options['clear-reply']) {
     updates.reply_channel = null;
     updates.reply_endpoint = null;
     updatedFields.push('reply_channel', 'reply_endpoint');
-  } else {
-    if (options['reply-channel']) {
-      updates.reply_channel = options['reply-channel'];
-      updatedFields.push('reply_channel');
+  } else if (has(options, 'reply-channel') || has(options, 'reply-endpoint')) {
+    const channel = has(options, 'reply-channel') ? options['reply-channel'] : task.reply_channel;
+    const endpoint = has(options, 'reply-endpoint') ? options['reply-endpoint'] : task.reply_endpoint;
+    if (!replyPair(channel, endpoint)) {
+      fail('INVALID_ARGS', '--reply-channel and --reply-endpoint must both be nonempty', {}, [], 1);
+      return;
     }
-    if (options['reply-endpoint']) {
-      updates.reply_endpoint = options['reply-endpoint'];
-      updatedFields.push('reply_endpoint');
-    }
+    if (has(options, 'reply-channel')) { updates.reply_channel = channel; updatedFields.push('reply_channel'); }
+    if (has(options, 'reply-endpoint')) { updates.reply_endpoint = endpoint; updatedFields.push('reply_endpoint'); }
   }
 
   // Update target_instance (empty string clears it)
@@ -497,7 +577,7 @@ async function cmdUpdate(taskId, options) {
   if (options['miss-threshold']) {
     const threshold = parseInt(options['miss-threshold'], 10);
     if (!Number.isInteger(threshold) || threshold < 0) {
-      console.error('Error: miss-threshold must be a positive integer');
+      fail('INVALID_ARGS', 'miss-threshold must be a positive integer');
       return;
     }
     updates.miss_threshold = threshold;
@@ -506,32 +586,37 @@ async function cmdUpdate(taskId, options) {
 
   // Update schedule (type and next_run_at)
   let scheduleUpdated = false;
+  const nextRunOnly = ['recurring', 'interval'].includes(task.type) && Boolean(options.in || options.at);
   if (options.in) {
     const seconds = parseDuration(options.in);
     if (!seconds) {
-      console.error(`Error: Invalid duration "${options.in}"`);
+      fail('INVALID_ARGS', `Invalid duration "${options.in}"`);
       return;
     }
-    updates.type = 'one-time';
-    updates.cron_expression = null;
-    updates.interval_seconds = null;
+    if (!nextRunOnly) {
+      updates.type = 'one-time';
+      updates.cron_expression = null;
+      updates.interval_seconds = null;
+    }
     updates.next_run_at = now() + seconds;
     scheduleUpdated = true;
   } else if (options.at) {
     const nextRunAt = parseTime(options.at);
     if (!nextRunAt) {
-      console.error(`Error: Could not parse time "${options.at}"`);
+      fail('INVALID_ARGS', `Could not parse time "${options.at}"`);
       return;
     }
-    updates.type = 'one-time';
-    updates.cron_expression = null;
-    updates.interval_seconds = null;
+    if (!nextRunOnly) {
+      updates.type = 'one-time';
+      updates.cron_expression = null;
+      updates.interval_seconds = null;
+    }
     updates.next_run_at = nextRunAt;
     scheduleUpdated = true;
   } else if (options.cron) {
     const cronExpression = options.cron;
     if (!isValidCron(cronExpression)) {
-      console.error(`Error: Invalid cron expression "${cronExpression}"`);
+      fail('INVALID_ARGS', `Invalid cron expression "${cronExpression}"`);
       return;
     }
     updates.type = 'recurring';
@@ -542,7 +627,7 @@ async function cmdUpdate(taskId, options) {
   } else if (options.every) {
     const intervalSeconds = parseDuration(options.every);
     if (!intervalSeconds) {
-      console.error(`Error: Invalid interval "${options.every}"`);
+      fail('INVALID_ARGS', `Invalid interval "${options.every}"`);
       return;
     }
     updates.type = 'interval';
@@ -552,25 +637,43 @@ async function cmdUpdate(taskId, options) {
     scheduleUpdated = true;
   }
 
+  // A rescheduled failed one-time task becomes pending again (task-ops sets
+  // the status and clears its failure details; status is never an update field).
+  let reenableFailed = false;
   if (scheduleUpdated) {
-    updates.timezone = getDefaultTimezone();
-    updatedFields.push('type', 'schedule');
+    if (!nextRunOnly) updates.timezone = getDefaultTimezone();
+    updatedFields.push(...(nextRunOnly ? ['next_run_at'] : ['type', 'schedule']));
+    if (task.type === 'one-time' && task.status === 'failed') {
+      if (updates.next_run_at <= now()) {
+        fail('RESCHEDULE_NOT_FUTURE', 'A failed task must be rescheduled to a future time', {}, [], 1);
+        return;
+      }
+      reenableFailed = true;
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    fail('NO_UPDATES', 'No updates provided');
+    if (!jsonOutput) console.log('Use --help to see available options');
+    return;
   }
 
   // Column whitelist + empty-updates validation live in applyTaskUpdates;
   // the broker additionally rejects target_instance changes (retargeting a
   // task would be a cross-instance message primitive).
   const res = await schedOp(
-    'update', { prefix: taskId, updates },
-    (db) => applyTaskUpdates(db, taskId, updates)
+    'update', { prefix: task.id, updates, reenableFailed },
+    (db) => applyTaskUpdates(db, task.id, updates, { reenableFailed })
   );
-  if (!res.ok) return printTaskError(res, taskId);
+  if (!res.ok) return failTask(res, taskId);
+  if (success({ task: res.task, ...(nextRunOnly ? { nextRunOnly: true } : {}) })) return;
 
   console.log(`\nTask updated: ${res.task.id}`);
   console.log(`  Updated fields: ${updatedFields.join(', ')}`);
 
   if (scheduleUpdated) {
-    console.log(`  Type: ${updates.type}`);
+    console.log(`  Type: ${updates.type || task.type}`);
+    if (nextRunOnly) console.log('  Only the next run changed; recurring schedule and timezone unchanged');
     console.log(`  Next run: ${formatTime(updates.next_run_at)} (${getRelativeTime(updates.next_run_at)})`);
   }
   console.log();
@@ -579,15 +682,30 @@ async function cmdUpdate(taskId, options) {
 // ===== Main =====
 
 async function main() {
+  const { command, args, options } = parseArgs(process.argv.slice(2));
+  const jsonCommands = ['add', 'update', 'done', 'complete', 'remove', 'rm', 'delete', 'pause', 'resume', 'history'];
+  jsonOutput = jsonCommands.includes(command) && process.argv.slice(2).includes('--json');
+
   try {
     process.env.TZ = loadTimezone();
   } catch (error) {
     const code = error.code || 'UNKNOWN_TZ_ERROR';
-    console.error(`Error [${code}]: ${error.message}`);
-    process.exit(1);
+    if (jsonOutput) fail(code, error.message);
+    else console.error(`Error [${code}]: ${error.message}`);
+    process.exitCode = 1;
+    return;
   }
 
-  const { command, args, options } = parseArgs(process.argv.slice(2));
+  if (jsonOutput) {
+    for (const [key, value] of Object.entries(options)) {
+      // `--target-instance ""` clears the target (multi-session).
+      if (key === 'target-instance' && value === '') continue;
+      if (value === undefined || value === '') {
+        fail('INVALID_ARGS', `Invalid or missing option: --${key}`);
+        return;
+      }
+    }
+  }
 
   switch (command) {
     case 'list':
@@ -615,7 +733,7 @@ async function main() {
       await cmdResume(args[0]);
       break;
     case 'history':
-      await cmdHistory(args[0]);
+      await cmdHistory(args[0], options);
       break;
     case 'next':
       await cmdNext();
@@ -629,16 +747,21 @@ async function main() {
       console.log(HELP);
       break;
     default:
-      if (command) {
-        console.error(`Unknown command: ${command}`);
+      if (jsonOutput) fail('INVALID_ARGS', command ? `Unknown command: ${command}` : 'Command is required');
+      else {
+        if (command) console.error(`Unknown command: ${command}`);
+        console.log(HELP);
       }
-      console.log(HELP);
   }
 }
 
 main().catch((err) => {
   // Broker/transport failures land here — fail loud, never fall back to a
   // direct DB path an isolated agent isn't allowed to touch.
+  if (jsonOutput) {
+    fail(err.code === 'DB_WRITE_FAILED' ? err.code : 'INTERNAL_ERROR', err.message);
+    return;
+  }
   console.error(`Error: ${err.message}`);
   process.exit(1);
 });
