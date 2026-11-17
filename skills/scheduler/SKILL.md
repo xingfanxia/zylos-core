@@ -14,6 +14,7 @@ Enables Claude to work autonomously by dispatching scheduled tasks via C4 comm-b
 3. If runtime is alive, dispatches task to C4 comm-bridge
 4. C4 handles execution control (idle waiting, priority queueing)
 5. Task sent to Claude based on priority and idle requirements
+6. Exception: the operator's internal jobs (`instance-dream-<id>`, `shared-memory-dream`, `daily-product-sweep`) are skipped without a model turn when they have nothing new to read, and recorded in `history` as a completed run with duration 0 and error `skipped: <reason>` (`scripts/precheck.js`). Every other task, including anything a user asked for, runs as scheduled.
 
 ## CLI
 

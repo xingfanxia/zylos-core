@@ -9,7 +9,10 @@ import { getNextRun } from './cron-utils.js';
 import { sendViaC4, readStatusFile } from './runtime.js';
 import { formatTime } from './time-utils.js';
 import { loadTimezone } from './tz.js';
-import { updateNextRunTime as _updateNextRunTime, processCompletedTasks as _processCompletedTasks, handleStaleRunningTasks as _handleStaleRunningTasks, TASK_TIMEOUT } from './daemon-tasks.js';
+import { updateNextRunTime as _updateNextRunTime, processCompletedTasks as _processCompletedTasks, handleStaleRunningTasks as _handleStaleRunningTasks, recordSkippedRun, TASK_TIMEOUT } from './daemon-tasks.js';
+import { skipReason, lastSuccessAt, countInbound, changedSince } from './precheck.js';
+import path from 'node:path';
+import os from 'node:os';
 
 const CHECK_INTERVAL = 5000;  // 5 seconds
 const CLEANUP_INTERVAL = 3600000;  // 1 hour
@@ -51,10 +54,50 @@ function isRuntimeAlive() {
   return status.state === 'busy' || status.state === 'idle';
 }
 
+const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
+const C4_DB_PATH = path.join(ZYLOS_DIR, 'comm-bridge', 'c4.db');
+
+async function loadInstances() {
+  try {
+    const { getAllInstances } = await import('../../multi-session/instance-config.js');
+    return getAllInstances();
+  } catch {
+    return []; // single-session mode
+  }
+}
+
+/**
+ * An internal job with nothing new to read (precheck.js) moves to its next run
+ * without a model turn (recordSkippedRun).
+ * @returns {Promise<boolean>} true if the task was skipped
+ */
+async function skipIfNothingNew(task) {
+  let reason = null;
+  try {
+    reason = skipReason(task, {
+      lastSuccessAt: (taskId) => lastSuccessAt(db, taskId),
+      countInbound: (ids, since) => countInbound(C4_DB_PATH, ids, since),
+      changedSince,
+      instances: await loadInstances(),
+      memoryDir: path.join(ZYLOS_DIR, 'memory'),
+      now: now(),
+    });
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Pre-check failed for ${task.id}, running it: ${error.message}`);
+  }
+  if (!reason) return false;
+
+  recordSkippedRun(db, task, reason);
+  console.log(`[${new Date().toISOString()}] Skipped task ${task.id} (${task.name}): ${reason}`);
+  return true;
+}
+
 /**
  * Dispatch a task to Claude via C4 comm-bridge
  */
 async function dispatchTask(task) {
+  if (await skipIfNothingNew(task)) return true;
+
   console.log(`[${new Date().toISOString()}] Dispatching task: ${task.id} (${task.name})`);
 
   // Atomically claim the task (only if still pending)

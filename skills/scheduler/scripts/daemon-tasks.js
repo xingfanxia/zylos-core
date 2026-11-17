@@ -33,6 +33,21 @@ export function updateNextRunTime(db, task) {
 }
 
 /**
+ * Record a run the pre-check skipped (precheck.js): a completed history entry
+ * with duration 0 and error "skipped: <reason>" (task_history allows no
+ * 'skipped' status), then the task's next run. A completed entry is also the
+ * pre-check's next baseline, which is right: nothing changed up to now.
+ */
+export function recordSkippedRun(db, task, reason) {
+  const currentTime = now();
+  db.prepare(`
+    INSERT INTO task_history (task_id, executed_at, completed_at, status, duration_ms, error)
+    VALUES (?, ?, ?, 'success', 0, ?)
+  `).run(task.id, currentTime, currentTime, `skipped: ${reason}`);
+  updateNextRunTime(db, task);
+}
+
+/**
  * Handle completed tasks - update recurring ones, finalize one-time
  */
 export function processCompletedTasks(db) {
