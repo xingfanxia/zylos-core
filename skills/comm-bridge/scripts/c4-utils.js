@@ -1,12 +1,15 @@
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import {
   FILE_SIZE_THRESHOLD,
   PASTE_CHAR_THRESHOLD,
+  DATA_DIR,
   ATTACHMENTS_DIR,
   CONTENT_PREVIEW_CHARS
 } from './c4-config.js';
+import { assertOwnedEntry, assertServiceDir, recipientUser, setFinalAccess } from './c4-recipient-access.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,7 +33,48 @@ export function sanitizeMessage(message) {
   return message.replace(/[\x00-\x08\x0B-\x1F]/g, '');
 }
 
-export function truncateForDelivery(content, replyViaSuffix = '', convId) {
+/**
+ * Write a spill: `<ATTACHMENTS_DIR>/<msgId>/message.txt`, readable by the
+ * service user and `user` only (c4-recipient-access.js). The directory goes to
+ * its final access first; the text goes to a fresh 0600 temp file that gets
+ * the same final access and then replaces message.txt by rename. So the path
+ * never exists with partial content, and a reader who already had it is
+ * never revoked while it is re-rendered.
+ * @returns {string} the message.txt path
+ * @throws on an unsafe parent or entry, or a recipient grant that fails
+ */
+function writeSpill(msgId, text, user) {
+  if (!fs.existsSync(ATTACHMENTS_DIR)) fs.mkdirSync(ATTACHMENTS_DIR, { recursive: true, mode: 0o750 });
+  assertServiceDir(DATA_DIR);
+  assertServiceDir(ATTACHMENTS_DIR);
+  const messageDir = path.join(ATTACHMENTS_DIR, msgId);
+  try {
+    fs.mkdirSync(messageDir, { mode: 0o700 });
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+  assertOwnedEntry(messageDir, 'dir');
+  setFinalAccess(messageDir, true, user);
+  const filePath = path.join(messageDir, 'message.txt');
+  const tmpPath = path.join(messageDir, `.message.txt.${process.pid}.${crypto.randomBytes(6).toString('hex')}`);
+  const { O_WRONLY, O_CREAT, O_EXCL, O_NOFOLLOW } = fs.constants;
+  const fd = fs.openSync(tmpPath, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600);
+  try {
+    try { fs.writeFileSync(fd, text, 'utf8'); } finally { fs.closeSync(fd); }
+    setFinalAccess(tmpPath, false, user);
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch { /* already renamed or gone */ }
+    throw err;
+  }
+  return filePath;
+}
+
+// recipientInstance is the row's stored target_instance: the spill is readable
+// by the service user and that instance's os_user only. An unknown instance or
+// a failed grant throws, so the caller keeps the row recoverable instead of
+// handing out a path nobody can open.
+export function truncateForDelivery(content, replyViaSuffix = '', convId, recipientInstance = null) {
   const fullMessage = content + replyViaSuffix;
   const byteLength = Buffer.byteLength(fullMessage, 'utf8');
   // Measure what actually reaches the input box (the dispatcher sanitizes
@@ -47,10 +91,7 @@ export function truncateForDelivery(content, replyViaSuffix = '', convId) {
   const msgId = (convId !== undefined && convId !== null)
     ? `conv-${convId}`
     : `${Date.now()}-${process.pid}-${spillSeq++}`;
-  const messageDir = path.join(ATTACHMENTS_DIR, msgId);
-  fs.mkdirSync(messageDir, { recursive: true });
-  const filePath = path.join(messageDir, 'message.txt');
-  fs.writeFileSync(filePath, fullMessage, 'utf8');
+  const filePath = writeSpill(msgId, fullMessage, recipientUser(recipientInstance));
 
   const preview = content.substring(0, CONTENT_PREVIEW_CHARS);
   const ellipsis = preview.length < content.length ? '...' : '';

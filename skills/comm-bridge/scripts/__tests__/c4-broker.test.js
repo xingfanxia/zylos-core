@@ -370,6 +370,27 @@ describe('broker handleRequest', () => {
     assert.equal(typeof s.data.context, 'string');
   });
 
+  it('session-init fails explicitly when a spill cannot be handed to its caller, never a preview with an unreadable path', async () => {
+    const { insertConversation } = await import('../c4-db.js');
+    const { FILE_SIZE_THRESHOLD } = await import('../c4-config.js');
+    const long = 'L'.repeat(FILE_SIZE_THRESHOLD + 100);
+    // inst-b's os_user (fake-b) does not exist, so its grant fails on any host.
+    const row = insertConversation('in', 'telegram', 'chat-b-1', long, 'delivered', 3, false, null, 'inst-b');
+    await assert.rejects(
+      broker.handleRequest({ op: 'session-init' }, 'inst-b'),
+      /recipient_acl_failed: fake-b/,
+    );
+    const dir = path.join(tmpDir, 'comm-bridge', 'attachments', `conv-${row.id}`);
+    assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir) : [], [], 'no message file and no temp file');
+    // The caller's own spill (os_user = this runner) is owner-only and delivered.
+    const own = insertConversation('in', 'telegram', 'chat-self', long, 'delivered', 3, false, null, 'inst-self');
+    const res = await broker.handleRequest({ op: 'session-init' }, 'inst-self');
+    assert.equal(res.ok, true, res.error);
+    const file = path.join(tmpDir, 'comm-bridge', 'attachments', `conv-${own.id}`, 'message.txt');
+    assert.ok(res.data.context.includes(file));
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  });
+
   it('startup shard requests keep checkpoint and conversation scope on the authenticated caller', async () => {
     const { insertConversation } = await import('../c4-db.js');
     for (const [caller, marker] of [['shard-a', 'SHARD_A'], ['shard-b', 'SHARD_B_PRIVATE']]) {

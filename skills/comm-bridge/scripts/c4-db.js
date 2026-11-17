@@ -1021,7 +1021,7 @@ export function formatConversationsForAgent(conversations, { spill = true } = {}
     ) ? buildReplyViaSuffix(conv.channel, conv.endpoint_id) : '';
     lines.push(`[${conv.timestamp}] ${dir} (${conv.channel}${endpoint}):`);
     lines.push(spill
-      ? truncateForDelivery(content, replyViaSuffix, conv.id)
+      ? truncateForDelivery(content, replyViaSuffix, conv.id, conv.target_instance)
       : content + replyViaSuffix);
     lines.push('');
   }

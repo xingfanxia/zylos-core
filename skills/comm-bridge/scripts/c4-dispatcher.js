@@ -815,7 +815,7 @@ export function getDeliveryContent(item) {
       item.endpoint_id &&
       !hasLegacyReplyViaSuffix(rawContent)
     ) ? buildReplyViaSuffix(item.channel, item.endpoint_id) : '';
-    return truncateForDelivery(rawContent, replyViaSuffix, item.id);
+    return truncateForDelivery(rawContent, replyViaSuffix, item.id, item.target_instance);
   }
 
   const isSlashCommand = rawContent.startsWith('/');
@@ -848,6 +848,25 @@ async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_
   requeueConversation(msg.id);
   log(`Channel unhealthy; backing off for ${RETRY_BASE_MS}ms`);
   await sleep(RETRY_BASE_MS);
+}
+
+/**
+ * A row whose delivery content could not be built is never pasted. Today that
+ * is a long conversation whose spill could not be written or handed to its
+ * recipient (c4-recipient-access.js). Each attempt is recorded in
+ * delivery-failures.log with its id and reason; the row then takes the normal
+ * bounded retry and ends `failed`, so the maintainer can repair the cause and
+ * requeue exactly these ids.
+ */
+async function handleContentFailure(item, err, statusFile = AGENT_STATUS_FILE) {
+  const detail = String(err?.message || err).split(' on ')[0].replace(/\s+/g, '_').slice(0, 160);
+  log(`Delivery content unavailable for ${item.type} id=${item.id}: ${err?.message || err}`);
+  logDeliveryFailure(item.type, item.id, 'CONTENT_ERROR', { detail });
+  if (item.type === 'control') {
+    await handleControlDeliveryFailure(item, `CONTENT_ERROR: ${detail}`);
+  } else {
+    await handleConversationDeliveryFailure(item, statusFile);
+  }
 }
 
 async function handleControlDeliveryFailure(control, reason) {
@@ -989,7 +1008,7 @@ async function processNextMessage() {
       const result = await multi.processWithMultiSession({
         getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
         releaseItem, isBypassState, shouldAutoAckHeartbeat,
-        handleConversationDeliveryFailure, handleControlDeliveryFailure,
+        handleConversationDeliveryFailure, handleControlDeliveryFailure, handleContentFailure,
         waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
         markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
         sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
@@ -1105,8 +1124,14 @@ async function processNextMessage() {
     }
   }
 
+  let deliveryContent;
+  try {
+    deliveryContent = getDeliveryContent(item);
+  } catch (err) {
+    await handleContentFailure(item, err);
+    return { delivered: false, state: agentState.state };
+  }
   log(`Delivering ${item.type} id=${item.id}${item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`}`);
-  const deliveryContent = getDeliveryContent(item);
   let result;
   deliveryTrace = { itemId: item.id, itemType: item.type };
   try {
@@ -1340,7 +1365,7 @@ async function main() {
 
 export {
   getAgentState, isAgentStatusFresh, sendToTmux, claimNextItem,
-  releaseItem, handleConversationDeliveryFailure, handleControlDeliveryFailure,
+  releaseItem, handleConversationDeliveryFailure, handleControlDeliveryFailure, handleContentFailure,
   waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
   markDelivered, ackControl, log, sleep, nowSeconds,
 };

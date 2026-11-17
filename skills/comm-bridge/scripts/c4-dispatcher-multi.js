@@ -356,6 +356,8 @@ export function multiSessionDispatch(item, helpers) {
  * @param {(opts: object) => boolean} helpers.shouldAutoAckHeartbeat
  * @param {(msg: object, statusFile?: string) => Promise<void>} helpers.handleConversationDeliveryFailure
  * @param {(control: object, reason: string) => Promise<void>} helpers.handleControlDeliveryFailure
+ * @param {(item: object, err: Error, statusFile?: string) => Promise<void>} helpers.handleContentFailure
+ *   row whose delivery content could not be built: never pasted, bounded retry, then failed
  * @param {(msgId: number, statusFile?: string) => Promise<void>} helpers.waitForRequireIdleSettlement
  * @param {(id: number) => void} helpers.markDelivered
  * @param {(id: number) => void} helpers.ackControl
@@ -387,6 +389,7 @@ export async function processWithMultiSession(helpers) {
     shouldAutoAckHeartbeat,
     handleConversationDeliveryFailure,
     handleControlDeliveryFailure,
+    handleContentFailure,
     waitForRequireIdleSettlement,
     markDelivered,
     ackControl,
@@ -612,17 +615,26 @@ export async function processWithMultiSession(helpers) {
         }
       }
 
+      // Clean-store model (#618): stored conversation rows carry no reply-via —
+      // reconstruct it here (and the "Meanwhile, " prefix for non-slash controls),
+      // same as the single-session path. Built BEFORE the "Delivering" line, so
+      // a row whose content could not be built (e.g. its spill could not be
+      // handed to its recipient) has no "Delivering" line: it was never pasted.
+      let deliveryContent;
+      try {
+        deliveryContent = getDeliveryContent(item);
+      } catch (err) {
+        await handleContentFailure(item, err, statusFile);
+        inFlight = null; // the failure handler owns the row (requeued or failed)
+        return summarize({ delivered: false, state: claudeState.state });
+      }
+
       // Actual tmux delivery.
       log(
         `Delivering ${item.type} id=${item.id}` +
         (item.type === 'control' ? ` priority=${item.priority}` : ` from ${item.channel}`) +
         (targetInstance ? ` -> ${targetInstance}` : '')
       );
-
-      // Clean-store model (#618): stored conversation rows carry no reply-via —
-      // reconstruct it here (and the "Meanwhile, " prefix for non-slash controls),
-      // same as the single-session path.
-      const deliveryContent = getDeliveryContent(item);
       const result = await sendToTmux(deliveryContent, {
         deliveryId: `${item.type}:${item.id}`,
         session,

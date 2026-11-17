@@ -199,6 +199,38 @@ describe('processWithMultiSession — per-instance delivery notify', () => {
     assert.equal(notifyCalls.length, 0);
   });
 
+  it('a conversation whose content cannot be built is never pasted and goes to the content-failure path', async () => {
+    const notifyCalls = [];
+    const pastes = [];
+    const delivered = [];
+    const contentFailures = [];
+    const released = [];
+    const logs = [];
+    const item = {
+      id: 44, type: 'conversation', channel: 'feishu',
+      target_instance: 'user-betty', content: 'long', endpoint_id: 'oc_A|type:p2p',
+    };
+    const res = await disp.processWithMultiSession(baseHelpers({
+      item, notifyCalls,
+      overrides: {
+        getDeliveryContent: () => { throw new Error('recipient_acl_failed: zylos-betty on /x/conv-44: EPERM'); },
+        sendToTmux: async (content) => { pastes.push(content); return 'submitted'; },
+        markDelivered: (id) => delivered.push(id),
+        handleContentFailure: async (msg, err) => { contentFailures.push([msg.id, err.message]); },
+        releaseItem: (i) => released.push(i.id),
+        log: (m) => logs.push(m),
+      },
+    }));
+    assert.equal(res.delivered, false);
+    assert.deepEqual(pastes, [], 'nothing pasted');
+    assert.deepEqual(delivered, [], 'not marked delivered');
+    assert.deepEqual(contentFailures, [[44, 'recipient_acl_failed: zylos-betty on /x/conv-44: EPERM']]);
+    assert.deepEqual(released, [], 'the failure path owns the row; the finally does not requeue it as well');
+    assert.equal(logs.filter((l) => /^Delivering conversation id=44\b/.test(l)).length, 0,
+      'no "Delivering" line: the log shows the row was never pasted');
+    assert.equal(notifyCalls.length, 0);
+  });
+
   it('delivers [KEYSTROKE] controls as raw keys to the per-instance session, never pasted text', async () => {
     const notifyCalls = [];
     const keystrokes = [];

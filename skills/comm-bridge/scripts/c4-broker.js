@@ -226,7 +226,13 @@ function handleConnection(conn, instanceId) {
       Promise.resolve()
         .then(() => handleRequest(req, instanceId))
         .then((r) => writeRes(conn, { id: reqId, ...r }, req.op === 'session-init' && req.params?.section != null ? SESSION_INIT_TRANSPORT_MAX_BYTES : null))
-        .catch((err) => writeRes(conn, { id: reqId, ok: false, error: String(err?.message || err) }));
+        .catch((err) => {
+          // A thrown op is unexpected (domain outcomes are returned as data), e.g.
+          // a session-init shard whose spill could not be handed to this caller:
+          // keep the caller and the reason in the service log for the maintainer.
+          log(`op ${req?.op ?? '(none)'} failed for ${instanceId}: ${String(err?.message || err)}`);
+          writeRes(conn, { id: reqId, ok: false, error: String(err?.message || err) });
+        });
     }
   });
   conn.on('error', () => { /* client vanished — nothing to clean up */ });
