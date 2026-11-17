@@ -2,58 +2,76 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-const MAX_ERROR_LENGTH = 500;
+const MAX_SUMMARY_LENGTH = 500;
+const KEEP_RECORDS = 30;
+const RECORD_NAME = /^\d{4}-\d{2}-\d{2}\.json$/;
 
 /**
- * Daily memory commit: runs zylos-memory's daily-commit.js and keeps the task's
- * state file. A failed run is recorded for the day as well (last_status
- * 'failed' with last_error), so it is not retried on every tick for the rest
- * of the hour; the next attempt is the next day.
+ * Daily commit of the shared memory repository. Every instance's monitor has
+ * this task, and one of them does the work: whichever reaches the hour first
+ * creates that day's record `<recordDir>/<date>.json` (exclusive create), runs
+ * zylos-memory's daily-commit.js and writes the outcome into the record. The
+ * others find the record and neither run nor log anything. One try a day, also
+ * when it fails: what makes a commit fail does not go away within the hour.
+ * The last 30 records are kept.
  */
-export function createDailyMemoryCommit({ stateFile, script, log }) {
-  let lastError = null;
+export function createDailyMemoryCommit({ recordDir, script, instanceId, getLocalDate, log }) {
+  let attemptedDate = null;
+  const recordFile = date => path.join(recordDir, `${date}.json`);
 
   function loadState() {
-    try {
-      if (!fs.existsSync(stateFile)) return null;
-      return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-    } catch { }
+    const today = getLocalDate();
+    if (attemptedDate === today || fs.existsSync(recordFile(today))) return { last_date: today };
     return null;
   }
 
-  function writeState(date, ok = true) {
-    try {
-      fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-      fs.writeFileSync(stateFile, JSON.stringify({
-        last_date: date,
-        last_status: ok ? 'ok' : 'failed',
-        ...(ok ? {} : { last_error: lastError }),
-        updated_at: new Date().toISOString()
-      }, null, 2));
-    } catch (err) {
-      log(`Daily memory commit: failed to write state (${err.message})`);
-    }
+  function prune() {
+    const old = fs.readdirSync(recordDir).filter(name => RECORD_NAME.test(name)).sort().slice(0, -KEEP_RECORDS);
+    for (const name of old) fs.rmSync(path.join(recordDir, name), { force: true });
   }
 
+  /** @returns {boolean|null} null when another monitor owns today's commit. */
   function execute() {
-    lastError = null;
+    const date = getLocalDate();
+    attemptedDate = date;
+    const file = recordFile(date);
+    const record = { date, instance: instanceId ?? null, status: 'running', started_at: new Date().toISOString() };
     try {
-      const output = execFileSync('node', [script], {
+      fs.mkdirSync(recordDir, { recursive: true });
+      fs.writeFileSync(file, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx' });
+    } catch (err) {
+      if (err.code === 'EEXIST') return null;
+      log(`Daily memory commit: cannot create ${file} (${err.message}), next attempt tomorrow`);
+      return false;
+    }
+
+    let ok = true;
+    let summary;
+    try {
+      summary = execFileSync('node', [script], {
         encoding: 'utf8',
         timeout: 30000,
         stdio: ['ignore', 'pipe', 'pipe']
-      });
-      if (output.trim()) {
-        log(`Daily memory commit: ${output.trim()}`);
-      }
-      return true;
+      }).trim();
     } catch (err) {
-      const detail = err?.stderr?.toString?.().trim() || err.message;
-      lastError = detail.length > MAX_ERROR_LENGTH ? `${detail.slice(0, MAX_ERROR_LENGTH)}…` : detail;
-      log(`Daily memory commit failed: ${detail}`);
-      return false;
+      ok = false;
+      summary = err?.stderr?.toString?.().trim() || err.message;
     }
+    log(ok ? `Daily memory commit: ${summary}` : `Daily memory commit failed: ${summary}`);
+
+    try {
+      fs.writeFileSync(file, `${JSON.stringify({
+        ...record,
+        status: ok ? 'ok' : 'failed',
+        summary: summary.length > MAX_SUMMARY_LENGTH ? `${summary.slice(0, MAX_SUMMARY_LENGTH)}…` : summary,
+        finished_at: new Date().toISOString()
+      }, null, 2)}\n`);
+      prune();
+    } catch (err) {
+      log(`Daily memory commit: failed to write ${file} (${err.message})`);
+    }
+    return ok;
   }
 
-  return { loadState, writeState, execute };
+  return { loadState, execute };
 }

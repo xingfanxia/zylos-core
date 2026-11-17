@@ -176,11 +176,12 @@ const files = new Map([
     last_check_human: new Date(now * 1000).toISOString().replace('T', ' ').substring(0, 19)
   }],
   ['daily-upgrade-state.json', { last_date: today, updated_at: new Date().toISOString() }],
-  ['daily-memory-commit-state.json', { last_date: today, updated_at: new Date().toISOString() }],
+  [`daily-memory-commit/${today}.json`, { date: today, status: 'ok' }],
   ['upgrade-check-state.json', { last_date: today, updated_at: new Date().toISOString() }]
 ]);
 
 for (const [name, payload] of files.entries()) {
+  fs.mkdirSync(path.dirname(path.join(monitorDir, name)), { recursive: true });
   fs.writeFileSync(path.join(monitorDir, name), `${JSON.stringify(payload, null, 2)}\n`);
 }
 EOF

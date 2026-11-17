@@ -25,7 +25,6 @@ function createScheduler({ primary, healthCheckEnabled = true }) {
     writeDailyUpgradeState: () => {},
     enqueueDailyUpgradeControl: () => true,
     loadMemoryCommitState: () => null,
-    writeMemoryCommitState: () => {},
     executeDailyMemoryCommit: () => true,
     loadUpgradeCheckState: () => null,
     writeUpgradeCheckState: () => {},

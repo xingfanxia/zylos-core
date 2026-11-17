@@ -167,11 +167,12 @@ The activity monitor runs a daily git commit of the `memory/` directory.
 
 - **Schedule**: 3:00 AM local time
 - **Timezone**: Same as daily upgrade (from `~/zylos/.env` TZ)
-- **Persisted state**: `~/zylos/activity-monitor/daily-memory-commit-state.json`
+- **One owner**: every instance's monitor has the task; the first to reach the hour creates that day's record `~/zylos/activity-monitor/daily-memory-commit/<date>.json` (exclusive create) and commits. The others find the record and do nothing, so the commit runs once a day while any monitor is up
+- **Record**: `status` (`running`, then `ok` or `failed`), the instance that ran it, and `summary` (the script's output, first 500 characters). The last 30 days are kept
 - **Script**: Calls `zylos-memory/scripts/daily-commit.js` directly (no C4, no Claude needed)
-- **Once per day, also when it fails**: Date-based deduplication. A failed run is recorded for the day (`last_status: "failed"`, `last_error` truncated) and the next attempt is the next day, not the next tick
+- **Once per day, also when it fails**: the next attempt is the next day
 - **Idempotent**: If no memory changes exist, the script skips the commit
-- **Large files**: Files over 50 MB are left out of the commit (untracked ones stay untracked, later changes to tracked ones are not committed) and listed in the activity monitor log
+- **Left out and listed**: files over 50 MB (untracked ones stay untracked, later changes to tracked ones are not committed), and files or directories the monitor's user cannot read; the rest is committed (`Committed <sha> with N skipped.`)
 
 ## Timing Guarantees
 
@@ -207,6 +208,6 @@ Config key: `auto_approve_permission` in `~/.zylos/config.json` (default: `true`
 
 ## Log File
 
-Activity log: `~/zylos/activity-monitor/activity.log`
-- Auto-truncates to 500 lines daily
+Activity log: `activity.log` in the instance's state directory (`~/zylos/activity-monitor/<instance>/`)
+- Rotated daily (UTC) to `activity.log.<date>`; 30 days are kept, at most 20 MB of rotated logs per instance
 - Logs state changes and guardian actions
