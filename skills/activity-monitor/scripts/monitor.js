@@ -160,7 +160,7 @@ import { rotateDailyLog } from './log-rotation.js';
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
-import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures } from '../../comm-bridge/scripts/c4-db.js';
+import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
@@ -1118,8 +1118,8 @@ function createTaskScheduler(activeUsageMonitor) {
     usageFleetAlertInterval: USAGE_FLEET_ALERT_INTERVAL,
     // Same direct admin send as the degraded and start-held alerts.
     contentErrorAlert: createContentErrorAlert({
-      monitorDir: MONITOR_DIR,
-      list: afterId => getContentErrorFailures(afterId, 20),
+      list: () => getContentErrorFailures(20),
+      markNotified: id => markContentErrorNotified(id),
       send: message => (ADMIN_CHAT_ID
         ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
         : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),

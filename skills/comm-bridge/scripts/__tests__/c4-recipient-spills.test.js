@@ -215,14 +215,35 @@ describe('dispatcher: a conversation whose spill cannot be granted', () => {
       assert.match(String(err?.message), /^recipient_acl_failed: zylos-a on /);
       await disp.handleContentFailure(item, err, statusFile);
       assert.equal(read().status, attempt === 1 ? 'pending' : 'failed');
+      assert.equal(read().delivery_action, attempt === 1 ? null : 'content-error:recipient_acl_failed',
+        'tagged only by the failure that ends the row');
     }
     const lines = fs.readFileSync(path.join(TMP_DIR, 'activity-monitor', 'delivery-failures.log'), 'utf8')
       .split('\n').filter((l) => l.includes(` id=${row.id} `));
     assert.equal(lines.filter((l) => / reason=CONTENT_ERROR detail=recipient_acl_failed:_?zylos-a$/.test(l)).length, 2, lines.join('\n'));
     assert.equal(lines.filter((l) => / reason=MAX_RETRIES /.test(l)).length, 1, lines.join('\n'));
     assert.deepEqual(fs.readdirSync(path.join(ATTACHMENTS_DIR, `conv-${row.id}`)), [], 'no message file, no temp file');
-    assert.equal(read().delivery_action, 'content-error:recipient_acl_failed', 'the reason stays on the row');
-    assert.deepEqual(db.getContentErrorFailures(0).map((r) => r.id), [row.id], 'the primary monitor alert finds it');
+    assert.deepEqual(db.getContentErrorFailures().map((r) => r.id), [row.id], 'the primary monitor alert finds it');
+    db.markContentErrorNotified(row.id);
+  });
+
+  it('a content failure, then a built content whose paste fails, is not reported as a content error', async () => {
+    const row = db.insertConversation('in', 'telegram', 'chat-y', big(), 'pending', 3, false, null, 'user-a');
+    const statusFile = path.join(TMP_DIR, 'agent-status.json');
+    const read = () => db.getDb().prepare('SELECT * FROM conversations WHERE id = ?').get(row.id);
+    fs.writeFileSync(statusFile, '{}');
+    assert.equal(db.claimConversation(row.id), true);
+    let err = null;
+    try { disp.getDeliveryContent({ ...read(), type: 'conversation' }); } catch (e) { err = e; }
+    await disp.handleContentFailure({ ...read(), type: 'conversation' }, err, statusFile);
+    // Attempt 2: the content was built (the grant was repaired) and the paste
+    // failed, which the dispatcher hands to the plain conversation failure path.
+    fs.writeFileSync(statusFile, '{}');
+    assert.equal(db.claimConversation(row.id), true);
+    await disp.handleConversationDeliveryFailure({ ...read(), type: 'conversation' }, statusFile);
+    assert.equal(read().status, 'failed');
+    assert.equal(read().delivery_action, null);
+    assert.deepEqual(db.getContentErrorFailures().map((r) => r.id), [], 'no content-error alert for a paste failure');
   });
 });
 

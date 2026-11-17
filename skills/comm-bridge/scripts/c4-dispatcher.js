@@ -25,7 +25,6 @@ import {
   close,
   incrementRetryCount,
   markFailed,
-  markContentError,
   markDelivered,
   getNextPendingControl,
   claimControl,
@@ -823,7 +822,8 @@ export function getDeliveryContent(item) {
   return (item.type === 'control' && !isSlashCommand) ? `Meanwhile, ${rawContent}` : rawContent;
 }
 
-async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_FILE) {
+// failTag: audit tag for the row if THIS failure is terminal (see markFailed).
+async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_FILE, failTag = null) {
   const channelHealthy = isAgentStatusFresh(statusFile);
 
   if (channelHealthy) {
@@ -832,7 +832,7 @@ async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_
     incrementRetryCount(msg.id);
 
     if (nextCount >= MAX_RETRIES) {
-      markFailed(msg.id);
+      markFailed(msg.id, failTag);
       retireSubmission(`conversation:${msg.id}`);
       log(`FAILED: conversation id=${msg.id} channel=${msg.channel} marked as failed after ${nextCount} retries`);
       logDeliveryFailure('conversation', msg.id, 'MAX_RETRIES', { channel: msg.channel, retries: nextCount });
@@ -855,9 +855,9 @@ async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_
  * A row whose delivery content could not be built is never pasted. Today that
  * is a long conversation whose spill could not be written or handed to its
  * recipient (c4-recipient-access.js). Each attempt is recorded in
- * delivery-failures.log with its id and reason, and a conversation row carries
- * `delivery_action = content-error:<code>`; the row then takes the normal
- * bounded retry and ends `failed`. The primary monitor alerts the admin chat
+ * delivery-failures.log with its id and reason; the row then takes the normal
+ * bounded retry, and if a content failure is the one that ends it `failed`,
+ * the row carries `delivery_action = content-error:<code>`. The primary monitor alerts the admin chat
  * with the ids and reason, so the maintainer can repair the cause and requeue
  * exactly these ids.
  */
@@ -868,10 +868,11 @@ async function handleContentFailure(item, err, statusFile = AGENT_STATUS_FILE) {
   if (item.type === 'control') {
     await handleControlDeliveryFailure(item, `CONTENT_ERROR: ${detail}`);
   } else {
-    // The reason stays on the row, where the primary monitor's content-error
-    // alert finds it once the row has failed (activity-monitor content-error-alert.js).
-    markContentError(item.id, detail.split(':')[0]);
-    await handleConversationDeliveryFailure(item, statusFile);
+    // Tagged only if this content failure is the row's terminal failure, in
+    // the same statement that marks it failed; the primary monitor's alert
+    // (activity-monitor content-error-alert.js) reads that tag. An earlier
+    // content failure followed by a paste failure is not tagged.
+    await handleConversationDeliveryFailure(item, statusFile, `content-error:${detail.split(':')[0].slice(0, 48)}`);
   }
 }
 

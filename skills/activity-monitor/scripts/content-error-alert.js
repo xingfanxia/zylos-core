@@ -1,21 +1,20 @@
 /**
  * Operator alert for user messages that were never delivered because their
  * content could not be built (the dispatcher's CONTENT_ERROR: today a long
- * message whose spill file could not be handed to its recipient). The
- * dispatcher marks such a row `delivery_action = content-error:<code>` and,
- * after its bounded retry, `failed` (c4-dispatcher.js handleContentFailure).
+ * message whose spill file could not be handed to its recipient). When such a
+ * failure is the one that ends a row `failed`, the dispatcher tags it
+ * `delivery_action = content-error:<code>` in the same statement
+ * (c4-dispatcher.js handleContentFailure, c4-db.js markFailed).
  *
  * The primary instance's monitor runs this as an interval task. It sends one
- * health alert per batch of new failed ids to the admin chat, through the same
- * direct send as the degraded and start-held alerts, and records the highest
- * notified id only after that send succeeded; a failed send is retried at the
- * next interval. Nothing is requeued here: recovery is the maintainer's.
+ * health alert per batch of not-yet-notified rows to the admin chat, through
+ * the same direct send as the degraded and start-held alerts. Only after that
+ * send succeeded is each row marked notified in the database
+ * (content-error-notified:<code>), so a restart neither repeats nor loses one,
+ * and a row with a lower id that fails later is still found (no id cursor).
+ * A failed send is retried at the next interval. Nothing is requeued here:
+ * recovery is the maintainer's.
  */
-import fs from 'fs';
-import path from 'path';
-
-export const CONTENT_ERROR_ALERT_FILE = 'content-error-alert.json';
-
 export function formatContentErrorAlert(rows) {
   const lines = rows.map((r) => {
     const who = String(r.target_instance || 'unrouted').replace(/^user-/, '');
@@ -30,35 +29,25 @@ export function formatContentErrorAlert(rows) {
 }
 
 /**
- * @param {{ monitorDir: string, list: (afterId: number) => object[],
+ * @param {{ list: () => object[], markNotified: (id: number) => boolean,
  *   send: (message: string) => Promise<{ ok: boolean, output?: string }>,
  *   log: (msg: string) => void }} deps
  */
-export function createContentErrorAlert({ monitorDir, list, send, log }) {
-  const stateFile = path.join(monitorDir, CONTENT_ERROR_ALERT_FILE);
+export function createContentErrorAlert({ list, markNotified, send, log }) {
   let lastRunAt = 0;
   let inFlight = null;
 
-  const readLastId = () => {
-    try { return Number(JSON.parse(fs.readFileSync(stateFile, 'utf8')).last_id) || 0; }
-    catch (err) { if (err.code === 'ENOENT') return 0; throw err; }
-  };
-  const writeLastId = (id) => {
-    const tmp = `${stateFile}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ last_id: id, notified_at: new Date().toISOString() }));
-    fs.renameSync(tmp, stateFile);
-  };
-
   async function runOnce() {
-    const rows = list(readLastId());
+    const rows = list();
     if (!rows.length) return;
+    const ids = rows.map((r) => r.id).join(',');
     const result = await send(formatContentErrorAlert(rows));
     if (!result?.ok) {
-      log(`Content-error alert for id(s) ${rows.map((r) => r.id).join(',')} not sent: ${result?.output || 'no result'}; retrying next interval`);
+      log(`Content-error alert for id(s) ${ids} not sent: ${result?.output || 'no result'}; retrying next interval`);
       return;
     }
-    writeLastId(rows[rows.length - 1].id);
-    log(`Content-error alert sent for id(s) ${rows.map((r) => r.id).join(',')}`);
+    for (const r of rows) markNotified(r.id);
+    log(`Content-error alert sent for id(s) ${ids}`);
   }
 
   return {

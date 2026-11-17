@@ -324,36 +324,43 @@ export function incrementRetryCount(id) {
 /**
  * Mark a message as failed
  * @param {number} id - message id
+ * @param {string|null} [deliveryAction] - audit tag naming THIS terminal
+ *   failure (e.g. content-error:<code>), set in the same statement; null keeps
+ *   the existing tag
  */
-export function markFailed(id) {
+export function markFailed(id, deliveryAction = null) {
   const db = getDb();
-  db.prepare('UPDATE conversations SET status = ? WHERE id = ?').run('failed', id);
+  db.prepare('UPDATE conversations SET status = ?, delivery_action = COALESCE(?, delivery_action) WHERE id = ?')
+    .run('failed', deliveryAction, id);
 }
 
 /**
- * Record on an inbound row (audit column only) that its delivery content could
- * not be built, so it was never pasted: today a spill that could not be handed
- * to its recipient. The primary monitor's content-error alert reads this.
- * @param {number} id - conversation id
- * @param {string} code - short reason code, e.g. recipient_acl_failed
- */
-export function markContentError(id, code) {
-  getDb().prepare("UPDATE conversations SET delivery_action = ? WHERE id = ? AND direction = 'in'")
-    .run(`content-error:${String(code).slice(0, 48)}`, id);
-}
-
-/**
- * Inbound rows that ended `failed` with a content error, oldest first.
- * @param {number} [afterId=0] - only rows with a larger id
+ * Inbound rows whose terminal failure was a content error (the dispatcher's
+ * markFailed(id, 'content-error:<code>')) and that the operator has not been
+ * told about yet. Not ordered by failure time and not cursor-based: a row
+ * stays listed until markContentErrorNotified, so a lower id that fails later
+ * is still found.
  * @param {number} [limit=20]
  * @returns {Array<{id:number,target_instance:string|null,delivery_action:string,timestamp:string}>}
  */
-export function getContentErrorFailures(afterId = 0, limit = 20) {
+export function getContentErrorFailures(limit = 20) {
   return getDb().prepare(`
     SELECT id, target_instance, delivery_action, timestamp FROM conversations
-    WHERE direction = 'in' AND status = 'failed' AND delivery_action LIKE 'content-error:%' AND id > ?
+    WHERE direction = 'in' AND status = 'failed' AND delivery_action LIKE 'content-error:%'
     ORDER BY id ASC LIMIT ?
-  `).all(afterId, limit);
+  `).all(limit);
+}
+
+/**
+ * Mark one content-error row as notified (content-error:<code> ->
+ * content-error-notified:<code>), only if it is still that failed row.
+ * @returns {boolean} whether this call marked it
+ */
+export function markContentErrorNotified(id) {
+  return getDb().prepare(`
+    UPDATE conversations SET delivery_action = 'content-error-notified:' || substr(delivery_action, 15)
+    WHERE id = ? AND direction = 'in' AND status = 'failed' AND delivery_action LIKE 'content-error:%'
+  `).run(id).changes > 0;
 }
 
 /**
