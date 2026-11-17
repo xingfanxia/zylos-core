@@ -224,6 +224,22 @@ describe('processWithMultiSession — per-instance delivery notify', () => {
     assert.equal(pastes.length, 0, 'keystroke must never be buffer-pasted as text');
   });
 
+  it('marks a submitted /exit done at once: the session that could ack it is gone (no waiting-ack row to redeliver)', async () => {
+    const { isSessionEndingControl } = await import('../c4-dispatcher.js');
+    const acked = [];
+    const exit = { id: 147021, type: 'control', priority: 1, target_instance: 'user-betty',
+      content: "/exit ---- ack via: '/usr/bin/node' '/x/c4-control.js' ack --id 147021" };
+    await disp.processWithMultiSession(baseHelpers({ item: exit, notifyCalls: [],
+      overrides: { isSessionEndingControl, ackControl: (id) => acked.push(id) } }));
+    assert.deepEqual(acked, [147021]);
+
+    const status = { id: 9, type: 'control', priority: 2, target_instance: 'user-betty',
+      content: "/status ---- ack via: '/usr/bin/node' '/x/c4-control.js' ack --id 9" };
+    await disp.processWithMultiSession(baseHelpers({ item: status, notifyCalls: [],
+      overrides: { isSessionEndingControl, ackControl: (id) => acked.push(id) } }));
+    assert.deepEqual(acked, [147021], 'other ack-suffixed controls still wait for their ack');
+  });
+
   it('holds (not spin-requeues) a suspended instance item and still delivers to a healthy instance', async () => {
     // Item 1 targets a suspended instance, item 2 a healthy one. The suspended
     // item must be HELD for the cycle (released at the end), and the healthy

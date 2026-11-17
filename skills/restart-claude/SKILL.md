@@ -67,3 +67,4 @@ node ~/zylos/.claude/skills/comm-bridge/scripts/c4-control.js enqueue --content 
 2. **Block subsequent messages**: block_queue_until_idle prevents other messages from being dispatched
 3. **Deliver when idle**: Dispatcher delivers `/exit` to tmux when Claude is idle
 4. **Daemon restart**: activity-monitor detects exit and restarts Claude
+5. **Outcome**: the control ends `done` once its submit was observed and that session ended or was replaced; nothing is sent to the new session, and no ack is awaited (the session that would ack is gone)

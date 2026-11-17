@@ -373,6 +373,7 @@ export function multiSessionDispatch(item, helpers) {
  * @param {(session: string) => object} [helpers.readKeystrokeTarget] - one pane read before a raw key
  * @param {(item: object, target: object) => { action: string, reason?: string }} [helpers.fenceKeystrokeControl]
  * @param {(id: number, reason: string) => boolean} [helpers.supersedeControl]
+ * @param {(content: string) => boolean} [helpers.isSessionEndingControl] - /exit: done once submitted, no ack can come
  * @returns {Promise<ProcessResult>}
  */
 export async function processWithMultiSession(helpers) {
@@ -407,6 +408,7 @@ export async function processWithMultiSession(helpers) {
     readKeystrokeTarget,
     fenceKeystrokeControl,
     supersedeControl,
+    isSessionEndingControl,
   } = helpers;
 
   // Reap idle non-primary instances before processing.
@@ -661,7 +663,7 @@ export async function processWithMultiSession(helpers) {
             }).catch((err) => log(`Warning: failed to notify AM of delivery: ${err.message}`));
           }
         } else {
-          const hasAck = (item.content || '').includes('---- ack via:');
+          const hasAck = (item.content || '').includes('---- ack via:') && !isSessionEndingControl?.(item.content);
           if (hasAck) {
             log(`Control id=${item.id} submitted, waiting ack`);
           } else {

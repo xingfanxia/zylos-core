@@ -12,7 +12,7 @@ fs.writeFileSync(path.join(root, '.zylos/config.json'), JSON.stringify({ runtime
 fs.writeFileSync(path.join(root, 'instances.json'), JSON.stringify({ instances: {
   group: { runtime: 'codex', tmux_session: 'claude-group' },
 } }));
-const { sendToTmux, runtimeForSession, retireSubmission } = await import('../c4-dispatcher.js');
+const { sendToTmux, runtimeForSession, retireSubmission, isSessionEndingControl } = await import('../c4-dispatcher.js');
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 const state = (inputState, extra = {}) => ({ inputState, paneIdentity: 'pane-one', inProgressCapture: false, usageOverlay: false, ...extra });
 
@@ -116,6 +116,41 @@ test('/exit consumed before guardian replacement is never sent into the replacem
   assert.equal(await sendToTmux('/exit', options), 'submitted');
   assert.equal(h.count('paste-buffer'), 1);
   assert.equal(h.count('send-keys'), 1);
+});
+
+// 2026-11-17 user-sean restart (control 147021, the restart-claude skill's
+// enqueue, so the content carries its ack suffix): the Claude session took
+// /exit and was gone before the monitor wrote offline; the Guardian started a
+// new session 4 s later. The control must end submitted, with nothing sent to
+// the new session.
+const EXIT_WITH_ACK = "/exit ---- ack via: '/usr/bin/node' '/home/x/zylos/.claude/skills/comm-bridge/scripts/c4-control.js' ack --id 147021";
+test('Claude /exit that ended its session is a success, never retried into the new session', async () => {
+  const statusFile = path.join(root, 'sean-agent-status.json');
+  fs.writeFileSync(statusFile, JSON.stringify({ state: 'idle', health: 'ok' }));
+  const gone = state('unknown', { paneIdentity: null, captureOk: false });
+  const h = harness([state('empty'), state('has_content'), gone]);
+  const options = { ...h.options, deliveryId: 'control:147021', runtime: 'claude', statusFile };
+  assert.equal(await sendToTmux(EXIT_WITH_ACK, options), 'verify_failed', 'first try: the status file still says idle');
+  h.useStates([state('empty', { paneIdentity: 'replacement' })]);
+  assert.equal(await sendToTmux(EXIT_WITH_ACK, options), 'submitted');
+  assert.equal(await sendToTmux(EXIT_WITH_ACK, options), 'submitted');
+  assert.equal(h.count('paste-buffer'), 1);
+  assert.equal(h.count('send-keys'), 1, 'no key reaches the replacement session');
+});
+
+test('Claude /exit is submitted once the monitor reports the session gone', async () => {
+  const statusFile = path.join(root, 'offline-agent-status.json');
+  fs.writeFileSync(statusFile, JSON.stringify({ state: 'offline', health: 'ok' }));
+  const h = harness([state('empty'), state('has_content'), state('unknown', { paneIdentity: null, captureOk: false })]);
+  assert.equal(await sendToTmux('/exit', { ...h.options, deliveryId: 'control:exit-claude', runtime: 'claude', statusFile }), 'submitted');
+});
+
+test('only /exit itself, with or without its ack suffix, is a session-ending control', () => {
+  assert.equal(isSessionEndingControl('/exit'), true);
+  assert.equal(isSessionEndingControl(EXIT_WITH_ACK), true);
+  assert.equal(isSessionEndingControl('/exit now please'), false);
+  assert.equal(isSessionEndingControl('Meanwhile, /exit'), false);
+  assert.equal(isSessionEndingControl('/clear ---- ack via: node c4-control.js ack --id 3'), false);
 });
 
 test('/exit without observed paste or Enter remains unsubmitted after replacement', async () => {

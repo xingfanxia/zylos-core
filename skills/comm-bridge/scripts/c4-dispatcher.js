@@ -35,7 +35,8 @@ import {
   cleanupControlQueue,
   bindControlSession,
   supersedeControl,
-  recordUncertainDelivery
+  recordUncertainDelivery,
+  stripTrailingAckSuffix
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -699,7 +700,7 @@ async function sendToTmux(message, options = {}) {
         { stdio: 'pipe', timeout: 5000 });
       pending = { deliveryId, message: sanitized, paneIdentity: initial.paneIdentity,
         observed: false, enterSent: false, terminal: false,
-        shutdown: options.acceptShutdownAfterSubmit || (runtime === 'codex' && sanitized.trim() === '/exit') };
+        shutdown: options.acceptShutdownAfterSubmit || isSessionEndingControl(sanitized) };
       submissions.set(session, pending);
     } catch (err) {
       log(`Error pasting to tmux: ${err.message}`);
@@ -777,6 +778,18 @@ export function parseKeystrokeKey(content) {
  */
 export function sendKeystroke(target, key) {
   execFileSync('tmux', ['send-keys', '-t', target, key], { stdio: 'pipe', timeout: 5000 });
+}
+
+/**
+ * A control whose purpose is to end the session it is delivered to: /exit, on
+ * any runtime, with or without its ack suffix. Its success is that session
+ * ending (or being replaced) after the observed submit, and no ack can come
+ * from a session that no longer exists. Claude was left out before, so an
+ * operator /exit restart of a persona retried into the new session, was
+ * refused there and ended failed (2026-11-17, user-sean control 147021).
+ */
+export function isSessionEndingControl(content) {
+  return stripTrailingAckSuffix(String(content || '')).trim() === '/exit';
 }
 
 export function isCodexExitLifecycleControl(item, activeRuntime = ACTIVE_RUNTIME) {
@@ -980,7 +993,7 @@ async function processNextMessage() {
         waitForRequireIdleSettlement, readProcState, isAgentConfirmedActive,
         markDelivered, ackControl, log, sleep, nowSeconds, getDeliveryContent,
         sendKeystroke, isKeystrokeControl, parseKeystrokeKey,
-        readKeystrokeTarget, fenceKeystrokeControl, supersedeControl,
+        readKeystrokeTarget, fenceKeystrokeControl, supersedeControl, isSessionEndingControl,
         getNextPendingForInstances: multi.getNextPendingForInstances,
         getPendingTargetInstancesNeedingWake: multi.getPendingTargetInstancesNeedingWake,
         getNextPendingControlForInstances: multi.getNextPendingControlForInstances,
@@ -1127,7 +1140,7 @@ async function processNextMessage() {
         log(`Warning: failed to notify AM of message delivery: ${err.message}`);
       });
     } else {
-      if (hasAckSuffix(item.content || '')) {
+      if (hasAckSuffix(item.content || '') && !isSessionEndingControl(item.content)) {
         log(`Control id=${item.id} submitted, waiting ack`);
       } else {
         ackControl(item.id);
