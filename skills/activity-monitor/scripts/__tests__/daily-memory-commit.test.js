@@ -3,8 +3,10 @@
 // state file (tasks/daily-memory-commit.js) and the real
 // zylos-memory/scripts/daily-commit.js, which runs git in a temporary memory
 // repository. Covers: a commit on the first tick of the hour and none after it;
-// a failed run recorded for the day and not retried on later ticks, retried the
-// next day; files over 50 MB left out of the commit and logged (untracked and
+// one commit a day across several monitors sharing the record directory, the
+// others silent; a failed run recorded for the day and not retried on later
+// ticks, retried the next day; unreadable files and directories left out and
+// named while the rest is committed; the last 30 records kept; files over 50 MB left out of the commit and logged (untracked and
 // tracked, and one staged before the run) while small files whose names their
 // paths would match as globs are committed, a long error kept to 500 characters
 // in the state, a file over core.bigFileThreshold (512 MB) never written into a
@@ -31,7 +33,7 @@ const MB = 1024 * 1024;
 
 let root;
 let memory;
-let stateFile;
+let recordDir;
 
 before(() => {
   root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'daily-memory-commit-')));
@@ -45,7 +47,7 @@ before(() => {
   });
   for (const dir of ['home', 'pm2', 'tmp']) fs.mkdirSync(path.join(root, dir));
   memory = path.join(process.env.ZYLOS_DIR, 'memory');
-  stateFile = path.join(process.env.ZYLOS_DIR, 'activity-monitor', 'daily-memory-commit-state.json');
+  recordDir = path.join(process.env.ZYLOS_DIR, 'activity-monitor', 'daily-memory-commit');
 });
 
 after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -69,14 +71,14 @@ function sparse(relative, size) {
 
 const commits = () => git('rev-list', '--count', 'HEAD').trim();
 const committed = () => git('ls-tree', '-r', '--name-only', 'HEAD').trim().split('\n');
-const state = () => JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+const record = date => JSON.parse(fs.readFileSync(path.join(recordDir, `${date}.json`), 'utf8'));
 const packFiles = () => fs.readdirSync(path.join(memory, '.git', 'objects', 'pack'));
 
-/** The activity monitor's task table with only the daily memory commit enabled, at 03:xx on `day.date`. */
-function scheduler(day) {
+/** One instance's activity monitor task table with only the daily memory commit enabled, at 03:xx on `day.date`. */
+function scheduler(day, { instanceId = 'admin', loadState } = {}) {
   const logs = [];
   const log = message => logs.push(message);
-  const commit = createDailyMemoryCommit({ stateFile, script: SCRIPT, log });
+  const commit = createDailyMemoryCommit({ recordDir, script: SCRIPT, instanceId, getLocalDate: () => day.date, log });
   const off = () => false;
   const tasks = createActivityMonitorTaskScheduler({
     usageMonitor: { isMonitorEnabled: off, isAlertEnabled: off },
@@ -91,8 +93,7 @@ function scheduler(day) {
     loadDailyUpgradeState: () => null,
     writeDailyUpgradeState: () => {},
     enqueueDailyUpgradeControl: () => { throw new Error('daily upgrade must not run'); },
-    loadMemoryCommitState: commit.loadState,
-    writeMemoryCommitState: commit.writeState,
+    loadMemoryCommitState: loadState ?? commit.loadState,
     executeDailyMemoryCommit: commit.execute,
     loadUpgradeCheckState: () => null,
     writeUpgradeCheckState: () => {},
@@ -104,15 +105,14 @@ function scheduler(day) {
     nowEpoch: () => 1_800_000_000,
     log,
   });
-  const attempts = () => logs.filter(line => line.startsWith('Daily memory commit')
-    && !line.startsWith('Daily memory commit: failed to write state')).length;
+  const attempts = () => logs.filter(line => line.startsWith('Daily memory commit')).length;
   return { tick: () => tasks.tick({ health: 'ok' }), logs, attempts };
 }
 
 describe('daily memory commit', () => {
   it('runs in an isolated memory directory', () => {
     assert.ok(memory.startsWith(root + path.sep));
-    assert.ok(stateFile.startsWith(root + path.sep));
+    assert.ok(recordDir.startsWith(root + path.sep));
     assert.equal(process.env.HOME, path.join(root, 'home'));
   });
 
@@ -123,9 +123,14 @@ describe('daily memory commit', () => {
     assert.equal(commits(), '1');
     assert.match(git('log', '-1', '--format=%s'), /^memory: daily snapshot /);
     assert.deepEqual(committed(), ['state.md']);
-    assert.equal(state().last_date, '2026-11-10');
-    assert.equal(state().last_status, 'ok');
-    assert.equal(state().last_error, undefined);
+    const sha = git('rev-parse', '--short', 'HEAD').trim();
+    assert.equal(run.logs.length, 2);
+    assert.ok(run.logs[0].startsWith('Daily memory commit: Initializing git repo in '), run.logs[0]);
+    assert.ok(run.logs[0].endsWith(`\nCommitted ${sha}.`), run.logs[0]);
+    assert.equal(run.logs[1], 'daily-memory-commit: executed (date=2026-11-10)');
+    assert.equal(record('2026-11-10').status, 'ok');
+    assert.equal(record('2026-11-10').instance, 'admin');
+    assert.ok(record('2026-11-10').summary.endsWith(`Committed ${sha}.`));
 
     fs.writeFileSync(path.join(memory, 'state.md'), '# State\nchanged\n');
     assert.equal(run.tick(), 0);
@@ -144,12 +149,10 @@ describe('daily memory commit', () => {
 
     assert.equal(run.tick(), 0);
     assert.equal(run.attempts(), 2);
-    assert.match(run.logs.at(-2), /^Daily memory commit failed: Skipped 1 file\(s\) over 50 MB, not committed: archive\/backup\.tar \(600 MB\)\ndaily-commit error: .*index\.lock/s);
-    assert.match(run.logs.at(-1), /^daily-memory-commit: failed, next attempt tomorrow \(date=2026-11-11\)$/);
-    assert.equal(state().last_date, '2026-11-11');
-    assert.equal(state().last_status, 'failed');
-    assert.match(state().last_error, /index\.lock/);
-    assert.ok(state().last_error.length <= 501);
+    assert.match(run.logs.at(-1), /^Daily memory commit failed: Skipped 1 file\(s\) over 50 MB, not committed: archive\/backup\.tar \(600 MB\)\ndaily-commit error: .*index\.lock/s);
+    assert.equal(record('2026-11-11').status, 'failed');
+    assert.match(record('2026-11-11').summary, /^Skipped 1 file\(s\) over 50 MB.*index\.lock/s);
+    assert.ok(record('2026-11-11').summary.length <= 501);
 
     for (let i = 0; i < 5; i++) assert.equal(run.tick(), 0);
     assert.equal(run.attempts(), 2, 'no retry later the same day');
@@ -161,9 +164,7 @@ describe('daily memory commit', () => {
     assert.equal(run.attempts(), 3);
     assert.equal(commits(), '2');
     assert.deepEqual(committed(), ['state.md']);
-    assert.equal(state().last_date, '2026-11-12');
-    assert.equal(state().last_status, 'ok');
-    assert.equal(state().last_error, undefined);
+    assert.equal(record('2026-11-12').status, 'ok');
   });
 
   it('leaves files over 50 MB out of the commit, logs them, and never streams a file over 512 MB into a pack', () => {
@@ -188,7 +189,8 @@ describe('daily memory commit', () => {
     assert.deepEqual(packFiles(), []);
     assert.deepEqual(git('ls-files', '--others', '-z').split('\0').filter(Boolean).sort(),
       ['archive/memory-backup.tar', 'archive/odd [1] *.bin'], 'the skipped files stay untracked');
-    assert.equal(state().last_status, 'ok');
+    assert.match(run.logs[0], /\nCommitted [0-9a-f]+ with 2 skipped\.$/);
+    assert.equal(record('2026-11-10').status, 'ok');
   });
 
   it('leaves daily upgrade and upgrade check retrying after a failure', () => {
@@ -203,7 +205,7 @@ describe('daily memory commit', () => {
       readDailyUpgradeEnabled: () => true, readHealthCheckEnabled: off,
       loadDailyUpgradeState: () => saved.upgrade ?? null, writeDailyUpgradeState: date => { saved.upgrade = { last_date: date }; },
       enqueueDailyUpgradeControl: () => { runs.upgrade++; return false; },
-      loadMemoryCommitState: () => null, writeMemoryCommitState: () => {}, executeDailyMemoryCommit: () => { throw new Error('not its hour'); },
+      loadMemoryCommitState: () => null, executeDailyMemoryCommit: () => { throw new Error('not its hour'); },
       loadUpgradeCheckState: () => saved.check ?? null, writeUpgradeCheckState: date => { saved.check = { last_date: date }; },
       executeUpgradeCheck: () => { runs.check++; return false; },
       loadHealthCheckState: () => null, enqueueHealthCheck: off,
@@ -239,8 +241,7 @@ describe('daily memory commit', () => {
     assert.equal(run.tick(), 1);
     assert.equal(commits(), '2', 'nothing else changed: no commit');
     assert.match(run.logs.at(-2), /Skipped 1 file\(s\).*\nNo memory changes to commit\.$/s);
-    assert.equal(state().last_date, '2026-11-12');
-    assert.equal(state().last_status, 'ok');
+    assert.equal(record('2026-11-12').status, 'ok');
     assert.deepEqual(packFiles(), []);
   });
 
@@ -271,7 +272,7 @@ describe('daily memory commit', () => {
     assert.equal(git('diff', '--name-only', 'HEAD^', 'HEAD').trim(), 'state.md');
     assert.equal(git('show', 'HEAD:state.md'), '# State\nchanged\n');
     assert.equal(fs.statSync(path.join(memory, 'big')).size, 60 * MB);
-    assert.equal(state().last_status, 'ok');
+    assert.equal(record('2026-11-11').status, 'ok');
   });
 
   // A tracked deletion precedes untracked names in Git's status stream even
@@ -291,7 +292,7 @@ describe('daily memory commit', () => {
     assert.equal(git('show', 'HEAD:z-big'), 'small\n');
   });
 
-  it('keeps the first 500 characters of a long error as last_error', () => {
+  it('keeps the first 500 characters of a long error in the record', () => {
     const day = { date: '2026-11-10' };
     const run = scheduler(day);
     assert.equal(run.tick(), 1);
@@ -305,9 +306,9 @@ describe('daily memory commit', () => {
     assert.match(failure, /^Daily memory commit failed: Skipped 11 file\(s\) over 50 MB, not committed: .*, and 1 more\n/);
     const detail = failure.slice(prefix.length);
     assert.ok(detail.length > 500, `the error is ${detail.length} characters`);
-    assert.equal(state().last_status, 'failed');
-    assert.equal(state().last_error.length, 501);
-    assert.equal(state().last_error, `${detail.slice(0, 500)}…`);
+    assert.equal(record('2026-11-11').status, 'failed');
+    assert.equal(record('2026-11-11').summary.length, 501);
+    assert.equal(record('2026-11-11').summary, `${detail.slice(0, 500)}…`);
   });
 
   it('does not commit a file over 50 MB that was already staged before the run', () => {
@@ -325,5 +326,82 @@ describe('daily memory commit', () => {
     assert.ok(run.logs.some(line => line.startsWith('Daily memory commit: Skipped 1 file(s) over 50 MB, not committed: archive/staged.tar (50 MB)')), run.logs.join('\n'));
     assert.equal(git('ls-files', '--stage', '--', 'archive').trim(), '', 'unstaged, not only left out of this commit');
     assert.equal(git('ls-files', '--others', '--', 'archive').trim(), 'archive/staged.tar');
+  });
+  it('commits once a day across the monitors that share the record, and the others log nothing', () => {
+    const day = { date: '2026-11-10' };
+    const monitors = ['admin', 'user-pan', 'user-elaine'].map(instanceId => scheduler(day, { instanceId }));
+    assert.deepEqual(monitors.map(run => run.tick()), [1, 0, 0]);
+    assert.equal(commits(), '1');
+    assert.equal(record('2026-11-10').instance, 'admin');
+    assert.deepEqual(monitors.slice(1).map(run => run.logs), [[], []]);
+
+    // The next day the first monitor to tick is another one (admin is down).
+    day.date = '2026-11-11';
+    fs.writeFileSync(path.join(memory, 'state.md'), '# State\nchanged\n');
+    assert.deepEqual([monitors[2].tick(), monitors[1].tick()], [1, 0]);
+    assert.equal(commits(), '2');
+    assert.equal(record('2026-11-11').instance, 'user-elaine');
+    assert.deepEqual(monitors[1].logs, []);
+  });
+
+  it('does nothing and logs nothing when another monitor creates the record between its check and its run', () => {
+    const day = { date: '2026-11-10' };
+    const first = scheduler(day, { instanceId: 'admin' });
+    // The second monitor checked before the first created the record.
+    const second = scheduler(day, { instanceId: 'user-pan', loadState: () => null });
+    assert.equal(first.tick(), 1);
+    assert.equal(second.tick(), 0);
+    assert.deepEqual(second.logs, []);
+    assert.equal(commits(), '1');
+    assert.equal(record('2026-11-10').instance, 'admin');
+  });
+
+  // chmod does not stop root from reading; skipped when run as root.
+  it('leaves unreadable files and directories out, names them, and commits the rest', { skip: process.getuid?.() === 0 }, () => {
+    const day = { date: '2026-11-10' };
+    const run = scheduler(day);
+    fs.mkdirSync(path.join(memory, 'tracked'));
+    fs.writeFileSync(path.join(memory, 'tracked', 'notes.md'), 'v1\n');
+    assert.equal(run.tick(), 1);
+
+    day.date = '2026-11-11';
+    fs.writeFileSync(path.join(memory, 'state.md'), '# State\nchanged\n');
+    fs.writeFileSync(path.join(memory, 'tracked', 'notes.md'), 'v2\n');
+    fs.chmodSync(path.join(memory, 'tracked', 'notes.md'), 0o000);
+    fs.mkdirSync(path.join(memory, 'instances', 'other', 'archive'), { recursive: true });
+    fs.writeFileSync(path.join(memory, 'instances', 'other', 'archive', 'old.md'), 'old\n');
+    fs.chmodSync(path.join(memory, 'instances', 'other', 'archive'), 0o000);
+    fs.writeFileSync(path.join(memory, 'checkpoint.md'), 'secret\n');
+    fs.chmodSync(path.join(memory, 'checkpoint.md'), 0o000);
+    fs.writeFileSync(path.join(memory, 'new.md'), 'readable\n');
+    // An unreadable directory git ignores is not reported.
+    fs.writeFileSync(path.join(memory, '.gitignore'), 'cache/\n');
+    fs.mkdirSync(path.join(memory, 'cache'));
+    fs.chmodSync(path.join(memory, 'cache'), 0o000);
+    try {
+      assert.equal(run.tick(), 1);
+      assert.equal(commits(), '2');
+      assert.deepEqual(committed(), ['.gitignore', 'new.md', 'state.md', 'tracked/notes.md']);
+      assert.equal(git('show', 'HEAD:tracked/notes.md'), 'v1\n', 'the unreadable change is not committed');
+      const summary = record('2026-11-11').summary;
+      assert.equal(record('2026-11-11').status, 'ok');
+      assert.match(summary, /^Skipped 3 unreadable path\(s\), not committed: /);
+      for (const name of ['tracked/notes.md', 'checkpoint.md', 'instances/other/archive/']) assert.ok(summary.includes(name), summary);
+      assert.ok(!summary.includes('cache'), summary);
+      assert.match(summary, /\nCommitted [0-9a-f]+ with 3 skipped\.$/);
+    } finally {
+      for (const p of ['tracked/notes.md', 'checkpoint.md']) fs.chmodSync(path.join(memory, p), 0o644);
+      for (const p of ['instances/other/archive', 'cache']) fs.chmodSync(path.join(memory, p), 0o755);
+    }
+  });
+
+  it('keeps the last 30 daily records', () => {
+    fs.mkdirSync(recordDir, { recursive: true });
+    for (let i = 1; i <= 31; i++) fs.writeFileSync(path.join(recordDir, `2026-10-${String(i).padStart(2, '0')}.json`), '{}\n');
+    assert.equal(scheduler({ date: '2026-11-10' }).tick(), 1);
+    const kept = fs.readdirSync(recordDir).sort();
+    assert.equal(kept.length, 30);
+    assert.equal(kept[0], '2026-10-03.json');
+    assert.equal(kept.at(-1), '2026-11-10.json');
   });
 });

@@ -154,6 +154,7 @@ import {
 } from './adapters/runtime-components.js';
 import { createActivityMonitorTaskScheduler } from './tasks/activity-monitor-tasks.js';
 import { createDailyMemoryCommit } from './tasks/daily-memory-commit.js';
+import { rotateDailyLog } from './log-rotation.js';
 // Fable guard (FG-4): the delivery side owns the limit-dialog classifier; a
 // named import so a renamed or removed export fails loudly at load.
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
@@ -217,7 +218,8 @@ const STATUSLINE_FILE = path.join(MONITOR_DIR, 'statusline.json');
 const LOG_FILE = path.join(MONITOR_DIR, 'activity.log');
 const HEALTH_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'health-check-state.json');
 const DAILY_UPGRADE_STATE_FILE = path.join(MONITOR_DIR, 'daily-upgrade-state.json');
-const DAILY_MEMORY_COMMIT_STATE_FILE = path.join(MONITOR_DIR, 'daily-memory-commit-state.json');
+// Shared by every instance's monitor: one record per day of the memory repository's daily commit.
+const DAILY_MEMORY_COMMIT_DIR = path.join(ZYLOS_DIR, 'activity-monitor', 'daily-memory-commit');
 const UPGRADE_CHECK_STATE_FILE = path.join(MONITOR_DIR, 'upgrade-check-state.json');
 const USAGE_STATE_FILE = path.join(MONITOR_DIR, 'usage.json');
 const USAGE_CODEX_STATE_FILE = path.join(MONITOR_DIR, 'usage-codex.json');
@@ -240,7 +242,8 @@ const CONV_DIR = path.join(os.homedir(), '.claude', 'projects', ZYLOS_PATH);
 // Activity monitor cadence
 const INTERVAL = 1000;
 const IDLE_THRESHOLD = 3;
-const LOG_MAX_LINES = 500;
+const LOG_KEEP_DAYS = 30;
+const LOG_KEEP_BYTES = 20 * 1024 * 1024;  // all rotated activity logs of this instance together
 const RATE_LIMIT_DEFAULT_COOLDOWN = 3600;  // 1 hour default when reset time can't be parsed
 const USER_MESSAGE_RECOVERY_COOLDOWN = 60; // 1 min between user-message-triggered recoveries
 
@@ -339,7 +342,7 @@ const DAILY_UPGRADE_CHECK_HOUR = 6;  // 6:00 AM local time
 const DAILY_COMMIT_SCRIPT = path.join(__dirname, '..', '..', 'zylos-memory', 'scripts', 'daily-commit.js');
 
 // State
-let lastTruncateDay = '';
+let lastRotateDay = '';
 let lastState = '';
 let idleSince = 0;
 let runtimeLaunchAtMs = 0;
@@ -385,21 +388,15 @@ function log(message) {
   }
 }
 
-function truncateLog() {
-  if (!fs.existsSync(LOG_FILE)) return;
-  const content = fs.readFileSync(LOG_FILE, 'utf8');
-  const lines = content.split('\n');
-  if (lines.length > LOG_MAX_LINES) {
-    fs.writeFileSync(LOG_FILE, lines.slice(-LOG_MAX_LINES).join('\n'));
-    log(`Log truncated to ${LOG_MAX_LINES} lines`);
-  }
-}
-
-function checkDailyTruncate() {
+// activity.log keeps 30 days: rotated daily, see log-rotation.js.
+function rotateLogDaily() {
   const today = new Date().toISOString().substring(0, 10);
-  if (today !== lastTruncateDay) {
-    truncateLog();
-    lastTruncateDay = today;
+  if (today === lastRotateDay) return;
+  lastRotateDay = today;
+  try {
+    rotateDailyLog(LOG_FILE, today, { keepDays: LOG_KEEP_DAYS, keepBytes: LOG_KEEP_BYTES });
+  } catch (err) {
+    log(`Log rotation failed: ${err.message}`);
   }
 }
 
@@ -990,8 +987,10 @@ function enqueueDailyUpgradeControl() {
 // ---------------------------------------------------------------------------
 
 const dailyMemoryCommit = createDailyMemoryCommit({
-  stateFile: DAILY_MEMORY_COMMIT_STATE_FILE,
+  recordDir: DAILY_MEMORY_COMMIT_DIR,
   script: DAILY_COMMIT_SCRIPT,
+  instanceId: INSTANCE_ID,
+  getLocalDate,
   log,
 });
 
@@ -1101,7 +1100,6 @@ function createTaskScheduler(activeUsageMonitor) {
     writeDailyUpgradeState,
     enqueueDailyUpgradeControl,
     loadMemoryCommitState: dailyMemoryCommit.loadState,
-    writeMemoryCommitState: dailyMemoryCommit.writeState,
     executeDailyMemoryCommit: dailyMemoryCommit.execute,
     loadUpgradeCheckState,
     writeUpgradeCheckState,
@@ -1257,7 +1255,7 @@ async function monitorLoop() {
       watchdogState,
     },
     idleThreshold: IDLE_THRESHOLD,
-    checkDailyTruncate,
+    checkDailyTruncate: rotateLogDaily,
     buildNotRunningStatus,
     buildRunningStatus,
     writeStatusFile,
