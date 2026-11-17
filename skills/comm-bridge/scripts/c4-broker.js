@@ -457,9 +457,12 @@ async function opSend(p, caller) {
     if (conversationId == null) return;
     try { setSendStatus(conversationId, status); } catch (e) { log(`WARN audit status ${status} (${conversationId}) failed: ${e.message}`); }
   };
+  // A channel may print one `C4-RESULT: <sentence>` line saying what happened
+  // (zylos-feishu media sends do); it is passed to the agent as is.
+  const result = outcome.result;
   if (outcome.code === 0) {
     settle('delivered');
-    return { ok: true, data: { sent: true, conversation_id: conversationId, channel } };
+    return { ok: true, data: { sent: true, conversation_id: conversationId, channel, ...(result ? { result } : {}) } };
   }
   if (outcome.timedOut) {
     settle('unknown');
@@ -471,8 +474,16 @@ async function opSend(p, caller) {
       data: { conversation_id: conversationId },
     };
   }
+  if (result && result.startsWith('unknown:')) {
+    settle('unknown');
+    return { ok: false, error: `channel_send_unknown: ${result}`, data: { conversation_id: conversationId } };
+  }
   markAuditFailed();
-  return { ok: false, error: `channel_send_failed:exit_${outcome.code}`, data: { conversation_id: conversationId } };
+  return {
+    ok: false,
+    error: `channel_send_failed:exit_${outcome.code}${result ? `: ${result}` : ''}`,
+    data: { conversation_id: conversationId },
+  };
 }
 
 /**
@@ -507,12 +518,19 @@ function opVoid(p, caller) {
 export const SEND_TIMEOUT_MS = Number(process.env.C4_SEND_TIMEOUT_MS) || 135000;
 const KILL_GRACE_MS = 5000;
 
+/** The last `C4-RESULT: ` line a channel script printed, at most 600 chars. */
+export function channelResult(stdout) {
+  const lines = String(stdout || '').split('\n').filter(l => l.startsWith('C4-RESULT: '));
+  return lines.length ? lines[lines.length - 1].slice('C4-RESULT: '.length).trim().slice(0, 600) : null;
+}
+
 export function spawnSend(channelScript, endpoint, content, timeoutMs = SEND_TIMEOUT_MS) {
   return new Promise((resolve) => {
     // Same arg shape c4-send uses: [endpoint, message] or [message].
     const args = endpoint != null ? [channelScript, endpoint, content] : [channelScript, content];
     const child = spawn('node', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stderr = '';
+    let stdout = '';
     let timedOut = false;
     let killTimer = null;
     const timer = setTimeout(() => {
@@ -520,13 +538,13 @@ export function spawnSend(channelScript, endpoint, content, timeoutMs = SEND_TIM
       child.kill('SIGTERM');
       killTimer = setTimeout(() => child.kill('SIGKILL'), KILL_GRACE_MS);
     }, timeoutMs);
-    child.stdout.on('data', () => {});
+    child.stdout.on('data', (d) => { if (stdout.length < 64 * 1024) stdout += d.toString(); });
     child.stderr.on('data', (d) => { stderr += d.toString(); });
     child.on('close', (code) => {
       clearTimeout(timer);
       if (killTimer) clearTimeout(killTimer);
       if (code !== 0 && stderr) log(`channel send stderr: ${stderr.trim().slice(0, 500)}`);
-      resolve({ code: code == null ? 1 : code, timedOut });
+      resolve({ code: code == null ? 1 : code, timedOut, result: channelResult(stdout) });
     });
     child.on('error', (err) => {
       clearTimeout(timer);
