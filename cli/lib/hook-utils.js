@@ -3,6 +3,7 @@
  * Used by self-upgrade.js and sync-settings-hooks.js.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
@@ -146,9 +147,44 @@ export function extractScriptPath(command) {
   return result ? expandHome(result) : command;
 }
 
-function zylosClaudeRoot() {
+function zylosClaudeDir() {
   const zylosDir = path.resolve(process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos'));
-  return `${path.resolve(zylosDir, '.claude').replaceAll('\\', '/').replace(/\/+$/, '')}/`;
+  return path.resolve(zylosDir, '.claude');
+}
+
+function zylosClaudeRoot() {
+  return `${zylosClaudeDir().replaceAll('\\', '/').replace(/\/+$/, '')}/`;
+}
+
+function realpathOrNull(target) {
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Registry suffix of `scriptPath` when one of its ancestor directories IS the
+ * zylos .claude directory through a symlink, else null. A host where
+ * `~/zylos` is a symlink to the real install (or ZYLOS_DIR names the link)
+ * writes the same script as `~/zylos/.claude/...` and as the absolute real
+ * path; both must key identically or hook sync treats them as two different
+ * user hooks, keeps both, and every event fires twice.
+ */
+function symlinkedZylosSuffix(scriptPath) {
+  const realRoot = realpathOrNull(zylosClaudeDir());
+  if (!realRoot) return null;
+  let dir = path.dirname(scriptPath);
+  while (true) {
+    const realDir = realpathOrNull(dir);
+    if (realDir && realDir === realRoot) {
+      return path.relative(dir, scriptPath).split(path.sep).join('/');
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
 }
 
 function normalizedAbsolutePath(scriptPath) {
@@ -184,7 +220,7 @@ export function hookScriptBaseKey(command) {
   const root = zylosClaudeRoot();
   if (scriptPath.startsWith(root)) return scriptPath.slice(root.length);
 
-  return scriptPath;
+  return symlinkedZylosSuffix(scriptPath) ?? scriptPath;
 }
 
 /**
