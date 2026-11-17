@@ -78,6 +78,11 @@ Each line is `#id time status channel chat preview`; status is `sending`,
 `delivered`, `failed` or `unknown`. Resend only a `failed` message; for
 `unknown`, ask the recipient whether it arrived.
 
+A channel may add one plain sentence to the result (Feishu media sends do):
+`sent: … (message om_…)`, `not sent: <why and what would work>`, or
+`unknown: …`. Tell the user a file was sent only on `sent`, follow the
+`not sent` advice, and never resend an `unknown` one.
+
 
 ## Database
 

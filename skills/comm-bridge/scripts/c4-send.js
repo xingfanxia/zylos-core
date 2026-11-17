@@ -235,8 +235,8 @@ async function main() {
 
   if (useBroker) {
     try {
-      await brokerCall('send', { channel, endpoint, content: message, deliveryAction });
-      console.log(`[C4] Message sent via ${channel} (broker)`);
+      const sent = await brokerCall('send', { channel, endpoint, content: message, deliveryAction });
+      console.log(`[C4] Message sent via ${channel} (broker)${sent?.result ? `: ${sent.result}` : ''}`);
       process.exit(0);
     } catch (err) {
       if (err.code === 'BROKER_TIMEOUT') {

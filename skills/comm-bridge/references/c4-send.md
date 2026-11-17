@@ -71,3 +71,8 @@ Channels are skills installed in `~/zylos/.claude/skills/`. Each channel must pr
 - **Config**: `~/zylos/<channel>/config.json` (for data like `primary_dm`)
 
 The send script must return exit code 0 on success, non-zero on failure.
+It may print one stdout line `C4-RESULT: <sentence>` saying what happened; the
+broker passes the sentence to the agent (`[C4] Message sent via <channel>
+(broker): <sentence>` or `channel_send_failed:exit_N: <sentence>`). A sentence
+that starts with `unknown:` on a non-zero exit records the send as `unknown`
+(`channel_send_unknown: <sentence>`), not `failed`.

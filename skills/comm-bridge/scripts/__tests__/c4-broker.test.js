@@ -549,6 +549,37 @@ describe('broker handleRequest', () => {
     }
   });
 
+  it('send: the channel\'s C4-RESULT line reaches the agent and an unknown result is recorded unknown', async () => {
+    const script = path.join(tmpDir, '.claude', 'skills', 'web-console', 'scripts', 'send.js');
+    const original = fs.readFileSync(script, 'utf8');
+    const run = async (body) => {
+      fs.writeFileSync(script, body);
+      return broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'x' } }, 'inst-a');
+    };
+    const status = (r) => getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(r.data.conversation_id).status;
+    try {
+      const sent = await run("console.log('progress');console.log('C4-RESULT: sent: the image is in the chat (message om_1).');process.exit(0);\n");
+      assert.equal(sent.ok, true);
+      assert.equal(sent.data.result, 'sent: the image is in the chat (message om_1).');
+      assert.equal(status(sent), 'delivered');
+
+      const notSent = await run("console.log('C4-RESULT: not sent: the video is 37.7 MB, over the limit.');process.exit(1);\n");
+      assert.equal(notSent.ok, false);
+      assert.equal(notSent.error, 'channel_send_failed:exit_1: not sent: the video is 37.7 MB, over the limit.');
+      assert.equal(status(notSent), 'failed');
+
+      const unknown = await run("console.log('C4-RESULT: unknown: Feishu did not answer. Do not send it again yet.');process.exit(1);\n");
+      assert.equal(unknown.ok, false);
+      assert.equal(unknown.error, 'channel_send_unknown: unknown: Feishu did not answer. Do not send it again yet.');
+      assert.equal(status(unknown), 'unknown');
+
+      const plain = await run('process.exit(2);\n');
+      assert.equal(plain.error, 'channel_send_failed:exit_2', 'channels without a result line are unchanged');
+    } finally {
+      fs.writeFileSync(script, original);
+    }
+  });
+
   it('sends: lists only the caller\'s recent sends with their status, newest first', async () => {
     await broker.handleRequest({ op: 'send', params: { channel: 'web-console', endpoint: 'console-1', content: 'from b' } }, 'inst-b');
     const a = await broker.handleRequest({ op: 'sends', params: { limit: 3 } }, 'inst-a');
