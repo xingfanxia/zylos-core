@@ -117,6 +117,34 @@ describe('Fable lease enforcement in the persona monitor (review #1)', () => {
     assert.equal(calls.stops, 0);
   });
 
+  it('leaves a Fable session alone while the guard defers its soft-quota downgrade, and stops it once the wait ends', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    fx.launch(clock.now);
+    const { monitor, calls } = monitorFor(fx, clock);
+    const at = new Date(T0 + MIN).toISOString();
+    // The daemon committed Opus g4 for a soft quota hold and deferred the restart until idle.
+    fs.writeFileSync(fableGuardStatePath(fx.zylosDir), JSON.stringify({ version: 1, generation_seq: 4,
+      holds: { [BACKUP]: { quota: { since: at, reset_window: '2026-11-13T06:00:00.000Z', detail: { source: 'observation', utilization: 0.8 } } } },
+      personas: { 'user-pan': { desired: { account: BACKUP, mode: 'opus', generation: 4 },
+        deferred_downgrade: { generation: 4, reason: 'soft_quota', since: at, until: new Date(T0 + 31 * MIN).toISOString() } } } }));
+    for (clock.now = T0 + MIN; clock.now <= T0 + 11 * MIN; clock.now += MIN) {
+      fx.writeUsage(clock.now, 0.8); // a live daemon keeps probing
+      monitor.tick();
+    }
+    assert.equal(calls.stops, 0, 'the turn is not interrupted during the wait');
+    fx.writeUsage(clock.now, 0.92); // hard threshold crossed: the wait is over
+    monitor.tick();
+    clock.now += 60_000;
+    monitor.tick();
+    assert.equal(calls.stops, 0, 'the daemon still gets its grace first');
+    clock.now += 61_000;
+    fx.writeUsage(clock.now, 0.92);
+    monitor.tick();
+    assert.equal(calls.stops, 1, 'past the grace the monitor forces Opus itself');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fx.monitorDir, LEASE_ENFORCEMENT_FILE), 'utf8')).reason, 'not_committed');
+  });
+
   it('is not created for a persona whose monitor started without a Fable decision', () => {
     const fx = fixture();
     const admin = resolveRuntimeProfile({ document: JSON.parse(fs.readFileSync(path.join(fx.zylosDir, 'instances.json'), 'utf8')),

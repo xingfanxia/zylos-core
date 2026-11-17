@@ -18,6 +18,7 @@ import { baseModel, recordProbeResult } from '../fable-probe.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 import {
   FABLE_GUARD_DEFAULTS,
+  fableDowngradeDeferral,
   fableGuardStatePath,
   fableUsagePath,
   prepareFableLaunch,
@@ -63,6 +64,7 @@ class Sim {
     this.launches = {};
     this.cached = {};
     this.readiness = {};
+    this.observations = {};
     this.now = T0;
     this.restarts = [];
     for (const id of PERSONAS) this.monitorStart(id, { at: T0 - 3_600_000 });
@@ -88,7 +90,7 @@ class Sim {
     const result = planFableGuard({
       document: this.document, state: this.state, usage: this.usage, statusByInstance: this.status,
       modelByInstance: this.models, evidenceByInstance: this.evidence, failuresByInstance: this.failures,
-      launchByInstance: this.launches, readinessByInstance: this.readiness,
+      launchByInstance: this.launches, readinessByInstance: this.readiness, observationByInstance: this.observations,
       failoverInstanceIds: new Set(failover), nowMs: this.now,
     });
     this.state = JSON.parse(JSON.stringify(result.state)); // what the daemon persists
@@ -199,18 +201,18 @@ describe('Fable guard fake-clock sequences', () => {
     assert.deepEqual(sim.pass().restarts.map(item => [item.instanceId, item.mode]), [['user-pan', 'fable']]);
   });
 
-  it('74% stays on Fable; 75% holds the account and downgrades immediately even when busy', () => {
+  it('74% stays on Fable; 75% holds the account and downgrades an idle persona at once', () => {
     const sim = new Sim();
     sim.toFable();
     sim.advance(5 * MIN);
     sim.observe(BACKUP, 0.74);
     assert.deepEqual(sim.pass().restarts, []);
-    sim.setState('user-pan', 'busy', { active_tools: 2 });
     sim.advance(5 * MIN);
     sim.observe(BACKUP, 0.75);
     const result = sim.pass();
     assert.deepEqual(sim.holds(), ['quota']);
     assert.equal(sim.state.holds[BACKUP].quota.reset_window, W1);
+    assert.equal(sim.state.holds[BACKUP].quota.hard_at, undefined, 'a reading is soft evidence');
     assert.deepEqual(result.restarts.map(item => item.instanceId).sort(), ['user-elaine', 'user-pan']);
     sim.launchAll(result.restarts);
     assert.equal(sim.launch('user-pan').launched, OPUS);
@@ -1421,5 +1423,196 @@ describe('Fable persona returning from Codex to a Claude profile (verdict C)', (
     assert.equal(sim.launches['user-pan'].mode, 'fable');
     assert.ok(sim.state.personas['user-pan'].verified?.model_at);
     assert.ok(restarts.length <= 1, `no restart loop: ${restarts.join(', ')}`);
+  });
+});
+
+describe('Fable guard soft-quota downgrade waits for an idle persona', () => {
+  // Both personas on Fable; user-pan is mid-turn when the reading crosses the threshold.
+  function deferredSim(utilization = 0.8, document = documentFixture()) {
+    const sim = new Sim(document);
+    sim.toFable();
+    sim.setState('user-pan', 'busy', { active_tools: 1 });
+    sim.advance(5 * MIN);
+    sim.observe(BACKUP, utilization);
+    const commit = sim.pass();
+    return { sim, commit };
+  }
+  const panRestarts = result => result.restarts.filter(item => item.instanceId === 'user-pan');
+
+  it('busy at 76%: Opus is committed, the restart waits, nothing is counted or verified, then idle restarts once', () => {
+    const { sim, commit } = deferredSim(0.76);
+    assert.deepEqual(commit.restarts.map(item => item.instanceId), ['user-elaine'], 'the idle persona downgrades at once');
+    const pan = sim.state.personas['user-pan'];
+    assert.equal(pan.desired.mode, 'opus');
+    assert.equal(pan.desired.reason, 'fable_blocked:quota');
+    assert.equal(pan.attempts, 0);
+    assert.deepEqual(pan.deferred_downgrade, { generation: pan.desired.generation, reason: 'soft_quota', since: iso(sim.now),
+      until: iso(sim.now + 30 * MIN), hard_threshold: 0.9, utilization: 0.76 });
+    assert.ok(commit.events.some(event => event.startsWith('user-pan:') && event.includes('restart deferred until idle')));
+    sim.launchAll(commit.restarts);
+    // Busy for 25 more minutes: far beyond the resume grace and the three-attempt budget.
+    for (let i = 0; i < 5; i++) {
+      sim.advance(5 * MIN);
+      sim.observe(BACKUP, 0.8);
+      const result = sim.pass();
+      assert.deepEqual(panRestarts(result), []);
+      assert.ok(!result.events.some(event => event.includes('ALERT')), result.events.join('\n'));
+    }
+    const waiting = sim.state.personas['user-pan'];
+    assert.equal(waiting.attempts, 0);
+    for (const key of ['gave_up', 'safe_stop', 'verified']) assert.equal(waiting[key], undefined, key);
+    assert.equal(waiting.deferred_downgrade.utilization, 0.8);
+    assert.equal(sim.launches['user-pan'].mode, 'fable', 'still on Fable');
+
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-deferred-'));
+    try {
+      fs.mkdirSync(path.join(zylosDir, 'activity-monitor', 'user-pan'), { recursive: true });
+      fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(sim.document));
+      fs.writeFileSync(fableGuardStatePath(zylosDir), JSON.stringify(sim.state));
+      fs.writeFileSync(path.join(zylosDir, 'activity-monitor', 'user-pan', 'fable-launch.json'), JSON.stringify(sim.launches['user-pan']));
+      const cli = path.resolve(import.meta.dirname, '..', 'fable-guard-cli.js');
+      const env = { ...process.env, ZYLOS_DIR: zylosDir };
+      const text = spawnSync(process.execPath, [cli, 'status'], { env, encoding: 'utf8' }).stdout;
+      const line = text.split('\n').find(row => row.startsWith('persona user-pan'));
+      assert.match(line, /desired=opus@claude-ax-backup .* launch=fable@claude-ax-backup .* state=downgrade-pending /);
+      assert.match(line, /DOWNGRADE PENDING: Opus committed, still on Fable until the persona is idle \(soft quota 80% < hard 90%\)/);
+      assert.doesNotMatch(line, /state=ready|GAVE UP|SAFE-STOP/);
+      const json = JSON.parse(spawnSync(process.execPath, [cli, 'status', '--json'], { env, encoding: 'utf8' }).stdout);
+      assert.equal(json.personas['user-pan'].deferred_downgrade.until, waiting.deferred_downgrade.until);
+      assert.equal(json.personas['user-pan'].verified, null);
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+
+    sim.setState('user-pan', 'idle');
+    sim.advance(MIN);
+    const idle = sim.pass();
+    assert.deepEqual(panRestarts(idle).map(item => [item.mode, item.attempt, item.reason]),
+      [['opus', 1, 'resume:deferred_downgrade:idle']]);
+    assert.equal(sim.state.personas['user-pan'].deferred_downgrade, undefined);
+    sim.advance(MIN);
+    assert.deepEqual(panRestarts(sim.pass()), [], 'never a second restart while the first is landing');
+    sim.launchAll(panRestarts(idle));
+    sim.advance(MIN);
+    sim.pass();
+    assert.ok(sim.state.personas['user-pan'].verified.model_at, 'done only once the Opus launch is verified');
+    assert.equal(sim.launches['user-pan'].mode, 'opus');
+  });
+
+  it('at or above hard_threshold a busy persona restarts at once, also when the reading rises during the wait', () => {
+    const { sim, commit } = deferredSim(0.9);
+    assert.deepEqual(commit.restarts.map(item => item.instanceId).sort(), ['user-elaine', 'user-pan']);
+    assert.equal(sim.state.personas['user-pan'].deferred_downgrade, undefined);
+
+    const rise = deferredSim(0.8).sim;
+    assert.ok(rise.state.personas['user-pan'].deferred_downgrade);
+    rise.advance(5 * MIN);
+    rise.observe(BACKUP, 0.93);
+    assert.deepEqual(panRestarts(rise.pass()).map(item => item.reason), ['resume:deferred_downgrade:hard_threshold']);
+  });
+
+  it('a persona still busy after downgrade_max_wait_sec is restarted; 0 never waits; config keys are read', () => {
+    const { sim } = deferredSim(0.8);
+    for (let i = 1; i <= 6; i++) {
+      sim.advance(5 * MIN);
+      sim.observe(BACKUP, 0.8);
+      const result = sim.pass();
+      assert.deepEqual(panRestarts(result).map(item => item.reason), i < 6 ? [] : ['resume:deferred_downgrade:max_wait'], `pass ${i}`);
+    }
+    const never = deferredSim(0.8, documentFixture({ guard: { downgrade_max_wait_sec: 0 } }));
+    assert.deepEqual(never.commit.restarts.map(item => item.instanceId).sort(), ['user-elaine', 'user-pan']);
+    const config = readFableGuardConfig(documentFixture({ guard: { hard_threshold: 0.85, downgrade_max_wait_sec: 600 } }));
+    assert.equal(config.hard_threshold, 0.85);
+    assert.equal(config.downgrade_max_wait_sec, 600);
+    const bad = readFableGuardConfig(documentFixture({ guard: { hard_threshold: 90, downgrade_max_wait_sec: 99_999 } }));
+    assert.equal(bad.hard_threshold, 0.9);
+    assert.equal(bad.downgrade_max_wait_sec, 1800);
+  });
+
+  it('a weekly reset during the wait cancels the downgrade: back to Fable on the running launch, no restart', () => {
+    const { sim } = deferredSim(0.8);
+    const fableLaunch = sim.launches['user-pan'].launch_id;
+    sim.advance(5 * MIN);
+    sim.observe(BACKUP, 0.1, W2);
+    const result = sim.pass();
+    assert.deepEqual(sim.holds(), []);
+    assert.deepEqual(panRestarts(result), []);
+    const pan = sim.state.personas['user-pan'];
+    assert.equal(pan.desired.mode, 'fable');
+    assert.equal(pan.desired.adopted_launch_id, fableLaunch);
+    assert.equal(pan.deferred_downgrade, undefined);
+    sim.advance(MIN);
+    assert.deepEqual(panRestarts(sim.pass()), []);
+    assert.ok(sim.state.personas['user-pan'].verified.model_at);
+  });
+
+  it('crash, stale, limit-dialog, probe-rejection and observation-blind downgrades of a busy persona stay immediate', () => {
+    const busyFable = () => { const sim = new Sim(); sim.toFable(); sim.setState('user-pan', 'busy', { active_tools: 1 }); return sim; };
+    const immediate = (sim, label) => {
+      const result = sim.pass();
+      assert.equal(sim.mode('user-pan'), 'opus', label);
+      assert.deepEqual(panRestarts(result).map(item => item.attempt), [1], label);
+      assert.equal(sim.state.personas['user-pan'].deferred_downgrade, undefined, label);
+      return result;
+    };
+    const crash = busyFable();
+    crash.advance(MIN);
+    crash.observe(BACKUP, 0.8);
+    crash.failures['user-pan'] = { failures: [1, 2].map(n => ({ at: iso(crash.now - n * 1000), mode: 'fable', runtime_profile: BACKUP, reason: 'exit' })) };
+    immediate(crash, 'crash');
+    assert.deepEqual(crash.holds(), ['crash', 'quota']);
+
+    const stale = busyFable();
+    stale.advance(13 * MIN);
+    immediate(stale, 'stale');
+
+    const dialog = busyFable();
+    dialog.evidence['user-pan'] = { at: iso(dialog.now), kind: 'fable_limit', runtime_profile: BACKUP, mode: 'fable' };
+    immediate(dialog, 'limit dialog');
+    assert.ok(dialog.state.holds[BACKUP].quota.hard_at);
+
+    const rejected = busyFable();
+    rejected.attempt(BACKUP, 'rejected', { resets_at: W1 });
+    immediate(rejected, 'probe rejection');
+
+    const blind = busyFable();
+    blind.advance(MIN);
+    blind.observe(BACKUP, 0.8);
+    blind.observations['user-pan'] = { alert: { since: iso(blind.now) } };
+    immediate(blind, 'observation blind');
+  });
+
+  it('the wait ends at once when a hard signal or another hold joins the soft quota hold', () => {
+    const dialog = deferredSim(0.8).sim;
+    dialog.advance(MIN);
+    dialog.observe(BACKUP, 0.8);
+    dialog.evidence['user-elaine'] = { at: iso(dialog.now), kind: 'fable_limit', runtime_profile: BACKUP, mode: 'fable' };
+    assert.deepEqual(panRestarts(dialog.pass()).map(item => item.reason), ['resume:deferred_downgrade:hard_quota_evidence']);
+
+    const stale = deferredSim(0.8).sim;
+    stale.advance(13 * MIN); // the probes stopped answering: lease gone
+    assert.deepEqual(panRestarts(stale.pass()).map(item => item.reason), ['resume:deferred_downgrade:hold:quota+stale']);
+  });
+
+  it('reads state written before this change: holds without hard_at and personas without deferred_downgrade', () => {
+    const config = readFableGuardConfig(documentFixture());
+    const nowMs = T0;
+    const usageEntry = { last_valid: { utilization: 0.8, resets_at: W1, observed_at: iso(nowMs - MIN) } };
+    const persona = { desired: { account: BACKUP, mode: 'opus', generation: 9 },
+      deferred_downgrade: { generation: 9, until: iso(nowMs + MIN) } };
+    const quota = detail => ({ quota: { since: iso(nowMs - MIN), reset_window: W1, detail } });
+    assert.equal(fableDowngradeDeferral({ persona, holds: quota({ source: 'observation', utilization: 0.8 }), usageEntry, config, nowMs }).deferred, true);
+    assert.equal(fableDowngradeDeferral({ persona, holds: quota({ source: 'probe_rejection' }), usageEntry, config, nowMs }).reason, 'hard_quota_evidence');
+    assert.equal(fableDowngradeDeferral({ persona, holds: quota({ source: 'limit_ui', persona: 'user-pan' }), usageEntry, config, nowMs }).reason, 'hard_quota_evidence');
+    assert.equal(fableDowngradeDeferral({ persona: { desired: persona.desired }, holds: quota({ source: 'observation' }), usageEntry, config, nowMs }).deferred, false);
+    // An old guard state (no deferral, no hard_at) plans exactly as before.
+    const sim = new Sim();
+    sim.toFable();
+    const old = JSON.parse(JSON.stringify(sim.state));
+    assert.ok(Object.values(old.personas).every(item => !('deferred_downgrade' in item)));
+    sim.state = old;
+    sim.advance(MIN);
+    sim.observe(BACKUP, 0.1);
+    assert.deepEqual(sim.pass().restarts, []);
   });
 });

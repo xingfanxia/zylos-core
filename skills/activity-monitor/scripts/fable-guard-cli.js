@@ -67,6 +67,7 @@ export function fableGuardStatus({ zylosDir = ZYLOS_DIR, nowMs = Date.now() } = 
         generation: launch.generation, reason: launch.reason, at: new Date(Number(launch.launched_at_ms)).toISOString() },
       ...(persona.unsupported ? { unsupported: persona.unsupported } : {}),
       ...(persona.executing ? { executing: persona.executing } : {}),
+      ...(persona.deferred_downgrade ? { deferred_downgrade: persona.deferred_downgrade } : {}),
       ...(persona.gave_up ? { gave_up: persona.gave_up } : {}),
       ...(persona.safe_stop ? { safe_stop: persona.safe_stop } : {}),
       ...(enforcement ? { lease_enforcement: enforcement } : {}),
@@ -119,7 +120,8 @@ function main(argv) {
 }
 
 function formatStatus({ config, accounts, personas }) {
-  const lines = [config ? `config: fable_model=${config.fable_model} threshold=${config.threshold}` : 'config: not configured (guard inert)'];
+  const lines = [config ? `config: fable_model=${config.fable_model} threshold=${config.threshold} hard_threshold=${config.hard_threshold}`
+    + ` downgrade_max_wait_sec=${config.downgrade_max_wait_sec}` : 'config: not configured (guard inert)'];
   for (const [account, item] of Object.entries(accounts)) {
     const obs = item.observation;
     const holds = Object.keys(item.holds);
@@ -135,10 +137,14 @@ function formatStatus({ config, accounts, personas }) {
       continue;
     }
     const verified = item.verified || {};
-    const state = verified.ready_at ? 'ready' : verified.model_at ? `model ok, readiness ${verified.readiness || 'pending'}`
-      : verified.not_running_at ? 'not running' : 'converging';
+    const deferred = item.deferred_downgrade;
+    const state = deferred ? 'downgrade-pending' : verified.ready_at ? 'ready'
+      : verified.model_at ? `model ok, readiness ${verified.readiness || 'pending'}` : verified.not_running_at ? 'not running' : 'converging';
     lines.push(`${head} launch=${item.launch ? `${item.launch.mode}@${item.launch.runtime_profile} g${item.launch.generation ?? '-'}` : '-'}`
       + ` state=${state}`
+      + (deferred ? ` DOWNGRADE PENDING: Opus committed, still on Fable until the persona is idle (soft quota`
+        + ` ${Math.round(Number(deferred.utilization) * 100)}% < hard ${Math.round(Number(deferred.hard_threshold) * 100)}%);`
+        + ` restart at the latest ${deferred.until}` : '')
       + (item.safe_stop?.confirmed_at
         ? ` SAFE-STOPPED (${item.safe_stop.why}, confirmed ${item.safe_stop.confirmed_at}); after checking: pm2 start activity-monitor-${id}`
         : item.safe_stop ? ` SAFE-STOP PENDING (${item.safe_stop.why}, attempt ${item.safe_stop.attempts || 1}`

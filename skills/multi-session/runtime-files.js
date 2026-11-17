@@ -37,6 +37,11 @@ export function getConfiguredRuntime({
 // runtime-failover daemon owns the state file; launches only read it.
 export const FABLE_GUARD_DEFAULTS = Object.freeze({
   threshold: 0.75,
+  // A downgrade caused only by the soft threshold waits for an idle persona
+  // while utilization stays below hard_threshold, for at most
+  // downgrade_max_wait_sec (0 = never wait).
+  hard_threshold: 0.9,
+  downgrade_max_wait_sec: 1800,
   subagent_model: 'claude-opus-5-5',
   probe_interval_sec: 300,
   lease_sec: 720,
@@ -56,6 +61,7 @@ const FABLE_NUMERIC_BOUNDS = {
   crash_window_sec: [60, 86_400],
   crash_failures: [1, 20],
   crash_probation_sec: [60, 7 * 86_400],
+  downgrade_max_wait_sec: [0, 7200],
 };
 const VALID_PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
@@ -75,6 +81,10 @@ export function readFableGuardConfig(document) {
   const config = { ...FABLE_GUARD_DEFAULTS, fable_model: raw.fable_model };
   const threshold = Number(raw.threshold);
   if (Number.isFinite(threshold) && threshold > 0 && threshold <= 1) config.threshold = threshold;
+  const hardThreshold = Number(raw.hard_threshold);
+  if (raw.hard_threshold != null && Number.isFinite(hardThreshold) && hardThreshold > 0 && hardThreshold <= 1) {
+    config.hard_threshold = hardThreshold;
+  }
   if (typeof raw.subagent_model === 'string' && VALID_MODEL.test(raw.subagent_model)) {
     config.subagent_model = raw.subagent_model;
   }
@@ -121,6 +131,35 @@ export function fableLeaseObservation(entry, nowMs, config) {
   const obs = fableLastObservation(entry, nowMs);
   if (!obs) return null;
   return nowMs - Date.parse(obs.observed_at) < config.lease_sec * 1000 && Date.parse(obs.resets_at) > nowMs ? obs : null;
+}
+
+/**
+ * A committed downgrade to Opus that the guard deferred until the persona is
+ * idle (persona.deferred_downgrade, written by the guard daemon). It stays
+ * deferred only while ALL of these hold: it belongs to the committed Opus
+ * generation; its deadline (`until`) has not passed; the account's only hold
+ * is a quota hold set from usage readings (no probe rejection, no limit
+ * dialog: `hard_at` absent); and a fresh lease reads below hard_threshold.
+ * The guard and the persona's monitor (lease enforcement) share this test, so
+ * the monitor also ends the wait when the daemon is gone (the lease expires).
+ * Launches never use it: a relaunch during the wait is admitted to Opus only.
+ */
+export function fableDowngradeDeferral({ persona, holds, usageEntry, config, nowMs = Date.now() } = {}) {
+  const deferral = persona?.deferred_downgrade;
+  const desired = persona?.desired;
+  if (!config || !deferral || desired?.mode !== 'opus' || deferral.generation !== desired.generation) {
+    return { deferred: false, reason: 'none' };
+  }
+  if (!(nowMs < Date.parse(deferral.until || ''))) return { deferred: false, reason: 'max_wait' };
+  const kinds = holds && typeof holds === 'object' ? Object.keys(holds).sort() : [];
+  const quota = holds?.quota;
+  if (!quota) return { deferred: false, reason: kinds.length ? `hold:${kinds.join('+')}` : 'hold_cleared' };
+  if (kinds.length !== 1) return { deferred: false, reason: `hold:${kinds.join('+')}` };
+  if (quota.hard_at || quota.detail?.source !== 'observation') return { deferred: false, reason: 'hard_quota_evidence' };
+  const lease = fableLeaseObservation(usageEntry, nowMs, config);
+  if (!lease) return { deferred: false, reason: 'lease_expired' };
+  if (!(Number(lease.utilization) < config.hard_threshold)) return { deferred: false, reason: 'hard_threshold' };
+  return { deferred: true, reason: 'soft_quota', utilization: Number(lease.utilization) };
 }
 
 /**

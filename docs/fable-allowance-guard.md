@@ -35,6 +35,8 @@ The policy writer owns these keys. Nothing else writes them.
 | `fable_guard` | object | absent | Absent, not an object, `enabled: false`, or an invalid `fable_model` ⇒ the whole feature is inert: no probe, no state, unchanged launches. |
 | `fable_guard.fable_model` | string, `VALID_MODEL` (`[1m]` suffix allowed) | required | Main model of a Fable-mode launch. The probe uses it without `[1m]`. |
 | `fable_guard.threshold` | number in (0, 1] | `0.75` | Fraction of the weekly Fable window (not a percent). `>=` holds the account. Out of range ⇒ default. |
+| `fable_guard.hard_threshold` | number in (0, 1] | `0.9` | At or above it a soft-quota downgrade never waits for an idle persona. Out of range ⇒ default. |
+| `fable_guard.downgrade_max_wait_sec` | integer 0–7200 | `1800` | Longest wait for an idle persona after a soft-quota downgrade commit; `0` ⇒ never wait. |
 | `fable_guard.probe_accounts` | array of profile ids | `[]` | Accounts probed even when no enabled persona sits on them (rollout before enabling anyone). |
 | `fable_guard.subagent_model` | string | `claude-opus-5-5` | Value of `CLAUDE_CODE_SUBAGENT_MODEL` for Fable personas. |
 | `fable_guard.probe_interval_sec` | integer 60–3600 | `300` | Fixed probe cadence per account. |
@@ -217,7 +219,9 @@ derived from it.
     "desired": { "account": "claude-ax-backup", "mode": "fable|opus", "generation": 12, "key": "<launch key>",
                  "model": "claude-fable-5-2", "committed_at": "...", "reason": "...", "adopted_launch_id": "<uuid, optional>" },
     "executed_generation": 12, "executed_at": "...", "attempts": 1,
-    "last_transition_at": "...", "verified": { "model_at": "...", "ack_at": "..." } } },
+    "last_transition_at": "...", "verified": { "model_at": "...", "ack_at": "..." },
+    "deferred_downgrade": { "generation": 12, "reason": "soft_quota", "since": "...", "until": "...",
+                            "hard_threshold": 0.9, "utilization": 0.78 } } },
   "manual_clears": [] }
 ```
 
@@ -227,7 +231,7 @@ below threshold). Unknown quota on an account ⇒ Opus.
 
 | Kind | Set when | Cleared when |
 |---|---|---|
-| `quota` | a fresh reading ≥ threshold; a probe rejection; a classified limit dialog on a persona of that account | a valid reading below threshold from a **later** reset window than `reset_window` (a hold without a known window pins the first later reading's window). Never by stale/crash events or by lowering the threshold back. |
+| `quota` | a fresh reading ≥ threshold; a probe rejection; a classified limit dialog on a persona of that account (these two also set `hard_at`, which stays for the life of the hold) | a valid reading below threshold from a **later** reset window than `reset_window` (a hold without a known window pins the first later reading's window). Never by stale/crash events or by lowering the threshold back. |
 | `stale` | the account is probed and has no valid lease | `stale_clear_observations` consecutive valid readings below threshold made after the hold |
 | `crash` | `crash_failures` Fable-session failures of one persona within `crash_window_sec` | trip 1: after `crash_probation_sec` (one retry). Trip 2 in the same window: a later-window reading below threshold |
 
@@ -252,7 +256,29 @@ Each daemon pass, under `instances.json.lock` and after the account failover
 has chosen the account: derive holds → derive the persona's mode →
 commit `desired {account, mode, generation}` once → reconcile.
 
-- Downgrade is immediate. Upgrade also needs `upgrade_min_dwell_sec` since the
+- Downgrade is immediate, with one exception: a **soft-quota downgrade of a
+  busy persona waits for it to be idle**. When the commit's reason is exactly
+  `fable_blocked:quota`, that quota hold came from readings only (no
+  `hard_at`: no probe rejection, no limit dialog), the fresh lease reads below
+  `hard_threshold`, the persona's current launch is Fable on that account and
+  `agent-status.json` says `busy`, the Opus commit is recorded as usual but its
+  restart is not issued: the persona gets `deferred_downgrade {generation,
+  since, until}` (`until` = commit + `downgrade_max_wait_sec`). While it
+  waits, nothing is verified, retried or counted (`attempts` stays 0, no
+  `resume:*`, no give-up), the launch gate still admits only Opus for any
+  relaunch, and `fable-guard-cli.js status` prints `state=downgrade-pending …
+  DOWNGRADE PENDING: Opus committed, still on Fable until the persona is idle`.
+  The wait ends on the first pass where the persona is `idle` (log `deferred
+  downgrade gN stops waiting (idle)`, one restart `resume:deferred_downgrade:idle`,
+  attempt 1), or at once when `until` passes (`max_wait`), the reading
+  reaches `hard_threshold`, the lease expires, a hard quota signal or any
+  other hold joins (`hold:quota+stale`, `hard_quota_evidence`), or the Fable
+  session is gone (its replacement is then verified normally). If the account
+  allows Fable again first (weekly reset, manual clear), the normal desired
+  recomputation cancels the downgrade: it commits Fable and adopts the still
+  running launch, with no restart. Crash, stale, observation-blind, disabled,
+  account-failover and every other downgrade reason stay immediate.
+- Upgrade also needs `upgrade_min_dwell_sec` since the
   persona's last model transition and the persona idle (fresh status, `idle`,
   health ok, no active tools).
 - The commit is the tuple `{account, mode, generation, key}`, where `key` is
@@ -382,8 +408,12 @@ session is safe only when that evidence says a non-Fable model; Fable **or no
 evidence** (record missing, older than the session, process unreadable) means
 it may be on Fable. Such a session is checked against admission (for the
 account of its launch record when the record belongs to this session, else
-the instance's current account). If admission has failed for longer than
-120 s (one daemon poll plus its cold restart, so a live daemon always acts
+the instance's current account). A session whose soft-quota downgrade the
+guard is deferring (`fableDowngradeDeferral` in `runtime-files.js`, the same
+test the daemon uses: `until` not passed, only a reading-based quota hold, a
+fresh lease below `hard_threshold`) is left alone; when the daemon is dead its
+probes stop, the lease expires within `lease_sec`, and enforcement resumes.
+If admission has failed for longer than 120 s (one daemon poll plus its cold restart, so a live daemon always acts
 first), the monitor logs `Fable guard ALERT`, writes
 `<monitor dir>/fable-lease-enforcement.json` (`status: pending`), and stops
 that session:

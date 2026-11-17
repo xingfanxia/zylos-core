@@ -40,6 +40,7 @@ import {
   FABLE_LAUNCH_FILE,
   FABLE_OBSERVATION_FILE,
   fableAdmission,
+  fableDowngradeDeferral,
   fableGuardStatePath,
   fableUsagePath,
   readFableGuardConfig,
@@ -489,9 +490,15 @@ export function createFableMonitor({
     const launch = readLaunch();
     const record = recordFor(launch, sessionRef);
     const profileId = record?.runtime_profile || document?.instances?.[instanceId]?.runtime_profile || null;
-    const admission = fableAdmission({ document, instanceId, profileId, nowMs,
-      guardState: readJson(fableGuardStatePath(zylosDir), null), usage: readJson(fableUsagePath(zylosDir), null) });
+    const guardState = readJson(fableGuardStatePath(zylosDir), null);
+    const usage = readJson(fableUsagePath(zylosDir), null);
+    const admission = fableAdmission({ document, instanceId, profileId, nowMs, guardState, usage });
     if (admission?.admitted) { unadmitted = null; return null; }
+    // The guard deferred this soft-quota downgrade until the persona is idle:
+    // the session finishes its turn. The grace starts again once the wait ends.
+    const persona = guardState?.personas?.[instanceId];
+    if (persona?.desired?.account === profileId && fableDowngradeDeferral({ persona, holds: guardState?.holds?.[persona?.desired?.account], config, nowMs,
+      usageEntry: usage?.accounts?.[persona?.desired?.account] }).deferred) { unadmitted = null; return null; }
     if (!unadmitted || unadmitted.sessionRef !== sessionRef) unadmitted = { sessionRef, since: nowMs };
     if (nowMs - unadmitted.since < graceMs) return null;
     if (evidence === 'unknown') {

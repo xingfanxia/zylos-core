@@ -16,6 +16,7 @@ import {
   FABLE_LAUNCH_FILE,
   FABLE_OBSERVATION_FILE,
   fableAccountSettingsFile,
+  fableDowngradeDeferral,
   fableGuardStatePath,
   fableLastObservation,
   fableLeaseObservation,
@@ -124,13 +125,17 @@ function currentWindow(entry, nowMs) {
   return obs && ms(obs.resets_at) > nowMs ? obs.resets_at : null;
 }
 
+// `hard_at`: the allowance itself refused (probe rejection, limit dialog), not
+// only a reading at or above the threshold. It never waits for an idle persona.
 function setQuotaHold(holds, { nowMs, resetWindow, detail }) {
+  const hard = detail.source !== 'observation';
   if (holds.quota) {
     holds.quota.detail = { ...holds.quota.detail, last: detail, last_at: iso(nowMs) };
     if (!holds.quota.reset_window && resetWindow) holds.quota.reset_window = resetWindow;
+    if (hard && !holds.quota.hard_at) holds.quota.hard_at = iso(nowMs);
     return false;
   }
-  holds.quota = { since: iso(nowMs), reset_window: resetWindow || null, detail };
+  holds.quota = { since: iso(nowMs), reset_window: resetWindow || null, detail, ...(hard ? { hard_at: iso(nowMs) } : {}) };
   return true;
 }
 
@@ -298,7 +303,10 @@ export function planFableGuard({
     const profileId = instance.runtime_profile || null;
     const status = statusByInstance[id] || {};
     const eligible = enabled && Boolean(fableAccountSettingsFile(document, profileId));
-    const priorMode = persona.desired?.mode || 'opus';
+    // A downgrade still waiting for an idle persona leaves Fable running: if
+    // the account allows Fable again meanwhile, it is cancelled, not upgraded.
+    const priorMode = persona.deferred_downgrade && persona.deferred_downgrade.generation === persona.desired?.generation
+      ? 'fable' : persona.desired?.mode || 'opus';
     let mode = 'opus';
     // The persona's monitor cannot observe its session's model: Opus until it can.
     const blind = eligible && fableObservationBlocked(observationByInstance[id]);
@@ -324,7 +332,9 @@ export function planFableGuard({
       persona.executed_generation = generation;
       persona.executed_at = iso(nowMs);
       persona.attempts = 0;
-      for (const key of ['verified', 'gave_up', 'restart_required', 'safe_stop', 'model_unknown_launch']) delete persona[key];
+      for (const key of ['verified', 'gave_up', 'restart_required', 'safe_stop', 'model_unknown_launch', 'deferred_downgrade']) {
+        delete persona[key];
+      }
       if (!claudeProfile(document, profileId)) {
         // A non-Claude engine cannot run Fable and writes no launch record;
         // the account failover owns its restart.
@@ -333,6 +343,10 @@ export function planFableGuard({
         persona.desired.adopted_launch_id = launch.launch_id;
       } else if (failoverInstanceIds.has(id)) {
         persona.attempts = 1; // the account failover's cold restart carries this commit
+      } else if (deferSoftQuotaDowngrade({ persona, holds: next.holds[profileId], usageEntry: usage?.accounts?.[profileId],
+        launch, status, config, nowMs, priorMode })) {
+        events.push(`${id}: g${generation} restart deferred until idle (soft quota ${persona.deferred_downgrade.utilization}`
+          + ` < ${config.hard_threshold}, at most until ${persona.deferred_downgrade.until}); Fable keeps the current turn`);
       } else if (policyOnlyChange(persona.desired, launch) && status.state !== 'idle') {
         // Nothing here reduces Fable exposure: restart once the persona is idle.
       } else if (status.state !== 'suspended') {
@@ -349,7 +363,7 @@ export function planFableGuard({
       continue;
     }
     reconcilePersona({ id, instance, persona, status, launch, actual: modelByInstance[id], readiness: readinessByInstance[id],
-      config, nowMs, restarts, events,
+      config, nowMs, restarts, events, holds: next.holds[profileId], usageEntry: usage?.accounts?.[profileId],
       failureCount: () => sessionFailures(persona, failuresByInstance[id], profileId,
         Math.max(nowMs - (config?.crash_window_sec || 0) * 1000, ms(persona.crash_counted_after) || 0)).length });
     if (!enabled && persona.desired.mode === 'opus' && persona.verified?.model_at) delete next.personas[id];
@@ -389,10 +403,41 @@ function policyOnlyChange(desired, launch) {
   return desired.mode === 'opus' && launch?.mode === 'opus' && launch.runtime_profile === desired.account;
 }
 
+// A downgrade caused only by the soft quota threshold (the account's only hold
+// is a reading-based quota hold below hard_threshold) does not interrupt a
+// busy Fable persona: the Opus commit stands, and its restart waits until the
+// persona is idle (reconcilePersona), at most downgrade_max_wait_sec.
+function deferSoftQuotaDowngrade({ persona, holds, usageEntry, launch, status, config, nowMs, priorMode }) {
+  const desired = persona.desired;
+  if (desired.mode !== 'opus' || priorMode !== 'fable' || desired.reason !== 'fable_blocked:quota'
+      || !(config.downgrade_max_wait_sec > 0) || status.state !== 'busy') return false;
+  if (!launchServes(launch, status, nowMs) || launch.mode !== 'fable' || launch.runtime_profile !== desired.account) return false;
+  persona.deferred_downgrade = { generation: desired.generation, reason: 'soft_quota', since: iso(nowMs),
+    until: iso(nowMs + config.downgrade_max_wait_sec * 1000), hard_threshold: config.hard_threshold };
+  const check = fableDowngradeDeferral({ persona, holds, usageEntry, config, nowMs });
+  if (check.deferred) {
+    persona.deferred_downgrade.utilization = check.utilization;
+    return true;
+  }
+  delete persona.deferred_downgrade;
+  return false;
+}
+
+// Why a deferred downgrade stops waiting, or null while it still waits.
+function deferralEnd({ persona, holds, usageEntry, launch, status, config, nowMs }) {
+  const check = fableDowngradeDeferral({ persona, holds, usageEntry, config, nowMs });
+  if (!check.deferred) return check.reason;
+  if (!launchServes(launch, status, nowMs) || launch.mode !== 'fable') return 'fable_not_running';
+  if (status.state !== 'busy') return status.state === 'idle' ? 'idle' : `state:${status.state || 'unknown'}`;
+  persona.deferred_downgrade.utilization = check.utilization;
+  return null;
+}
+
 // Verify a committed generation against the running engine's launch record
 // (account, policy, generation) and its reported model, and resume an
 // interrupted transition. A committed opus with Fable still running is not done.
-function reconcilePersona({ id, instance, persona, status, launch, actual, readiness, config, nowMs, restarts, events, failureCount }) {
+function reconcilePersona({ id, instance, persona, status, launch, actual, readiness, config, nowMs, restarts, events, failureCount,
+  holds, usageEntry }) {
   const desired = persona.desired;
   if (persona.executed_generation !== desired.generation) return;
   const executedMs = ms(persona.executed_at);
@@ -426,6 +471,19 @@ function reconcilePersona({ id, instance, persona, status, launch, actual, readi
   if (persona.safe_stop?.generation === desired.generation) {
     reconcileSafeStop({ id, persona, status, launch, actual, config, nowMs, restarts, events, tmuxSession });
     return;
+  }
+  if (persona.deferred_downgrade) {
+    // Waiting for idle: Fable finishes the turn; nothing is verified, retried or counted.
+    const why = deferralEnd({ persona, holds, usageEntry, launch, status, config, nowMs });
+    if (!why) return;
+    delete persona.deferred_downgrade;
+    events.push(`${id}: deferred downgrade g${desired.generation} stops waiting (${why})`);
+    if (launchServes(launch, status, nowMs) && launch.mode === 'fable') {
+      resume(`deferred_downgrade:${why}`);
+      return;
+    }
+    // The Fable session is gone already: verify its replacement from now on.
+    persona.executed_at = iso(nowMs);
   }
   if (!isRunning(status, nowMs)) {
     // A suspended persona launches through the admission gate when it wakes.
