@@ -11,10 +11,16 @@
  *   orchestrators), composing every part in one string.
  *
  * Multi-session aware (fork): identity/references resolve from the shared
- * memory tier, state from the per-instance tier; instances additionally get
- * the cross-instance digest (eligibility-gated), the memory write policy, and
- * per-instance instruction files — in shard mode these ride with the 'state'
- * part so no fork context is lost.
+ * memory tier, state from the per-instance tier.
+ *
+ * Persona block: an instance's own instruction files (who it is, whom it
+ * serves) and its memory write policy are small, operator-owned and must be
+ * present on every start. In shard mode they are the GUARANTEED part of the
+ * first shard ('identity'), emitted before the shared bot identity, so no
+ * later or larger section can push them out of the shard budget. Mutable
+ * content (shared identity, active state, the cross-instance digest) is
+ * returned as labeled sections that the shard composer trims from the end,
+ * least important last section first, with a marker naming the full files.
  */
 
 import { isCliEntry } from '../../multi-session/cli-entry.js';
@@ -116,40 +122,52 @@ function defaultZylosDir() {
 }
 
 /**
- * The per-instance tail: cross-instance digest (eligibility-gated), memory
- * write policy, and per-instance instruction files. Shared by the legacy
- * full-context path and the 'state' shard so both carry identical fork context.
+ * The persona block: per-instance instruction files (identity and scope)
+ * followed by the memory write policy. Empty in single-session mode. Shared
+ * by the legacy full-context path and the 'identity' shard.
  */
-function instanceTailParts({ zylosDir, instanceId, runtime = null }) {
+function personaParts({ zylosDir, instanceId, runtime = null }) {
+  if (!instanceId) return [];
   const parts = [];
-
-  // Shared context digest (cross-instance awareness)
-  // Only inject for admin/scheduler/group — user instances don't need other users' activity,
-  // and the cross-user references can cause identity confusion.
-  if (_isDigestEligible(instanceId, zylosDir)) {
-    const digestPath = resolveSharedMemoryFile(zylosDir, 'recent-activity.md');
-    const digestResult = readFileSafe(digestPath);
-    if (digestResult.ok && digestResult.content.trim()) {
-      parts.push(section('CROSS-INSTANCE CONTEXT', digestPath));
+  const activeRuntime = runtime || getInstanceRuntime({ zylosDir, instanceId });
+  for (const entry of getInstanceInstructionFiles({ zylosDir, instanceId, runtime: activeRuntime })) {
+    const result = readFileSafe(entry.path);
+    if (result.ok && result.content && result.content.trim().length > 0) {
+      parts.push(inlineSection(entry.label, result.content));
     }
   }
-
-  if (instanceId) {
-    parts.push(inlineSection(
-      'MEMORY WRITE POLICY',
-      describeMemoryWritePolicy({ instanceId, instancesFilePath: path.join(zylosDir, 'instances.json') })
-    ));
-
-    const activeRuntime = runtime || getInstanceRuntime({ zylosDir, instanceId });
-    for (const entry of getInstanceInstructionFiles({ zylosDir, instanceId, runtime: activeRuntime })) {
-      const result = readFileSafe(entry.path);
-      if (result.ok && result.content && result.content.trim().length > 0) {
-        parts.push(inlineSection(entry.label, result.content));
-      }
-    }
-  }
-
+  parts.push(inlineSection(
+    'MEMORY WRITE POLICY',
+    describeMemoryWritePolicy({ instanceId, instancesFilePath: path.join(zylosDir, 'instances.json') })
+  ));
   return parts;
+}
+
+/**
+ * Cross-instance digest, only for admin/scheduler/group (user instances don't
+ * need other users' activity, and cross-user references can cause identity
+ * confusion). Returns a labeled section or null.
+ */
+function digestSection({ zylosDir, instanceId }) {
+  if (!_isDigestEligible(instanceId, zylosDir)) return null;
+  const digestPath = resolveSharedMemoryFile(zylosDir, 'recent-activity.md');
+  const digestResult = readFileSafe(digestPath);
+  if (!digestResult.ok || !digestResult.content.trim()) return null;
+  return {
+    label: 'CROSS-INSTANCE CONTEXT',
+    text: inlineSection('CROSS-INSTANCE CONTEXT', digestResult.content),
+    path: digestPath,
+  };
+}
+
+function fileSection(label, filePath) {
+  return { label, text: section(label, filePath), path: filePath };
+}
+
+function stateFilePath(zylosDir, instanceId) {
+  return instanceId
+    ? resolveInstanceMemoryFile(zylosDir, instanceId, 'state.md')
+    : path.join(getMemoryDir(zylosDir), 'state.md');
 }
 
 export const MEMORY_PARTS = Object.freeze({
@@ -159,26 +177,39 @@ export const MEMORY_PARTS = Object.freeze({
 });
 
 /**
- * Emit a single memory section. Used by the session-start shard orchestrator
- * so each memory file gets its own hook stdout budget instead of sharing one.
- * Instance-aware: identity/references come from the shared tier, state from
- * the per-instance tier — and the state shard carries the per-instance tail
- * (digest / write policy / instruction files) so shard mode loses nothing.
+ * Emit a single memory shard body. Used by the session-start shard
+ * orchestrator so each memory file gets its own hook stdout budget.
+ *
+ * 'identity' and 'state' return the structured shard body understood by
+ * composeShardOutput: `{ guaranteed, sections }`. `guaranteed` (the persona
+ * block, identity shard only) is never trimmed; `sections` are in importance
+ * order and are trimmed from the last one backwards, each carrying the path
+ * of the file that holds its full text. 'references' stays a plain string.
  */
-export function emitMemoryPart(part, _payload = null) {
+export function emitMemoryPart(part, _payload = null, {
+  zylosDir = defaultZylosDir(),
+  instanceId = process.env.ZYLOS_INSTANCE_ID || null,
+  runtime = null,
+} = {}) {
   const spec = MEMORY_PARTS[part];
   if (!spec) throw new Error(`unknown memory part "${part}"`);
-  const zylosDir = defaultZylosDir();
-  const instanceId = process.env.ZYLOS_INSTANCE_ID || null;
 
-  if (part === 'identity' || part === 'references') {
+  if (part === 'references') {
     return section(spec.label, resolveSharedMemoryFile(zylosDir, spec.file));
   }
-
-  const stateSection = section(spec.label, instanceId
-    ? resolveInstanceMemoryFile(zylosDir, instanceId, spec.file)
-    : path.join(getMemoryDir(zylosDir), spec.file));
-  return [stateSection, ...instanceTailParts({ zylosDir, instanceId })].join('\n\n');
+  if (part === 'identity') {
+    return {
+      guaranteed: personaParts({ zylosDir, instanceId, runtime }).join('\n\n'),
+      sections: [fileSection(spec.label, resolveSharedMemoryFile(zylosDir, spec.file))],
+    };
+  }
+  return {
+    guaranteed: '',
+    sections: [
+      fileSection(spec.label, stateFilePath(zylosDir, instanceId)),
+      digestSection({ zylosDir, instanceId }),
+    ].filter(Boolean),
+  };
 }
 
 export function getStartupMemoryContextParts({
@@ -186,16 +217,16 @@ export function getStartupMemoryContextParts({
   instanceId = process.env.ZYLOS_INSTANCE_ID || null,
   runtime = null,
 } = {}) {
-  const parts = [
+  // Persona block first: this legacy single-stdout block is persisted by
+  // Claude Code above 10,000 chars with only a ~2KB inline preview, so
+  // whatever comes first is all that is reliably seen.
+  return [
+    ...personaParts({ zylosDir, instanceId, runtime }),
     section('BOT IDENTITY', resolveSharedMemoryFile(zylosDir, 'identity.md')),
-    section('ACTIVE STATE', instanceId
-      ? resolveInstanceMemoryFile(zylosDir, instanceId, 'state.md')
-      : path.join(getMemoryDir(zylosDir), 'state.md')),
+    section('ACTIVE STATE', stateFilePath(zylosDir, instanceId)),
     section('REFERENCES', resolveSharedMemoryFile(zylosDir, 'references.md')),
-    ...instanceTailParts({ zylosDir, instanceId, runtime }),
-  ];
-
-  return parts;
+    digestSection({ zylosDir, instanceId })?.text,
+  ].filter(Boolean);
 }
 
 /**

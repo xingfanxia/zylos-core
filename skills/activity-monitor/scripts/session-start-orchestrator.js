@@ -325,29 +325,168 @@ export function shardSpillPath(sessionId, shardName, { tmpdir = os.tmpdir() } = 
 }
 
 /**
+ * Normalize an emitter's return value to the structured shard body.
+ * A plain string is one unlabeled trimmable section (the historical
+ * contract every component emitter still uses). A structured body is
+ * `{ guaranteed?: string, sections?: [{ text, label?, path? }] }`.
+ */
+export function normalizeShardBody(body) {
+  if (body != null && typeof body === 'object' && !Array.isArray(body)) {
+    const sections = (Array.isArray(body.sections) ? body.sections : [])
+      .filter(item => item && String(item.text ?? '').trim())
+      .map(item => ({
+        text: String(item.text).trim(),
+        label: item.label || null,
+        path: item.path || null,
+      }));
+    return { guaranteed: String(body.guaranteed ?? '').trim(), sections };
+  }
+  const text = (body == null ? '' : String(body)).trim();
+  return { guaranteed: '', sections: text ? [{ text, label: null, path: null }] : [] };
+}
+
+function joinBody(parts) {
+  return parts.filter(Boolean).join('\n\n');
+}
+
+// Cut a fitted slice back to its last line break so a trimmed section never
+// ends mid-line (or mid-character run of a list item).
+function fitAtLineBoundary(text, budget) {
+  const fit = fitToBudget(text, budget);
+  if (!fit.truncated) return fit.text;
+  const lastBreak = fit.text.lastIndexOf('\n');
+  return lastBreak > 0 ? fit.text.slice(0, lastBreak) : fit.text;
+}
+
+function cost(text) {
+  return { chars: text.length, tokens: estimateTokens(text) };
+}
+
+function budgetLeft(budget, used) {
+  return {
+    maxChars: Math.max(0, budget.maxChars - used.chars),
+    maxTokens: Math.max(0, budget.maxTokens - used.tokens),
+  };
+}
+
+function addCost(used, text) {
+  // estimateTokens is subadditive (sum of ceilings >= ceiling of sum), so a
+  // running sum never under-counts the concatenated output.
+  const next = cost(text);
+  return { chars: used.chars + next.chars, tokens: used.tokens + next.tokens };
+}
+
+// Markdown headings that start inside the cut tail, so the agent knows which
+// named sections (e.g. a standing-rules section at the end of state.md) it
+// must open the file to read. keptChars 0 lists every heading (worst case).
+function cutHeadings(text, keptChars) {
+  return [...text.slice(keptChars).matchAll(/^#{1,4} .+$/gm)].map(match => match[0].trim().slice(0, 80));
+}
+
+function trimNotice({ trimmed, omitted, sections, spillPath, totalChars, keptChars, guaranteedTrimmed }) {
+  if (sections.every(item => !item.label)) {
+    // Unlabeled (plain string) body: historical wording.
+    return `[shard output truncated: first ${keptChars} of ${totalChars} chars inline; full section saved to: ${spillPath}]`;
+  }
+  const parts = [];
+  if (guaranteedTrimmed) parts.push('persona section exceeded the shard budget and was cut (fix the instance instruction files)');
+  if (trimmed) {
+    const headings = cutHeadings(trimmed.text, trimmed.worstCase ? 0 : trimmed.keptChars);
+    parts.push(`${trimmed.label || 'section'} kept its first ${trimmed.keptChars} of ${trimmed.text.length} chars; the rest of it was cut from its end${headings.length ? ` (cut headings: ${headings.join(' | ')})` : ''}`);
+  }
+  if (omitted.length) parts.push(`omitted: ${omitted.map(item => item.label || 'section').join(', ')}`);
+  const files = [trimmed, ...omitted].filter(item => item?.path).map(item => item.path);
+  if (files.length) parts.push(`read the full text in: ${[...new Set(files)].join(', ')}`);
+  parts.push(`full shard copy: ${spillPath}`);
+  return `[trimmed to fit the startup budget: ${parts.join('; ')}]`;
+}
+
+/**
  * Compose a shard's stdout under its dual budget (chars for Claude's 10K
- * persist threshold, estimated tokens for Codex's elision threshold). Over
- * budget → keep the header, trim the body tail, and point at the spilled
- * full copy so nothing is lost.
+ * persist threshold, estimated tokens for Codex's elision threshold).
+ *
+ * Emission order is header, then the guaranteed part, then the trimmable
+ * sections in importance order. The guaranteed part is never trimmed by a
+ * later section: over budget, sections are kept whole while they fit, the
+ * first one that does not fit is cut from its end at a line boundary, and
+ * the rest are omitted. A visible marker names what was cut and the files
+ * that hold the full text; the whole body is also spilled to `spillPath`.
  */
 export function composeShardOutput({ header, body, budget, spillPath }) {
-  const trimmedBody = (body == null ? '' : String(body)).trim();
-  const full = trimmedBody ? `${header}\n${trimmedBody}\n` : `${header}\n`;
+  const { guaranteed, sections } = normalizeShardBody(body);
+  const fullBody = joinBody([guaranteed, ...sections.map(item => item.text)]);
+  const full = fullBody ? `${header}\n${fullBody}\n` : `${header}\n`;
   if (withinBudget(full, budget)) {
-    return { output: full, truncated: false };
+    return { output: full, truncated: false, guaranteedChars: guaranteed.length };
   }
 
-  const notice = keptChars =>
-    `\n[shard output truncated: first ${keptChars} of ${trimmedBody.length} chars inline; full section saved to: ${spillPath}]`;
-  const worstOverhead = `${header}${notice(trimmedBody.length)}\n`;
-  const fit = fitToBudget(trimmedBody, {
-    maxChars: Math.max(0, budget.maxChars - (worstOverhead.length + 1)),
-    maxTokens: Math.max(0, budget.maxTokens - estimateTokens(worstOverhead)),
+  // Reserve room for the longest marker any trim point could produce, before
+  // placing anything (every possible "first section cut" plus "all omitted").
+  const noticeFor = (index) => trimNotice({
+    trimmed: index < sections.length ? { ...sections[index], keptChars: sections[index].text.length, worstCase: true } : null,
+    omitted: sections.slice(index < sections.length ? index + 1 : 0),
+    sections,
+    spillPath,
+    totalChars: fullBody.length,
+    keptChars: fullBody.length,
+    guaranteedTrimmed: true,
+  });
+  const notices = Array.from({ length: sections.length + 1 }, (_, index) => cost(noticeFor(index)));
+  const reserve = {
+    chars: header.length + 3 + Math.max(...notices.map(item => item.chars)),
+    tokens: estimateTokens(header) + 1 + Math.max(...notices.map(item => item.tokens)),
+  };
+
+  let guaranteedText = guaranteed;
+  let guaranteedTrimmed = false;
+  if (guaranteed && !withinBudget(guaranteed, budgetLeft(budget, reserve))) {
+    guaranteedText = fitAtLineBoundary(guaranteed, budgetLeft(budget, reserve));
+    guaranteedTrimmed = true;
+  }
+
+  const kept = [];
+  const omitted = [];
+  let trimmed = null;
+  let used = addCost(reserve, guaranteedText);
+  for (const item of sections) {
+    if (trimmed || omitted.length) {
+      omitted.push(item);
+      continue;
+    }
+    const withSeparator = addCost(used, '\n\n');
+    if (withinBudget(item.text, budgetLeft(budget, withSeparator))) {
+      kept.push(item.text);
+      used = addCost(withSeparator, item.text);
+      continue;
+    }
+    const keptText = fitAtLineBoundary(item.text, budgetLeft(budget, withSeparator));
+    if (keptText.trim()) {
+      kept.push(keptText);
+      used = addCost(withSeparator, keptText);
+      trimmed = { ...item, keptChars: keptText.length };
+    } else {
+      omitted.push(item);
+    }
+  }
+
+  const inlineBody = joinBody([guaranteedText, ...kept]);
+  const notice = trimNotice({
+    trimmed,
+    omitted,
+    sections,
+    spillPath,
+    totalChars: fullBody.length,
+    keptChars: inlineBody.length,
+    guaranteedTrimmed,
   });
   return {
-    output: `${header}\n${fit.text}${notice(fit.text.length)}\n`,
+    output: `${header}\n${inlineBody ? `${inlineBody}\n` : ''}${notice}\n`,
     truncated: true,
-    fullBody: trimmedBody,
+    fullBody,
+    guaranteedChars: guaranteedText.length,
+    guaranteedTrimmed,
+    trimmedLabel: trimmed?.label || null,
+    omittedLabels: omitted.map(item => item.label || 'section'),
   };
 }
 
@@ -532,7 +671,8 @@ export async function runSessionStartShard(name, payload = {}, {
   let error = null;
   try {
     const output = await withTimeout(Promise.resolve().then(() => shard.emit(payload)), emitBudgetMs, name);
-    body = output == null ? '' : String(output);
+    // Structured bodies ({ guaranteed, sections }) go to the composer as-is.
+    body = output == null ? '' : (typeof output === 'object' ? output : String(output));
   } catch (err) {
     // Keep the failure visible in the injected stream (and keep the [k/N]
     // numbering intact) instead of silently dropping the section.
@@ -590,7 +730,13 @@ export async function runSessionStartShard(name, payload = {}, {
     status,
     durationMs: Date.now() - startMs,
     stdoutBytes: Buffer.byteLength(composed.output),
-    extra: [waitExtra, composed.truncated ? 'truncated=1' : ''].filter(Boolean).join(':'),
+    extra: [
+      waitExtra,
+      composed.truncated ? 'truncated=1' : '',
+      composed.trimmedLabel ? `trimmed=${composed.trimmedLabel.replace(/\s+/g, '_')}` : '',
+      composed.omittedLabels?.length ? `omitted=${composed.omittedLabels.join(',').replace(/\s+/g, '_')}` : '',
+      composed.guaranteedTrimmed ? 'persona_cut=1' : '',
+    ].filter(Boolean).join(':'),
     error,
   });
 }
