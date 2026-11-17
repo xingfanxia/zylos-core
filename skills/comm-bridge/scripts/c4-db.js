@@ -331,6 +331,32 @@ export function markFailed(id) {
 }
 
 /**
+ * Record on an inbound row (audit column only) that its delivery content could
+ * not be built, so it was never pasted: today a spill that could not be handed
+ * to its recipient. The primary monitor's content-error alert reads this.
+ * @param {number} id - conversation id
+ * @param {string} code - short reason code, e.g. recipient_acl_failed
+ */
+export function markContentError(id, code) {
+  getDb().prepare("UPDATE conversations SET delivery_action = ? WHERE id = ? AND direction = 'in'")
+    .run(`content-error:${String(code).slice(0, 48)}`, id);
+}
+
+/**
+ * Inbound rows that ended `failed` with a content error, oldest first.
+ * @param {number} [afterId=0] - only rows with a larger id
+ * @param {number} [limit=20]
+ * @returns {Array<{id:number,target_instance:string|null,delivery_action:string,timestamp:string}>}
+ */
+export function getContentErrorFailures(afterId = 0, limit = 20) {
+  return getDb().prepare(`
+    SELECT id, target_instance, delivery_action, timestamp FROM conversations
+    WHERE direction = 'in' AND status = 'failed' AND delivery_action LIKE 'content-error:%' AND id > ?
+    ORDER BY id ASC LIMIT ?
+  `).all(afterId, limit);
+}
+
+/**
  * Outbound send lifecycle: an out-row is written 'sending' before the channel
  * script runs and ends 'delivered', 'failed' or 'unknown' (the script was
  * stopped at the time limit, so the message may or may not have arrived).

@@ -25,6 +25,7 @@ import {
   close,
   incrementRetryCount,
   markFailed,
+  markContentError,
   markDelivered,
   getNextPendingControl,
   claimControl,
@@ -854,9 +855,11 @@ async function handleConversationDeliveryFailure(msg, statusFile = AGENT_STATUS_
  * A row whose delivery content could not be built is never pasted. Today that
  * is a long conversation whose spill could not be written or handed to its
  * recipient (c4-recipient-access.js). Each attempt is recorded in
- * delivery-failures.log with its id and reason; the row then takes the normal
- * bounded retry and ends `failed`, so the maintainer can repair the cause and
- * requeue exactly these ids.
+ * delivery-failures.log with its id and reason, and a conversation row carries
+ * `delivery_action = content-error:<code>`; the row then takes the normal
+ * bounded retry and ends `failed`. The primary monitor alerts the admin chat
+ * with the ids and reason, so the maintainer can repair the cause and requeue
+ * exactly these ids.
  */
 async function handleContentFailure(item, err, statusFile = AGENT_STATUS_FILE) {
   const detail = String(err?.message || err).split(' on ')[0].replace(/\s+/g, '_').slice(0, 160);
@@ -865,6 +868,9 @@ async function handleContentFailure(item, err, statusFile = AGENT_STATUS_FILE) {
   if (item.type === 'control') {
     await handleControlDeliveryFailure(item, `CONTENT_ERROR: ${detail}`);
   } else {
+    // The reason stays on the row, where the primary monitor's content-error
+    // alert finds it once the row has failed (activity-monitor content-error-alert.js).
+    markContentError(item.id, detail.split(':')[0]);
     await handleConversationDeliveryFailure(item, statusFile);
   }
 }

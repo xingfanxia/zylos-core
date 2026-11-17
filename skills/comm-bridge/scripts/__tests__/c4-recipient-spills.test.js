@@ -221,6 +221,8 @@ describe('dispatcher: a conversation whose spill cannot be granted', () => {
     assert.equal(lines.filter((l) => / reason=CONTENT_ERROR detail=recipient_acl_failed:_?zylos-a$/.test(l)).length, 2, lines.join('\n'));
     assert.equal(lines.filter((l) => / reason=MAX_RETRIES /.test(l)).length, 1, lines.join('\n'));
     assert.deepEqual(fs.readdirSync(path.join(ATTACHMENTS_DIR, `conv-${row.id}`)), [], 'no message file, no temp file');
+    assert.equal(read().delivery_action, 'content-error:recipient_acl_failed', 'the reason stays on the row');
+    assert.deepEqual(db.getContentErrorFailures(0).map((r) => r.id), [row.id], 'the primary monitor alert finds it');
   });
 });
 

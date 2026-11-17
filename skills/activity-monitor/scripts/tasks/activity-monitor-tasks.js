@@ -9,6 +9,8 @@ export function createActivityMonitorTaskScheduler({
   usageCheckInterval,
   usageAlertInterval,
   usageFleetAlertInterval,
+  contentErrorAlert = null,
+  contentErrorAlertInterval = 300,
   readDailyUpgradeEnabled,
   readHealthCheckEnabled,
   loadDailyUpgradeState,
@@ -110,6 +112,18 @@ export function createActivityMonitorTaskScheduler({
       gate: (snapshot) => snapshot.health !== 'auth_failed',
       getLastRunAt: () => usageMonitor.getLastFleetAlertRunAt(),
       execute: (snapshot) => usageMonitor.runFleetAlert(snapshot),
+    },
+    {
+      // Undelivered user messages whose content could not be built (spill
+      // could not be handed to its recipient): one admin alert per new batch
+      // of failed ids. Primary only, like the fleet alert; not health-gated,
+      // because the send does not go through this instance's model.
+      id: 'content-error-alert',
+      type: 'interval',
+      intervalSec: contentErrorAlertInterval,
+      enabled: () => Boolean(contentErrorAlert) && usageMonitor.isPrimaryInstance(),
+      getLastRunAt: () => contentErrorAlert.getLastRunAt(),
+      execute: (snapshot) => contentErrorAlert.run(snapshot),
     },
   ], {
     getLocalHour,
