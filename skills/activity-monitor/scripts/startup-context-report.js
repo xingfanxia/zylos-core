@@ -123,6 +123,11 @@ export async function buildStartupReport({ zylosDir, instanceId, withC4 = false,
   const orchestrator = await import(new URL('activity-monitor/scripts/session-start-orchestrator.js', root).href);
   const memory = await import(new URL('zylos-memory/scripts/session-start-inject.js', root).href);
   const { chain } = registry.buildChain({ zylosDir });
+  // Same budget selection as the shard hook (older renderers: dual budget).
+  const runtime = orchestrator.resolveShardRuntime ? orchestrator.resolveShardRuntime({ zylosDir, instanceId }) : null;
+  const budgetFor = shard => (orchestrator.shardBudgetForRuntime
+    ? orchestrator.shardBudgetForRuntime(shard.budget, runtime)
+    : shard.budget);
 
   const rows = [];
   const shards = [];
@@ -134,7 +139,7 @@ export async function buildStartupReport({ zylosDir, instanceId, withC4 = false,
     }
     const body = await shard.emit({ source: 'startup' });
     const header = orchestrator.shardHeader({ position: shard.chainIndex + 1, total: chain.length, name: shard.name });
-    const composed = orchestrator.composeShardOutput({ header, body, budget: shard.budget, spillPath: '(spill file)' });
+    const composed = orchestrator.composeShardOutput({ header, body, budget: budgetFor(shard), spillPath: '(spill file)' });
     const structured = orchestrator.normalizeShardBody
       ? orchestrator.normalizeShardBody(body)
       : { guaranteed: '', sections: [{ text: String(body ?? '').trim() }] };
@@ -160,7 +165,7 @@ export async function buildStartupReport({ zylosDir, instanceId, withC4 = false,
       outputChars: composed.output.length,
       outputTokens: registry.estimateTokens(composed.output),
       truncated: composed.truncated,
-      budget: shard.budget,
+      budget: budgetFor(shard),
     });
   }
 
@@ -175,11 +180,11 @@ export async function buildStartupReport({ zylosDir, instanceId, withC4 = false,
     legacy.memoryTokens = registry.estimateTokens(text);
     legacy.persistedByClaude = text.length > CLAUDE_PERSIST_CHARS;
   }
-  return { zylosDir, instanceId, rows, shards, legacy, hooks: settings ? hookDuplication(settings) : [] };
+  return { zylosDir, instanceId, runtime, rows, shards, legacy, hooks: settings ? hookDuplication(settings) : [] };
 }
 
 export function formatReport(report) {
-  const lines = [`Startup context for instance '${report.instanceId}' (${report.zylosDir})`, ''];
+  const lines = [`Startup context for instance '${report.instanceId}' (${report.zylosDir}), runtime ${report.runtime || 'unknown (dual budget)'}`, ''];
   lines.push('shard | section | chars | ~tokens | guaranteed | inline');
   lines.push('---|---|---|---|---|---');
   for (const shard of report.shards) {
@@ -192,7 +197,7 @@ export function formatReport(report) {
       const inline = row.status === 'trimmed' ? `trimmed (${row.inlineChars} chars inline)` : row.status;
       lines.push(`${row.position} ${row.shard} | ${row.section} | ${row.chars} | ${row.tokens} | ${row.guaranteed ? 'yes' : 'no'} | ${inline}`);
     }
-    lines.push(`${shard.position} ${shard.shard} | = shard output | ${shard.outputChars} | ${shard.outputTokens} | | ${shard.truncated ? 'over budget, trimmed' : 'within budget'} (cap ${shard.budget.maxChars} chars / ${shard.budget.maxTokens} tokens)`);
+    lines.push(`${shard.position} ${shard.shard} | = shard output | ${shard.outputChars} | ${shard.outputTokens} | | ${shard.truncated ? 'over budget, trimmed' : 'within budget'} (cap ${shard.budget.maxChars} chars${Number.isFinite(shard.budget.maxTokens) ? ` / ${shard.budget.maxTokens} tokens` : ', no token cap'})`);
   }
   lines.push('');
   if (report.legacy.registered) {
