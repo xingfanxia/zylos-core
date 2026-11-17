@@ -180,7 +180,7 @@ Persistent memory lives in `~/zylos/memory/`.
 | **Custom** | `custom-hooks/session-start/*.md` | Operator-placed standing directives (machine-local); not agent-managed | Always (session start) |
 | **State** | `memory/instances/<id>/state.md` | Active work, pending tasks for this instance | Always (session start) |
 | **References** | `memory/shared/references.md` | Pointers to config files, key paths | Always (session start) |
-| **User Profiles** | `memory/shared/users/<id>/profile.md` | Per-user preferences | On demand |
+| **User Profiles** | `memory/users/<id>/profile.md` | Per-user preferences | On demand |
 | **Reference** | `memory/shared/reference/*.md` | Decisions, projects, shared prefs, ideas | On demand |
 | **Sessions** | `memory/instances/<id>/sessions/current.md` | This instance's event log | On demand |
 | **Archive** | `memory/archive/` | Cold storage | Rarely |
@@ -205,8 +205,8 @@ readme `.md` files inside.
 The bot serves a team. Route user-specific preferences to
 `memory/users/<id>/profile.md`. Bot identity stays in `identity.md`.
 
-In multi-session mode, shared identity/reference/user files live under
-`memory/shared/`; per-instance state and sessions live under
+In multi-session mode, shared identity/reference files live under
+`memory/shared/` and user profiles under `memory/users/<id>/`; per-instance state and sessions live under
 `memory/instances/<id>/`; group-chat memory lives under
 `memory/groups/<group_key>/` and is owned by the group instance.
 
