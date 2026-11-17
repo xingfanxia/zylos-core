@@ -8,7 +8,9 @@
  * it is guaranteed (never trimmed), and how much of it is inline. It also
  * reports whether settings.json still runs the legacy no-argument
  * orchestrator (a second copy of the memory block) and how many hook
- * commands per event are duplicate spellings of one script.
+ * commands per event are duplicate spellings of one script, and the state
+ * of the persona's standing rules file (present, bytes, within its bound,
+ * delivered in the guaranteed block) without printing its content.
  *
  * Read-only: it reads memory/instruction files and settings.json, writes
  * nothing, and skips the C4 shards unless --with-c4 is given (they open the
@@ -112,6 +114,32 @@ export function hookDuplication(settings) {
   return rows;
 }
 
+/**
+ * Size-only facts about the standing rules file and whether shard 1
+ * delivered it in its guaranteed block. Never returns the file's text.
+ */
+export function standingRulesFacts({ rulesPath, maxChars, rows }) {
+  let stat = null;
+  try {
+    stat = fs.statSync(rulesPath);
+  } catch { /* absent */ }
+  if (!stat) return { path: rulesPath, present: false, maxChars };
+  let chars = null;
+  try {
+    chars = fs.readFileSync(rulesPath, 'utf8').trim().length;
+  } catch { /* unreadable: size only */ }
+  const row = rows.find(item => item.section === 'STANDING RULES');
+  return {
+    path: rulesPath,
+    present: true,
+    bytes: stat.size,
+    chars,
+    maxChars,
+    withinBound: chars == null ? null : chars <= maxChars,
+    delivered: row ? `${row.guaranteed ? 'guaranteed' : 'not guaranteed'}, shard ${row.position}, ${row.status}` : 'not delivered',
+  };
+}
+
 export async function buildStartupReport({ zylosDir, instanceId, withC4 = false, codeRoot = null }) {
   if (!zylosDir || !instanceId) throw new Error('need --instance-dir, or --zylos-dir and --instance');
   process.env.ZYLOS_DIR = zylosDir;
@@ -122,6 +150,7 @@ export async function buildStartupReport({ zylosDir, instanceId, withC4 = false,
   const registry = await import(new URL('activity-monitor/scripts/shard-registry.js', root).href);
   const orchestrator = await import(new URL('activity-monitor/scripts/session-start-orchestrator.js', root).href);
   const memory = await import(new URL('zylos-memory/scripts/session-start-inject.js', root).href);
+  const policy = await import(new URL('multi-session/memory-policy.js', root).href);
   const { chain } = registry.buildChain({ zylosDir });
   // Same budget selection as the shard hook (older renderers: dual budget).
   const runtime = orchestrator.resolveShardRuntime ? orchestrator.resolveShardRuntime({ zylosDir, instanceId }) : null;
@@ -180,7 +209,10 @@ export async function buildStartupReport({ zylosDir, instanceId, withC4 = false,
     legacy.memoryTokens = registry.estimateTokens(text);
     legacy.persistedByClaude = text.length > CLAUDE_PERSIST_CHARS;
   }
-  return { zylosDir, instanceId, runtime, rows, shards, legacy, hooks: settings ? hookDuplication(settings) : [] };
+  const rules = memory.standingRulesPath
+    ? standingRulesFacts({ rulesPath: memory.standingRulesPath(zylosDir, instanceId), maxChars: policy.STANDING_RULES_MAX_CHARS, rows })
+    : null;
+  return { zylosDir, instanceId, runtime, rows, shards, legacy, rules, hooks: settings ? hookDuplication(settings) : [] };
 }
 
 export function formatReport(report) {
@@ -200,6 +232,17 @@ export function formatReport(report) {
     lines.push(`${shard.position} ${shard.shard} | = shard output | ${shard.outputChars} | ${shard.outputTokens} | | ${shard.truncated ? 'over budget, trimmed' : 'within budget'} (cap ${shard.budget.maxChars} chars${Number.isFinite(shard.budget.maxTokens) ? ` / ${shard.budget.maxTokens} tokens` : ', no token cap'})`);
   }
   lines.push('');
+  const rules = report.rules;
+  if (!rules) {
+    lines.push('Standing rules file: not supported by this renderer.');
+  } else if (!rules.present) {
+    lines.push(`Standing rules file: absent (${rules.path}).`);
+  } else {
+    const bound = rules.withinBound == null
+      ? 'unreadable'
+      : `${rules.chars} chars, ${rules.withinBound ? 'within' : 'OVER'} the ${rules.maxChars}-char bound`;
+    lines.push(`Standing rules file: present (${rules.path}), ${rules.bytes} bytes, ${bound}; delivered: ${rules.delivered}.`);
+  }
   if (report.legacy.registered) {
     lines.push(`Legacy no-argument orchestrator: REGISTERED - injects a second memory block of ${report.legacy.memoryChars} chars / ~${report.legacy.memoryTokens} tokens${report.legacy.persistedByClaude ? ' (over 10,000 chars: Claude Code persists it to a file and keeps a short preview inline)' : ''}, plus a second C4 block.`);
   } else {

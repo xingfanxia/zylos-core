@@ -14,7 +14,8 @@
  * memory tier, state from the per-instance tier.
  *
  * Persona block: an instance's own instruction files (who it is, whom it
- * serves) and its memory write policy are small, operator-owned and must be
+ * serves), its memory write policy and its standing rules (rules.md, the
+ * user's always-apply rules, bounded in size) are small and must be
  * present on every start. In shard mode they are the GUARANTEED part of the
  * first shard ('identity'), emitted before the shared bot identity, so no
  * later or larger section can push them out of the shard budget. Mutable
@@ -29,7 +30,11 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
-import { describeMemoryWritePolicy } from '../../multi-session/memory-policy.js';
+import {
+  describeMemoryWritePolicy,
+  STANDING_RULES_FILE,
+  STANDING_RULES_MAX_CHARS,
+} from '../../multi-session/memory-policy.js';
 import {
   getInstanceInstructionFiles,
   getInstanceRuntime,
@@ -121,10 +126,35 @@ function defaultZylosDir() {
   return process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 }
 
+export function standingRulesPath(zylosDir, instanceId) {
+  return resolveInstanceMemoryFile(zylosDir, instanceId, STANDING_RULES_FILE);
+}
+
 /**
- * The persona block: per-instance instruction files (identity and scope)
- * followed by the memory write policy. Empty in single-session mode. Shared
- * by the legacy full-context path and the 'identity' shard.
+ * The STANDING RULES section for one rules file, or null when the file is
+ * absent or empty. Over STANDING_RULES_MAX_CHARS it keeps the first lines
+ * that fit and says so, with the instruction to shorten the file: the
+ * bound is what keeps the guaranteed block inside the shard budget.
+ */
+export function standingRulesSection(rulesPath) {
+  const result = readFileSafe(rulesPath);
+  if (!result.ok) {
+    return result.reason === 'missing' ? null : inlineSection('STANDING RULES', `(${result.reason})`);
+  }
+  const content = result.content.trim();
+  if (!content) return null;
+  if (content.length <= STANDING_RULES_MAX_CHARS) return inlineSection('STANDING RULES', content);
+  const slice = content.slice(0, STANDING_RULES_MAX_CHARS);
+  const lastBreak = slice.lastIndexOf('\n');
+  const kept = (lastBreak > 0 ? slice.slice(0, lastBreak) : slice).trimEnd();
+  return inlineSection('STANDING RULES', `${kept}\n[${rulesPath} is ${content.length} chars, over its ${STANDING_RULES_MAX_CHARS}-char limit, so only its first ${kept.length} chars are shown here. Shorten it now: merge similar rules and delete withdrawn ones until it fits.]`);
+}
+
+/**
+ * The persona block: per-instance instruction files (identity and scope),
+ * the memory write policy, then the standing rules file. Empty in
+ * single-session mode. Shared by the legacy full-context path and the
+ * 'identity' shard.
  */
 function personaParts({ zylosDir, instanceId, runtime = null }) {
   if (!instanceId) return [];
@@ -140,6 +170,8 @@ function personaParts({ zylosDir, instanceId, runtime = null }) {
     'MEMORY WRITE POLICY',
     describeMemoryWritePolicy({ instanceId, instancesFilePath: path.join(zylosDir, 'instances.json') })
   ));
+  const rules = standingRulesSection(standingRulesPath(zylosDir, instanceId));
+  if (rules) parts.push(rules);
   return parts;
 }
 

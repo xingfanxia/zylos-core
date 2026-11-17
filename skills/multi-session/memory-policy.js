@@ -206,6 +206,27 @@ export function validateMemoryWrite(filePath, {
   });
 }
 
+/**
+ * The persona's standing rules: one short per-instance file, written by the
+ * persona itself, delivered whole in the guaranteed part of startup shard 1
+ * on every start and compaction under both runtimes. The bound keeps the
+ * guaranteed block (instance instructions + this policy + the rules) inside
+ * Codex's per-hook token cap even when the file is all CJK; a file over the
+ * bound is delivered cut at a line with a "shorten it now" marker.
+ */
+export const STANDING_RULES_FILE = 'rules.md';
+export const STANDING_RULES_MAX_CHARS = 1_500;
+
+function standingRulesPolicy(instanceId, { isGroup = false } = {}) {
+  return [
+    `Standing rules: memory/instances/${instanceId}/${STANDING_RULES_FILE} is shown at every start (limit ${STANDING_RULES_MAX_CHARS} chars).`,
+    'When someone you serve states a rule that should always apply ("以后都这样", "记住", or a correction of a repeated mistake), add it there as one line in their words with the date (YYYY-MM-DD).',
+    'Keep it short: merge similar rules and delete rules they withdrew. Task state goes to state.md; keep standing rules out of state.md and Claude Code auto-memory.',
+    ...(isGroup ? ['A rule for one chat only goes in that chat\'s memory/groups/<group_key>/ instead.'] : []),
+    'Before sending a deliverable, re-read the rules file and check the deliverable against the rules that apply.',
+  ].join('\n');
+}
+
 export function describeMemoryWritePolicy({
   instanceId = process.env.ZYLOS_INSTANCE_ID || null,
   instancesFilePath = DEFAULT_INSTANCES_FILE,
@@ -227,6 +248,7 @@ export function describeMemoryWritePolicy({
       `Instance '${instanceId}' is the group instance (serves many chats).`,
       `Allowed writes: memory/instances/${instanceId}/..., memory/groups/<group_key>/... (per-chat memory), and memory/users/<id>/profile.md.`,
       'Keep each chat\'s memory under its own memory/groups/<group_key>/ — never cross-reference groups or write another instance\'s memory.',
+      standingRulesPolicy(instanceId, { isGroup: true }),
     ].join('\n');
   }
 
@@ -235,6 +257,7 @@ export function describeMemoryWritePolicy({
       `Instance '${instanceId}' is primary.`,
       `Allowed writes: memory/instances/${instanceId}/..., memory/shared/..., memory/archive/..., and memory/users/<id>/profile.md.`,
       'Never write another instance\'s memory directory.',
+      standingRulesPolicy(instanceId),
     ].join('\n');
   }
 
@@ -243,6 +266,7 @@ export function describeMemoryWritePolicy({
       `Instance '${instanceId}' is the scheduler instance.`,
       `Allowed writes: memory/instances/${instanceId}/..., memory/shared/... for cross-instance sync, memory/archive/..., and memory/users/<id>/profile.md.`,
       'Never write another instance\'s memory directory.',
+      standingRulesPolicy(instanceId),
     ].join('\n');
   }
 
@@ -250,5 +274,6 @@ export function describeMemoryWritePolicy({
     `Instance '${instanceId}' is a non-primary worker/user instance.`,
     `Allowed writes: memory/instances/${instanceId}/... and memory/users/<id>/profile.md only.`,
     'Do not write memory/shared/..., memory/archive/..., top-level memory/*.md, or another instance\'s memory directory.',
+    standingRulesPolicy(instanceId),
   ].join('\n');
 }

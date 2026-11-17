@@ -163,7 +163,7 @@ Launches CC from per-instance working directory:
 On every CC restart (suspend/wake, crash recovery, heartbeat timeout, context rotation, daily upgrade), three layers restore context:
 
 1. **`--continue` flag** — resumes CC's internal context window (compressed conversation, reasoning, tool calls). CC's project dir is derived from `realpath(instanceCwd)` with `/` and `_` replaced by `-`.
-2. **`session-start-inject.js`** (SessionStart hook) — injects per-instance memory (`state.md`, `sessions/current.md`), per-instance `ZYLOS.md` identity anchor, and (for admin/scheduler/group only) cross-instance activity digest
+2. **`session-start-inject.js`** (SessionStart hook) — injects per-instance memory (`state.md`, `sessions/current.md`), per-instance `ZYLOS.md` identity anchor, the instance's standing rules (`memory/instances/<id>/rules.md`), and (for admin/scheduler/group only) cross-instance activity digest. The identity anchor, the memory write policy and the standing rules are the guaranteed (never trimmed) start of shard 1 under both runtimes; `rules.md` is bounded at `STANDING_RULES_MAX_CHARS` (1,500, `skills/multi-session/memory-policy.js`) so that block fits Codex's per-hook token cap even when the file is all CJK. A longer file is shown cut at a line with a marker telling the persona to shorten it. `activity-monitor/scripts/startup-context-report.js` reports the file's size, bound and delivery without printing it.
 3. **`c4-session-init.js`** (SessionStart hook) — injects last checkpoint summary + up to 30 recent instance-scoped conversations from c4.db. If instance-scoped queries are unavailable, injects nothing (never falls back to unfiltered global queries).
 
 Layer 1 preserves CC's internal understanding; layers 2-3 provide structured context from external systems. All three fire on every restart.
@@ -188,6 +188,7 @@ The memory layer is now hardened for future mixed-runtime use.
 | Shared identity / references / shared reference docs | `memory/shared/...` | primary instance or scheduler |
 | Archive | `memory/archive/...` | primary instance or scheduler |
 | Per-instance working state | `memory/instances/<id>/...` | owning instance only |
+| Per-instance standing rules (the user's always-apply rules, one dated line each) | `memory/instances/<id>/rules.md` | owning instance only |
 | Per-group memory (ZY-GRP-1) | `memory/groups/<group_key>/...` | the group instance (`type:group`) only |
 | User profile | `memory/users/<uid>/profile.md` | any instance |
 

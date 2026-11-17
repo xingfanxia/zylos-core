@@ -22,6 +22,7 @@ This skill must be run via a runtime-appropriate background subagent mechanism. 
 ├── identity.md              # Bot soul + digital assets (always loaded)
 ├── state.md                 # Active working state (always loaded)
 ├── references.md            # Pointers to config files (always loaded)
+├── instances/<id>/rules.md  # Multi-session: the user's standing rules (always loaded, 1,500-char bound)
 ├── users/
 │   └── <id>/profile.md      # Per-user preferences
 ├── reference/
@@ -111,6 +112,11 @@ and do not start another sync writer while one is in flight.
 - `reference/preferences.md`: standing team-wide preferences.
 - `reference/ideas.md`: uncommitted proposals.
 - `users/<id>/profile.md`: user-specific preferences.
+- `instances/<id>/rules.md` (multi-session): rules the user said should
+  always apply ("以后都这样", "记住", a correction of a repeated mistake).
+  One line each, in the user's words, with the date; merge or update an
+  existing line instead of appending a duplicate, delete withdrawn rules,
+  and keep the file under its 1,500-char bound. Never in `state.md`.
 - `state.md`: active focus, pending items, and blockers only, per the
   content rules in `references/state-format.md`; completed-task narrative,
   decisions, and run history are routed out, never accumulated.

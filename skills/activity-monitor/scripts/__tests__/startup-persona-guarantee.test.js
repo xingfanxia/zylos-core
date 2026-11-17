@@ -16,7 +16,9 @@ import {
   emitMemoryPart,
   getStartupMemoryContextParts,
   injectMemory,
+  standingRulesSection,
 } from '../../../zylos-memory/scripts/session-start-inject.js';
+import { STANDING_RULES_FILE, STANDING_RULES_MAX_CHARS } from '../../../multi-session/memory-policy.js';
 import { formatSection } from '../../../comm-bridge/scripts/session-format.js';
 
 // Synthetic text with the live files' shape: mostly CJK, line-oriented
@@ -348,4 +350,131 @@ describe('shard budget follows the session runtime', () => {
       assert.ok(output.length <= DEFAULT_SHARD_BUDGET.maxChars);
     });
   }
+});
+
+// The persona's standing rules file (memory/instances/<id>/rules.md): one
+// dated line per rule, mostly CJK, like the users' own words.
+function rulesLines(count) {
+  return Array.from({ length: count }, (_, index) =>
+    `- 2026-11-${String((index % 28) + 1).padStart(2, '0')} 规则${index + 1}：文案和图片分开发送，标题不超过二十个字`).join('\n');
+}
+
+function writeRules(text, instanceId = 'user-test') {
+  const rulesPath = path.join(zylosDir, 'memory', 'instances', instanceId, STANDING_RULES_FILE);
+  fs.writeFileSync(rulesPath, text);
+  return rulesPath;
+}
+
+// A rules file just under the bound: the worst case the bound allows.
+function rulesAtBound() {
+  let text = '';
+  for (let count = 1; rulesLines(count).length <= STANDING_RULES_MAX_CHARS; count += 1) text = rulesLines(count);
+  return text;
+}
+
+describe('standing rules are part of the guaranteed block of shard 1', () => {
+  it('fixture: the at-bound rules file is all lines and close to the bound', () => {
+    const text = rulesAtBound();
+    assert.ok(text.length <= STANDING_RULES_MAX_CHARS);
+    assert.ok(text.length > STANDING_RULES_MAX_CHARS - 60, `${text.length} chars`);
+  });
+
+  for (const [label, setup] of [
+    ['claude', { runtime: 'claude' }],
+    ['codex', { runtime: 'codex' }],
+    ['unknown', { profiles: { 'p-bad': { runtime: 'gemini' } } }],
+  ]) {
+    it(`a rules file at the bound is delivered whole under the ${label} runtime, after the persona block`, async () => {
+      // A huge shared identity: the trimmable section must give way, never the rules.
+      makeZylos({ ...setup, identity: `# Bot Identity\n${cjkLines(400, '身份')}\n` });
+      const rules = rulesAtBound();
+      writeRules(rules);
+      const output = await runShard('identity');
+      assert.ok(complete(output, 'STANDING RULES'));
+      assert.ok(output.includes(rules));
+      const order = ['INSTANCE INSTRUCTIONS', 'MEMORY WRITE POLICY', 'STANDING RULES', 'BOT IDENTITY'].map(name => output.indexOf(`=== ${name} ===`));
+      assert.deepEqual([...order].sort((a, b) => a - b), order);
+      assert.match(output, /BOT IDENTITY kept its first/);
+      assert.equal(output.includes('persona section exceeded'), false);
+      const budget = shardBudgetForRuntime(DEFAULT_SHARD_BUDGET, label === 'unknown' ? null : label);
+      assert.ok(withinBudget(output, budget), `${output.length} chars / ${estimateTokens(output)} tokens`);
+    });
+  }
+
+  it('reproduces the defect under Codex: a rule at the end of state.md is cut, the same rule in rules.md arrives', async () => {
+    const rule = '- 2026-11-17 以后标题都不超过二十个字（原话）';
+    makeZylos({ runtime: 'codex', state: `${threeKTokenState()}${rule}\n` });
+    const state = await runShard('state');
+    assert.match(state, /ACTIVE STATE kept its first/);
+    assert.equal(state.includes(rule), false);
+    writeRules(rule);
+    const identity = await runShard('identity');
+    assert.ok(identity.includes(rule));
+    assert.ok(complete(identity, 'STANDING RULES'));
+  });
+
+  it('a rules file over the bound is cut at a line with a marker telling the persona to shorten it', async () => {
+    makeZylos({ runtime: 'codex' });
+    const rules = rulesLines(80);
+    assert.ok(rules.length > STANDING_RULES_MAX_CHARS * 2);
+    const rulesPath = writeRules(rules);
+    const output = await runShard('identity');
+    assert.ok(complete(output, 'STANDING RULES'));
+    const section = output.slice(output.indexOf('=== STANDING RULES ==='), output.indexOf('=== END STANDING RULES ==='));
+    const marker = section.match(/\n(\[.+ over its 1500-char limit, so only its first (\d+) chars are shown here\. Shorten it now: .+\])\n/);
+    assert.ok(marker, section.slice(-400));
+    assert.ok(marker[1].includes(rulesPath));
+    assert.ok(Number(marker[2]) <= STANDING_RULES_MAX_CHARS);
+    // Everything before the marker is whole lines of the file, from its start.
+    const kept = section.split('\n').slice(1, section.split('\n').indexOf(marker[1]));
+    const fileLines = rules.split('\n');
+    assert.deepEqual(kept, fileLines.slice(0, kept.length));
+    assert.ok(kept.length > 10);
+    assert.equal(output.includes(fileLines.at(-1)), false);
+    assert.equal(output.includes('persona section exceeded'), false);
+    assert.ok(withinBudget(output, DEFAULT_SHARD_BUDGET));
+  });
+
+  it('an absent or empty rules file adds nothing and raises nothing', () => {
+    makeZylos();
+    const without = emitMemoryPart('identity');
+    assert.equal(without.guaranteed.includes('STANDING RULES'), false);
+    writeRules('  \n\n');
+    assert.deepEqual(emitMemoryPart('identity'), without);
+    assert.equal(standingRulesSection(path.join(zylosDir, 'nowhere', 'rules.md')), null);
+  });
+
+  it('the state shard and its trimming are unchanged by a rules file', () => {
+    makeZylos();
+    const before = compose('state', emitMemoryPart('state'));
+    writeRules(rulesAtBound());
+    const after = compose('state', emitMemoryPart('state'));
+    assert.deepEqual(after, before);
+    assert.equal(after.output.includes('STANDING RULES'), false);
+    assert.equal(after.trimmedLabel, 'ACTIVE STATE');
+  });
+
+  it('the legacy single block carries the rules right after the write policy', () => {
+    makeZylos();
+    writeRules(rulesLines(3));
+    const parts = getStartupMemoryContextParts();
+    assert.match(parts[0], /^=== INSTANCE INSTRUCTIONS ===/);
+    assert.match(parts[1], /^=== MEMORY WRITE POLICY ===/);
+    assert.match(parts[2], /^=== STANDING RULES ===/);
+  });
+
+  it('the write policy states the rules contract for every instance type, and single-session has none', () => {
+    for (const [instanceId, type, primary] of [['user-test', 'user', false], ['admin', 'dedicated', true], ['group', 'group', false], ['scheduler', 'dedicated', false]]) {
+      makeZylos({ instanceId, type, primary });
+      const policy = emitMemoryPart('identity').guaranteed;
+      assert.ok(policy.includes(`memory/instances/${instanceId}/rules.md is shown at every start (limit ${STANDING_RULES_MAX_CHARS} chars)`), instanceId);
+      assert.match(policy, /one line in their words with the date/);
+      assert.match(policy, /Task state goes to state\.md/);
+      assert.match(policy, /Before sending a deliverable, re-read the rules file/);
+      assert.equal(/memory\/groups\/<group_key>\/ instead/.test(policy), type === 'group', instanceId);
+    }
+    makeZylos();
+    delete process.env.ZYLOS_INSTANCE_ID;
+    assert.equal(emitMemoryPart('identity').guaranteed, '');
+  });
 });

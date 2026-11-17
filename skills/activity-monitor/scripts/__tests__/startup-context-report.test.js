@@ -81,3 +81,37 @@ describe('startup-context-report', () => {
     assert.deepEqual(rows, [{ event: 'PreToolUse', matcher: '', commands: 3, unique: 2 }]);
   });
 });
+
+describe('startup-context-report: standing rules file', () => {
+  const rulesPath = path.join(zylosDir, 'memory', 'instances', 'user-a', 'rules.md');
+
+  it('reports an absent rules file', async () => {
+    fs.rmSync(rulesPath, { force: true });
+    const report = await buildStartupReport({ zylosDir, instanceId: 'user-a' });
+    assert.deepEqual(report.rules, { path: rulesPath, present: false, maxChars: 1500 });
+    assert.match(formatReport(report), /Standing rules file: absent \(/);
+  });
+
+  it('reports size, bound and delivery without the content', async () => {
+    const secret = 'RULE-SENTINEL 图片和文案分开发';
+    fs.writeFileSync(rulesPath, `- 2026-11-17 ${secret}\n`);
+    try {
+      const report = await buildStartupReport({ zylosDir, instanceId: 'user-a' });
+      assert.equal(report.rules.present, true);
+      assert.equal(report.rules.bytes, fs.statSync(rulesPath).size);
+      assert.equal(report.rules.withinBound, true);
+      assert.equal(report.rules.delivered, 'guaranteed, shard 1/6, full');
+      const text = formatReport(report);
+      assert.match(text, /Standing rules file: present \(.+\), \d+ bytes, \d+ chars, within the 1500-char bound; delivered: guaranteed, shard 1\/6, full\./);
+      assert.equal(text.includes('RULE-SENTINEL'), false);
+      assert.equal(JSON.stringify(report.rules).includes('RULE-SENTINEL'), false);
+
+      fs.writeFileSync(rulesPath, Array.from({ length: 100 }, (_, index) => `- rule ${index} keep captions short`).join('\n'));
+      const over = await buildStartupReport({ zylosDir, instanceId: 'user-a' });
+      assert.equal(over.rules.withinBound, false);
+      assert.match(formatReport(over), /OVER the 1500-char bound; delivered: guaranteed, shard 1\/6, full/);
+    } finally {
+      fs.rmSync(rulesPath, { force: true });
+    }
+  });
+});
