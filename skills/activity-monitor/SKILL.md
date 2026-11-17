@@ -65,6 +65,12 @@ pm2 list
 - **Restart Delay**: Waits 5 seconds of continuous "not running" before restarting
 - **Maintenance Wait**: Detects restart/upgrade scripts and waits for completion
 - **Recovery Prompt**: Sends catch-up message via C4 after restart
+- **Failed starts**: a launch counts as started once the engine has run 30 s without a break. A launch the Guardian has to replace before that is a failed start, with its cause from the launch path: the adapter's own error, or the launcher's record `launch-result.json` in the persona's monitor dir (`launcher_failed` with its module/stage error, `spawn_failed`, or `exited` with the engine's exit code). The first failed start is retried as is. On the second:
+  - **account/engine cause** (the engine was reached and exited, or its binary is missing): `agent-status.json` `start_failure.class = account`, which `runtime-failover` reads as `start_failed` and moves the persona to the next eligible tier at once (no dwell), blocking the tier it left. If no move comes within 60 s, the persona is held as below.
+  - **local cause** (the launcher could not load or left no record, a spec/chown/tmux/instruction error): no chain move. The persona is held: one admin alert per downtime episode, then one retry every `degraded_probe_interval` (20 min) until a start succeeds.
+  - A Fable-mode launch is left to the Fable guard's crash hold (`class = fable`), then held the same way.
+  Downtime is in the PM2 out log as `Guardian: start failed …`, `start held …` and `start recovered on <profile>: down from <A> to <B> (… last cause: …)`; the open episode (`start_failure`) and the last confirmed start (`start_confirmed_at`) are in `agent-status.json`.
+- **Deploy canary**: `node cli/lib/runtime/tmux-launcher.js --check`, run as each persona's Unix user, loads the launcher's module graph and starts nothing.
 
 ## How It Works
 

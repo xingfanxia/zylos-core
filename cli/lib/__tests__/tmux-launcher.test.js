@@ -153,3 +153,72 @@ describe('tmux-launcher', () => {
     });
   });
 });
+
+// SWITCH-1: the launcher reports its own launch so the Guardian can tell a
+// local launch-path failure from an engine that came up and exited.
+describe('tmux-launcher launch result', () => {
+  const RUNTIME_DIR = path.dirname(LAUNCHER_PATH);
+  const run = (launcher, args) => {
+    try {
+      return { status: 0, stdout: execFileSync(process.execPath, [launcher, ...args], { timeout: 10_000, encoding: 'utf8', stdio: 'pipe' }) };
+    } catch (err) {
+      return { status: err.status, stdout: String(err.stdout || ''), stderr: String(err.stderr || '') };
+    }
+  };
+  const resultFor = (spec, launcher = LAUNCHER_PATH) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-launch-result-'));
+    const file = path.join(dir, 'launch-result.json');
+    const specPath = writeSpec({ cwd: os.tmpdir(), env: { PATH: process.env.PATH, HOME: process.env.HOME },
+      ...spec, launchResultFile: file, launchId: 'L1' });
+    const outcome = run(launcher, [specPath]);
+    tmpFiles.splice(tmpFiles.indexOf(specPath), 1);
+    const record = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : null;
+    fs.rmSync(dir, { recursive: true, force: true });
+    return { ...outcome, record };
+  };
+
+  it('records the engine exit code of a launch whose engine came up and exited', () => {
+    const { status, record } = resultFor({ command: process.execPath, args: ['-e', 'process.exit(3)'] });
+    assert.equal(status, 3);
+    assert.equal(record.launch_id, 'L1');
+    assert.equal(record.state, 'exited');
+    assert.equal(record.exit_code, 3);
+    assert.ok(Number.isFinite(record.ran_ms));
+  });
+
+  it('records a missing engine binary as spawn_failed', () => {
+    const { status, record } = resultFor({ command: '/nonexistent/zylos-engine', args: [] });
+    assert.equal(status, 1);
+    assert.equal(record.state, 'spawn_failed');
+    assert.equal(record.error_code, 'ENOENT');
+  });
+
+  it('records an unresolvable launcher module (2026-11-17 dotenv) as launcher_failed, and --check fails the same way', () => {
+    // A copy of the launcher whose tmux-env.js imports a package the user cannot resolve.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-launcher-copy-'));
+    for (const name of ['tmux-launcher.js', 'launch-result.js', 'upgrade-context.js']) {
+      fs.copyFileSync(path.join(RUNTIME_DIR, name), path.join(dir, name));
+    }
+    fs.writeFileSync(path.join(dir, 'tmux-env.js'), "import { parse } from 'zylos-missing-package-for-test';\nexport { parse };\n");
+    try {
+      const { status, record } = resultFor({ command: process.execPath, args: ['-e', 'process.exit(0)'] }, path.join(dir, 'tmux-launcher.js'));
+      assert.equal(status, 1);
+      assert.equal(record.state, 'launcher_failed');
+      assert.equal(record.stage, 'modules');
+      assert.equal(record.error_code, 'ERR_MODULE_NOT_FOUND');
+      assert.match(record.error, /zylos-missing-package-for-test/);
+
+      const check = run(path.join(dir, 'tmux-launcher.js'), ['--check']);
+      assert.equal(check.status, 1);
+      assert.match(check.stderr, /ERR_MODULE_NOT_FOUND/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('--check loads the real module graph without a spec and starts nothing', () => {
+    const check = run(LAUNCHER_PATH, ['--check']);
+    assert.equal(check.status, 0);
+    assert.match(check.stdout, /launcher modules ok/);
+  });
+});

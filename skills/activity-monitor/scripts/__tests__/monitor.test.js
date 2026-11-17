@@ -135,3 +135,16 @@ it('explains temporary unavailability without unsupported delivery guarantees', 
   assert.match(text, /每 20 分钟自动检查一次/);
   assert.doesNotMatch(text, /不会丢失|先排队|恢复后继续处理|claude 登录|kill-restart/);
 });
+
+it('names a held failed start, its Beijing start time and cause, and says why no line was switched', () => {
+  const details = { since: '2026-11-17T02:00:05.000Z', attempts: 2, retrySec: 1200, profile: 'claude-ax-backup',
+    cause: "launcher modules: ERR_MODULE_NOT_FOUND Cannot find package 'dotenv'" };
+  const local = monitor.formatStartHeldAdminAlert({ ...details, class: 'local' });
+  assert.match(local, /无法启动新会话/);
+  assert.match(local, /北京时间 2026\/11\/17 10:00:05 起已启动失败 2 次/);
+  assert.match(local, /ERR_MODULE_NOT_FOUND/);
+  assert.match(local, /换线路也会同样失败/);
+  assert.match(local, /每 20 分钟自动重试一次/);
+  const account = monitor.formatStartHeldAdminAlert({ ...details, class: 'account' });
+  assert.match(account, /线路 claude-ax-backup 启动失败，也没有其他线路接手/);
+});

@@ -79,10 +79,19 @@ export function createGuardian(activeAdapter, activeToolPipeline, initialRuntime
   monitorDir,
   signalTtlSec,
   onAgentStart,
+  initialStartFailure = null,
+  notifyStartHeld = null,
+  heldRetrySec,
   log,
 }) {
   return new Guardian(activeAdapter, {
     log,
+    // SWITCH-1 failed starts: profile and Fable mode of what this monitor launches.
+    profileId: activeAdapter.config?.runtimeProfile?.id || null,
+    fableMode: activeAdapter.config?.runtimeProfile?.fable?.mode === 'fable',
+    initialStartFailure,
+    notifyStartHeld,
+    ...(heldRetrySec ? { heldRetrySec } : {}),
     ...(onAgentStart ? { onAgentStart } : {}), // Fable guard crash accounting (tracked personas only)
     monitorDir, // ZY-LIFE-1: enables the auto-suspend gate
     signalTtlSec, // REL-6: orphaned suspend/wake signals are ignored + deleted

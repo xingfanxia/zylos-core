@@ -18,7 +18,7 @@ import {
   scheduleFableProbes,
   writeJsonAtomic as writeGuardJson,
 } from './fable-guard.js';
-import { fableGuardStatePath } from '../../multi-session/runtime-files.js';
+import { fableGuardStatePath, fableUsagePath } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -26,8 +26,10 @@ const SINGLE_PROFILE_FILE = path.join(ZYLOS_DIR, '.zylos', 'runtime-profiles.jso
 const CONFIG_FILE = path.join(ZYLOS_DIR, '.zylos', 'config.json');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
 const DEFAULT_POLL_MS = Number.parseInt(process.env.RUNTIME_FAILOVER_POLL_MS || '', 10) || 10_000;
-const HEALTH_FAILOVER_STATES = new Set(['rate_limited', 'auth_failed', 'degraded', 'down']);
-const QUARANTINE_HEALTH_STATES = new Set(['auth_failed', 'degraded', 'down']);
+// start_failed: the persona's Guardian could not start the engine twice for a
+// cause another account/engine may not share (agent-status start_failure).
+const HEALTH_FAILOVER_STATES = new Set(['rate_limited', 'auth_failed', 'degraded', 'down', 'start_failed']);
+const QUARANTINE_HEALTH_STATES = new Set(['auth_failed', 'degraded', 'down', 'start_failed']);
 
 function readJson(filePath, fallback = null) {
   try {
@@ -280,6 +282,53 @@ function firstUsableTier({ chain, profiles, blocked, providerUsage, policy, nowM
   }) || null;
 }
 
+// Whether persona `other`'s success on a profile also proves it for `instanceId`:
+// the same persona, or the same credential (a shared settings file; the same
+// Codex subscription account; otherwise the same Unix user's home). The Azure
+// key is per persona user, so admin succeeding there proves nothing for Pan.
+function sharesCredential({ profileId, profile, instanceId, other, instances, accountKeys }) {
+  if (other === instanceId) return true;
+  if (profile.runtime === 'claude' && profile.claude_settings_file) return true;
+  if (profile.usage_provider === 'codex') {
+    const key = accountKeys[instanceId]?.[profileId];
+    return Boolean(key) && key === accountKeys[other]?.[profileId];
+  }
+  return (instances[instanceId]?.os_user || null) === (instances[other]?.os_user || null);
+}
+
+/**
+ * Blocks with fresh proof that the profile works again. A block is written
+ * when a persona leaves a profile on a failed health reading or failed starts
+ * (or a Codex model quota failure); it clears on any success recorded for that
+ * profile after `blocked_at`, by this persona or one using the same credential:
+ * a functional heartbeat ACK (agent-status functional_ack_at), a confirmed
+ * engine start (start_confirmed_at, for start_failed blocks), or, for an
+ * auth_failed block on a settings-file Claude profile, a valid Fable probe of
+ * that account. Codex canary receipts keep their own path
+ * (verifiedQuotaRecoveries).
+ */
+export function provenBlockedProfiles({
+  instanceId, blockedProfiles = {}, profiles = {}, instances = {}, successes = {}, fableValidAt = {}, accountKeys = {},
+} = {}) {
+  const proven = [];
+  for (const [profileId, block] of Object.entries(blockedProfiles)) {
+    if (!block?.health || !profiles[profileId]) continue;
+    const blockedAtMs = Date.parse(block.blocked_at || '');
+    if (!Number.isFinite(blockedAtMs)) continue;
+    const profile = profiles[profileId];
+    const witness = Object.entries(successes).find(([other, success]) => success?.profile === profileId
+      && (Number(success.ackAt) > blockedAtMs || (block.health === 'start_failed' && Number(success.startAt) > blockedAtMs))
+      && sharesCredential({ profileId, profile, instanceId, other, instances, accountKeys }));
+    if (witness) {
+      proven.push({ profileId, health: block.health, proof: `success:${witness[0]}` });
+    } else if (block.health === 'auth_failed' && profile.runtime === 'claude' && profile.claude_settings_file
+        && Number(fableValidAt[profileId]) > blockedAtMs) {
+      proven.push({ profileId, health: block.health, proof: 'fable_probe' });
+    }
+  }
+  return proven;
+}
+
 export function planRuntimeFailover({
   document,
   providerUsage,
@@ -287,6 +336,8 @@ export function planRuntimeFailover({
   currentSubscriptionAccountKeys = {},
   rotationMarkers = {},
   modelSnapshots = {},
+  successes = {},
+  fableValidAt = {},
   nowMs = Date.now(),
 } = {}) {
   const next = structuredClone(document || {});
@@ -294,7 +345,8 @@ export function planRuntimeFailover({
   const profiles = next.runtime_profiles || {};
   const chain = Array.isArray(policy.chain) ? policy.chain.filter(id => profiles[id]) : [];
   const changes = [];
-  if (!policy.enabled || chain.length < 2) return { document: next, changes };
+  const cleared = [];
+  if (!policy.enabled || chain.length < 2) return { document: next, changes, cleared };
   const held = heldProfiles(policy);
   const ineligible = ineligibleProfiles(policy);
 
@@ -311,13 +363,22 @@ export function planRuntimeFailover({
     const currentAccountKeys = currentSubscriptionAccountKeys[instanceId] || {};
     const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys })
       .filter(id => !held.has(id));
-    const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !recovered.includes(id)));
+    const proven = provenBlockedProfiles({ instanceId, blockedProfiles, profiles, instances: next.instances,
+      successes, fableValidAt, accountKeys: currentSubscriptionAccountKeys })
+      .filter(item => !held.has(item.profileId) && !recovered.includes(item.profileId));
+    const clearedIds = [...recovered, ...proven.map(item => item.profileId)];
+    const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !clearedIds.includes(id)));
+    // A cleared block is removed for good, whether or not this pass switches.
+    if (clearedIds.length) {
+      instance.runtime_failover_blocked_profiles = eligibleBlocks;
+      for (const id of recovered) cleared.push({ instanceId, profileId: id, health: blockedProfiles[id]?.health, proof: 'codex_canary' });
+      for (const item of proven) cleared.push({ instanceId, ...item });
+    }
     if (instance.runtime_failover_suspended) {
       // Stopped rather than run on a reserve model; resume on the first usable tier.
       const resume = firstUsableTier({ chain, profiles, blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))),
         providerUsage, policy, nowMs });
       if (!resume) continue;
-      if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
       delete instance.runtime_failover_suspended;
       instance.runtime_profile = resume;
       instance.runtime = profiles[resume].runtime;
@@ -331,7 +392,6 @@ export function planRuntimeFailover({
       blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))), providerUsage, policy, nowMs });
     if (leave) {
       const reason = `plan_ineligible:${currentProfile}`;
-      if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
       delete instance.runtime_usage_rotation_wait;
       instance.runtime_profile = leave;
       instance.runtime = profiles[leave].runtime;
@@ -349,7 +409,8 @@ export function planRuntimeFailover({
     const usageFailoverNotBeforeMs = downshift ? 0 : rotationDeadline(instance, { policy, profiles, currentProfile, providerUsage,
       marker: rotationMarkers[instanceId]?.[currentProfile], nowMs });
     const decision = chooseRuntimeProfile({
-      skipDwell: Boolean(downshift),
+      // A tier that cannot start is no flap risk: it is blocked as it is left.
+      skipDwell: Boolean(downshift) || currentHealth === 'start_failed',
       usageFailoverNotBeforeMs,
       currentProfile,
       chain,
@@ -372,7 +433,6 @@ export function planRuntimeFailover({
     if (downshift) decision.reason = `model_downshift:${downshift}`;
     if (decision.profile === currentProfile && !downshift) continue;
 
-    if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
     if (QUARANTINE_HEALTH_STATES.has(currentHealth) || (currentHealth === 'rate_limited' && profiles[currentProfile]?.usage_provider === 'codex')) {
       // An explicit model quota failure can coexist with a low general Codex
       // quota. Keep it held until a newer same-model success proves recovery.
@@ -408,7 +468,7 @@ export function planRuntimeFailover({
       tmuxSession: instance.tmux_session || `${target.runtime}-${instanceId}`,
     });
   }
-  return { document: next, changes, stateChanged: JSON.stringify(next) !== JSON.stringify(document || {}) };
+  return { document: next, changes, cleared, stateChanged: JSON.stringify(next) !== JSON.stringify(document || {}) };
 }
 
 /**
@@ -509,13 +569,51 @@ function readModelSnapshots(document) {
   return result;
 }
 
-function readHealthByInstance(document) {
+/**
+ * The health a persona's agent-status means for failover. The Guardian asks
+ * for the next line by publishing an account-class start_failure on the
+ * profile it launches; once the persona has moved, that record is moot.
+ */
+export function failoverHealth(status = {}, instance = {}) {
+  const failure = status.start_failure;
+  if (failure?.class === 'account' && failure.profile && failure.profile === instance.runtime_profile) return 'start_failed';
+  return status.health || status.health_state || status.state || 'ok';
+}
+
+function readHealthByInstance(document, statuses = readStatuses(document)) {
   const result = {};
   for (const [instanceId, instance] of Object.entries(document?.instances || {})) {
-    const status = readJson(path.join(monitorDirFor(instanceId, instance), 'agent-status.json'), {});
-    result[instanceId] = status.health || status.health_state || status.state || 'ok';
+    result[instanceId] = failoverHealth(statuses[instanceId] || {}, instance);
   }
   return result;
+}
+
+function readStatuses(document) {
+  const result = {};
+  for (const [instanceId, instance] of Object.entries(document?.instances || {})) {
+    result[instanceId] = readJson(path.join(monitorDirFor(instanceId, instance), 'agent-status.json'), {});
+  }
+  return result;
+}
+
+// Recorded successes per persona: the profile its monitor launched, its last
+// functional ACK and its last confirmed engine start (epoch ms).
+function readSuccesses(statuses) {
+  const result = {};
+  for (const [instanceId, status] of Object.entries(statuses)) {
+    if (!status.runtime_profile) continue;
+    result[instanceId] = { profile: status.runtime_profile, ackAt: Number(status.functional_ack_at) || 0,
+      startAt: Number(status.start_confirmed_at) || 0 };
+  }
+  return result;
+}
+
+// Last valid Fable probe per account (= Claude profile id), epoch ms.
+function readFableValidAt(zylosDir) {
+  const accounts = readJson(fableUsagePath(zylosDir), {})?.accounts || {};
+  return Object.fromEntries(Object.entries(accounts)
+    .map(([account, entry]) => [account, Date.parse(entry?.last_valid?.observed_at || '')])
+    .filter(([, ms]) => Number.isFinite(ms)));
 }
 
 // Called inside the instances.json read/modify/write lock. Preserve access for
@@ -580,16 +678,22 @@ export function applyRuntimeFailover({
   if (fs.existsSync(INSTANCES_FILE)) {
     withFileLock(`${INSTANCES_FILE}.lock`, () => {
       const document = readJson(INSTANCES_FILE, {});
+      const statuses = readStatuses(document);
       const planned = planRuntimeFailover({
         document,
         currentSubscriptionAccountKeys: readCurrentSubscriptionAccountKeys(document),
         rotationMarkers: readSubscriptionRotationMarkers(document),
         providerUsage,
-        healthByInstance: readHealthByInstance(document),
+        healthByInstance: readHealthByInstance(document, statuses),
         modelSnapshots: readModelSnapshots(document),
+        successes: readSuccesses(statuses),
+        fableValidAt: readFableValidAt(zylosDir),
         nowMs,
       });
       changes = planned.changes;
+      for (const item of planned.cleared || []) {
+        log(`[runtime-failover] ${item.instanceId}: block on ${item.profileId} (${item.health}) cleared by ${item.proof}`);
+      }
       // Fable guard (FG-2): same lock, after the account choice, so one
       // restart carries both the account and the model of a persona.
       let guard = null;
