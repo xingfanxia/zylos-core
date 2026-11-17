@@ -496,6 +496,67 @@ export function claimedHookBaseKeys({ zylosDir = ZYLOS_DIR } = {}) {
   return new Set(declarations.flatMap(declaration => declaration.claimHooks));
 }
 
+const ORCHESTRATOR_KEY = 'skills/activity-monitor/scripts/session-start-orchestrator.js';
+
+function rawScriptIsHomeRelative(command) {
+  return /(?:^|\s)["']?~\//.test(String(command));
+}
+
+/**
+ * Remove duplicate registrations of core-managed hooks, in place. Never adds
+ * or rewrites a hook, so it is safe to apply on its own (see
+ * prune-duplicate-hooks.js) without the rest of a full sync.
+ *
+ * - Within one matcher group, core-managed hooks with the same script key
+ *   (e.g. `~/zylos/.claude/x.js` and the absolute path of the same file) are
+ *   one registration: keep the HOME-independent absolute form (else the
+ *   first), drop the rest. Claude Code de-duplicates only identical command
+ *   strings, so two spellings of one script run twice per event.
+ * - A SessionStart group that already runs the orchestrator per shard
+ *   (`--shard <name>`) does not also run the legacy no-argument orchestrator,
+ *   which would inject the same memory and C4 context a second time.
+ *
+ * @returns {Array<{event: string, matcher: string, command: string, reason: string}>}
+ */
+export function pruneDuplicateHookRegistrations(settings, { zylosDir = ZYLOS_DIR, dryRun = false } = {}) {
+  const removed = [];
+  for (const [event, groups] of Object.entries(settings?.hooks || {})) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!Array.isArray(group?.hooks)) continue;
+      const matcher = group.matcher ?? '';
+      const coreKeys = group.hooks.map(hook => (isCoreManaged(hook, { zylosDir }) ? hookScriptKey(hook.command) : null));
+      const keep = new Map();
+      coreKeys.forEach((key, index) => {
+        if (!key) return;
+        const current = keep.get(key);
+        if (current === undefined
+          || (rawScriptIsHomeRelative(group.hooks[current].command) && !rawScriptIsHomeRelative(group.hooks[index].command))) {
+          keep.set(key, index);
+        }
+      });
+      const hasShardOrchestrator = event === 'SessionStart'
+        && coreKeys.some(key => key?.startsWith(`${ORCHESTRATOR_KEY}#shard=`));
+
+      const drop = new Set();
+      coreKeys.forEach((key, index) => {
+        if (!key) return;
+        if (hasShardOrchestrator && key === ORCHESTRATOR_KEY) {
+          drop.add(index);
+          removed.push({ event, matcher, command: group.hooks[index].command, reason: 'legacy orchestrator superseded by --shard commands' });
+        } else if (keep.get(key) !== index) {
+          drop.add(index);
+          removed.push({ event, matcher, command: group.hooks[index].command, reason: `duplicate of ${group.hooks[keep.get(key)].command}` });
+        }
+      });
+      if (!dryRun && drop.size > 0) {
+        group.hooks = group.hooks.filter((_, index) => !drop.has(index));
+      }
+    }
+  }
+  return removed;
+}
+
 /**
  * Sync hooks between template and installed settings (in-memory).
  * Exported for unit testing. Called by main() after loading files.
@@ -517,6 +578,17 @@ export function syncHooks(installedSettings, _templateSettings, {
 
   // Ensure hooks object exists
   if (!installedSettings.hooks) installedSettings.hooks = {};
+
+  // Collapse duplicate spellings first so the forward pass below updates the
+  // one surviving registration instead of keeping two that both fire.
+  // (In a dry run nothing is removed, so remember what was reported to keep
+  // the reverse pass from counting the same hook again.)
+  const prunedIds = new Set();
+  for (const item of pruneDuplicateHookRegistrations(installedSettings, { zylosDir, dryRun })) {
+    removed++;
+    prunedIds.add(`${item.event}\0${item.matcher}\0${item.command}`);
+    log(`  - ${item.event}[${item.matcher}]: ${item.command} (${item.reason})`);
+  }
 
   // --- Forward pass: add missing matcher groups/hooks, update hooks in matched groups ---
   // Strategy: align by matcher group, not by individual hook across all groups.
@@ -609,6 +681,7 @@ export function syncHooks(installedSettings, _templateSettings, {
           && claimedKeys.size > 0
           && claimedKeys.has(hookScriptBaseKey(h.command));
         if (!isCoreManaged(h, { zylosDir }) && !claimed) continue;
+        if (dryRun && prunedIds.has(`${event}\0${groupMatcher}\0${h.command}`)) continue;
 
         const installedKey = hookScriptKey(h.command);
         // Check only the corresponding template group, not all groups
