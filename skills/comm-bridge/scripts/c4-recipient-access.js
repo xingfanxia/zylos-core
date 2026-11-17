@@ -17,7 +17,7 @@
  * producer and the backfill that act on the same path at the same time
  * converge: both derive the same final ACL from the same row.
  *
- * Safety contract: a path must be a directory or a single-link regular file
+ * Safety contract: a path must be a directory or a regular file without a second link
  * owned by this process, never a symlink, inside parents that nobody but this
  * process can modify (assertServiceDir). If an isolated recipient's ACL cannot
  * be set the call throws, so a caller never hands out a path its recipient
@@ -82,8 +82,10 @@ export function assertServiceDir(dir) {
  */
 export function assertOwnedEntry(p, kind) {
   const st = fs.lstatSync(p);
+  // nlink 0: a concurrent re-render just renamed a new file over this name, so
+  // the inode we looked up is already gone; the path now names the new file.
   const ok = st.uid === process.getuid() && !st.isSymbolicLink()
-    && (kind === 'dir' ? st.isDirectory() : st.isFile() && st.nlink === 1);
+    && (kind === 'dir' ? st.isDirectory() : st.isFile() && st.nlink <= 1);
   if (!ok) throw new Error(`unsafe_path: ${p}`);
   return st;
 }
