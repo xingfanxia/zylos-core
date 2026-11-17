@@ -9,6 +9,8 @@
  *   - CodexAdapter   (cli/lib/runtime/codex.js, Phase 4)
  */
 
+import { readLaunchResult } from './launch-result.js';
+
 export class RuntimeAdapter {
   /**
    * @param {object} config - Zylos config object (from getZylosConfig())
@@ -46,6 +48,17 @@ export class RuntimeAdapter {
    */
   clearStaleState() {
     // Optional hook.
+  }
+
+  /**
+   * The launcher's record of the latest launch (launch-result.js). undefined
+   * when this launch path writes none (an existing tmux session, a legacy
+   * adapter); null when the launcher was due to write one and did not.
+   *
+   * @returns {object|null|undefined}
+   */
+  readLaunchResult() {
+    return readLaunchResult(this.lastLaunchRecord);
   }
 
   /**

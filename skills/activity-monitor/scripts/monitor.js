@@ -469,6 +469,9 @@ function writeStatusFile(statusObj) {
       runtime_profile: adapter.config?.runtimeProfile?.id || null,
       functional_ack_at: engine.lastFunctionalAckAt || 0,
       functional_ack_phase: engine.lastFunctionalAckPhase || null,
+      // Failed starts (Guardian): the open downtime episode and the last
+      // confirmed start. Records only; nothing moves on them.
+      ...(orchestrator?.components?.guardian?.startStatus?.() || {}),
     },
     healthEngine: engine,
   });
@@ -783,6 +786,24 @@ function formatDegradedAdminAlert({ cycleCount, windowSec, probeIntervalSec }) {
 // must fully self-contain: the try/catch here covers not just runC4Send but also
 // formatDegradedAdminAlert (throws on bad details) and log (can throw on ENOSPC),
 // guaranteeing the returned promise never rejects → no unhandledRejection.
+// Failed-start hold admin alert (SWITCH-1): from the Guardian, through the
+// same direct send as the degraded alert. Resolves the send's receipt; the
+// Guardian records the alert as delivered only on { ok: true }.
+function formatStartHeldAdminAlert({ since, attempts, cause, retrySec }) {
+  const instance = (INSTANCE_ID || 'primary').replace(/^user-/, '');
+  const sinceText = new Date(since).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  return [
+    `🔴 ${instance} 无法启动新会话`,
+    `从北京时间 ${sinceText} 起已启动失败 ${attempts} 次。原因：${cause}`,
+    `启动失败不会触发换线路。接下来每 ${Math.round(retrySec / 60)} 分钟自动重试一次，修复后会自动恢复。`,
+  ].join('\n');
+}
+
+function notifyStartHeldAdmin(details) {
+  if (!ADMIN_CHAT_ID) return Promise.resolve({ ok: false, output: 'no admin chat_id configured', permanent: true });
+  return runC4Send('feishu', ADMIN_CHAT_ID, formatStartHeldAdminAlert(details), 'health-alert');
+}
+
 async function notifyDegradedAdmin(details) {
   try {
     if (!ADMIN_CHAT_ID) {
@@ -1226,8 +1247,12 @@ function createHealthEngine(activeAdapter, initialStatus) {
   return activeEngine;
 }
 
-function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, { monitorDir } = {}) {
+function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, { monitorDir, initialStartFailure, inheritHold } = {}) {
   return createRuntimeGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchAtMs, {
+    initialStartFailure,
+    inheritHold,
+    notifyStartHeld: notifyStartHeldAdmin,
+    heldRetrySec: DEGRADED_PROBE_INTERVAL,
     apiActivityFile: API_ACTIVITY_FILE,
     hookStateFile: HOOK_STATE_FILE,
     // REL-6: forwarding monitorDir enables the suspend/wake gate — this wrapper
@@ -1329,7 +1354,7 @@ function init() {
 // prior argv-based gate passed `node --test` (argv[1] = the test file) yet broke
 // every pm2-launched instance. The env opt-out is the only launch-mode-agnostic
 // signal, and it is exactly what the tests already set.
-export { runC4Send, notifyDegradedAdmin, formatDegradedAdminAlert };
+export { runC4Send, notifyDegradedAdmin, formatDegradedAdminAlert, formatStartHeldAdminAlert };
 
 const RUN_MAIN = process.env.MONITOR_DISABLE_MAIN !== '1';
 

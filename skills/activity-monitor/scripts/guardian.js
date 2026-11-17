@@ -14,6 +14,35 @@ export const DEFAULT_SIGNAL_TTL_SEC = 600;
 // Throttle for the health-gate skip log (the gate can hold for hours at 1s ticks).
 const GATE_LOG_INTERVAL_SEC = 60;
 
+// Failed starts (SWITCH-1). A launch is a started session once the engine has
+// been running for START_CONFIRM_SEC without a break; a launch the Guardian has
+// to replace before that is a failed start. The first one is retried as is;
+// after the second the persona is held, whatever the cause: the operator is
+// alerted once and the launch is retried once every heldRetrySec. A failed
+// start never moves the persona: runtime-failover keeps acting only on its own
+// signals, and if it moves a held persona, the new monitor starts fresh on the
+// new tier (the episode ends when a start there is confirmed).
+export const START_CONFIRM_SEC = 30;
+export const DEFAULT_HELD_RETRY_SEC = 1200;
+// A known failed alert send is retried at the next retry windows, this often in all.
+export const MAX_ALERT_ATTEMPTS = 3;
+const iso = ms => new Date(ms).toISOString();
+
+/** Why a launch did not come up, from facts the launch path already has. */
+export function describeFailedStart({ prepareError = null, launchResult } = {}) {
+  if (prepareError) return `prepare: ${prepareError}`;
+  if (launchResult === undefined) return 'engine did not stay up';
+  if (launchResult === null) return 'launcher left no record (sudo, node or the launcher failed before running)';
+  const detail = [launchResult.error_code, launchResult.error].filter(Boolean).join(' ');
+  if (launchResult.state === 'launcher_failed') return `launcher ${launchResult.stage}: ${detail}`;
+  if (launchResult.state === 'spawn_failed') return `engine binary: ${detail}`;
+  if (launchResult.state === 'exited') {
+    const how = launchResult.signal ? `signal ${launchResult.signal}` : `exit ${launchResult.exit_code}`;
+    return `engine exited after ${Math.round((launchResult.ran_ms || 0) / 1000)}s (${how})`;
+  }
+  return 'engine started but did not stay up';
+}
+
 export function getRunningMaintenance({ execSyncImpl = defaultExecSync } = {}) {
   try {
     execSyncImpl('pgrep -f "[r]estart-claude" > /dev/null 2>&1', { timeout: 500 });
@@ -86,6 +115,11 @@ export class Guardian {
       initialRuntimeLaunchAtMs: 0,
       monitorDir: null, // ZY-LIFE-1: per-instance state dir for suspend/wake signals
       signalTtlSec: null, // null → DEFAULT_SIGNAL_TTL_SEC; 0 disables the TTL
+      profileId: null, // runtime profile this monitor launches (start-failure records)
+      initialStartFailure: null, // the previous monitor's open start-failure episode
+      inheritHold: false, // keep that episode's hold timing (no runtime switch since)
+      notifyStartHeld: null, // operator alert: resolves {ok, output, permanent}
+      heldRetrySec: DEFAULT_HELD_RETRY_SEC,
       ...deps,
     };
     this.notRunningCount = 0;
@@ -99,6 +133,26 @@ export class Guardian {
     // running in this process since the last start, and did a wake cause it?
     this.sawRunningSinceStart = false;
     this.wokeSinceStart = false;
+    // Failed-start bookkeeping. `launch` is the latest launch this process
+    // issued; `startFailure` the open downtime episode, persisted through
+    // agent-status.json. A restarted monitor keeps the episode; it keeps the
+    // hold timing only on the same profile with no runtime switch (failover,
+    // Fable guard) in between, so a move always gets a fresh attempt.
+    this.launch = null;
+    this.failedStarts = 0;
+    this.startConfirmedAtMs = 0;
+    this.alertInFlight = false;
+    const prior = this.deps.initialStartFailure;
+    const keepHold = this.deps.inheritHold && prior?.profile === this.deps.profileId
+      && Number.isFinite(Date.parse(prior?.next_attempt_at || ''));
+    this.startFailure = typeof prior?.since === 'string'
+      ? { ...prior, ...(keepHold ? {} : { held_since: null, next_attempt_at: null }) }
+      : null;
+  }
+
+  /** The start facts agent-status.json publishes (runtime-failover reads them). */
+  startStatus() {
+    return { start_failure: this.startFailure, start_confirmed_at: this.startConfirmedAtMs || null };
   }
 
   getState() {
@@ -155,6 +209,15 @@ export class Guardian {
     this.startupGrace = 0;
     this.notRunningCount = 0;
     this.sawRunningSinceStart = true;
+    // An episode inherited while a session already runs (the previous monitor
+    // launched it and was restarted before confirming): confirm that session.
+    if (!this.launch && this.startFailure) {
+      this.launch = { atMs: this.deps.nowMs(), runningSince: 0, confirmed: false, judged: false, prepareError: null };
+    }
+    if (this.launch && !this.launch.confirmed) {
+      if (!this.launch.runningSince) this.launch.runningSince = currentTime;
+      else if (currentTime - this.launch.runningSince >= START_CONFIRM_SEC) this._confirmStart();
+    }
 
     if (this.consecutiveRestarts > 0) {
       if (this.stableRunningSince === 0) {
@@ -313,6 +376,7 @@ export class Guardian {
 
     this.notRunningCount += 1;
     this.stableRunningSince = 0;
+    if (this.launch) this.launch.runningSince = 0;
 
     let attemptedRestart = false;
     const restartDelay = Math.min(
@@ -322,7 +386,7 @@ export class Guardian {
     if (this.notRunningCount >= restartDelay) {
       if (healthGate) {
         this._logGateThrottled(healthGate, currentTime);
-      } else {
+      } else if (this._mayRelaunch()) {
         this.deps.log(restartLog.replace('{count}', String(this.notRunningCount)));
         attemptedRestart = this.startAgent();
       }
@@ -361,6 +425,8 @@ export class Guardian {
       this.startupGrace = STARTUP_GRACE_TICKS;
       this.notRunningCount = 0;
       this.runtimeLaunchAtMs = this.deps.nowMs();
+      const launch = { atMs: this.runtimeLaunchAtMs, runningSince: 0, confirmed: false, judged: false, prepareError: null };
+      this.launch = launch;
 
       this.deps.log(`Guardian: Starting ${this.adapter.displayName}...`);
 
@@ -374,6 +440,7 @@ export class Guardian {
 
       const reportFailure = (err) => {
         this.deps.log(`Guardian: Failed to start ${this.adapter.displayName}: ${err.message}`);
+        launch.prepareError = String(err?.message || err).split('\n')[0].slice(0, 300);
       };
       const launchPrepared = () => {
         try {
@@ -399,5 +466,103 @@ export class Guardian {
     } finally {
       this.startAgentInProgress = false;
     }
+  }
+
+  // ── Failed starts (SWITCH-1) ─────────────────────────────────────────
+  // Called when a relaunch is otherwise due: the latest launch did not come up,
+  // so judge it once, then say whether this tick may launch again.
+  _mayRelaunch() {
+    if (this.launch && !this.launch.confirmed && !this.launch.judged) this._recordFailedStart();
+    const failure = this.startFailure;
+    if (!failure?.held_since) return true;
+    const nowMs = this.deps.nowMs();
+    if (nowMs < Date.parse(failure.next_attempt_at)) return false;
+    failure.next_attempt_at = iso(nowMs + this.deps.heldRetrySec * 1000);
+    this.deps.log(`Guardian: start held on ${this.deps.profileId || 'current profile'}; scheduled retry`);
+    this._alertOnce(); // a send that failed before gets its next try here
+    return true;
+  }
+
+  _recordFailedStart() {
+    const launch = this.launch;
+    launch.judged = true;
+    this.failedStarts += 1;
+    let launchResult;
+    try { launchResult = this.adapter.readLaunchResult?.(); } catch { launchResult = null; }
+    const cause = describeFailedStart({ prepareError: launch.prepareError, launchResult });
+    const prior = this.startFailure;
+    this.startFailure = {
+      since: iso(launch.atMs),
+      held_since: null,
+      next_attempt_at: null,
+      alerted_at: null,
+      alert_attempts: 0,
+      ...prior,
+      profile: this.deps.profileId,
+      attempts: (prior?.attempts || 0) + 1,
+      cause,
+      last_failed_at: iso(this.deps.nowMs()),
+    };
+    this.deps.log(`Guardian: start failed on ${this.deps.profileId || 'current profile'} `
+      + `(${this.failedStarts} in a row): ${cause}`);
+    // A held retry that fails stays held; a first failure is retried as is.
+    if (this.startFailure.held_since || this.failedStarts < 2) return;
+    this._hold();
+  }
+
+  _hold() {
+    const nowMs = this.deps.nowMs();
+    const failure = this.startFailure;
+    failure.held_since = iso(nowMs);
+    failure.next_attempt_at = iso(nowMs + this.deps.heldRetrySec * 1000);
+    this.deps.log(`Guardian: start held on ${this.deps.profileId || 'current profile'}; `
+      + `retrying once every ${this.deps.heldRetrySec}s`);
+    this._alertOnce();
+  }
+
+  // One operator alert per episode, recorded only on a verified send. A failed
+  // send is retried at the next retry window, MAX_ALERT_ATTEMPTS in all; a
+  // permanent failure (no admin destination) is logged once and not retried.
+  _alertOnce() {
+    const failure = this.startFailure;
+    if (!failure || failure.alerted_at || this.alertInFlight || !this.deps.notifyStartHeld
+        || (failure.alert_attempts || 0) >= MAX_ALERT_ATTEMPTS) return;
+    failure.alert_attempts = (failure.alert_attempts || 0) + 1;
+    this.alertInFlight = true;
+    const settle = (ok, detail, permanent) => {
+      this.alertInFlight = false;
+      if (this.startFailure !== failure) return; // the episode ended meanwhile
+      if (ok) {
+        failure.alerted_at = iso(this.deps.nowMs());
+        this.deps.log('Guardian: start-held alert sent');
+        return;
+      }
+      if (permanent) failure.alert_attempts = MAX_ALERT_ATTEMPTS;
+      this.deps.log(`Guardian: start-held alert not delivered (${String(detail || 'send failed').slice(0, 200)}); `
+        + (failure.alert_attempts < MAX_ALERT_ATTEMPTS ? 'retrying at the next retry window' : 'not retried'));
+    };
+    let sent;
+    try {
+      sent = Promise.resolve(this.deps.notifyStartHeld({ profile: this.deps.profileId, since: failure.since,
+        attempts: failure.attempts, cause: failure.cause, retrySec: this.deps.heldRetrySec }));
+    } catch (err) {
+      settle(false, err?.message || err, false);
+      return;
+    }
+    sent.then(res => settle(res?.ok === true, res?.output, res?.permanent === true),
+      err => settle(false, err?.message || err, false));
+  }
+
+  _confirmStart() {
+    this.launch.confirmed = true;
+    this.startConfirmedAtMs = this.deps.nowMs();
+    const failure = this.startFailure;
+    if (failure) {
+      const downSec = Math.max(0, Math.round((this.startConfirmedAtMs - Date.parse(failure.since)) / 1000));
+      this.deps.log(`Guardian: start recovered on ${this.deps.profileId || 'current profile'}: down from ${failure.since} `
+        + `to ${iso(this.startConfirmedAtMs)} (${downSec}s, ${failure.attempts} failed starts; last cause: ${failure.cause})`);
+    }
+    this.startFailure = null;
+    this.failedStarts = 0;
   }
 }

@@ -22,6 +22,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 import { RuntimeAdapter } from './base.js';
+import { prepareLaunchResult } from './launch-result.js';
 import { assertInstructionReady, buildInstructionFile } from './instruction-builder.js';
 import { CodexContextMonitor } from './codex-context-monitor.js';
 import { createCodexProbe } from '../heartbeat/codex-probe.js';
@@ -296,6 +297,7 @@ export class CodexAdapter extends RuntimeAdapter {
    * @returns {Promise<void>}
    */
   async launch(opts = {}) {
+    this.lastLaunchRecord = null;
     const bypassPermissions = resolveCodexBypassPermissions(ZYLOS_DIR, opts);
     assertInstructionReady('codex');
     // Keep managed sessions independent of shared daemon feature settings.
@@ -482,6 +484,8 @@ export class CodexAdapter extends RuntimeAdapter {
       const args = [...launchArgs, ...profileArgs, kickPrompt];
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
+      // The launcher's own report of this launch, in the persona's monitor dir.
+      const launchRecord = prepareLaunchResult(_getMonitorDir ? _getMonitorDir() : monitorDir);
       const specPath = writeLaunchSpec({
         command: codexBin,
         args,
@@ -490,6 +494,8 @@ export class CodexAdapter extends RuntimeAdapter {
         cwd: instanceCwd,
         personaEnvFile,
         exitLogFile,
+        launchResultFile: launchRecord?.file,
+        launchId: launchRecord?.launchId,
       });
 
       if (osUser) {
@@ -520,6 +526,7 @@ export class CodexAdapter extends RuntimeAdapter {
         try { fs.unlinkSync(specPath); } catch { }
         throw new Error(`Failed to create tmux session: ${e.message}`);
       }
+      this.lastLaunchRecord = launchRecord;
     }
 
     // 4. Schedule startup dialog check (8s after launch)

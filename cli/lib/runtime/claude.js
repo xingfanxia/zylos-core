@@ -20,6 +20,7 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 import { RuntimeAdapter } from './base.js';
+import { prepareLaunchResult } from './launch-result.js';
 import { assertInstructionReady, buildInstructionFile } from './instruction-builder.js';
 import { ClaudeContextMonitor } from './claude-context-monitor.js';
 import { createClaudeProbe } from '../heartbeat/claude-probe.js';
@@ -374,6 +375,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @returns {Promise<void>}
    */
   async launch(opts = {}) {
+    this.lastLaunchRecord = null;
     const bypassPermissions = opts.bypassPermissions ?? DEFAULT_BYPASS;
     assertInstructionReady('claude');
     // Fable allowance guard: every launch (Guardian relaunches reuse the
@@ -505,6 +507,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
       args.push(...profileFlags);
 
       const launcherPath = path.join(path.dirname(import.meta.url.replace('file://', '')), 'tmux-launcher.js');
+      // The launcher's own report of this launch, in the persona's monitor dir.
+      const launchRecord = prepareLaunchResult(_getMonitorDir ? _getMonitorDir() : monitorDir);
       const specPath = writeLaunchSpec({
         command: CLAUDE_BIN,
         args,
@@ -512,6 +516,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
         cwd: instanceCwd,
         personaEnvFile,
         exitLogFile,
+        launchResultFile: launchRecord?.file,
+        launchId: launchRecord?.launchId,
       });
 
       // Spec is 0600 in /tmp (sticky): hand it to the agent user so the
@@ -544,6 +550,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         try { fs.unlinkSync(specPath); } catch { }
         throw new Error(`Failed to create tmux session: ${e.message}`);
       }
+      this.lastLaunchRecord = launchRecord;
     }
   }
 

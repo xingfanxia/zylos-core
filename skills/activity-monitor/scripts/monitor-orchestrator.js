@@ -87,7 +87,11 @@ export class MonitorOrchestrator {
     }
     // monitorDir enables the guardian's suspend/wake gate — omitting it here
     // (the pre-REL-6 wiring) silently disabled signal consumption fleet-wide.
-    const guardian = createGuardian(adapter, toolPipeline, runtimeLaunchAtMs, { monitorDir });
+    const guardian = createGuardian(adapter, toolPipeline, runtimeLaunchAtMs, {
+      monitorDir,
+      initialStartFailure: initialStatus.start_failure || null, // an open failed-start episode
+      inheritHold: !runtimeSwitchSignal, // a switch (failover, Fable guard) gets a fresh attempt
+    });
 
     if (!engine.evidence?.store && !runtimeSwitchSignal && initialHealth === 'rate_limited' && initialStatus.cooldown_until) {
       engine.enterRateLimited(initialStatus.cooldown_until, initialStatus.rate_limit_reset || '');
