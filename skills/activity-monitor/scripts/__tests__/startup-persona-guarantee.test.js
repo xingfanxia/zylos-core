@@ -5,7 +5,13 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { DEFAULT_SHARD_BUDGET, estimateTokens, withinBudget } from '../shard-registry.js';
-import { composeShardOutput, runSessionStartShard, shardHeader } from '../session-start-orchestrator.js';
+import {
+  composeShardOutput,
+  resolveShardRuntime,
+  runSessionStartShard,
+  shardBudgetForRuntime,
+  shardHeader,
+} from '../session-start-orchestrator.js';
 import {
   emitMemoryPart,
   getStartupMemoryContextParts,
@@ -46,7 +52,8 @@ const PERSONA_TEXT = [
 let zylosDir;
 const savedEnv = {};
 
-function makeZylos({ instanceId = 'user-test', type = 'user', primary = false, state = realisticState(), identity = null, digest = null } = {}) {
+function makeZylos({ instanceId = 'user-test', type = 'user', primary = false, state = realisticState(), identity = null, digest = null, runtime = 'claude', profiles = null } = {}) {
+  if (zylosDir) fs.rmSync(zylosDir, { recursive: true, force: true });
   zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'persona-guarantee-'));
   const shared = path.join(zylosDir, 'memory', 'shared');
   fs.mkdirSync(shared, { recursive: true });
@@ -59,7 +66,8 @@ function makeZylos({ instanceId = 'user-test', type = 'user', primary = false, s
   fs.writeFileSync(path.join(zylosDir, 'instances', instanceId, 'ZYLOS.md'), PERSONA_TEXT);
   fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify({
     scheduler_instance: 'scheduler',
-    instances: { [instanceId]: { type, primary, runtime: 'claude' } },
+    ...(profiles ? { runtime_profiles: profiles } : {}),
+    instances: { [instanceId]: { type, primary, runtime, ...(profiles ? { runtime_profile: Object.keys(profiles)[0] } : {}) } },
   }));
   process.env.ZYLOS_DIR = zylosDir;
   process.env.ZYLOS_INSTANCE_ID = instanceId;
@@ -249,4 +257,95 @@ describe('startup persona block survives realistic state sizes', () => {
     assert.equal(body.guaranteed, '');
     assert.equal(body.sections[0].label, 'BOT IDENTITY');
   });
+});
+
+// A ~3k-token state.md that is well under Claude's 10,000-char persist
+// threshold: the shape of Elaine's and Pan's files.
+function threeKTokenState() {
+  return `# user-test Instance State\n## Current Focus\n${cjkLines(60, '当前')}\n## Working Pointers and Boundaries\n${cjkLines(55, '边界')}\n`;
+}
+
+async function runShard(name, options = {}) {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'persona-runtime-'));
+  const outPath = path.join(outDir, 'out.txt');
+  const fd = fs.openSync(outPath, 'w+');
+  try {
+    await runSessionStartShard(name, { source: 'startup' }, {
+      stdout: { fd },
+      zylosDir,
+      tmpdir: outDir,
+      registerExitFlagImpl: () => {},
+      ...options,
+    });
+  } finally {
+    fs.closeSync(fd);
+  }
+  const output = fs.readFileSync(outPath, 'utf8');
+  fs.rmSync(outDir, { recursive: true, force: true });
+  return output;
+}
+
+describe('shard budget follows the session runtime', () => {
+  it('fixture: the state is over the token cap and under the char cap', () => {
+    const state = formatSection('ACTIVE STATE', threeKTokenState());
+    assert.ok(estimateTokens(state) > 2900, `${estimateTokens(state)} tokens`);
+    assert.ok(state.length < DEFAULT_SHARD_BUDGET.maxChars - 500, `${state.length} chars`);
+  });
+
+  it('resolves the runtime the launcher would use, and null when the profile is invalid', () => {
+    makeZylos({ runtime: 'claude' });
+    assert.equal(resolveShardRuntime({ zylosDir, instanceId: 'user-test' }), 'claude');
+    makeZylos({ runtime: 'claude', profiles: { 'p-codex': { runtime: 'codex' } } });
+    assert.equal(resolveShardRuntime({ zylosDir, instanceId: 'user-test' }), 'codex');
+    makeZylos({ runtime: 'claude', profiles: { 'p-bad': { runtime: 'gemini' } } });
+    assert.equal(resolveShardRuntime({ zylosDir, instanceId: 'user-test' }), null);
+  });
+
+  it('a Claude session is bound by the char limit only', () => {
+    assert.deepEqual(shardBudgetForRuntime(DEFAULT_SHARD_BUDGET, 'claude'), {
+      maxChars: DEFAULT_SHARD_BUDGET.maxChars,
+      maxTokens: Number.POSITIVE_INFINITY,
+    });
+    assert.deepEqual(shardBudgetForRuntime(DEFAULT_SHARD_BUDGET, 'codex'), { ...DEFAULT_SHARD_BUDGET });
+    assert.deepEqual(shardBudgetForRuntime(DEFAULT_SHARD_BUDGET, null), { ...DEFAULT_SHARD_BUDGET });
+  });
+
+  it('Claude runtime: a 3k-token, under-10k-char state.md is delivered whole', async () => {
+    makeZylos({ runtime: 'claude', state: threeKTokenState() });
+    const output = await runShard('state');
+    assert.ok(complete(output, 'ACTIVE STATE'));
+    assert.ok(output.includes('## Working Pointers and Boundaries'));
+    assert.equal(output.includes('[trimmed to fit'), false);
+    assert.ok(output.length <= DEFAULT_SHARD_BUDGET.maxChars);
+  });
+
+  it('Codex runtime: the token cap and the trim marker stay', async () => {
+    makeZylos({ runtime: 'codex', state: threeKTokenState() });
+    const output = await runShard('state');
+    assert.match(output, /\[trimmed to fit the startup budget: ACTIVE STATE kept its first/);
+    assert.ok(withinBudget(output, DEFAULT_SHARD_BUDGET));
+  });
+
+  it('unknown runtime: the dual budget stays', async () => {
+    makeZylos({ state: threeKTokenState(), profiles: { 'p-bad': { runtime: 'gemini' } } });
+    const output = await runShard('state');
+    assert.match(output, /\[trimmed to fit the startup budget: ACTIVE STATE/);
+    assert.ok(withinBudget(output, DEFAULT_SHARD_BUDGET));
+  });
+
+  for (const [label, setup] of [
+    ['claude', { runtime: 'claude' }],
+    ['codex', { runtime: 'codex' }],
+    ['unknown', { profiles: { 'p-bad': { runtime: 'gemini' } } }],
+  ]) {
+    it(`persona block stays guaranteed under the ${label} runtime`, async () => {
+      makeZylos({ ...setup, identity: `# Bot Identity\n${cjkLines(400, '身份')}\n` });
+      const output = await runShard('identity');
+      assert.ok(complete(output, 'INSTANCE INSTRUCTIONS'));
+      assert.ok(complete(output, 'MEMORY WRITE POLICY'));
+      assert.ok(output.indexOf('=== INSTANCE INSTRUCTIONS ===') < output.indexOf('=== BOT IDENTITY ==='));
+      assert.match(output, /BOT IDENTITY kept its first/);
+      assert.ok(output.length <= DEFAULT_SHARD_BUDGET.maxChars);
+    });
+  }
 });

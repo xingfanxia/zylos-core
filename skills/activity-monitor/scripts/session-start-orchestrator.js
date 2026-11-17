@@ -20,6 +20,7 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { formatSection } from '../../comm-bridge/scripts/session-format.js';
+import { getInstanceRuntimeProfile } from '../../multi-session/runtime-files.js';
 import {
   SIDE_EFFECT_NAMES,
   estimateTokens,
@@ -319,6 +320,31 @@ export function shardHeader({ position, total, name, waitNote = '' }) {
   return `=== ZYLOS STARTUP CONTEXT [${position}/${total}] ${name}${waitNote ? ` (${waitNote})` : ''} ===`;
 }
 
+/**
+ * The engine this session runs under, from the same runtime profile the
+ * launcher uses to start it (instances.json active profile → instance
+ * runtime → .zylos/config.json). null when it cannot be resolved.
+ */
+export function resolveShardRuntime({ zylosDir, instanceId = process.env.ZYLOS_INSTANCE_ID || null } = {}) {
+  try {
+    const profile = getInstanceRuntimeProfile({ ...(zylosDir ? { zylosDir } : {}), instanceId });
+    if (profile?.errors?.length) return null;
+    return profile?.runtime === 'claude' || profile?.runtime === 'codex' ? profile.runtime : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Each limit applies only to the runtime it protects: Claude Code persists
+ * hook stdout above maxChars (no token cap), Codex elides above its per-hook
+ * token cap (maxTokens; the char cap is kept as an outer bound). Unknown
+ * runtime keeps both.
+ */
+export function shardBudgetForRuntime(budget, runtime) {
+  return runtime === 'claude' ? { ...budget, maxTokens: Number.POSITIVE_INFINITY } : { ...budget };
+}
+
 export function shardSpillPath(sessionId, shardName, { tmpdir = os.tmpdir() } = {}) {
   const cleaned = String(sessionId || 'nosession').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128);
   return path.join(tmpdir, SPILL_ROOT_NAME, cleaned, `${shardName}.txt`);
@@ -600,6 +626,7 @@ export async function runSessionStartShard(name, payload = {}, {
   readFlagStatusImpl = readFlagStatus,
   writeFlagImpl = writeFlag,
   requireHealthyContext = startupContextRequired(),
+  runtime,
   registerExitFlagImpl = fn => process.once('exit', fn),
   actions = {
     foreground: runForeground,
@@ -691,7 +718,9 @@ export async function runSessionStartShard(name, payload = {}, {
     waitNote,
   });
   const spillPath = shardSpillPath(sessionId, shard.name, sequencerOptions);
-  const composed = composeShardOutput({ header, body, budget: shard.budget, spillPath });
+  const activeRuntime = runtime === undefined ? resolveShardRuntime(zylosDir ? { zylosDir } : {}) : runtime;
+  const budget = shardBudgetForRuntime(shard.budget, activeRuntime);
+  const composed = composeShardOutput({ header, body, budget, spillPath });
   if (composed.truncated) {
     try {
       fs.mkdirSync(path.dirname(spillPath), { recursive: true });
@@ -732,6 +761,7 @@ export async function runSessionStartShard(name, payload = {}, {
     stdoutBytes: Buffer.byteLength(composed.output),
     extra: [
       waitExtra,
+      `runtime=${activeRuntime || 'unknown'}`,
       composed.truncated ? 'truncated=1' : '',
       composed.trimmedLabel ? `trimmed=${composed.trimmedLabel.replace(/\s+/g, '_')}` : '',
       composed.omittedLabels?.length ? `omitted=${composed.omittedLabels.join(',').replace(/\s+/g, '_')}` : '',
