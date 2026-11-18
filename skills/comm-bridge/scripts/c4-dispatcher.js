@@ -37,7 +37,7 @@ import {
   supersedeControl,
   recordUncertainDelivery,
   stripTrailingAckSuffix,
-  waitForVerifiedDb,
+  startDialogSchemaCheck,
   publishCapabilities,
   refreshCapabilities,
   withdrawCapabilities,
@@ -1258,7 +1258,9 @@ function maybeEmitHeartbeat(result) {
   lastHeartbeatMs = now;
   // Keep the published capability fresh while this process runs (it goes
   // stale for the dialog watch within minutes after a hang or a kill).
-  try { refreshCapabilities(DISPATCHER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
+  if (dialogSchemaCheck?.ready()) {
+    try { refreshCapabilities(DISPATCHER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
+  }
   try {
     log(formatHeartbeatLine({
       pendingConv: getPendingCount(),
@@ -1379,18 +1381,25 @@ function acquireSingletonLock() {
 // controls. The watch queues nothing until a live dispatcher has published it.
 const DISPATCHER_PROCESS = 'c4-dispatcher';
 export const DISPATCHER_CAPABILITIES = Object.freeze(['dialog_ref']);
+let dialogSchemaCheck = null;
 
 async function main() {
   if (!acquireSingletonLock()) {
     close();
     process.exit(1);
   }
-  // Serve only on a verified schema (every migration recorded, dialog_ref
-  // present); until then nothing is claimed and no capability is published.
-  await waitForVerifiedDb({ log });
-  publishCapabilities(DISPATCHER_PROCESS, DISPATCHER_CAPABILITIES);
-  process.on('exit', () => { try { withdrawCapabilities(DISPATCHER_PROCESS); } catch { /* best effort */ } });
-  log(`=== C4 Dispatcher Started === (schema verified; capabilities: ${DISPATCHER_CAPABILITIES.join(' ')})`);
+  log('=== C4 Dispatcher Started ===');
+  // Delivery does not wait for the dialog-binding schema: without
+  // control_queue.dialog_ref no row is bound to a dialog (nothing queues one
+  // before this capability is published) and every row is delivered as
+  // before. The capability is published only once the schema is verified;
+  // until then the check retries with backoff and logs once a minute.
+  dialogSchemaCheck = startDialogSchemaCheck({ processName: DISPATCHER_PROCESS, log,
+    onReady: () => publishCapabilities(DISPATCHER_PROCESS, DISPATCHER_CAPABILITIES) });
+  process.on('exit', () => {
+    dialogSchemaCheck?.stop();
+    try { withdrawCapabilities(DISPATCHER_PROCESS); } catch { /* best effort */ }
+  });
   log(`Tmux session: ${TMUX_SESSION}`);
   trace('delivery_config', { bracketedPasteEnabled: BRACKETED_PASTE_ENABLED });
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);

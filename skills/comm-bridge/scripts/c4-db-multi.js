@@ -16,7 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getDb, CONTROL_CLAIM_ORDER } from './c4-db.js';
+import { getDb, CONTROL_CLAIM_ORDER, dialogRefSelect } from './c4-db.js';
 import { groupKeyFromEndpoint } from '../../multi-session/c4-helpers.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -236,7 +236,7 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
     return db.prepare(`
       SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
              status, retry_count, available_at, last_error, created_at, updated_at,
-             target_instance, session_ref, dialog_ref
+             target_instance, session_ref, ${dialogRefSelect(db)}
       FROM control_queue
       WHERE status = 'pending'
         AND (available_at IS NULL OR available_at <= ?)
@@ -251,7 +251,7 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
   return db.prepare(`
     SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
            status, retry_count, available_at, last_error, created_at, updated_at,
-           target_instance, session_ref, dialog_ref
+           target_instance, session_ref, ${dialogRefSelect(db)}
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)

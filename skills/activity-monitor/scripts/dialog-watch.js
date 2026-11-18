@@ -50,8 +50,10 @@
  * pane). Nothing is read from a persona-writable directory.
  * Capability gate: nothing is queued until the running dispatcher (and, for an
  * isolated persona, the broker) have published that they understand the
- * prompt binding (c4_process_capabilities); until then the watch only
- * observes and alerts.
+ * prompt binding (c4_process_capabilities), which they do only once the
+ * dialog-binding schema (migrations/005, 006) is verified. Until then, and
+ * whenever that schema is missing, the watch only observes and alerts: its
+ * state is neither read nor saved and it queues nothing.
  * Alerts use the direct admin send of the degraded and start-held alerts; a
  * failed send is tried again a minute later. Logs and alerts carry ids,
  * counts, kinds and ages; a dialog's title row only for a permission prompt;
@@ -100,7 +102,7 @@ export function formatDialogAlert({ instanceId, kind, title, onScreenMs, held, o
   const action = {
     sent: `已自动按过一次 Esc（${minutes(escapeSentMs)} 分钟前送达），权限确认框仍在。`,
     queued: 'Esc 已排队但还没有送达。',
-    withheld: '没有发送 Esc：正在运行的 c4-dispatcher / c4-broker 还不支持对话框绑定（先重启它们）。',
+    withheld: '没有发送 Esc：c4-dispatcher / c4-broker 还没有确认对话框绑定（尚未重启，或数据库迁移 005/006 未完成，见它们的日志）。',
     failed: 'Esc 未能放入队列。',
     pending: '还没到自动按 Esc 的时间。',
     none: '这类对话框不会自动按键。',

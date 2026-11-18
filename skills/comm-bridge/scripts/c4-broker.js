@@ -50,7 +50,7 @@ import {
   setSendStatus,
   getRecentSends,
   close as closeDb,
-  waitForVerifiedDb,
+  startDialogSchemaCheck,
   publishCapabilities,
   refreshCapabilities,
   withdrawCapabilities,
@@ -854,17 +854,24 @@ const BROKER_PROCESS = 'c4-broker';
 export const BROKER_CAPABILITIES = Object.freeze(['dialog_ref']);
 const CAPABILITY_REFRESH_MS = 60_000;
 
-async function main() {
+function main() {
   if (!acquireSingletonLock()) process.exit(1);
-  // Serve only on a verified schema (every migration recorded, dialog_ref
-  // present); until then no socket is opened and no capability published.
-  await waitForVerifiedDb({ log });
-  publishCapabilities(BROKER_PROCESS, BROKER_CAPABILITIES);
-  process.on('exit', () => { try { withdrawCapabilities(BROKER_PROCESS); } catch { /* best effort */ } });
+  log('=== C4 Broker Started ===');
+  // The broker serves as before whatever the schema (its control inserts keep
+  // a bound row apart only when control_queue.dialog_ref exists, and nothing
+  // is bound without it). The capability is published only once the
+  // dialog-binding schema is verified; until then the check retries with
+  // backoff and logs once a minute.
+  const schemaCheck = startDialogSchemaCheck({ processName: BROKER_PROCESS, log,
+    onReady: () => publishCapabilities(BROKER_PROCESS, BROKER_CAPABILITIES) });
+  process.on('exit', () => {
+    schemaCheck.stop();
+    try { withdrawCapabilities(BROKER_PROCESS); } catch { /* best effort */ }
+  });
   setInterval(() => {
+    if (!schemaCheck.ready()) return;
     try { refreshCapabilities(BROKER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
   }, CAPABILITY_REFRESH_MS).unref();
-  log(`=== C4 Broker Started === (schema verified; capabilities: ${BROKER_CAPABILITIES.join(' ')})`);
   scanInstances();
   // Fallback re-scan (SIGHUP from c4-approve is primary; this also keeps the
   // event loop alive when zero isolated instances exist yet).

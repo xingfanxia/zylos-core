@@ -28,59 +28,50 @@ export function stripTrailingAckSuffix(content) {
 // Run pending SQL migrations from the migrations/ directory (sync, inline).
 // Each migration and its ledger row commit together under an immediate
 // (write-locked) transaction that re-checks the ledger, so two processes
-// starting at once apply it once. Throws on failure: getDb retries and never
-// caches a handle whose schema is incomplete (DELIVER-1 review).
-function _runMigrations(database) {
+// starting at once apply it once. As on the base, an ordinary opener logs a
+// failure once and serves with the schema it finds; only the dialog-binding
+// check (verifyDialogSchema, strict) throws.
+function _runMigrations(database, { strict = false } = {}) {
   const migrationsDir = path.join(__dirname, '..', 'migrations');
-  if (!fs.existsSync(migrationsDir)) return [];
-
-  database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
-    name TEXT PRIMARY KEY,
-    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  const files = fs.readdirSync(migrationsDir)
-    .filter(f => f.endsWith('.sql'))
-    .sort();
-
-  for (const file of files) {
-    if (database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(file)) continue;
-    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
-    database.transaction(() => {
-      if (database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(file)) return;
-      try {
-        database.exec(sql);
-      } catch (err) {
-        // init-db.sql now creates the multi-session columns/indexes up front, so
-        // on a fresh DB these ADD COLUMN migrations hit "duplicate column name".
-        // That means the migration's effect is already present — mark it applied.
-        if (!/duplicate column name/i.test(err.message)) throw err;
-      }
-      database.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
-    }).immediate();
+  if (!fs.existsSync(migrationsDir)) {
+    if (strict) throw new Error(`no migrations directory at ${migrationsDir}`);
+    return;
   }
-  return files;
-}
 
-// The schema this code serves with: every migration recorded, and the
-// columns and tables later code relies on present.
-function _verifyForkSchema(database, files) {
-  const applied = new Set(database.prepare('SELECT name FROM _migrations').all().map((r) => r.name));
-  const missing = files.filter((f) => !applied.has(f));
-  if (missing.length) throw new Error(`c4 schema incomplete: migrations not applied: ${missing.join(', ')}`);
-  const columns = new Set(database.prepare('PRAGMA table_info(control_queue)').all().map((c) => c.name));
-  for (const column of ['session_ref', 'dialog_ref']) {
-    if (!columns.has(column)) throw new Error(`c4 schema incomplete: control_queue.${column} missing`);
-  }
-  for (const table of ['dialog_watch_state', 'c4_process_capabilities']) {
-    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table)) {
-      throw new Error(`c4 schema incomplete: table ${table} missing`);
+  try {
+    database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
+      name TEXT PRIMARY KEY,
+      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    const files = fs.readdirSync(migrationsDir)
+      .filter(f => f.endsWith('.sql'))
+      .sort();
+
+    for (const file of files) {
+      if (database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(file)) continue;
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
+      database.transaction(() => {
+        if (database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(file)) return;
+        try {
+          database.exec(sql);
+        } catch (err) {
+          // init-db.sql now creates the multi-session columns/indexes up front, so
+          // on a fresh DB these ADD COLUMN migrations hit "duplicate column name".
+          // That means the migration's effect is already present — mark it applied
+          // and continue instead of aborting the whole chain (which used to leave
+          // later migrations unapplied and spam the error every run).
+          if (!/duplicate column name/i.test(err.message)) throw err;
+        }
+        database.prepare('INSERT INTO _migrations (name) VALUES (?)').run(file);
+      }).immediate();
     }
+    return files;
+  } catch (err) {
+    if (strict) throw err;
+    console.error(`[c4-db] Migration error: ${err.message}`);
   }
 }
-
-const SCHEMA_ATTEMPTS = 5;
-const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 let db = null;
 
@@ -89,12 +80,8 @@ let db = null;
  */
 export function getDb() {
   assertCoreDatabaseAvailable(path.dirname(DATA_DIR));
-  if (db) return db;
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  // A concurrent writer can hold the write lock past busy_timeout while a
-  // migration waits. Retry with backoff; a handle is cached only once every
-  // migration is recorded and the schema it adds is there.
-  for (let attempt = 1; ; attempt++) {
+  if (!db) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
     const connection = new Database(DB_PATH);
     try {
       guardDatabase(connection, schema);
@@ -102,31 +89,124 @@ export function getDb() {
       connection.pragma('busy_timeout = 5000');
       connection.pragma('foreign_keys = ON');
       // Fork: multi-session migrations (target_instance etc.) on top of the core chain.
-      _verifyForkSchema(connection, _runMigrations(connection));
+      _runMigrations(connection);
       db = connection;
-      return db;
-    } catch (error) {
-      connection.close();
-      if (attempt >= SCHEMA_ATTEMPTS) throw error;
-      console.error(`[c4-db] Schema not ready (attempt ${attempt}/${SCHEMA_ATTEMPTS}): ${error.message}`);
-      sleepSync(100 * 2 ** (attempt - 1));
+    } catch (error) { connection.close(); throw error; }
+  }
+  return db;
+}
+
+// ── Dialog binding schema (DELIVER-1) ──────────────────────────────────────
+//
+// control_queue.dialog_ref (migrations/005), dialog_watch_state,
+// c4_process_capabilities and the two unique indexes (migrations/006) are
+// used only by the dialog binding: c4-dispatcher and c4-broker verify them
+// before they publish their capability, and the activity monitor's dialog
+// watch stays observe-and-alert until both have. Every other opener serves
+// with whatever schema it finds, as on the base: the claim queries select
+// `NULL AS dialog_ref` and the held-work count drops its filter while the
+// column is missing (no row can be bound without it).
+const DIALOG_TABLES = ['dialog_watch_state', 'c4_process_capabilities'];
+const DIALOG_INDEXES = ['idx_control_queue_dialog_escape', 'idx_control_queue_dialog_notice'];
+let dialogColumnSeen = false;
+
+// Whether control_queue.dialog_ref exists. Once seen it is remembered (it
+// never goes away while new code runs); while missing it is asked again.
+function hasDialogColumn(database = getDb()) {
+  if (dialogColumnSeen) return true;
+  dialogColumnSeen = database.prepare('PRAGMA table_info(control_queue)').all().some((c) => c.name === 'dialog_ref');
+  return dialogColumnSeen;
+}
+
+/** The claim queries' select term: the column, or NULL while it is missing. */
+export function dialogRefSelect(database = getDb()) {
+  return hasDialogColumn(database) ? 'dialog_ref' : 'NULL AS dialog_ref';
+}
+
+const tableExists = (database, name) => Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+let dialogSchemaSeen = false;
+
+/**
+ * Read-only: whether the dialog-binding schema (column, tables, indexes) is
+ * there. The dialog watch stays observe-and-alert while it is not; its state
+ * and capability reads return nothing then. Never migrates.
+ */
+export function dialogSchemaPresent(database = getDb()) {
+  if (dialogSchemaSeen) return true;
+  dialogSchemaSeen = hasDialogColumn(database) && DIALOG_TABLES.every((t) => tableExists(database, t))
+    && DIALOG_INDEXES.every((i) => Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(i)));
+  return dialogSchemaSeen;
+}
+
+/**
+ * Apply any pending migration (strictly: a failure is returned, not just
+ * logged) and check the schema the dialog binding needs: every file in
+ * migrations/ recorded, control_queue.session_ref and dialog_ref, both tables
+ * and both unique indexes. Never throws.
+ * @returns {{ ok: true } | { ok: false, reason: string }}
+ */
+export function verifyDialogSchema() {
+  try {
+    const database = getDb();
+    const files = _runMigrations(database, { strict: true });
+    const applied = new Set(database.prepare('SELECT name FROM _migrations').all().map((r) => r.name));
+    const missing = files.filter((f) => !applied.has(f));
+    if (missing.length) return { ok: false, reason: `migrations not applied: ${missing.join(', ')}` };
+    const columns = new Set(database.prepare('PRAGMA table_info(control_queue)').all().map((c) => c.name));
+    for (const column of ['session_ref', 'dialog_ref']) {
+      if (!columns.has(column)) return { ok: false, reason: `control_queue.${column} missing` };
     }
+    for (const table of DIALOG_TABLES) if (!tableExists(database, table)) return { ok: false, reason: `table ${table} missing` };
+    for (const index of DIALOG_INDEXES) {
+      if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)) {
+        return { ok: false, reason: `index ${index} missing` };
+      }
+    }
+    dialogColumnSeen = true;
+    dialogSchemaSeen = true;
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: String(err?.message || err).split('\n')[0] };
   }
 }
 
 /**
- * Open and verify the database (every migration applied, the schema it adds
- * present), retrying with backoff until it is. The dispatcher and the broker
- * call this before they serve and before they publish a capability.
- * @returns {Promise<void>}
+ * For c4-dispatcher and c4-broker: verify the dialog-binding schema, retrying
+ * with backoff (delayMs doubling up to maxDelayMs) until it is there, and only
+ * then call onReady (publish the capability). Meanwhile the process serves as
+ * on the base and logs one line per minute at most. Timers are unref'd.
+ * @returns {{ stop: () => void, ready: () => boolean }}
  */
-export async function waitForVerifiedDb({ log = (m) => console.error(m), delayMs = 2000, maxDelayMs = 30000 } = {}) {
-  for (let delay = delayMs; ; delay = Math.min(delay * 2, maxDelayMs)) {
-    try { getDb(); return; } catch (err) {
-      log(`c4 database not ready, not serving yet: ${err.message}; retry in ${Math.round(delay / 1000)}s`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
+export function startDialogSchemaCheck({ processName, onReady, log = (m) => console.error(m),
+  delayMs = 2000, maxDelayMs = 60_000, logEveryMs = 60_000, now = () => Date.now() } = {}) {
+  let ready = false;
+  let timer = null;
+  let lastLog = -Infinity;
+  let delay = delayMs;
+  const attempt = () => {
+    timer = null;
+    const result = verifyDialogSchema();
+    if (result.ok) {
+      ready = true;
+      try {
+        onReady?.();
+      } catch (err) {
+        ready = false;
+        log(`${processName}: dialog binding schema verified, but publishing the capability failed (${err.message}); retrying`);
+        timer = setTimeout(attempt, delay); timer.unref?.();
+      }
+      if (ready) log(`${processName}: dialog binding schema verified; capability published`);
+      return;
     }
-  }
+    if (now() - lastLog >= logEveryMs) {
+      lastLog = now();
+      log(`${processName}: dialog binding schema not ready (${result.reason}); serving as before without it, capability not published; retrying`);
+    }
+    timer = setTimeout(attempt, delay); timer.unref?.();
+    delay = Math.min(delay * 2, maxDelayMs);
+  };
+  attempt();
+  return { stop: () => { if (timer) clearTimeout(timer); timer = null; }, ready: () => ready };
 }
 
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
@@ -485,9 +565,11 @@ export function getUndeliveredInboundSummary(instanceId, { includeUntargeted = f
 export function getHeldWorkSummary(instanceId, { includeUntargeted = false, now = nowSeconds() } = {}) {
   const target = `(target_instance IS ?${includeUntargeted ? ' OR target_instance IS NULL' : ''})`;
   const conv = getUndeliveredInboundSummary(instanceId, { includeUntargeted });
-  const ctl = getDb().prepare(`
+  // Without the column no row can be bound to a dialog: nothing to exclude.
+  const database = getDb();
+  const ctl = database.prepare(`
     SELECT COUNT(*) AS count, MIN(created_at) AS oldest FROM control_queue
-    WHERE status = 'pending' AND ${target} AND dialog_ref IS NULL
+    WHERE status = 'pending' AND ${target}${hasDialogColumn(database) ? ' AND dialog_ref IS NULL' : ''}
       AND (available_at IS NULL OR available_at <= ?)
   `).get(instanceId ?? null, now);
   const times = [conv.oldestAt, ctl?.oldest ? ctl.oldest * 1000 : null].filter((t) => Number.isFinite(t));
@@ -553,7 +635,11 @@ export function insertControl(content, options = {}) {
     // A dialog binding is always paired with its pane: a dispatcher never
     // stamps a session onto such a row at claim (bindControlSession).
     if (sessionRef === null) throw new Error('a dialog-bound control needs its sessionRef');
+    if (!hasDialogColumn(database)) throw new Error('a dialog-bound control needs control_queue.dialog_ref (migrations/005)');
   }
+  // Only a database that has the column can hold a bound row to keep apart;
+  // on one without it the statement below is the base's.
+  const dialogClause = hasDialogColumn(database);
 
   const tx = database.transaction(() => {
     const current = nowSeconds();
@@ -606,7 +692,9 @@ export function insertControl(content, options = {}) {
 
     // A keystroke only replaces an equivalent pending key for the SAME session
     // binding: a late key of a replaced session must never discard the key
-    // queued for its replacement, nor the other way round.
+    // queued for its replacement, nor the other way round. Likewise for the
+    // dialog binding: an unbound key never replaces the dialog watch's bound
+    // one (DELIVER-1 review 3).
     const sameSession = content.startsWith(KEYSTROKE_PREFIX);
     const supersedeResult = database.prepare(`
       UPDATE control_queue
@@ -614,14 +702,13 @@ export function insertControl(content, options = {}) {
       WHERE id != ?
         AND status = 'pending'
         AND raw_content = ?
-        AND target_instance IS ?
-        AND dialog_ref IS ?${sameSession ? '\n        AND session_ref IS ?' : ''}
+        AND target_instance IS ?${dialogClause ? '\n        AND dialog_ref IS ?' : ''}${sameSession ? '\n        AND session_ref IS ?' : ''}
     `).run(
       current,
       id,
       content,
       targetInstance,
-      dialogRef,
+      ...(dialogClause ? [dialogRef] : []),
       ...(sameSession ? [sessionRef] : [])
     );
 
@@ -649,6 +736,7 @@ export function insertControl(content, options = {}) {
  * kept in this database because personas cannot write it; null if none.
  */
 export function loadDialogWatchState(instanceId) {
+  if (!dialogSchemaPresent()) return null;
   const row = getDb().prepare('SELECT state FROM dialog_watch_state WHERE instance_key = ?').get(instanceId ?? '');
   if (!row) return null;
   try { return JSON.parse(row.state); } catch { return null; }
@@ -657,6 +745,7 @@ export function loadDialogWatchState(instanceId) {
 /** Save (or with null, remove) the dialog watch's state for one instance. */
 export function saveDialogWatchState(instanceId, state) {
   const database = getDb();
+  if (!dialogSchemaPresent(database)) return;
   if (state == null) {
     database.prepare('DELETE FROM dialog_watch_state WHERE instance_key = ?').run(instanceId ?? '');
     return;
@@ -696,6 +785,7 @@ export function withdrawCapabilities(processName, { pid = process.pid } = {}) {
  */
 export function hasLiveCapability(processName, capability, { maxAgeSec = 180, now = nowSeconds(),
   isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err?.code === 'EPERM'; } } } = {}) {
+  if (!dialogSchemaPresent()) return false;
   const row = getDb().prepare('SELECT pid, capabilities, updated_at FROM c4_process_capabilities WHERE process = ?').get(processName);
   if (!row || now - row.updated_at > maxAgeSec) return false;
   if (!String(row.capabilities).split(/\s+/).includes(capability)) return false;
@@ -808,7 +898,8 @@ export function getNextPendingControl(current = nowSeconds()) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-           status, retry_count, available_at, last_error, created_at, updated_at, target_instance, session_ref, dialog_ref
+           status, retry_count, available_at, last_error, created_at, updated_at, target_instance, session_ref,
+           ${dialogRefSelect(database)}
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
@@ -854,6 +945,7 @@ function dialogControlScope({ instanceId, sessionRef, dialogRef, kind }) {
  */
 export function findDialogControl(scope) {
   const { sql, params } = dialogControlScope(scope);
+  if (!hasDialogColumn()) return null;
   return getDb().prepare(`SELECT id, status FROM control_queue WHERE ${sql} ORDER BY id DESC LIMIT 1`).get(...params) || null;
 }
 
@@ -872,6 +964,7 @@ export function insertDialogControl({ instanceId, sessionRef, dialogRef, kind, c
   if (kind === 'escape' && content !== '[KEYSTROKE]Escape') throw new Error('a dialog escape is exactly [KEYSTROKE]Escape');
   if (kind === 'notice' && String(content).startsWith('[KEYSTROKE]')) throw new Error('a dialog notice is text, not a key');
   const database = getDb();
+  if (!dialogSchemaPresent(database)) throw new Error('dialog binding schema not ready (migrations/005, 006)');
   try {
     return database.transaction(() => {
       const existing = findDialogControl(scope);
@@ -900,6 +993,7 @@ export function insertDialogControl({ instanceId, sessionRef, dialogRef, kind, c
  */
 export function withdrawDialogControl({ id, reason, ...scope }) {
   const { sql, params } = dialogControlScope(scope);
+  if (!hasDialogColumn()) return false;
   return getDb().prepare(`
     UPDATE control_queue SET status = 'superseded', last_error = ?, updated_at = ?
     WHERE id = ? AND status = 'pending' AND ${sql}
@@ -1331,6 +1425,8 @@ export function close() {
     db.close();
     db = null;
   }
+  dialogColumnSeen = false;
+  dialogSchemaSeen = false;
 }
 
 // CLI mode
