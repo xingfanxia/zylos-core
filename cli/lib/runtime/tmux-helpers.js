@@ -125,6 +125,19 @@ export function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFileSync
 }
 
 /**
+ * The retained-session launch of every runtime adapter (Claude, Codex) calls
+ * this right before it types a command line and Enter into an existing pane:
+ * it throws unless tmuxPaneAtShellPrompt() positively finds an idle shell
+ * prompt, so nothing is typed into a running runtime, its composer or a
+ * permission prompt (DELIVER-1, 2026-11-18). The thrown launch failure goes
+ * to the guardian's failed-start handling (retry once, then hold and alert).
+ */
+export function requirePaneAtShellPrompt(session, deps) {
+  const prompt = tmuxPaneAtShellPrompt(session, deps);
+  if (!prompt.ok) throw new Error(`existing tmux session ${session} is not at a shell prompt (${prompt.reason}); nothing typed`);
+}
+
+/**
  * Delete a tmux buffer (best-effort).
  * @param {string} bufferName
  */

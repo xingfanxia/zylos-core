@@ -43,6 +43,7 @@ import {
   tmuxNewSession,
   getProcessName,
   hasChildProcess,
+  requirePaneAtShellPrompt,
 } from './tmux-helpers.js';
 import {
   buildCleanEnv,
@@ -442,6 +443,10 @@ export class CodexAdapter extends RuntimeAdapter {
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
       const cmd = `${envPrefix}cd "${instanceCwd}"; ${profileCodexCmd} ${shellArgument(kickPrompt)}; ${exitLogSnippet}`;
+      // Typed only into a pane positively at an idle shell prompt; otherwise
+      // nothing is typed and the launch fails (requirePaneAtShellPrompt). The
+      // failover chain can relaunch any persona on Codex in its tmux session.
+      requirePaneAtShellPrompt(SESSION);
       await this.sendMessage(cmd);
     } else {
       // New session — launcher pipeline

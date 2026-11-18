@@ -893,35 +893,53 @@ describe('Claude launch — existing session', () => {
     assert.ok(sent.includes(" '--model' 'claude-opus-5-5[1m]' '--effort' 'high'"));
   });
 
-  // DELIVER-1: the command line and its Enter are typed only into a pane
-  // positively at an idle shell prompt; never into a running Claude, its
-  // composer or a permission prompt (where Enter could approve).
-  it('types nothing into a retained pane that is not at an idle shell prompt; the launch fails', async () => {
-    const cases = {
-      'Claude in the foreground': ['0 4242 claude', '4242 1 claude claude\n'],
-      'node launcher in the foreground': ['0 4242 node', '4242 1 node node tmux-launcher.js\n'],
-      'shell running a child': ['0 4242 bash', '4242 1 bash -bash\n4300 4242 claude claude\n'],
-      'dead pane': ['1 4242 bash', '4242 1 bash -bash\n'],
-      'unreadable pane': ['', ''],
-    };
-    try {
-      for (const [name, [probe, table]] of Object.entries(cases)) {
-        tmuxSessionExists = true;
-        paneProbe = probe;
-        psTable = table;
-        let sent = null;
-        const adapter = makeAdapter(ClaudeAdapter);
-        adapter.sendMessage = async (text) => { sent = text; };
-        await assert.rejects(adapter.launch({ bypassPermissions: false }), /is not at a shell prompt/, name);
-        assert.equal(sent, null, `${name}: nothing typed`);
-        assert.equal(findTmuxNewSession(), undefined, `${name}: no new session either`);
-      }
-    } finally {
-      paneProbe = '0 4242 bash';
-      psTable = '4242 1 bash -bash\n';
-    }
-  });
 });
+
+// DELIVER-1: both adapters' retained-session launch types its command line and
+// Enter only into a pane positively at an idle shell prompt (shared check
+// tmux-helpers.js requirePaneAtShellPrompt); never into a running runtime, its
+// composer or a permission prompt, where Enter could approve. The failover
+// chain can relaunch any ax-devbox persona on Codex in its tmux session.
+const NOT_A_SHELL_PROMPT = {
+  'Claude in the foreground': ['0 4242 claude', '4242 1 claude claude\n'],
+  'Codex in the foreground': ['0 4242 codex', '4242 1 codex codex\n'],
+  'node launcher in the foreground': ['0 4242 node', '4242 1 node node tmux-launcher.js\n'],
+  'shell running a child': ['0 4242 bash', '4242 1 bash -bash\n4300 4242 codex codex\n'],
+  'dead pane': ['1 4242 bash', '4242 1 bash -bash\n'],
+  'unreadable pane': ['', ''],
+};
+for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => CodexAdapter]]) {
+  describe(`${label} launch — retained session only at a shell prompt`, () => {
+    it(`${label}: types nothing into a retained pane that is not at an idle shell prompt; the launch fails`, async () => {
+      try {
+        for (const [name, [probe, table]] of Object.entries(NOT_A_SHELL_PROMPT)) {
+          tmuxSessionExists = true;
+          paneProbe = probe;
+          psTable = table;
+          calls.execFileSync.length = 0;
+          let sent = null;
+          const adapter = makeAdapter(Cls());
+          adapter.sendMessage = async (text) => { sent = text; };
+          await assert.rejects(adapter.launch({ bypassPermissions: false }), /is not at a shell prompt/, name);
+          assert.equal(sent, null, `${name}: nothing typed`);
+          assert.equal(findTmuxNewSession(), undefined, `${name}: no new session either`);
+        }
+      } finally {
+        paneProbe = '0 4242 bash';
+        psTable = '4242 1 bash -bash\n';
+      }
+    });
+
+    it(`${label}: types into a retained pane at an idle shell prompt`, async () => {
+      tmuxSessionExists = true;
+      let sent = null;
+      const adapter = makeAdapter(Cls());
+      adapter.sendMessage = async (text) => { sent = text; };
+      await adapter.launch({ bypassPermissions: false });
+      assert.ok(sent && sent.length > 0);
+    });
+  });
+}
 
 describe('Claude launch — compat mode PATH dedupe', () => {
   it('spec.env.PATH is deduplicated in compat mode', async () => {
