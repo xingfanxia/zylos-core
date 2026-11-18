@@ -1389,13 +1389,6 @@ async function main() {
     process.exit(1);
   }
   log('=== C4 Dispatcher Started ===');
-  // Delivery does not wait for the dialog-binding schema: without
-  // control_queue.dialog_ref no row is bound to a dialog (nothing queues one
-  // before this capability is published) and every row is delivered as
-  // before. The capability is published only once the schema is verified;
-  // until then the check retries with backoff and logs once a minute.
-  dialogSchemaCheck = startDialogSchemaCheck({ processName: DISPATCHER_PROCESS, log,
-    onReady: () => publishCapabilities(DISPATCHER_PROCESS, DISPATCHER_CAPABILITIES) });
   process.on('exit', () => {
     dialogSchemaCheck?.stop();
     try { withdrawCapabilities(DISPATCHER_PROCESS); } catch { /* best effort */ }
@@ -1440,6 +1433,15 @@ async function main() {
   }, WATCHDOG_CHECK_INTERVAL_MS);
   watchdog.unref();
 
+  // Delivery does not wait for the dialog-binding schema: without
+  // control_queue.dialog_ref no row is bound to a dialog (nothing queues one
+  // before this capability is published) and every row is delivered as
+  // before. The check starts with the loop (its first attempt a second after
+  // the first tick began), fails fast on a busy database, and retries with
+  // backoff, logging once a minute; the capability is published only once the
+  // schema is verified.
+  dialogSchemaCheck = startDialogSchemaCheck({ processName: DISPATCHER_PROCESS, log, firstDelayMs: 1000,
+    onReady: () => publishCapabilities(DISPATCHER_PROCESS, DISPATCHER_CAPABILITIES) });
   await dispatcherLoop();
   close();
   process.exit(0);

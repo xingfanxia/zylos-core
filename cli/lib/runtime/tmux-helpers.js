@@ -101,10 +101,13 @@ export function tmuxPasteBuffer(session, tmpFile, bufferName) {
 //     (PROMPT_ROW_MAX) and, with the cursor, unchanged across two reads
 //     PROMPT_SETTLE_MS apart.
 // The text then goes to that pane id after one more read shows the same pane,
-// pane process and shell in the foreground; a pane that is gone or changed
-// gets nothing. Enter follows only after a read between paste and Enter shows
-// the same pane, process and shell and, on the cursor's logical line, exactly
-// the verified prompt followed by the pasted text. Otherwise no Enter (the
+// pane process and shell in the foreground, and the cursor still on the
+// checked prompt row (same row, same text) at its end; otherwise nothing is
+// typed. Enter follows only after a read between paste and Enter shows the
+// same pane, process and shell, and the line is taken at the cursor's
+// coordinates: the logical line through the cursor's row (wrapped rows
+// joined) must be exactly the verified prompt followed by the pasted text,
+// and the cursor must sit at the end of its own row. Otherwise no Enter (the
 // line is left as typed, no key is sent to clean it up) and the launch fails. Not distinguished: a shell builtin waiting for
 // input (`read`, a heredoc continuation) looks exactly like an idle prompt to
 // tmux and /proc; the typed line would become that builtin's input. It cannot
@@ -170,7 +173,7 @@ export async function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFi
       || second.cursorX !== first.cursorX || second.cursorY !== first.cursorY || !again || again.y !== row.y || again.text !== row.text) {
     return { ok: false, reason: 'pane changed while it was checked' };
   }
-  return { ok: true, reason: 'shell prompt', pane: { id: first.id, pid: first.pid, command: first.command, promptRow: row.text } };
+  return { ok: true, reason: 'shell prompt', pane: { id: first.id, pid: first.pid, command: first.command, promptRow: row.text, promptY: row.y } };
 }
 
 /**
@@ -178,7 +181,7 @@ export async function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFi
  * before typing. Resolves the verified pane, or throws (nothing typed); the
  * failed launch goes to the guardian's failed-start handling (retry once,
  * then hold and alert).
- * @returns {Promise<{ id: string, pid: number, command: string, promptRow: string }>}
+ * @returns {Promise<{ id: string, pid: number, command: string, promptRow: string, promptY: number }>}
  */
 export async function requirePaneAtShellPrompt(session, deps) {
   const prompt = await tmuxPaneAtShellPrompt(session, deps);
@@ -186,46 +189,63 @@ export async function requirePaneAtShellPrompt(session, deps) {
   return prompt.pane;
 }
 
-// The logical line (wrapped rows joined) the cursor is on, from a capture
-// that reaches back far enough for a long command line.
-function cursorLogicalLine(paneId, execFileSyncImpl) {
+// Rows of a capture between visible rows `from` and `to` (negative: history),
+// trailing blanks trimmed; null when unreadable.
+function captureRows(paneId, extra, from, to, execFileSyncImpl) {
   try {
-    const text = String(execFileSyncImpl('tmux', ['capture-pane', '-p', '-J', '-S', '-100', '-t', paneId], {
+    const text = String(execFileSyncImpl('tmux', ['capture-pane', '-p', ...extra, '-S', String(from), '-E', String(to), '-t', paneId], {
       encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'],
     }));
-    const rows = text.replace(/\n$/, '').split('\n').map((row) => row.replace(/\s+$/, ''));
-    let y = rows.length - 1;
-    while (y >= 0 && !rows[y]) y--;
-    return y < 0 ? null : rows[y];
+    return text.replace(/\n$/, '').split('\n').map((row) => row.replace(/\s+$/, ''));
   } catch {
     return null;
   }
 }
 
+// The physical row at the cursor's y, and the logical line (wrapped rows
+// joined) that ends at that row. Both are taken at the cursor's coordinates,
+// never from "the last non-empty row".
+const rowAt = (paneId, y, impl) => captureRows(paneId, [], y, y, impl)?.[0] ?? null;
+function lineThroughRow(paneId, y, impl) {
+  const rows = captureRows(paneId, ['-J'], -100, y, impl);
+  return rows ? rows[rows.length - 1] : null;
+}
+
 const samePane = (now, pane) => Boolean(now) && now.id === pane.id && !now.dead && now.pid === pane.pid && now.command === pane.command;
+const width = (text) => [...text].length;
 
 /**
  * Paste `text` (from tmpFile) into the pane verified by
- * requirePaneAtShellPrompt, by its pane id, then submit it. Before the paste
- * one read must show the same pane alive with the same pane process and shell
- * in the foreground. Before Enter another read must show the same again and,
- * on the cursor's logical line, the verified prompt row followed by `text`.
- * On any difference nothing more is sent (before the paste: nothing at all;
- * after it: no Enter, the line stays as typed) and this throws.
+ * requirePaneAtShellPrompt, by its pane id, then submit it.
+ * Before the paste one read must show the same pane alive with the same pane
+ * process and shell in the foreground, the cursor on the checked prompt row
+ * (same y) and that row, read at the cursor's y, still the checked prompt
+ * with the cursor at its end. Before Enter another read must show the same
+ * pane, process and shell; at the cursor's coordinates the logical line ending
+ * on the cursor's row must be the verified prompt followed by `text`, and the
+ * cursor must be at the end of its row. On any difference nothing more is
+ * sent (before the paste: nothing at all; after it: no Enter, the line stays
+ * as typed) and this throws.
  */
 export async function tmuxPasteToVerifiedPane(pane, tmpFile, bufferName, text, { execFileSyncImpl = execFileSync,
   sendKeys = sendTmuxKeys, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), echoMs = 200 } = {}) {
-  if (!samePane(readPane(pane.id, execFileSyncImpl), pane)) {
+  const before = readPane(pane.id, execFileSyncImpl);
+  const promptNow = before && rowAt(pane.id, before.cursorY, execFileSyncImpl);
+  if (!samePane(before, pane) || before.cursorY !== pane.promptY || promptNow !== pane.promptRow
+      || before.cursorX < width(pane.promptRow) || before.cursorX > width(pane.promptRow) + 1) {
     throw new Error(`pane ${pane.id} is gone or changed since it was verified; nothing typed`);
   }
   execFileSyncImpl('tmux', ['load-buffer', '-b', bufferName, tmpFile], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   execFileSyncImpl('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', pane.id], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   await sleep(echoMs);
   const typed = String(text).replace(/\s+$/, '');
-  const line = cursorLogicalLine(pane.id, execFileSyncImpl);
   const expected = [`${pane.promptRow} ${typed}`, `${pane.promptRow}${typed}`];
-  if (!samePane(readPane(pane.id, execFileSyncImpl), pane) || !expected.includes(line)) {
-    throw new Error(`pane ${pane.id} changed or does not show the pasted line after the paste; not submitted (the line is left as typed)`);
+  const after = readPane(pane.id, execFileSyncImpl);
+  const line = after && lineThroughRow(pane.id, after.cursorY, execFileSyncImpl);
+  const cursorRow = after && rowAt(pane.id, after.cursorY, execFileSyncImpl);
+  if (!samePane(after, pane) || !expected.includes(line) || cursorRow === null || !cursorRow
+      || !line.endsWith(cursorRow) || after.cursorX !== width(cursorRow)) {
+    throw new Error(`pane ${pane.id} changed or does not show the pasted line at the cursor after the paste; not submitted (the line is left as typed)`);
   }
   sendKeys(pane.id, ['Enter'], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
 }

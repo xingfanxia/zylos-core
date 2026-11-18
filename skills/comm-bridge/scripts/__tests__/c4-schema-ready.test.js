@@ -68,6 +68,7 @@ it('the schema check waits with backoff, logs once a minute, never calls onReady
     const lines = []; let readyCalls = 0; let t = 0;
     const check = db.startDialogSchemaCheck({ processName: 'probe', log: (l) => lines.push(l), now: () => t,
       onReady: () => { readyCalls++; }, delayMs: 20, maxDelayMs: 20 });
+    const deferred = lines.length === 0 && !check.ready();
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     await sleep(400);
     const blocked = { lines: lines.length, ready: check.ready(), readyCalls };
@@ -76,13 +77,14 @@ it('the schema check waits with backoff, logs once a minute, never calls onReady
     const { default: Database } = await import(${JSON.stringify(path.join(SCRIPTS, '..', 'node_modules', 'better-sqlite3', 'lib', 'index.js'))});
     const raw = new Database(process.env.ZYLOS_DIR + '/comm-bridge/c4.db'); raw.exec('DROP TRIGGER block_005'); raw.close();
     await sleep(200);
-    console.log(JSON.stringify({ blocked, aMinuteLater, ready: check.ready(), readyCalls, lines }));
+    console.log(JSON.stringify({ deferred, blocked, aMinuteLater, ready: check.ready(), readyCalls, lines }));
     check.stop(); db.close();`);
   assert.equal(r.status, 0, r.stderr);
   const out = JSON.parse(r.stdout);
+  assert.equal(out.deferred, true, 'the first attempt runs on a timer, after the caller has started serving');
   assert.deepEqual(out.blocked, { lines: 1, ready: false, readyCalls: 0 }, 'about 20 attempts, one line');
   assert.equal(out.aMinuteLater, 2);
-  assert.match(out.lines[0], /^probe: dialog binding schema not ready \(migration 005 blocked\); serving as before without it, capability not published; retrying$/);
+  assert.match(out.lines[0], /^probe: dialog binding not ready \(schema: migration 005 blocked\); serving as before without it, capability not published; retrying$/);
   assert.deepEqual([out.ready, out.readyCalls], [true, 1]);
   assert.equal(out.lines.at(-1), 'probe: dialog binding schema verified; capability published');
   assert.equal(schemaFacts(dbFile(root)).dialogRef, true);
@@ -102,7 +104,7 @@ it('the dispatcher on a pre-005 database with a blocked migration keeps its loop
   try {
     await waitFor(() => (p.out.text.match(/dispatcher alive/g) || []).length >= 3, 20_000, 'three heartbeats');
     assert.match(p.out.text, /=== C4 Dispatcher Started ===/);
-    assert.equal((p.out.text.match(/dialog binding schema not ready \(migration 005 blocked\)/g) || []).length, 1);
+    assert.equal((p.out.text.match(/dialog binding not ready \(schema: migration 005 blocked\)/g) || []).length, 1);
     assert.deepEqual(schemaFacts(dbFile(root)), { dialogRef: false, tables: [], capabilities: [] });
     unblock(dbFile(root));
     await waitFor(() => schemaFacts(dbFile(root)).capabilities.length === 1, 30_000, 'the capability row');
@@ -116,7 +118,7 @@ it('the broker on a pre-005 database with a blocked migration serves and publish
   const root = pre005Blocked();
   const p = startProcess(root, 'c4-broker.js', { C4_BROKER_DISABLE_MAIN: '' });
   try {
-    await waitFor(() => /dialog binding schema not ready/.test(p.out.text), 15_000, 'the not-ready line');
+    await waitFor(() => /dialog binding not ready/.test(p.out.text), 15_000, 'the not-ready line');
     assert.match(p.out.text, /=== C4 Broker Started ===/);
     assert.equal(p.child.exitCode, null, 'still running');
     assert.deepEqual(schemaFacts(dbFile(root)).capabilities, []);
@@ -136,4 +138,72 @@ it('on a fresh database the dispatcher publishes dialog_ref with its pid at once
     assert.doesNotMatch(p.out.text, /not ready/);
   } finally { await p.stop(); }
   assert.deepEqual(schemaFacts(dbFile(root)).capabilities, []);
+});
+
+it('a capability that cannot be published is retried on the same backoff and logged once a minute, like a schema gap', () => {
+  const root = freshRoot();
+  const r = inChild(root, `
+    const lines = []; const at = []; const start = Date.now();
+    const check = db.startDialogSchemaCheck({ processName: 'probe', log: (l) => lines.push(l), delayMs: 40, maxDelayMs: 160,
+      onReady: () => { at.push(Date.now() - start); throw new Error('disk full'); } });
+    await new Promise((r) => setTimeout(r, 900));
+    check.stop();
+    console.log(JSON.stringify({ at, lines, ready: check.ready() }));
+    db.close();`);
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  // Attempts at about 0, 40, 120, 280, 440, 600, 760 ms: doubling to the cap, not every 40 ms (about 22).
+  assert.ok(out.at.length >= 4 && out.at.length <= 8, JSON.stringify(out.at));
+  const gaps = out.at.slice(1).map((t, i) => t - out.at[i]);
+  assert.ok(gaps[1] >= 70 && gaps[2] >= 140, `backoff grows: ${gaps}`);
+  assert.equal(out.lines.length, 1, 'one line within the minute');
+  assert.match(out.lines[0], /^probe: dialog binding not ready \(publishing the capability failed: disk full\); serving as before/);
+  assert.equal(out.ready, false);
+});
+
+it('a busy database fails the open\'s migration attempt and the schema check fast, never the 5 s timeout', async () => {
+  const root = pre005Blocked();
+  unblock(dbFile(root)); // pending migrations that would apply, but another writer holds the lock
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', `import Database from ${JSON.stringify(path.join(SCRIPTS, '..', 'node_modules', 'better-sqlite3', 'lib', 'index.js'))};
+    const d = new Database(${JSON.stringify(dbFile(root))}); d.exec('BEGIN IMMEDIATE'); console.log('locked');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 8000); d.exec('ROLLBACK'); d.close();`]);
+  try {
+    await new Promise((resolve, reject) => { holder.stdout.once('data', resolve); holder.once('error', reject); });
+    const r = inChild(root, `
+      let t = Date.now(); db.getDb(); const open = Date.now() - t;
+      t = Date.now(); const check = db.verifyDialogSchema(); const verify = Date.now() - t;
+      console.log(JSON.stringify({ open, verify, check, served: db.getHeldWorkSummary(null).count }));
+      db.close();`);
+    assert.equal(r.status, 0, r.stderr);
+    const out = JSON.parse(r.stdout);
+    assert.ok(out.open < 1500 && out.verify < 1500, JSON.stringify(out));
+    assert.equal(out.check.ok, false);
+    assert.match(out.check.reason, /locked|busy/i);
+    assert.equal(out.served, 0, 'reads still served');
+    assert.match(r.stderr, /\[c4-db\] Migration error: database is locked/);
+  } finally {
+    holder.kill('SIGKILL');
+  }
+});
+
+it('ready needs the 005 and 006 ledger rows by name, even when every object exists and 006 is not on disk', () => {
+  const root = freshRoot();
+  assert.equal(inChild(root, 'db.getDb(); db.close();').status, 0);
+  // A skills copy whose migrations/ lacks 006; the database has every object but not 006's ledger row.
+  const tree = path.join(root, 'tree', 'comm-bridge');
+  fs.mkdirSync(path.join(tree, 'migrations'), { recursive: true });
+  fs.cpSync(SCRIPTS, path.join(tree, 'scripts'), { recursive: true });
+  for (const f of fs.readdirSync(path.join(SCRIPTS, '..', 'migrations'))) {
+    if (!f.startsWith('006-')) fs.copyFileSync(path.join(SCRIPTS, '..', 'migrations', f), path.join(tree, 'migrations', f));
+  }
+  fs.symlinkSync(path.join(SCRIPTS, '..', 'node_modules'), path.join(tree, 'node_modules'));
+  const raw = spawnSync(process.execPath, ['--input-type=module', '-e', `import Database from ${JSON.stringify(path.join(SCRIPTS, '..', 'node_modules', 'better-sqlite3', 'lib', 'index.js'))};
+    const d = new Database(${JSON.stringify(dbFile(root))}); d.exec("DELETE FROM _migrations WHERE name = '006-add-dialog-watch-state.sql'"); d.close();`]);
+  assert.equal(raw.status, 0, String(raw.stderr));
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', `import * as db from ${JSON.stringify(path.join(tree, 'scripts', 'c4-db.js'))};
+    console.log(JSON.stringify({ check: db.verifyDialogSchema(), present: db.dialogSchemaPresent(), capable: db.hasLiveCapability('c4-dispatcher', 'dialog_ref') }));
+    db.close();`], { env: env(root), encoding: 'utf8', timeout: 60_000 });
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout), { check: { ok: false, reason: 'migration 006-add-dialog-watch-state.sql not recorded' },
+    present: false, capable: false });
 });

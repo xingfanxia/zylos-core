@@ -138,18 +138,42 @@ describe('isTimeoutError classifier', () => {
 
 // DELIVER-1: the retained-session launch pastes and submits only to the pane
 // it verified, by pane id: one read before the paste, and one between paste
-// and Enter that must show the same pane and, on the cursor's line, the
-// verified prompt followed by the pasted text.
+// and Enter. Lines are read at the cursor's coordinates: before the paste the
+// cursor's row must be the checked prompt row; after it the logical line
+// through the cursor's row must be the prompt followed by the pasted text,
+// with the cursor at the end of its row.
 describe('tmuxPasteToVerifiedPane', async () => {
   const { tmuxPasteToVerifiedPane } = await import('../tmux-helpers.js');
-  const pane = { id: '%7', pid: 4242, command: 'bash', promptRow: 'user@host:~$' };
+  const PROMPT = 'user@host:~$';
+  const pane = { id: '%7', pid: 4242, command: 'bash', promptRow: PROMPT, promptY: 3 };
   const TEXT = 'cd "/x"; claude --model y';
+  const LINE = `${PROMPT} ${TEXT}`;
   const SAME = '%7 0 4242 13 3 bash';
-  // probes: what display-message answers on each read; capture: the screen after the paste.
-  const run = async (probes, capture = `user@host:~$ ${TEXT}\n`) => {
+  const AFTER = `%7 0 4242 ${LINE.length} 3 bash`;
+  // A screen is a list of rows; a row ending in '\\' wraps into the next one
+  // (capture-pane -J joins them). -S/-E select visible rows (negative: from 0).
+  const rows = (...r) => r;
+  const BEFORE_SCREEN = rows('Last login: today', '', `${PROMPT} ls`, PROMPT, '', '');
+  const AFTER_SCREEN = rows('Last login: today', '', `${PROMPT} ls`, LINE, '', '');
+  function capture(screen, args) {
+    const at = (flag) => Number(args[args.indexOf(flag) + 1]);
+    const from = Math.max(0, at('-S'));
+    const to = Math.min(screen.length - 1, at('-E'));
+    const out = [];
+    for (let y = from; y <= to; y++) {
+      const wraps = screen[y].endsWith('\\');
+      const text = wraps ? screen[y].slice(0, -1) : screen[y];
+      if (args.includes('-J') && y > from && screen[y - 1].endsWith('\\')) out[out.length - 1] += text;
+      else out.push(text);
+    }
+    return `${out.join('\n')}\n`;
+  }
+  // probes: what display-message answers on each read; screens: before and after the paste.
+  const run = async (probes, after = AFTER_SCREEN, before = BEFORE_SCREEN) => {
     const calls = [];
     const keys = [];
     let reads = 0;
+    let pasted = false;
     const execFileSyncImpl = (file, args) => {
       calls.push([file, ...args]);
       if (args[0] === 'display-message') {
@@ -157,7 +181,8 @@ describe('tmuxPasteToVerifiedPane', async () => {
         if (probe === null) throw new Error("can't find pane: %7");
         return probe;
       }
-      if (args[0] === 'capture-pane') return capture;
+      if (args[0] === 'capture-pane') return capture(pasted ? after : before, args);
+      if (args[0] === 'paste-buffer') pasted = true;
       return '';
     };
     let error = null;
@@ -165,14 +190,23 @@ describe('tmuxPasteToVerifiedPane', async () => {
       await tmuxPasteToVerifiedPane(pane, '/tmp/msg.txt', 'zylos-buf', TEXT,
         { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]), sleep: async () => {} });
     } catch (err) { error = err; }
-    return { calls, keys, error, pasted: calls.some((c) => c[1] === 'paste-buffer') };
+    return { calls, keys, error, pasted };
   };
 
   it('pastes to the verified pane id and submits once the pane shows the prompt and the pasted line', async () => {
-    const got = await run([SAME, SAME]);
+    const got = await run([SAME, AFTER]);
     assert.equal(got.error, null);
     assert.deepEqual(got.calls.filter((c) => c[1] === 'load-buffer' || c[1] === 'paste-buffer'),
       [['tmux', 'load-buffer', '-b', 'zylos-buf', '/tmp/msg.txt'], ['tmux', 'paste-buffer', '-p', '-r', '-b', 'zylos-buf', '-t', '%7']]);
+    assert.deepEqual(got.keys, [['%7', 'Enter']]);
+  });
+
+  it('submits a long line wrapped over several rows when the cursor ends it on the last one', async () => {
+    const head = LINE.slice(0, 20);
+    const tail = LINE.slice(20);
+    const got = await run([SAME, `%7 0 4242 ${tail.length} 4 bash`],
+      rows('Last login: today', '', `${PROMPT} ls`, `${head}\\`, tail, ''));
+    assert.equal(got.error, null);
     assert.deepEqual(got.keys, [['%7', 'Enter']]);
   });
 
@@ -185,18 +219,46 @@ describe('tmuxPasteToVerifiedPane', async () => {
     }
   });
 
+  it('types nothing when the cursor is no longer on the checked prompt row, or that row changed', async () => {
+    const cases = {
+      'cursor moved to another row': [['%7 0 4242 13 2 bash']],
+      'cursor not at the end of the prompt': [['%7 0 4242 4 3 bash']],
+      'prompt row changed': [[SAME], AFTER_SCREEN, rows('Last login: today', '', `${PROMPT} ls`, `${PROMPT} x`, '', '')],
+    };
+    for (const [name, [probes, after, before]] of Object.entries(cases)) {
+      const got = await run(probes, after, before);
+      assert.match(got.error?.message || '', /nothing typed/, name);
+      assert.equal(got.pasted, false, name);
+      assert.deepEqual(got.keys, [], name);
+    }
+  });
+
   it('pastes but never presses Enter when the pane changed between paste and Enter, or the line is not the pasted one', async () => {
     const cases = {
       'pane gone': [[SAME, null]],
-      'engine took the foreground': [[SAME, '%7 0 4242 40 3 claude']],
-      'line differs': [[SAME, SAME], `user@host:~$ ${TEXT}x\n`],
-      'text went elsewhere': [[SAME, SAME], 'user@host:~$\n'],
+      'engine took the foreground': [[SAME, `%7 0 4242 ${LINE.length} 3 claude`]],
+      'line differs': [[SAME, `%7 0 4242 ${LINE.length + 1} 3 bash`], rows('', '', '', `${LINE}x`, '', '')],
+      'text went elsewhere': [[SAME, SAME], BEFORE_SCREEN],
     };
-    for (const [name, [probes, capture]] of Object.entries(cases)) {
-      const got = await run(probes, capture);
+    for (const [name, [probes, after]] of Object.entries(cases)) {
+      const got = await run(probes, after);
       assert.match(got.error?.message || '', /not submitted \(the line is left as typed\)/, name);
       assert.equal(got.pasted, true, name);
       assert.deepEqual(got.keys, [], `${name}: no Enter and no other key`);
+    }
+  });
+
+  it('never presses Enter when the pasted line is the last row but the cursor sits on an earlier, different row, or not at the end', async () => {
+    const cases = {
+      'cursor on an earlier row': [[SAME, '%7 0 4242 15 2 bash']],
+      'cursor on the pasted row, not at its end': [[SAME, `%7 0 4242 ${LINE.length - 3} 3 bash`]],
+      'cursor below the pasted line': [[SAME, '%7 0 4242 0 4 bash']],
+    };
+    for (const [name, [probes]] of Object.entries(cases)) {
+      const got = await run(probes);
+      assert.match(got.error?.message || '', /not submitted \(the line is left as typed\)/, name);
+      assert.equal(got.pasted, true, name);
+      assert.deepEqual(got.keys, [], `${name}: no Enter`);
     }
   });
 });

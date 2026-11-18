@@ -31,6 +31,7 @@ const SEC = 1000;
 const row = (id) => db.getDb().prepare('SELECT status, last_error, target_instance, dialog_ref FROM control_queue WHERE id = ?').get(id);
 const escapes = () => db.getDb().prepare("SELECT id, target_instance, status FROM control_queue WHERE raw_content = '[KEYSTROKE]Escape' ORDER BY id").all();
 const capable = (...names) => { for (const name of names) db.publishCapabilities(name, ['dialog_ref']); };
+const DISPATCHER = ['c4-dispatcher'];
 
 function watchFor(instanceId, { isolated = false, logs = [], alerts = [] } = {}) {
   const clock = { t: T0 };
@@ -51,7 +52,7 @@ describe('ownership: the queue, not saved state, is the authority', () => {
   it('a forged saved state naming another persona\'s control id, pane and prompt withdraws nothing', async () => {
     capable('c4-dispatcher');
     const theirs = db.insertDialogControl({ instanceId: 'user-elaine', sessionRef: ELAINE_PANE, dialogRef: ELAINE_PROMPT,
-      kind: 'escape', content: '[KEYSTROKE]Escape', priority: 0, bypassState: true }).id;
+      kind: 'escape', content: '[KEYSTROKE]Escape', priority: 0, bypassState: true, requires: DISPATCHER }).id;
     db.saveDialogWatchState('user-pan', { version: 1, dialog: null, declines: [
       { escapeId: theirs, sessionRef: ELAINE_PANE, id: ELAINE_PROMPT, title: 'x', notice: null, since: T0 - 1000, goneAt: T0 - 500 },
       { escapeId: theirs, sessionRef: PAN_PANE, id: PROMPT.id, title: 'x', notice: null, since: T0 - 1000, goneAt: T0 - 500 },
@@ -64,8 +65,9 @@ describe('ownership: the queue, not saved state, is the authority', () => {
   });
 
   it('every scoped call refuses another persona\'s row, even by its exact id', () => {
+    capable('c4-dispatcher');
     const theirs = db.insertDialogControl({ instanceId: 'user-elaine', sessionRef: ELAINE_PANE, dialogRef: ELAINE_PROMPT,
-      kind: 'escape', content: '[KEYSTROKE]Escape', priority: 0, bypassState: true }).id;
+      kind: 'escape', content: '[KEYSTROKE]Escape', priority: 0, bypassState: true, requires: DISPATCHER }).id;
     const pan = bindDialogWatchQueue({ instanceId: 'user-pan', db });
     assert.equal(pan.findOwnControl({ sessionRef: ELAINE_PANE, dialogRef: ELAINE_PROMPT, kind: 'escape' }), null);
     assert.equal(pan.withdrawOwnControl({ id: theirs, sessionRef: ELAINE_PANE, dialogRef: ELAINE_PROMPT, kind: 'escape' }), false);
@@ -94,7 +96,8 @@ describe('ownership: the queue, not saved state, is the authority', () => {
 
 describe('at most one Escape and one decline message per instance, pane and prompt', () => {
   it('a second insert, in any status of the first, returns the existing row (and the index refuses a raw duplicate)', () => {
-    const scope = { instanceId: 'user-pan', sessionRef: PAN_PANE, dialogRef: PROMPT.id };
+    capable('c4-dispatcher');
+    const scope = { instanceId: 'user-pan', sessionRef: PAN_PANE, dialogRef: PROMPT.id, requires: DISPATCHER };
     const first = db.insertDialogControl({ ...scope, kind: 'escape', content: '[KEYSTROKE]Escape', priority: 0, bypassState: true });
     assert.equal(first.existing, false);
     for (const status of ['pending', 'done', 'superseded']) {
@@ -141,8 +144,10 @@ describe('capability gate', () => {
     const pan = watchFor('user-pan', { isolated: true });
     await pan.run(2 * 60 * SEC, { modal: PROMPT, sessionRef: PAN_PANE });
     assert.deepEqual(escapes(), [], 'dispatcher only: not enough for an isolated persona');
-    db.publishCapabilities('c4-broker', ['dialog_ref'], { pid: 2 ** 22 + 12345 });
+    db.publishCapabilities('c4-broker', ['dialog_ref'], { pid: 2 ** 22 + 12345, startedAt: 1 });
     assert.equal(db.hasLiveCapability('c4-broker', 'dialog_ref'), false, 'dead pid');
+    db.publishCapabilities('c4-broker', ['dialog_ref'], { startedAt: db.processStartTime(process.pid) - 60 });
+    assert.equal(db.hasLiveCapability('c4-broker', 'dialog_ref'), false, 'a reused pid: the running process started at another time');
     db.publishCapabilities('c4-broker', ['dialog_ref']);
     db.getDb().prepare("UPDATE c4_process_capabilities SET updated_at = updated_at - 600 WHERE process = 'c4-broker'").run();
     assert.equal(db.hasLiveCapability('c4-broker', 'dialog_ref'), false, 'stale row');
@@ -152,5 +157,32 @@ describe('capability gate', () => {
     assert.equal(escapes().length, 1);
     db.withdrawCapabilities('c4-broker');
     assert.equal(db.hasLiveCapability('c4-broker', 'dialog_ref'), false, 'withdrawn at exit');
+  });
+
+  it('a capability withdrawn after the Escape was sent authorizes no decline, even while the pre-check still says yes', async () => {
+    capable('c4-dispatcher', 'c4-broker');
+    const logs = [];
+    const clock = { t: T0 };
+    // A pre-check that always answers yes, as a stale cached positive would.
+    const watch = createDialogWatch({ instanceId: 'user-pan',
+      ...bindDialogWatchQueue({ instanceId: 'user-pan', isolated: true, db }), deliveryCapable: () => true,
+      notifyOperator: async () => ({ ok: true }), log: (line) => logs.push(line), now: () => clock.t });
+    const run = async (until, frame) => {
+      for (; clock.t <= T0 + until; clock.t += SEC) { watch.tick({ sessionState: 'idle', healthOk: true, ...frame }); await watch.settled(); }
+    };
+    await run(61 * SEC, { modal: PROMPT, sessionRef: PAN_PANE });
+    assert.equal(escapes().length, 1);
+    db.ackControl(escapes()[0].id);
+    await run(63 * SEC, { modal: PROMPT, sessionRef: PAN_PANE });
+    db.withdrawCapabilities('c4-broker');
+    assert.equal(db.hasLiveCapability('c4-broker', 'dialog_ref'), false);
+    await run(70 * SEC, { modal: null, sessionRef: PAN_PANE });
+    const notices = db.getDb().prepare("SELECT COUNT(*) AS n FROM control_queue WHERE substr(raw_content, 1, 11) != '[KEYSTROKE]'").get().n;
+    assert.equal(notices, 0, 'the insert transaction refused it');
+    assert.ok(logs.some((l) => /does not enforce the prompt binding/.test(l)));
+    capable('c4-broker');
+    await run(80 * SEC, { modal: null, sessionRef: PAN_PANE });
+    assert.equal(db.getDb().prepare("SELECT COUNT(*) AS n FROM control_queue WHERE substr(raw_content, 1, 11) != '[KEYSTROKE]'").get().n, 1,
+      'announced once the broker enforces the binding again');
   });
 });

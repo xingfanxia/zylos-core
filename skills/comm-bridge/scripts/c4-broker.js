@@ -857,12 +857,17 @@ const CAPABILITY_REFRESH_MS = 60_000;
 function main() {
   if (!acquireSingletonLock()) process.exit(1);
   log('=== C4 Broker Started ===');
+  scanInstances();
+  // Fallback re-scan (SIGHUP from c4-approve is primary; this also keeps the
+  // event loop alive when zero isolated instances exist yet).
+  setInterval(scanInstances, RESCAN_INTERVAL_MS);
   // The broker serves as before whatever the schema (its control inserts keep
   // a bound row apart only when control_queue.dialog_ref exists, and nothing
-  // is bound without it). The capability is published only once the
-  // dialog-binding schema is verified; until then the check retries with
-  // backoff and logs once a minute.
-  const schemaCheck = startDialogSchemaCheck({ processName: BROKER_PROCESS, log,
+  // is bound without it). The check starts after the sockets (first attempt a
+  // second later), fails fast on a busy database, and retries with backoff,
+  // logging once a minute; the capability is published only once the
+  // dialog-binding schema is verified.
+  const schemaCheck = startDialogSchemaCheck({ processName: BROKER_PROCESS, log, firstDelayMs: 1000,
     onReady: () => publishCapabilities(BROKER_PROCESS, BROKER_CAPABILITIES) });
   process.on('exit', () => {
     schemaCheck.stop();
@@ -872,10 +877,6 @@ function main() {
     if (!schemaCheck.ready()) return;
     try { refreshCapabilities(BROKER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
   }, CAPABILITY_REFRESH_MS).unref();
-  scanInstances();
-  // Fallback re-scan (SIGHUP from c4-approve is primary; this also keeps the
-  // event loop alive when zero isolated instances exist yet).
-  setInterval(scanInstances, RESCAN_INTERVAL_MS);
 }
 
 // PM2 sets argv[1] to its ProcessContainerFork.js, so classic isMainModule

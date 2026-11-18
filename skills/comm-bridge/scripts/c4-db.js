@@ -10,6 +10,7 @@ import { guardDatabase, assertCoreDatabaseAvailable } from './sqlite-schema.js';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
 import { DATA_DIR, DB_PATH, CONTROL_MAX_RETRIES } from './c4-config.js';
 import { normalizeStatusEndpoint } from './status-endpoint.js';
 import { buildReplyViaSuffix, hasLegacyReplyViaSuffix, truncateForDelivery } from './c4-utils.js';
@@ -30,19 +31,24 @@ export function stripTrailingAckSuffix(content) {
 // (write-locked) transaction that re-checks the ledger, so two processes
 // starting at once apply it once. As on the base, an ordinary opener logs a
 // failure once and serves with the schema it finds; only the dialog-binding
-// check (verifyDialogSchema, strict) throws.
+// check (verifyDialogSchema, strict) throws. A migration waits for the write
+// lock at most MIGRATION_BUSY_MS, never the connection's 5 s: a busy database
+// only means the next opener or the next schema check tries again, and no
+// process stalls its serving on it.
+const MIGRATION_BUSY_MS = 250;
 function _runMigrations(database, { strict = false } = {}) {
   const migrationsDir = path.join(__dirname, '..', 'migrations');
-  if (!fs.existsSync(migrationsDir)) {
-    if (strict) throw new Error(`no migrations directory at ${migrationsDir}`);
-    return;
-  }
+  if (!fs.existsSync(migrationsDir)) return;
 
+  const busy = database.pragma('busy_timeout', { simple: true });
+  database.pragma(`busy_timeout = ${MIGRATION_BUSY_MS}`);
   try {
-    database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
-      name TEXT PRIMARY KEY,
-      applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`);
+    if (!tableExists(database, '_migrations')) {
+      database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
+        name TEXT PRIMARY KEY,
+        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )`);
+    }
 
     const files = fs.readdirSync(migrationsDir)
       .filter(f => f.endsWith('.sql'))
@@ -70,6 +76,8 @@ function _runMigrations(database, { strict = false } = {}) {
   } catch (err) {
     if (strict) throw err;
     console.error(`[c4-db] Migration error: ${err.message}`);
+  } finally {
+    database.pragma(`busy_timeout = ${busy}`);
   }
 }
 
@@ -106,6 +114,7 @@ export function getDb() {
 // with whatever schema it finds, as on the base: the claim queries select
 // `NULL AS dialog_ref` and the held-work count drops its filter while the
 // column is missing (no row can be bound without it).
+const DIALOG_MIGRATIONS = ['005-add-control-dialog-ref.sql', '006-add-dialog-watch-state.sql'];
 const DIALOG_TABLES = ['dialog_watch_state', 'c4_process_capabilities'];
 const DIALOG_INDEXES = ['idx_control_queue_dialog_escape', 'idx_control_queue_dialog_notice'];
 let dialogColumnSeen = false;
@@ -123,45 +132,51 @@ export function dialogRefSelect(database = getDb()) {
   return hasDialogColumn(database) ? 'dialog_ref' : 'NULL AS dialog_ref';
 }
 
-const tableExists = (database, name) => Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+function tableExists(database, name) {
+  return Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+}
+
+// What the dialog binding needs, read from the database alone (whatever
+// files are on disk): the ledger rows of 005 and 006 by name, the column,
+// both tables and both unique indexes. Null when complete, else the first gap.
+function dialogSchemaGap(database) {
+  if (!tableExists(database, '_migrations')) return 'migration ledger missing';
+  for (const name of DIALOG_MIGRATIONS) {
+    if (!database.prepare('SELECT 1 FROM _migrations WHERE name = ?').get(name)) return `migration ${name} not recorded`;
+  }
+  const columns = new Set(database.prepare('PRAGMA table_info(control_queue)').all().map((c) => c.name));
+  for (const column of ['session_ref', 'dialog_ref']) if (!columns.has(column)) return `control_queue.${column} missing`;
+  for (const table of DIALOG_TABLES) if (!tableExists(database, table)) return `table ${table} missing`;
+  for (const index of DIALOG_INDEXES) {
+    if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)) return `index ${index} missing`;
+  }
+  return null;
+}
 let dialogSchemaSeen = false;
 
 /**
- * Read-only: whether the dialog-binding schema (column, tables, indexes) is
- * there. The dialog watch stays observe-and-alert while it is not; its state
- * and capability reads return nothing then. Never migrates.
+ * Read-only: whether the dialog-binding schema is complete (dialogSchemaGap).
+ * The dialog watch stays observe-and-alert while it is not; its state and
+ * capability reads return nothing then. Never migrates.
  */
 export function dialogSchemaPresent(database = getDb()) {
   if (dialogSchemaSeen) return true;
-  dialogSchemaSeen = hasDialogColumn(database) && DIALOG_TABLES.every((t) => tableExists(database, t))
-    && DIALOG_INDEXES.every((i) => Boolean(database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(i)));
+  dialogSchemaSeen = dialogSchemaGap(database) === null;
   return dialogSchemaSeen;
 }
 
 /**
- * Apply any pending migration (strictly: a failure is returned, not just
- * logged) and check the schema the dialog binding needs: every file in
- * migrations/ recorded, control_queue.session_ref and dialog_ref, both tables
- * and both unique indexes. Never throws.
+ * Apply any pending migration found on disk (strictly: a failure is returned,
+ * not just logged; a busy database fails fast) and check the schema the
+ * dialog binding needs (dialogSchemaGap). Never throws.
  * @returns {{ ok: true } | { ok: false, reason: string }}
  */
 export function verifyDialogSchema() {
   try {
     const database = getDb();
-    const files = _runMigrations(database, { strict: true });
-    const applied = new Set(database.prepare('SELECT name FROM _migrations').all().map((r) => r.name));
-    const missing = files.filter((f) => !applied.has(f));
-    if (missing.length) return { ok: false, reason: `migrations not applied: ${missing.join(', ')}` };
-    const columns = new Set(database.prepare('PRAGMA table_info(control_queue)').all().map((c) => c.name));
-    for (const column of ['session_ref', 'dialog_ref']) {
-      if (!columns.has(column)) return { ok: false, reason: `control_queue.${column} missing` };
-    }
-    for (const table of DIALOG_TABLES) if (!tableExists(database, table)) return { ok: false, reason: `table ${table} missing` };
-    for (const index of DIALOG_INDEXES) {
-      if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(index)) {
-        return { ok: false, reason: `index ${index} missing` };
-      }
-    }
+    _runMigrations(database, { strict: true });
+    const gap = dialogSchemaGap(database);
+    if (gap) return { ok: false, reason: gap };
     dialogColumnSeen = true;
     dialogSchemaSeen = true;
     return { ok: true };
@@ -171,41 +186,42 @@ export function verifyDialogSchema() {
 }
 
 /**
- * For c4-dispatcher and c4-broker: verify the dialog-binding schema, retrying
- * with backoff (delayMs doubling up to maxDelayMs) until it is there, and only
- * then call onReady (publish the capability). Meanwhile the process serves as
- * on the base and logs one line per minute at most. Timers are unref'd.
+ * For c4-dispatcher and c4-broker, started after they serve: verify the
+ * dialog-binding schema and then publish the capability (onReady). Either
+ * failing is retried on one backoff (delayMs doubling up to maxDelayMs) with
+ * one log line a minute at most; the process serves as before meanwhile. The
+ * first attempt runs on a timer (firstDelayMs), never before serving starts.
+ * Timers are unref'd.
  * @returns {{ stop: () => void, ready: () => boolean }}
  */
 export function startDialogSchemaCheck({ processName, onReady, log = (m) => console.error(m),
-  delayMs = 2000, maxDelayMs = 60_000, logEveryMs = 60_000, now = () => Date.now() } = {}) {
+  firstDelayMs = 0, delayMs = 2000, maxDelayMs = 60_000, logEveryMs = 60_000, now = () => Date.now() } = {}) {
   let ready = false;
   let timer = null;
   let lastLog = -Infinity;
   let delay = delayMs;
-  const attempt = () => {
-    timer = null;
-    const result = verifyDialogSchema();
-    if (result.ok) {
-      ready = true;
-      try {
-        onReady?.();
-      } catch (err) {
-        ready = false;
-        log(`${processName}: dialog binding schema verified, but publishing the capability failed (${err.message}); retrying`);
-        timer = setTimeout(attempt, delay); timer.unref?.();
-      }
-      if (ready) log(`${processName}: dialog binding schema verified; capability published`);
-      return;
-    }
+  const schedule = (ms) => { timer = setTimeout(attempt, ms); timer.unref?.(); };
+  const fail = (reason) => {
     if (now() - lastLog >= logEveryMs) {
       lastLog = now();
-      log(`${processName}: dialog binding schema not ready (${result.reason}); serving as before without it, capability not published; retrying`);
+      log(`${processName}: dialog binding not ready (${reason}); serving as before without it, capability not published; retrying`);
     }
-    timer = setTimeout(attempt, delay); timer.unref?.();
+    schedule(delay);
     delay = Math.min(delay * 2, maxDelayMs);
   };
-  attempt();
+  function attempt() {
+    timer = null;
+    const result = verifyDialogSchema();
+    if (!result.ok) return fail(`schema: ${result.reason}`);
+    try {
+      onReady?.();
+    } catch (err) {
+      return fail(`publishing the capability failed: ${String(err?.message || err).split('\n')[0]}`);
+    }
+    ready = true;
+    log(`${processName}: dialog binding schema verified; capability published`);
+  }
+  schedule(firstDelayMs);
   return { stop: () => { if (timer) clearTimeout(timer); timer = null; }, ready: () => ready };
 }
 
@@ -756,11 +772,39 @@ export function saveDialogWatchState(instanceId, state) {
   `).run(instanceId ?? '', JSON.stringify(state), nowSeconds());
 }
 
+// The start time of a running process, epoch seconds, from the operating
+// system (Linux: /proc/<pid>/stat start ticks after boot plus the boot time;
+// elsewhere: ps lstart). Null when the process does not exist. A published
+// capability carries its process's start time, so a pid reused by another
+// process never counts.
+let clockTicks = null;
+export function processStartTime(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (process.platform === 'linux') {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const ticks = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19]);
+      const boot = Number(/^btime (\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8'))?.[1]);
+      if (clockTicks === null) {
+        try { clockTicks = Number(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 2000 }).trim()) || 100; } catch { clockTicks = 100; }
+      }
+      return Number.isFinite(ticks) && Number.isFinite(boot) ? boot + Math.floor(ticks / clockTicks) : null;
+    }
+    const started = Date.parse(execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+    return Number.isFinite(started) ? Math.floor(started / 1000) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * A running c4 process publishes what it understands (e.g. 'dialog_ref'):
- * its pid and start time, refreshed while it runs, removed when it exits.
+ * its pid and its start time as the operating system reports it, refreshed
+ * while it runs, removed when it exits.
  */
-export function publishCapabilities(processName, capabilities, { pid = process.pid, startedAt = nowSeconds() } = {}) {
+export function publishCapabilities(processName, capabilities, { pid = process.pid, startedAt = processStartTime(pid) } = {}) {
+  if (!Number.isInteger(startedAt)) throw new Error(`start time of pid ${pid} unreadable`);
   getDb().prepare(`
     INSERT INTO c4_process_capabilities (process, pid, started_at, capabilities, updated_at) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(process) DO UPDATE SET pid = excluded.pid, started_at = excluded.started_at,
@@ -780,16 +824,19 @@ export function withdrawCapabilities(processName, { pid = process.pid } = {}) {
 }
 
 /**
- * Whether `processName` is running now and has published `capability`: its
- * row is fresher than `maxAgeSec` and its pid is alive.
+ * Whether `processName` is running now and has published `capability`: the
+ * dialog-binding schema is there, its row is fresher than `maxAgeSec`, and
+ * the process with that pid is running and started exactly when the row says
+ * (a dead or reused pid does not count). Read fresh on every call.
  */
 export function hasLiveCapability(processName, capability, { maxAgeSec = 180, now = nowSeconds(),
-  isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err?.code === 'EPERM'; } } } = {}) {
+  startTimeOf = processStartTime } = {}) {
   if (!dialogSchemaPresent()) return false;
-  const row = getDb().prepare('SELECT pid, capabilities, updated_at FROM c4_process_capabilities WHERE process = ?').get(processName);
+  const row = getDb().prepare('SELECT pid, started_at, capabilities, updated_at FROM c4_process_capabilities WHERE process = ?').get(processName);
   if (!row || now - row.updated_at > maxAgeSec) return false;
   if (!String(row.capabilities).split(/\s+/).includes(capability)) return false;
-  return isAlive(row.pid);
+  const started = startTimeOf(row.pid);
+  return started !== null && started === row.started_at;
 }
 
 // ── [KEYSTROKE] session fence ──────────────────────────────────────────────
@@ -955,20 +1002,28 @@ export function findDialogControl(scope) {
  * decline message per (instance, session_ref, dialog_ref), checked in one
  * immediate transaction and backed by unique partial indexes (migrations/006).
  * The content is the plain row any dispatcher understands; the binding is in
- * session_ref and dialog_ref.
- * @returns {{ id: number, status: string, existing: boolean }}
+ * session_ref and dialog_ref. A new row is written only if every process in
+ * `requires` has a live capability (hasLiveCapability) checked inside the
+ * same transaction; otherwise nothing is written and `refused` names the
+ * first one missing ('schema' when the dialog-binding schema is not there).
+ * @returns {{ id: number|null, status: string|null, existing: boolean, refused?: string }}
  */
-export function insertDialogControl({ instanceId, sessionRef, dialogRef, kind, content, priority, bypassState = false }) {
+export function insertDialogControl({ instanceId, sessionRef, dialogRef, kind, content, priority, bypassState = false, requires }) {
   const scope = { instanceId, sessionRef, dialogRef, kind };
   dialogControlScope(scope);
   if (kind === 'escape' && content !== '[KEYSTROKE]Escape') throw new Error('a dialog escape is exactly [KEYSTROKE]Escape');
   if (kind === 'notice' && String(content).startsWith('[KEYSTROKE]')) throw new Error('a dialog notice is text, not a key');
+  if (!Array.isArray(requires) || requires.length === 0) throw new Error('a dialog control names the processes that must enforce it');
   const database = getDb();
-  if (!dialogSchemaPresent(database)) throw new Error('dialog binding schema not ready (migrations/005, 006)');
+  if (!dialogSchemaPresent(database)) return { id: null, status: null, existing: false, refused: 'schema' };
   try {
     return database.transaction(() => {
       const existing = findDialogControl(scope);
       if (existing) return { ...existing, existing: true };
+      // Authorized here, in the insert's own write transaction, from the
+      // capability rows as they are now: never from a cached answer.
+      const missing = requires.find((name) => !hasLiveCapability(name, 'dialog_ref'));
+      if (missing) return { id: null, status: null, existing: false, refused: missing };
       const current = nowSeconds();
       const result = database.prepare(`
         INSERT INTO control_queue (raw_content, content, priority, require_idle, bypass_state, status, retry_count,

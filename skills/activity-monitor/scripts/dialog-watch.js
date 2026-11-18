@@ -170,17 +170,19 @@ function restoredState(state, now, timing) {
  * functions.
  */
 export function bindDialogWatchQueue({ instanceId = null, isolated = false, routesUntargeted = () => false, db }) {
+  // The dispatcher always delivers; the broker writes rows for isolated
+  // personas only, so only their watch also needs a capable broker.
+  const required = isolated ? ['c4-dispatcher', 'c4-broker'] : ['c4-dispatcher'];
+  // Every insert is authorized inside its own transaction (requires).
   const insert = (kind, content, priority, bypassState, sessionRef, dialogRef) => {
     try {
-      const row = db.insertDialogControl({ instanceId, sessionRef, dialogRef, kind, content, priority, bypassState });
+      const row = db.insertDialogControl({ instanceId, sessionRef, dialogRef, kind, content, priority, bypassState, requires: required });
+      if (row.refused) return { ok: false, refused: row.refused, output: `${row.refused} does not enforce the binding` };
       return { ok: true, id: row.id, existing: row.existing };
     } catch (err) {
       return { ok: false, output: err.message };
     }
   };
-  // The dispatcher always delivers; the broker writes rows for isolated
-  // personas only, so only their watch also needs a capable broker.
-  const required = isolated ? ['c4-dispatcher', 'c4-broker'] : ['c4-dispatcher'];
   return {
     enqueueKey: (key, sessionRef, dialogRef) => insert('escape', `[KEYSTROKE]${key}`, 0, true, sessionRef, dialogRef),
     enqueueNotice: (text, sessionRef, dialogRef) => insert('notice', text, 1, false, sessionRef, dialogRef),
@@ -239,18 +241,30 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
     log(`Dialog watch: saved state unreadable (${clip(err?.message, 160)}); starting clean`);
   }
 
-  // Whether the running dispatcher (and broker) enforce the prompt binding;
-  // asked at most every 10 s.
-  let capable = { value: false, at: -Infinity };
-  function canQueue(t) {
-    if (t - capable.at >= 10_000) {
-      let value = false;
-      try { value = deliveryCapable() === true; } catch { value = false; }
-      if (value !== capable.value) log(value ? 'Dialog watch: dispatcher (and broker) enforce the prompt binding; Escapes may be queued'
-        : 'Dialog watch: the running dispatcher or broker does not enforce the prompt binding; nothing is queued, only alerts');
-      capable = { value, at: t };
-    }
-    return capable.value;
+  // Whether to try an insert at all. Only a negative answer is remembered
+  // (10 s, observe-only); a positive one is never cached and never authorizes
+  // anything: each insert checks the capability rows inside its own
+  // transaction and is refused when they no longer hold.
+  let refusedAt = -Infinity;
+  let capableNoted = null;
+  function noteCapable(value) {
+    if (value === capableNoted) return;
+    capableNoted = value;
+    log(value ? 'Dialog watch: dispatcher (and broker) enforce the prompt binding; Escapes may be queued'
+      : 'Dialog watch: the running dispatcher or broker does not enforce the prompt binding; nothing is queued, only alerts');
+  }
+  function mayQueue(t) {
+    if (t - refusedAt < 10_000) return false;
+    let value = false;
+    try { value = deliveryCapable() === true; } catch { value = false; }
+    if (!value) { refusedAt = t; noteCapable(false); }
+    return value;
+  }
+  function refused(t, res) {
+    if (!res?.refused) return false;
+    refusedAt = t;
+    noteCapable(false);
+    return true;
   }
 
   // This instance's own control of `kind` for that pane and prompt, from the
@@ -323,16 +337,19 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
       }
       // Only the session whose prompt was declined is told; the message is
       // bound to it through delivery. Not before the binding is enforced.
-      if (!canQueue(t)) {
+      const notEnforced = () => {
         if (t - d.goneAt < timing.declineResolveMs) return true;
         log(`Dialog watch: decline of control ${escapeId} not announced: the binding is not enforced by the running processes`);
         return false;
-      }
+      };
+      if (!mayQueue(t)) return notEnforced();
       if (sessionRef !== d.sessionRef) {
         log(`Dialog watch: session replaced after the decline of control ${escapeId}; no decline message`);
         return false;
       }
       const res = enqueueNotice(formatDeclinedNotice({ title: d.title, notice: d.notice }), d.sessionRef, d.id);
+      if (refused(t, res)) return notEnforced();
+      if (res?.ok) noteCapable(true);
       log(!res?.ok ? `Dialog watch: decline message not queued (${clip(res?.output, 160)})`
         : res.existing ? `Dialog watch: decline already announced (control ${res.id})`
           : `Dialog watch: session told its tool call was declined (control ${res.id ?? '?'})`);
@@ -353,14 +370,18 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
       return;
     }
     if (t - dialog.since < timing.permissionGraceMs) return;
-    if (!canQueue(t)) {
+    const withhold = () => {
       if (!dialog.withheld) { dialog.withheld = true; changed(); log(`Dialog watch: Escape for ${describe(dialog)} withheld (binding not enforced)`); }
-      return;
-    }
+    };
+    if (!mayQueue(t)) return withhold();
     // One attempt per prompt. A failed enqueue is not repeated; the alert
     // says so if the prompt stays. The queue keeps at most one Escape per
     // persona, pane and prompt: an existing one is adopted, never doubled.
+    // A refusal (the binding no longer enforced at insert time) is not a
+    // failure: the Escape stays withheld and is tried again later.
     const res = enqueueKey('Escape', dialog.sessionRef, dialog.id);
+    if (refused(t, res)) return withhold();
+    if (res?.ok) noteCapable(true);
     dialog.escape = res?.ok ? 'queued' : 'failed';
     dialog.withheld = false;
     dialog.escapeAt = t;

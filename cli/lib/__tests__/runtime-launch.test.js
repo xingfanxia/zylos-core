@@ -964,7 +964,7 @@ for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => Cod
       adapter.sendMessage = async (text, opts) => { sent = text; options = opts; };
       await adapter.launch({ bypassPermissions: false });
       assert.ok(sent && sent.length > 0);
-      assert.deepEqual(options, { pane: { id: '%7', pid: 4242, command: 'bash', promptRow: 'user@host:~$' } });
+      assert.deepEqual(options, { pane: { id: '%7', pid: 4242, command: 'bash', promptRow: 'user@host:~$', promptY: 3 } });
     });
   });
 }
