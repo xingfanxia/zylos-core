@@ -20,21 +20,19 @@ const FABLE = detectModal(fx.FABLE_LIMIT_LIVE);
 const T0 = Date.parse('2026-11-18T04:16:35Z');
 
 // `statusOf(id)`: what the dispatcher has done with an Escape control by now.
-function harness({ sendOk = true, keyOk = true, statusOf = () => 'done' } = {}) {
+// `store`: the saved state, shared across watches to simulate a monitor restart.
+function harness({ sendOk = true, keyOk = true, statusOf = () => 'done', store = { state: null }, t = T0, startId = 900 } = {}) {
   const h = {
-    t: T0, keys: [], withdrawn: [], notices: [], alerts: [], logs: [],
-    undelivered: { count: 0, oldestAt: null }, status: new Map(),
+    t, keys: [], withdrawn: [], notices: [], alerts: [], logs: [], store,
+    undelivered: { count: 0, oldestAt: null, conversations: 0, controls: 0 },
   };
-  let nextId = 900;
+  let nextId = startId;
   h.watch = createDialogWatch({
     instanceId: 'user-pan',
     now: () => h.t,
     enqueueKey: (key, sessionRef, dialogId) => {
       h.keys.push({ key, sessionRef, dialogId });
-      if (!keyOk) return { ok: false, output: 'database is locked' };
-      const id = ++nextId;
-      h.status.set(id, 'pending');
-      return { ok: true, output: `OK: enqueued control ${id}` };
+      return keyOk ? { ok: true, id: ++nextId } : { ok: false, output: 'database is locked' };
     },
     controlStatus: (id) => statusOf(id, h),
     withdrawKey: (id) => {
@@ -42,8 +40,10 @@ function harness({ sendOk = true, keyOk = true, statusOf = () => 'done' } = {}) 
       h.withdrawn.push(id);
       return true;
     },
-    enqueueNotice: (text, sessionRef) => { h.notices.push({ text, sessionRef }); return { ok: true, output: `OK: enqueued control ${++nextId}` }; },
-    readUndelivered: () => h.undelivered,
+    enqueueNotice: (text, sessionRef, dialogId) => { h.notices.push({ text, sessionRef, dialogId }); return { ok: true, id: ++nextId }; },
+    readHeld: () => ({ conversations: 0, controls: 0, ...h.undelivered }),
+    loadState: () => (store.state ? JSON.parse(JSON.stringify(store.state)) : null),
+    saveState: (state) => { store.state = state ? JSON.parse(JSON.stringify(state)) : null; },
     notifyOperator: async (message) => { h.alerts.push(message); return { ok: typeof sendOk === 'function' ? sendOk() : sendOk }; },
     log: (line) => h.logs.push(line),
   });
@@ -81,7 +81,8 @@ describe('dialog watch: a permission prompt nobody can answer', () => {
     await h.run(2 * MIN, { modal: null });
     assert.deepEqual(h.withdrawn, [], 'the Escape was sent: nothing to withdraw');
     assert.equal(h.notices.length, 1);
-    assert.deepEqual(h.notices[0], { text: formatDeclinedNotice({ title: 'Bash command', notice: fx.DANGEROUS_RM_NOTICE }), sessionRef: PANE });
+    assert.deepEqual(h.notices[0], { text: formatDeclinedNotice({ title: 'Bash command', notice: fx.DANGEROUS_RM_NOTICE }),
+      sessionRef: PANE, dialogId: RM_PROMPT.id });
     assert.match(h.notices[0].text, /"Bash command" \/ "Dangerous rm operation on possibly-empty variable path: .*use a literal path\)"/);
   });
 
@@ -174,14 +175,14 @@ describe('dialog watch: operator alert while a dialog holds delivery', () => {
     const h = harness();
     const secret = { kind: 'unknown', text: 'Private Menu Heading' };
     await h.run(2 * MIN, { modal: secret });
-    h.undelivered = { count: 3, oldestAt: T0 + 2 * MIN };
+    h.undelivered = { count: 3, oldestAt: T0 + 2 * MIN, conversations: 3 };
     await h.run(7 * MIN - 2 * SEC, { modal: secret });
     assert.deepEqual(h.alerts, [], 'not 5 min after the dialog appeared: 5 min after it first held a message');
     await h.run(7 * MIN + 30 * SEC, { modal: secret });
     assert.equal(h.alerts.length, 1);
     assert.match(h.alerts[0], /^🔴 pan 的会话被对话框卡住/);
-    assert.match(h.alerts[0], /对话框：unknown，已在屏幕上 7 分钟，挡住投递 5 分钟。/);
-    assert.match(h.alerts[0], /等待送达：3 条/);
+    assert.match(h.alerts[0], /对话框：unknown，已在屏幕上 7 分钟。/);
+    assert.match(h.alerts[0], /等待送达：3 条（消息 3，控制 0）/);
     assert.match(h.alerts[0], /这类对话框不会自动按键/);
     await h.run(67 * MIN - 2 * SEC, { modal: secret });
     assert.equal(h.alerts.length, 1, 'no repeat within the hour');
@@ -191,8 +192,8 @@ describe('dialog watch: operator alert while a dialog holds delivery', () => {
   });
 
   it('a permission prompt\'s alert names its title row, never its notice', async () => {
-    const h = harness({ statusOf: () => 'superseded' });
-    h.undelivered = { count: 1, oldestAt: T0 };
+    const h = harness();
+    h.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
     await h.run(6 * MIN, { modal: RM_PROMPT });
     assert.equal(h.alerts.length, 1);
     assert.match(h.alerts[0], /permission「Bash command」/);
@@ -218,13 +219,13 @@ describe('dialog watch: operator alert while a dialog holds delivery', () => {
 describe('dialog watch: stuck delivery is visible', () => {
   it('messages undelivered > 10 min while the session is idle: status not ok, one alert with count and oldest age', async () => {
     const h = harness();
-    h.undelivered = { count: 13, oldestAt: T0 };
+    h.undelivered = { count: 13, oldestAt: T0, conversations: 13 };
     await h.run(10 * MIN, { modal: null });
     assert.equal(h.watch.deliveryStuck(), null, 'not before 10 min');
     await h.run(12 * MIN, { modal: null });
     assert.deepEqual(h.watch.deliveryStuck(), { cause: 'session_idle', pending: 13, oldest_age_seconds: Math.round((h.t - T0) / SEC) });
     assert.equal(h.alerts.length, 1);
-    assert.match(h.alerts[0], /^🔴 pan 有 13 条消息超过 10 分钟没有送达/);
+    assert.match(h.alerts[0], /^🔴 pan 有 13 条待送达（消息 13，控制 0）超过 10 分钟没有送达/);
     assert.match(h.alerts[0], /最早一条已等 10 分钟/);
 
     // The session goes busy and idle again over the same backlog: no new alert.
@@ -236,7 +237,7 @@ describe('dialog watch: stuck delivery is visible', () => {
     h.undelivered = { count: 0, oldestAt: null };
     await h.run(21 * MIN, { modal: null });
     assert.equal(h.watch.deliveryStuck(), null);
-    assert.ok(h.logs.includes('Dialog watch: undelivered backlog cleared'));
+    assert.ok(h.logs.includes('Dialog watch: waiting work cleared'));
   });
 
   it('a dialog holding the backlog: one alert (the dialog\'s), and the status names the dialog kind', async () => {
@@ -262,6 +263,67 @@ describe('dialog watch: stuck delivery is visible', () => {
     await h.run(20 * MIN, { modal: RM_PROMPT });
     await h.run(21 * MIN, { modal: null });
     for (const line of h.logs) assert.doesNotMatch(line, /rm -f|Dangerous|\$D/, line);
+  });
+});
+
+// DELIVER-1 second review.
+describe('dialog watch: a prompt that Escape does not dismiss', () => {
+  it('only a queued control held behind the prompt: alert after 5 min, and the status counts it', async () => {
+    const h = harness();
+    h.undelivered = { count: 1, oldestAt: T0, conversations: 0, controls: 1 };
+    await h.run(65 * MIN, { modal: RM_PROMPT });
+    assert.equal(h.keys.length, 1, 'still one Escape');
+    assert.ok(h.alerts.length >= 1);
+    assert.match(h.alerts[0], /等待送达：1 条（消息 0，控制 1）/);
+    assert.deepEqual(h.watch.deliveryStuck(), { cause: 'dialog:permission', pending: 1, oldest_age_seconds: Math.round((h.t - T0) / SEC) });
+  });
+
+  it('nothing queued at all: a permission prompt still up 5 min after its Escape was sent alerts', async () => {
+    const h = harness();
+    await h.run(6 * MIN - 2 * SEC, { modal: RM_PROMPT });
+    assert.deepEqual(h.alerts, [], 'Escape sent at 60 s; not yet 5 min later');
+    await h.run(6 * MIN + 5 * SEC, { modal: RM_PROMPT });
+    assert.equal(h.alerts.length, 1);
+    assert.match(h.alerts[0], /没有排队的消息，但会话在对话框关闭前无法继续工作/);
+    assert.match(h.alerts[0], /已自动按过一次 Esc（5 分钟前送达），权限确认框仍在/);
+    await h.run(66 * MIN - 2 * SEC, { modal: RM_PROMPT });
+    assert.equal(h.alerts.length, 1, 'then at most hourly');
+    await h.run(67 * MIN, { modal: RM_PROMPT });
+    assert.equal(h.alerts.length, 2);
+  });
+});
+
+describe('dialog watch: a monitor restart keeps one Escape per prompt and one alert per hour', () => {
+  it('resumes the saved prompt state: no second Escape, no alert within the hour', async () => {
+    const store = { state: null };
+    const first = harness({ store });
+    await first.run(10 * MIN, { modal: RM_PROMPT });
+    assert.equal(first.keys.length, 1);
+    assert.equal(first.alerts.length, 1, 'alerted 5 min after the Escape went out');
+    assert.equal(store.state.dialog.escape, 'queued');
+    assert.ok(store.state.dialog.escapeSentAt > 0);
+
+    // The monitor restarts with the same prompt still on the same pane.
+    const second = harness({ store, t: first.t + 30 * SEC, startId: 950 });
+    await second.run(40 * MIN, { modal: RM_PROMPT });
+    assert.deepEqual(second.keys, [], 'no second Escape for the same prompt');
+    assert.deepEqual(second.alerts, [], 'no alert within the hour of the last one');
+    assert.ok(second.logs.some((l) => /resumed permission dialog state/.test(l)));
+    await second.run(67 * MIN, { modal: RM_PROMPT });
+    assert.equal(second.alerts.length, 1, 'the hourly reminder comes on time');
+
+    // The prompt goes: the decline is announced once and the state cleared.
+    await second.run(68 * MIN, { modal: null });
+    assert.equal(second.notices.length, 1);
+    assert.equal(store.state, null);
+  });
+
+  it('an unknown dialog\'s saved state holds no pane text', async () => {
+    const store = { state: null };
+    const h = harness({ store });
+    await h.run(2 * MIN, { modal: { kind: 'unknown', text: 'Private Menu Heading' } });
+    assert.ok(store.state.dialog);
+    assert.doesNotMatch(JSON.stringify(store.state), /Private Menu Heading/);
   });
 });
 

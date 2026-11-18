@@ -236,7 +236,7 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
     return db.prepare(`
       SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
              status, retry_count, available_at, last_error, created_at, updated_at,
-             target_instance, session_ref
+             target_instance, session_ref, dialog_ref
       FROM control_queue
       WHERE status = 'pending'
         AND (available_at IS NULL OR available_at <= ?)
@@ -251,7 +251,7 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
   return db.prepare(`
     SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
            status, retry_count, available_at, last_error, created_at, updated_at,
-           target_instance, session_ref
+           target_instance, session_ref, dialog_ref
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)

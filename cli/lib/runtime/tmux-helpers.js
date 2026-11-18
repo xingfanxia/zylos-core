@@ -88,53 +88,115 @@ export function tmuxPasteBuffer(session, tmpFile, bufferName) {
   });
 }
 
+// ── Retained-session launch: a verified shell prompt, bound to its pane ────
+//
+// Both runtime adapters (Claude, Codex) relaunch into an existing tmux
+// session by typing a command line and Enter. That is safe only at an idle
+// shell prompt: typed into a running engine, its composer or one of its
+// dialogs, Enter could submit or approve something (DELIVER-1, 2026-11-18).
+// Positive evidence, all on ONE pane resolved once (its immutable pane id):
+//   - the pane is alive; tmux reports a shell as its foreground command; the
+//     pane process is that shell and has no child process;
+//   - the cursor sits at the end of the last non-empty row, which is short
+//     (PROMPT_ROW_MAX) and, with the cursor, unchanged across two reads
+//     PROMPT_SETTLE_MS apart.
+// The text and its Enter then go to that pane id, after one more read shows
+// the same pane, pane process and shell in the foreground; a pane that is gone
+// or changed gets nothing. Not distinguished: a shell builtin waiting for
+// input (`read`, a heredoc continuation) looks exactly like an idle prompt to
+// tmux and /proc; the typed line would become that builtin's input. It cannot
+// reach an engine or its dialog, because an engine in the foreground (or as a
+// child of the shell) is rejected first.
 const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'dash', 'ksh', 'fish']);
 const shellName = (name) => String(name || '').replace(/^-/, '').split('/').pop();
+const PANE_FORMAT = '#{pane_id} #{pane_dead} #{pane_pid} #{cursor_x} #{cursor_y} #{pane_current_command}';
+export const PROMPT_ROW_MAX = 80;
+export const PROMPT_SETTLE_MS = 300;
 
-/**
- * Positive evidence that a session's pane sits at an idle shell prompt, the
- * only state in which typing a command line and Enter into it is safe. All of:
- * the pane is alive, tmux reports a shell as its foreground command, the pane
- * process is that shell, and the shell has no child process at all. Anything
- * else (Claude or another program running, a dialog, a launcher, an unreadable
- * pane) is not a prompt, and the caller must type nothing.
- * @param {string} session
- * @returns {{ ok: boolean, reason: string }}
- */
-export function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFileSync, buildTree = buildProcessTree } = {}) {
-  let out;
+function readPane(target, execFileSyncImpl) {
   try {
-    out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', session, '#{pane_dead} #{pane_pid} #{pane_current_command}'], {
-      encoding: 'utf8',
-      timeout: CMD_TIMEOUT,
-      stdio: ['ignore', 'pipe', 'ignore'],
+    const out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', target, PANE_FORMAT], {
+      encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'],
     })).trim();
+    const m = /^(%\d+) (\d+) (\d+) (\d+) (\d+) (\S+)$/.exec(out);
+    if (!m) return null;
+    return { id: m[1], dead: m[2] !== '0', pid: Number(m[3]), cursorX: Number(m[4]), cursorY: Number(m[5]), command: shellName(m[6]) };
   } catch {
-    return { ok: false, reason: 'pane unreadable' };
+    return null;
   }
-  const m = /^(\d+) (\d+) (\S+)$/.exec(out);
-  if (!m) return { ok: false, reason: 'pane unreadable' };
-  if (m[1] !== '0') return { ok: false, reason: 'pane is dead' };
-  const pid = Number(m[2]);
-  if (!SHELL_NAMES.has(shellName(m[3]))) return { ok: false, reason: `foreground is ${shellName(m[3]).slice(0, 32)}, not a shell` };
-  const tree = buildTree();
-  const own = tree.infoOf.get(pid);
-  if (!own || !SHELL_NAMES.has(shellName(own.comm))) return { ok: false, reason: 'pane process is not a shell' };
-  if ((tree.childrenOf.get(pid) || []).length > 0) return { ok: false, reason: 'shell is running a command' };
-  return { ok: true, reason: 'shell prompt' };
+}
+
+function lastRow(paneId, execFileSyncImpl) {
+  let text;
+  try {
+    text = String(execFileSyncImpl('tmux', ['capture-pane', '-p', '-t', paneId], {
+      encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'],
+    }));
+  } catch {
+    return null;
+  }
+  const rows = text.replace(/\n$/, '').split('\n').map((row) => row.replace(/\s+$/, ''));
+  let y = rows.length - 1;
+  while (y >= 0 && !rows[y]) y--;
+  return y < 0 ? null : { y, text: rows[y] };
 }
 
 /**
- * The retained-session launch of every runtime adapter (Claude, Codex) calls
- * this right before it types a command line and Enter into an existing pane:
- * it throws unless tmuxPaneAtShellPrompt() positively finds an idle shell
- * prompt, so nothing is typed into a running runtime, its composer or a
- * permission prompt (DELIVER-1, 2026-11-18). The thrown launch failure goes
- * to the guardian's failed-start handling (retry once, then hold and alert).
+ * Positive evidence that a session's pane sits at an idle shell prompt.
+ * @param {string} session
+ * @returns {Promise<{ ok: boolean, reason: string, pane?: { id: string, pid: number, command: string } }>}
  */
-export function requirePaneAtShellPrompt(session, deps) {
-  const prompt = tmuxPaneAtShellPrompt(session, deps);
+export async function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFileSync, buildTree = buildProcessTree,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), settleMs = PROMPT_SETTLE_MS } = {}) {
+  const first = readPane(session, execFileSyncImpl);
+  if (!first) return { ok: false, reason: 'pane unreadable' };
+  if (first.dead) return { ok: false, reason: 'pane is dead' };
+  if (!SHELL_NAMES.has(first.command)) return { ok: false, reason: `foreground is ${first.command.slice(0, 32)}, not a shell` };
+  const tree = buildTree();
+  const own = tree.infoOf.get(first.pid);
+  if (!own || !SHELL_NAMES.has(shellName(own.comm))) return { ok: false, reason: 'pane process is not a shell' };
+  if ((tree.childrenOf.get(first.pid) || []).length > 0) return { ok: false, reason: 'shell is running a command' };
+  const row = lastRow(first.id, execFileSyncImpl);
+  const atRowEnd = (pane, r) => r && pane.cursorY === r.y && pane.cursorX >= [...r.text].length && pane.cursorX <= [...r.text].length + 1;
+  if (!atRowEnd(first, row)) return { ok: false, reason: 'cursor is not at the end of the last row' };
+  if ([...row.text].length > PROMPT_ROW_MAX) return { ok: false, reason: 'last row is too long for a prompt' };
+  await sleep(settleMs);
+  const second = readPane(first.id, execFileSyncImpl);
+  const again = lastRow(first.id, execFileSyncImpl);
+  if (!second || second.dead || second.pid !== first.pid || second.command !== first.command
+      || second.cursorX !== first.cursorX || second.cursorY !== first.cursorY || !again || again.y !== row.y || again.text !== row.text) {
+    return { ok: false, reason: 'pane changed while it was checked' };
+  }
+  return { ok: true, reason: 'shell prompt', pane: { id: first.id, pid: first.pid, command: first.command } };
+}
+
+/**
+ * The retained-session launch of every runtime adapter calls this right
+ * before typing. Resolves the verified pane, or throws (nothing typed); the
+ * failed launch goes to the guardian's failed-start handling (retry once,
+ * then hold and alert).
+ * @returns {Promise<{ id: string, pid: number, command: string }>}
+ */
+export async function requirePaneAtShellPrompt(session, deps) {
+  const prompt = await tmuxPaneAtShellPrompt(session, deps);
   if (!prompt.ok) throw new Error(`existing tmux session ${session} is not at a shell prompt (${prompt.reason}); nothing typed`);
+  return prompt.pane;
+}
+
+/**
+ * Paste a file's text and Enter into the pane verified by
+ * requirePaneAtShellPrompt, by its pane id. One more read directly before
+ * must show the same pane alive with the same pane process and shell in the
+ * foreground; otherwise nothing is pasted and this throws.
+ */
+export function tmuxPasteToVerifiedPane(pane, tmpFile, bufferName, { execFileSyncImpl = execFileSync, sendKeys = sendTmuxKeys } = {}) {
+  const now = readPane(pane.id, execFileSyncImpl);
+  if (!now || now.id !== pane.id || now.dead || now.pid !== pane.pid || now.command !== pane.command) {
+    throw new Error(`pane ${pane.id} is gone or changed since it was verified; nothing typed`);
+  }
+  execFileSyncImpl('tmux', ['load-buffer', '-b', bufferName, tmpFile], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
+  execFileSyncImpl('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', pane.id], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
+  sendKeys(pane.id, ['Enter'], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
 }
 
 /**

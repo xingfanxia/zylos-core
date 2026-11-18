@@ -426,6 +426,32 @@ export function getUndeliveredInboundSummary(instanceId, { includeUntargeted = f
 }
 
 /**
+ * Every row of one instance that is waiting to be handed to its session, the
+ * work a dialog on its pane holds (DELIVER-1): inbound conversations pending or
+ * claimed right now, and controls pending and already available. Excluded:
+ * controls bound to a dialog (dialog_ref: the dialog watch's own Escape and
+ * decline message), and claimed controls (an ack-mode control stays claimed
+ * after its paste while it waits for its ack: it is delivered, not held).
+ * The primary instance of a multi-session host also delivers the untargeted
+ * rows: pass `includeUntargeted`. Counts and times only, never content.
+ * @param {string|null} instanceId
+ * @param {{ includeUntargeted?: boolean, now?: number }} [options] - now in epoch seconds
+ * @returns {{ count: number, oldestAt: number|null, conversations: number, controls: number }} oldestAt in epoch ms
+ */
+export function getHeldWorkSummary(instanceId, { includeUntargeted = false, now = nowSeconds() } = {}) {
+  const target = `(target_instance IS ?${includeUntargeted ? ' OR target_instance IS NULL' : ''})`;
+  const conv = getUndeliveredInboundSummary(instanceId, { includeUntargeted });
+  const ctl = getDb().prepare(`
+    SELECT COUNT(*) AS count, MIN(created_at) AS oldest FROM control_queue
+    WHERE status = 'pending' AND ${target} AND dialog_ref IS NULL
+      AND (available_at IS NULL OR available_at <= ?)
+  `).get(instanceId ?? null, now);
+  const times = [conv.oldestAt, ctl?.oldest ? ctl.oldest * 1000 : null].filter((t) => Number.isFinite(t));
+  return { count: conv.count + (ctl?.count || 0), oldestAt: times.length ? Math.min(...times) : null,
+    conversations: conv.count, controls: ctl?.count || 0 };
+}
+
+/**
  * Get count of pending control items
  * @returns {number}
  */
@@ -474,9 +500,11 @@ export function insertControl(content, options = {}) {
     availableAt = null,
     appendAckSuffix = true,
     targetInstance = null,
-    sessionRef = null
+    sessionRef = null,
+    dialogRef = null
   } = options;
   if (sessionRef !== null) assertSessionRef(sessionRef);
+  if (dialogRef !== null) assertDialogRef(dialogRef);
 
   const tx = database.transaction(() => {
     const current = nowSeconds();
@@ -523,6 +551,9 @@ export function insertControl(content, options = {}) {
     if (sessionRef !== null) {
       database.prepare('UPDATE control_queue SET session_ref = ? WHERE id = ?').run(sessionRef, id);
     }
+    if (dialogRef !== null) {
+      database.prepare('UPDATE control_queue SET dialog_ref = ? WHERE id = ?').run(dialogRef, id);
+    }
 
     // A keystroke only replaces an equivalent pending key for the SAME session
     // binding: a late key of a replaced session must never discard the key
@@ -534,12 +565,14 @@ export function insertControl(content, options = {}) {
       WHERE id != ?
         AND status = 'pending'
         AND raw_content = ?
-        AND target_instance IS ?${sameSession ? '\n        AND session_ref IS ?' : ''}
+        AND target_instance IS ?
+        AND dialog_ref IS ?${sameSession ? '\n        AND session_ref IS ?' : ''}
     `).run(
       current,
       id,
       content,
       targetInstance,
+      dialogRef,
       ...(sameSession ? [sessionRef] : [])
     );
 
@@ -574,6 +607,15 @@ export function insertControl(content, options = {}) {
 
 const SESSION_REF_RE = /^\$\d+:\d+:%\d+:\d+$/;
 const KEYSTROKE_PREFIX = '[KEYSTROKE]';
+
+// A permission prompt's id (tmux-input-state.js detectModal): 16 hex digits.
+const DIALOG_REF_RE = /^[0-9a-f]{16}$/;
+
+export function assertDialogRef(dialogRef) {
+  if (typeof dialogRef !== 'string' || !DIALOG_REF_RE.test(dialogRef)) {
+    throw new Error(`invalid dialogRef ${JSON.stringify(dialogRef)}: expected a 16-hex-digit prompt id`);
+  }
+}
 
 export function assertSessionRef(sessionRef) {
   if (typeof sessionRef !== 'string' || !SESSION_REF_RE.test(sessionRef)) {
@@ -657,7 +699,7 @@ export function getNextPendingControl(current = nowSeconds()) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-           status, retry_count, available_at, last_error, created_at, updated_at, target_instance, session_ref
+           status, retry_count, available_at, last_error, created_at, updated_at, target_instance, session_ref, dialog_ref
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)

@@ -135,3 +135,44 @@ describe('isTimeoutError classifier', () => {
     assert.equal(isTimeoutError(new Error('ENOENT')), false);
   });
 });
+
+// DELIVER-1: the retained-session launch pastes and submits only to the pane
+// it verified, by pane id, after one more read shows the same pane.
+describe('tmuxPasteToVerifiedPane', async () => {
+  const { tmuxPasteToVerifiedPane } = await import('../tmux-helpers.js');
+  const pane = { id: '%7', pid: 4242, command: 'bash' };
+  const run = (probe) => {
+    const calls = [];
+    const keys = [];
+    const execFileSyncImpl = (file, args) => {
+      calls.push([file, ...args]);
+      if (args[0] === 'display-message') {
+        if (probe === null) throw new Error("can't find pane: %7");
+        return probe;
+      }
+      return '';
+    };
+    let error = null;
+    try {
+      tmuxPasteToVerifiedPane(pane, '/tmp/msg.txt', 'zylos-buf', { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]) });
+    } catch (err) { error = err; }
+    return { calls, keys, error };
+  };
+
+  it('pastes and submits to the verified pane id when the same shell is still there', () => {
+    const got = run('%7 0 4242 13 3 bash');
+    assert.equal(got.error, null);
+    assert.deepEqual(got.calls.slice(1), [['tmux', 'load-buffer', '-b', 'zylos-buf', '/tmp/msg.txt'],
+      ['tmux', 'paste-buffer', '-p', '-r', '-b', 'zylos-buf', '-t', '%7']]);
+    assert.deepEqual(got.keys, [['%7', 'Enter']]);
+  });
+
+  it('types nothing when the pane is gone or its foreground or process changed', () => {
+    for (const probe of [null, '%7 1 4242 13 3 bash', '%7 0 4242 13 3 claude', '%7 0 5151 13 3 bash']) {
+      const got = run(probe);
+      assert.match(got.error?.message || '', /gone or changed since it was verified; nothing typed/, String(probe));
+      assert.deepEqual(got.calls.filter((c) => c[1] !== 'display-message'), [], String(probe));
+      assert.deepEqual(got.keys, [], String(probe));
+    }
+  });
+});

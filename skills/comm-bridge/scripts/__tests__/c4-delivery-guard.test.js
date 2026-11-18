@@ -173,7 +173,7 @@ describe('keystroke policy (DELIVER-1: a permission prompt takes cancellation on
   it('a dialog-bound Escape goes only to that very prompt', () => {
     const modal = detectModal(fx.DANGEROUS_RM_PROMPT);
     const at = (m) => ({ ok: true, sessionRef: '$1:1000:%2:123', modal: m, sessionCreatedAt: 1000 });
-    const bound = { id: 4, content: `[KEYSTROKE]Escape dialog=${modal.id}` };
+    const bound = { id: 4, content: '[KEYSTROKE]Escape', dialog_ref: modal.id };
     assert.deepEqual(fenceKeystrokeControl(bound, at(modal), { bind: noBinding }), { action: 'deliver' });
     for (const other of [null, detectModal(fx.PERMISSION_PROMPT_LIVE), detectModal(fx.UNKNOWN_DIALOG_LIVE), LIMIT]) {
       assert.deepEqual(fenceKeystrokeControl(bound, at(other), { bind: noBinding }), { action: 'supersede', reason: 'DIALOG_GONE' });

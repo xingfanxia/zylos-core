@@ -44,6 +44,7 @@ import {
   getProcessName,
   hasChildProcess,
   requirePaneAtShellPrompt,
+  tmuxPasteToVerifiedPane,
 } from './tmux-helpers.js';
 import {
   buildCleanEnv,
@@ -257,7 +258,9 @@ export class CodexAdapter extends RuntimeAdapter {
    * @param {string} text
    * @returns {Promise<void>}
    */
-  async sendMessage(text) {
+  // `pane`: the pane verified by requirePaneAtShellPrompt; the text and its
+  // Enter then go to that pane id only (tmuxPasteToVerifiedPane).
+  async sendMessage(text, { pane = null } = {}) {
     const msgId = `${Date.now()}-${process.pid}`;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-'));
     const tmpFile = path.join(tmpDir, 'msg.txt');
@@ -265,7 +268,8 @@ export class CodexAdapter extends RuntimeAdapter {
 
     try {
       fs.writeFileSync(tmpFile, text);
-      tmuxPasteBuffer(SESSION, tmpFile, bufferName);
+      if (pane) tmuxPasteToVerifiedPane(pane, tmpFile, bufferName);
+      else tmuxPasteBuffer(SESSION, tmpFile, bufferName);
     } finally {
       try { fs.unlinkSync(tmpFile); fs.rmdirSync(tmpDir); } catch { }
       tmuxDeleteBuffer(bufferName);
@@ -443,11 +447,12 @@ export class CodexAdapter extends RuntimeAdapter {
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
       const cmd = `${envPrefix}cd "${instanceCwd}"; ${profileCodexCmd} ${shellArgument(kickPrompt)}; ${exitLogSnippet}`;
-      // Typed only into a pane positively at an idle shell prompt; otherwise
-      // nothing is typed and the launch fails (requirePaneAtShellPrompt). The
-      // failover chain can relaunch any persona on Codex in its tmux session.
-      requirePaneAtShellPrompt(SESSION);
-      await this.sendMessage(cmd);
+      // Typed only into the one pane positively found at an idle shell prompt,
+      // by its pane id; otherwise nothing is typed and the launch fails
+      // (requirePaneAtShellPrompt, tmuxPasteToVerifiedPane). The failover
+      // chain can relaunch any persona on Codex in its tmux session.
+      const pane = await requirePaneAtShellPrompt(SESSION);
+      await this.sendMessage(cmd, { pane });
     } else {
       // New session — launcher pipeline
       const dotenvVars = readMergedDotenvVars([path.join(ZYLOS_DIR, '.env')]);

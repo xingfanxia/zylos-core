@@ -452,10 +452,12 @@ export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl =
  *               is superseded too (PERMISSION_PROMPT): a prompt nobody can
  *               answer is only ever cancelled, so no key may approve it
  *               (Enter, a digit, y, text), however old or whoever queued it.
- *               A dialog-bound Escape (`[KEYSTROKE]Escape dialog=<id>`, the
- *               activity monitor's dialog watch) is superseded unless that
- *               very prompt (same pane, same prompt id) is still on screen
- *               (DIALOG_GONE)
+ *               A dialog-bound key (control_queue.dialog_ref: the activity
+ *               monitor's dialog watch Escape) is superseded unless that very
+ *               prompt (same pane, same prompt id) is still on screen
+ *               (DIALOG_GONE). The binding travels out of band: the row's
+ *               content is the plain `[KEYSTROKE]Escape`, which a dispatcher
+ *               without this column treats as any other Escape
  *   defer     - any other modal owns the keyboard (keystrokeBlockedByModal)
  *   deliver   - send the key
  * An unbound key is bound to the pane read here before any deferral, so a
@@ -472,7 +474,7 @@ export function fenceKeystrokeControl(item, target, { bind = bindControlSession 
     return { action: 'supersede', reason: 'SESSION_PREDATES' };
   }
   const key = parseKeystrokeKey(item.content);
-  const dialogId = parseKeystrokeDialog(item.content);
+  const dialogId = item.dialog_ref || null;
   const modal = target.modal;
   if (dialogId) {
     return key === 'Escape' && modal?.kind === 'permission' && modal.id === dialogId
@@ -802,17 +804,8 @@ export function isKeystrokeControl(item) {
   return item.type === 'control' && (item.content || '').startsWith('[KEYSTROKE]');
 }
 
-// `[KEYSTROKE]<key>` optionally followed by ` dialog=<id>`: the key is the
-// first token only; the dialog id binds a cancellation to one permission
-// prompt (fenceKeystrokeControl). Older dispatchers would send the whole rest
-// as one tmux key name, so the dialog watch must never run ahead of this
-// dispatcher (DELIVER-1 deploy order).
 export function parseKeystrokeKey(content) {
-  return (content || '').slice('[KEYSTROKE]'.length).trim().split(/\s+/)[0] || '';
-}
-
-export function parseKeystrokeDialog(content) {
-  return /\sdialog=([0-9a-f]{16})\s*$/.exec((content || '').slice('[KEYSTROKE]'.length))?.[1] ?? null;
+  return (content || '').slice('[KEYSTROKE]'.length).trim();
 }
 
 /**

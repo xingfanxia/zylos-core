@@ -299,3 +299,26 @@ describe('getUndeliveredInboundSummary', () => {
     assert.deepEqual(dbMod.getUndeliveredInboundSummary('nobody'), { count: 0, oldestAt: null });
   });
 });
+
+// DELIVER-1 second review: everything a dialog holds for a persona counts,
+// controls included; the dialog watch's own bound rows and controls that are
+// delivered and waiting for their ack (claimed) do not.
+describe('getHeldWorkSummary', () => {
+  it('counts held conversations and available pending controls, not the watch\'s own rows or ack-waiting ones', () => {
+    const now = Math.floor(Date.now() / 1000);
+    control({ target: 'user-pan', content: 'queued text control' });
+    control({ target: 'user-pan', content: 'later', availableAt: now + 3600 });
+    control({ target: 'user-pan', content: 'waiting for its ack', status: 'running' });
+    dbMod.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, targetInstance: 'user-pan',
+      dialogRef: '0123456789abcdef' });
+    assert.deepEqual(dbMod.getHeldWorkSummary('user-pan').count, 1);
+    assert.equal(dbMod.getHeldWorkSummary('user-pan').controls, 1);
+    conv({ target: 'user-pan' });
+    const both = dbMod.getHeldWorkSummary('user-pan');
+    assert.deepEqual([both.count, both.conversations, both.controls], [2, 1, 1]);
+    assert.equal(typeof both.oldestAt, 'number');
+    control({ target: null, content: 'legacy untargeted' });
+    assert.equal(dbMod.getHeldWorkSummary('admin').count, 0);
+    assert.equal(dbMod.getHeldWorkSummary('admin', { includeUntargeted: true }).count, 1);
+  });
+});

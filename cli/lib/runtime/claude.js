@@ -35,6 +35,7 @@ import {
   getProcessName,
   hasChildProcess,
   requirePaneAtShellPrompt,
+  tmuxPasteToVerifiedPane,
 } from './tmux-helpers.js';
 import {
   buildCleanEnv,
@@ -324,7 +325,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @param {string} text
    * @returns {Promise<void>}
    */
-  async sendMessage(text) {
+  // `pane`: the pane verified by requirePaneAtShellPrompt; the text and its
+  // Enter then go to that pane id only (tmuxPasteToVerifiedPane).
+  async sendMessage(text, { pane = null } = {}) {
     const msgId = `${Date.now()}-${process.pid}`;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-'));
     const tmpFile = path.join(tmpDir, 'msg.txt');
@@ -332,7 +335,8 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     try {
       fs.writeFileSync(tmpFile, text);
-      tmuxPasteBuffer(SESSION, tmpFile, bufferName);
+      if (pane) tmuxPasteToVerifiedPane(pane, tmpFile, bufferName);
+      else tmuxPasteBuffer(SESSION, tmpFile, bufferName);
     } finally {
       try { fs.unlinkSync(tmpFile); fs.rmdirSync(tmpDir); } catch { }
       tmuxDeleteBuffer(bufferName);
@@ -465,9 +469,10 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     if (tmuxHasSession(SESSION)) {
       // Existing session — send command via sendMessage, no env rebuild.
-      // Typed only into a pane positively at an idle shell prompt; otherwise
-      // nothing is typed and the launch fails (requirePaneAtShellPrompt).
-      requirePaneAtShellPrompt(SESSION);
+      // Typed only into the one pane positively found at an idle shell prompt,
+      // by its pane id; otherwise nothing is typed and the launch fails
+      // (requirePaneAtShellPrompt, tmuxPasteToVerifiedPane).
+      const pane = await requirePaneAtShellPrompt(SESSION);
       // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
       const recoveryPrompt = upgradeStartupPrompt(ZYLOS_DIR);
       const envExports = [
@@ -480,7 +485,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
       const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}${recoveryPrompt ? " " + shellArgument(recoveryPrompt) : ""}; ${exitLogSnippet}`;
-      await this.sendMessage(cmd);
+      await this.sendMessage(cmd, { pane });
     } else {
       // New session — launcher pipeline
       // Shared ~/zylos/.env, manifest, stripped vars and the built-in Claude

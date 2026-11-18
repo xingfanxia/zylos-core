@@ -35,8 +35,8 @@ function conversation(target, timestamp) {
   return Number(db.prepare(`INSERT INTO conversations (direction, channel, endpoint_id, content, status, priority, target_instance, timestamp)
     VALUES ('in', 'feishu', 'oc_x', 'm', 'pending', 3, ?, ?)`).run(target, timestamp).lastInsertRowid);
 }
-function control(target, content, { bypass = false, priority = 0 } = {}) {
-  return dbMod.insertControl(content, { priority, bypassState: bypass, appendAckSuffix: false, targetInstance: target }).id;
+function control(target, content, { bypass = false, priority = 0, dialogRef = null } = {}) {
+  return dbMod.insertControl(content, { priority, bypassState: bypass, appendAckSuffix: false, targetInstance: target, dialogRef }).id;
 }
 const conv = (id) => db.prepare('SELECT status, retry_count FROM conversations WHERE id = ?').get(id);
 const ctl = (id) => db.prepare('SELECT status, last_error FROM control_queue WHERE id = ?').get(id);
@@ -157,7 +157,7 @@ describe('fair selection for every row class (DELIVER-1 review)', () => {
   it('the Escape for a permission prompt is claimed first: before older keys and messages of the same persona', async () => {
     conversation('user-pan', '2026-11-18 04:20:00');
     const older = ['Enter', '1', '2', '3', 'y', 'n', 'a', 'b', 'c', 'd'].map((k) => control('user-pan', `[KEYSTROKE]${k}`, { bypass: true }));
-    const escape = control('user-pan', `[KEYSTROKE]Escape dialog=${PROMPT.id}`, { bypass: true });
+    const escape = control('user-pan', '[KEYSTROKE]Escape', { bypass: true, dialogRef: PROMPT.id });
     const { result, keys } = await pass({ 'user-pan': PROMPT });
     assert.equal(result.delivered, true);
     assert.deepEqual(keys, [{ target: '%2', key: 'Escape' }]);
@@ -182,11 +182,11 @@ describe('cancellation only, bound to its prompt', () => {
   });
 
   it('a dialog-bound Escape is superseded once its prompt is gone or replaced by another one', async () => {
-    const gone = control('user-pan', `[KEYSTROKE]Escape dialog=${PROMPT.id}`, { bypass: true });
+    const gone = control('user-pan', '[KEYSTROKE]Escape', { bypass: true, dialogRef: PROMPT.id });
     let run = await pass({});
     assert.deepEqual(run.keys, []);
     assert.deepEqual(ctl(gone), { status: 'superseded', last_error: 'DIALOG_GONE' });
-    const other = control('user-pan', `[KEYSTROKE]Escape dialog=${PROMPT.id}`, { bypass: true });
+    const other = control('user-pan', '[KEYSTROKE]Escape', { bypass: true, dialogRef: PROMPT.id });
     run = await pass({ 'user-pan': { ...PROMPT, id: 'fedcba9876543210' } });
     assert.deepEqual(run.keys, []);
     assert.deepEqual(ctl(other), { status: 'superseded', last_error: 'DIALOG_GONE' });
