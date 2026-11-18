@@ -32,16 +32,29 @@ export function stripTrailingAckSuffix(content) {
 // starting at once apply it once. As on the base, an ordinary opener logs a
 // failure once and serves with the schema it finds; only the dialog-binding
 // check (verifyDialogSchema, strict) throws. A migration waits for the write
-// lock at most MIGRATION_BUSY_MS, never the connection's 5 s: a busy database
-// only means the next opener or the next schema check tries again, and no
-// process stalls its serving on it.
-const MIGRATION_BUSY_MS = 250;
+// lock at most SHORT_WAIT_MS (withShortWait), never the connection's 5 s: a
+// busy database only means the next opener or the next schema check tries
+// again, and no process stalls its serving on it.
 function _runMigrations(database, { strict = false } = {}) {
   const migrationsDir = path.join(__dirname, '..', 'migrations');
   if (!fs.existsSync(migrationsDir)) return;
+  return withShortWait(database, () => _applyMigrations(database, migrationsDir, strict));
+}
 
+// Optional writes of the dialog binding (migrations, capability publish,
+// refresh and withdraw, the watch's state save) wait for the write lock at
+// most SHORT_WAIT_MS instead of the connection's 5 s and throw SQLITE_BUSY
+// otherwise; their callers try again at their next interval. Real deliveries
+// keep the normal allowance. Single-threaded, so the restored timeout is the
+// only one any other statement sees.
+const SHORT_WAIT_MS = 250;
+function withShortWait(database, fn) {
   const busy = database.pragma('busy_timeout', { simple: true });
-  database.pragma(`busy_timeout = ${MIGRATION_BUSY_MS}`);
+  database.pragma(`busy_timeout = ${SHORT_WAIT_MS}`);
+  try { return fn(); } finally { database.pragma(`busy_timeout = ${busy}`); }
+}
+
+function _applyMigrations(database, migrationsDir, strict) {
   try {
     if (!tableExists(database, '_migrations')) {
       database.exec(`CREATE TABLE IF NOT EXISTS _migrations (
@@ -76,8 +89,6 @@ function _runMigrations(database, { strict = false } = {}) {
   } catch (err) {
     if (strict) throw err;
     console.error(`[c4-db] Migration error: ${err.message}`);
-  } finally {
-    database.pragma(`busy_timeout = ${busy}`);
   }
 }
 
@@ -762,14 +773,16 @@ export function loadDialogWatchState(instanceId) {
 export function saveDialogWatchState(instanceId, state) {
   const database = getDb();
   if (!dialogSchemaPresent(database)) return;
-  if (state == null) {
-    database.prepare('DELETE FROM dialog_watch_state WHERE instance_key = ?').run(instanceId ?? '');
-    return;
-  }
-  database.prepare(`
-    INSERT INTO dialog_watch_state (instance_key, state, updated_at) VALUES (?, ?, ?)
-    ON CONFLICT(instance_key) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
-  `).run(instanceId ?? '', JSON.stringify(state), nowSeconds());
+  withShortWait(database, () => {
+    if (state == null) {
+      database.prepare('DELETE FROM dialog_watch_state WHERE instance_key = ?').run(instanceId ?? '');
+      return;
+    }
+    database.prepare(`
+      INSERT INTO dialog_watch_state (instance_key, state, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(instance_key) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
+    `).run(instanceId ?? '', JSON.stringify(state), nowSeconds());
+  });
 }
 
 // The start time of a running process, epoch seconds, from the operating
@@ -805,22 +818,29 @@ export function processStartTime(pid) {
  */
 export function publishCapabilities(processName, capabilities, { pid = process.pid, startedAt = processStartTime(pid) } = {}) {
   if (!Number.isInteger(startedAt)) throw new Error(`start time of pid ${pid} unreadable`);
-  getDb().prepare(`
+  const database = getDb();
+  withShortWait(database, () => database.prepare(`
     INSERT INTO c4_process_capabilities (process, pid, started_at, capabilities, updated_at) VALUES (?, ?, ?, ?, ?)
     ON CONFLICT(process) DO UPDATE SET pid = excluded.pid, started_at = excluded.started_at,
       capabilities = excluded.capabilities, updated_at = excluded.updated_at
-  `).run(processName, pid, startedAt, capabilities.join(' '), nowSeconds());
+  `).run(processName, pid, startedAt, capabilities.join(' '), nowSeconds()));
 }
 
-/** Refresh this process's published row (only if it is still its own). */
+/**
+ * Refresh this process's published row (only if it is still its own). A busy
+ * database throws after the short wait; the caller tries at its next interval,
+ * and a row never refreshed goes stale by the 3-minute rule.
+ */
 export function refreshCapabilities(processName, { pid = process.pid } = {}) {
-  return getDb().prepare('UPDATE c4_process_capabilities SET updated_at = ? WHERE process = ? AND pid = ?')
-    .run(nowSeconds(), processName, pid).changes > 0;
+  const database = getDb();
+  return withShortWait(database, () => database.prepare('UPDATE c4_process_capabilities SET updated_at = ? WHERE process = ? AND pid = ?')
+    .run(nowSeconds(), processName, pid).changes > 0);
 }
 
 /** Remove this process's published row (only if it is still its own). */
 export function withdrawCapabilities(processName, { pid = process.pid } = {}) {
-  getDb().prepare('DELETE FROM c4_process_capabilities WHERE process = ? AND pid = ?').run(processName, pid);
+  const database = getDb();
+  withShortWait(database, () => database.prepare('DELETE FROM c4_process_capabilities WHERE process = ? AND pid = ?').run(processName, pid));
 }
 
 /**

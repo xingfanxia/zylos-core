@@ -276,13 +276,21 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
   const describe = (d) => (isPermission(d) ? `permission prompt "${clip(d.title)}"` : `${d.kind} dialog`);
   const changed = () => { dirty = true; };
 
-  function persist() {
-    if (!dirty) return;
-    dirty = false;
+  // A failed save (a busy database gives up after a short wait) is tried
+  // again on a later tick, at most every pendingCheckMs; logged once a minute.
+  let saveFailedAt = -Infinity;
+  let saveFailLoggedAt = -Infinity;
+  function persist(t = now()) {
+    if (!dirty || t - saveFailedAt < timing.pendingCheckMs) return;
     try {
       saveState(dialog || declines.length ? { version: STATE_VERSION, dialog, declines } : null);
+      dirty = false;
     } catch (err) {
-      log(`Dialog watch: state not saved (${clip(err?.message, 160)})`);
+      saveFailedAt = t;
+      if (t - saveFailLoggedAt >= 60_000) {
+        saveFailLoggedAt = t;
+        log(`Dialog watch: state not saved (${clip(err?.message, 160)}); tried again later`);
+      }
     }
   }
 

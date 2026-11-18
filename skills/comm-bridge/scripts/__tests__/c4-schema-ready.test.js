@@ -207,3 +207,34 @@ it('ready needs the 005 and 006 ledger rows by name, even when every object exis
   assert.deepEqual(JSON.parse(r.stdout), { check: { ok: false, reason: 'migration 006-add-dialog-watch-state.sql not recorded' },
     present: false, capable: false });
 });
+
+it('under a held write lock every bookkeeping write of the dialog binding gives up within the short wait; deliveries keep 5 s', async () => {
+  const root = freshRoot();
+  assert.equal(inChild(root, `db.getDb(); db.publishCapabilities('c4-dispatcher', ['dialog_ref']); db.close();`).status, 0);
+  const holder = spawn(process.execPath, ['--input-type=module', '-e', `import Database from ${JSON.stringify(path.join(SCRIPTS, '..', 'node_modules', 'better-sqlite3', 'lib', 'index.js'))};
+    const d = new Database(${JSON.stringify(dbFile(root))}); d.exec('BEGIN IMMEDIATE'); console.log('locked');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 8000); d.exec('ROLLBACK'); d.close();`]);
+  try {
+    await new Promise((resolve, reject) => { holder.stdout.once('data', resolve); holder.once('error', reject); });
+    const r = inChild(root, `
+      db.getDb();
+      const timed = (name, fn) => { const t = Date.now(); let error = null; try { fn(); } catch (e) { error = e.code || e.message; } return { name, ms: Date.now() - t, error }; };
+      const out = [
+        timed('publish', () => db.publishCapabilities('c4-dispatcher', ['dialog_ref'])),
+        timed('refresh', () => db.refreshCapabilities('c4-dispatcher')),
+        timed('withdraw', () => db.withdrawCapabilities('c4-dispatcher')),
+        timed('state', () => db.saveDialogWatchState('user-pan', { version: 1, dialog: null, declines: [] })),
+      ];
+      console.log(JSON.stringify({ out, allowance: db.getDb().pragma('busy_timeout', { simple: true }) }));
+      db.close();`);
+    assert.equal(r.status, 0, r.stderr);
+    const { out, allowance } = JSON.parse(r.stdout);
+    for (const { name, ms, error } of out) {
+      assert.equal(error, 'SQLITE_BUSY', name);
+      assert.ok(ms < 1500, `${name} waited ${ms} ms`);
+    }
+    assert.equal(allowance, 5000, 'the connection keeps the normal allowance for everything else');
+  } finally {
+    holder.kill('SIGKILL');
+  }
+});

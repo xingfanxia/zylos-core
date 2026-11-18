@@ -169,7 +169,7 @@ describe('tmuxPasteToVerifiedPane', async () => {
     return `${out.join('\n')}\n`;
   }
   // probes: what display-message answers on each read; screens: before and after the paste.
-  const run = async (probes, after = AFTER_SCREEN, before = BEFORE_SCREEN) => {
+  const run = async (probes, after = AFTER_SCREEN, before = BEFORE_SCREEN, { target = pane, text = TEXT } = {}) => {
     const calls = [];
     const keys = [];
     let reads = 0;
@@ -187,7 +187,7 @@ describe('tmuxPasteToVerifiedPane', async () => {
     };
     let error = null;
     try {
-      await tmuxPasteToVerifiedPane(pane, '/tmp/msg.txt', 'zylos-buf', TEXT,
+      await tmuxPasteToVerifiedPane(target, '/tmp/msg.txt', 'zylos-buf', text,
         { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]), sleep: async () => {} });
     } catch (err) { error = err; }
     return { calls, keys, error, pasted };
@@ -259,6 +259,62 @@ describe('tmuxPasteToVerifiedPane', async () => {
       assert.match(got.error?.message || '', /not submitted \(the line is left as typed\)/, name);
       assert.equal(got.pasted, true, name);
       assert.deepEqual(got.keys, [], `${name}: no Enter`);
+    }
+  });
+
+  // DELIVER-1 fifth review: cursor_x counts terminal cells, not code points.
+  const shell = { id: '%7', pid: 4242, command: 'bash', promptRow: '$', promptY: 0 };
+  const shellRun = (text, cursorX, row) => run(['%7 0 4242 2 0 bash', `%7 0 4242 ${cursorX} 0 bash`],
+    rows(row, '', ''), rows('$', '', ''), { target: shell, text });
+
+  it('measures rows in display cells: after "$ 中abcdefghi" the cursor at cell 13 submits, at 12 (code points) it does not', async () => {
+    const row = '$ 中abcdefghi';
+    assert.equal([...row].length, 12);
+    const right = await shellRun('中abcdefghi', 13, row);
+    assert.equal(right.error, null);
+    assert.deepEqual(right.keys, [['%7', 'Enter']]);
+    const short = await shellRun('中abcdefghi', 12, row);
+    assert.match(short.error?.message || '', /not submitted/);
+    assert.deepEqual(short.keys, [], 'one cell short: no Enter');
+  });
+
+  it('a combining mark takes no cell: the cursor at the cell count submits, at the code point count it does not', async () => {
+    const text = 'touch cafe\u0301';
+    const row = `$ ${text}`;
+    assert.equal([...row].length, 13);
+    assert.deepEqual((await shellRun(text, 12, row)).keys, [['%7', 'Enter']]);
+    assert.deepEqual((await shellRun(text, 13, row)).keys, []);
+  });
+
+  it('types nothing when the command or the prompt has a character of uncertain width (ambiguous, emoji sequence)', async () => {
+    for (const text of ['echo 25°C', 'echo ─', 'echo λ', 'echo 👍🏽', 'echo ❤\uFE0F', 'echo a\u200Db']) {
+      const got = await shellRun(text, 2 + [...text].length, `$ ${text}`);
+      assert.match(got.error?.message || '', /uncertain width; nothing typed/, text);
+      assert.equal(got.pasted, false, text);
+      assert.deepEqual(got.keys, [], text);
+    }
+    const ambiguousPrompt = await run(['%7 0 4242 3 0 bash'], rows('λ$ x'), rows('λ$', ''),
+      { target: { ...shell, promptRow: 'λ$' }, text: 'x' });
+    assert.match(ambiguousPrompt.error?.message || '', /uncertain width; nothing typed/);
+    assert.equal(ambiguousPrompt.pasted, false);
+  });
+});
+
+describe('cellWidth (terminal cells, or null when not known with confidence)', async () => {
+  const { cellWidth } = await import('../cell-width.js');
+  it('counts ASCII 1, wide and fullwidth East Asian 2, combining and zero-width 0', () => {
+    assert.equal(cellWidth('abc'), 3);
+    assert.equal(cellWidth('中a'), 3);
+    assert.equal(cellWidth('한글'), 4);
+    assert.equal(cellWidth('Ａ\u3000'), 4);
+    assert.equal(cellWidth('ｱ'), 1, 'halfwidth katakana');
+    assert.equal(cellWidth('e\u0301'), 1);
+    assert.equal(cellWidth('a\u200Bb'), 2);
+    assert.equal(cellWidth('ñ'), 1);
+  });
+  it('is null for ambiguous width, emoji and their components, controls, format and unassigned characters', () => {
+    for (const s of ['°', '─', 'é', 'λ', 'Я', '👍', '👍🏽', '❤\uFE0F', 'a\u200Db', '🇯🇵', '\t', '\u00AD', '\uE000', '\u{10FFFD}', '\u0378']) {
+      assert.equal(cellWidth(s), null, JSON.stringify(s));
     }
   });
 });

@@ -8,6 +8,7 @@
 import { execFileSync } from 'node:child_process';
 import { sendTmuxKeys } from '../tmux-send-keys.js';
 import { buildProcessTree, hasDescendantProcess } from './process-tree.js';
+import { cellWidth } from './cell-width.js';
 
 const CMD_TIMEOUT = 3000;
 const LAUNCH_TIMEOUT = 10_000;
@@ -108,7 +109,10 @@ export function tmuxPasteBuffer(session, tmpFile, bufferName) {
 // coordinates: the logical line through the cursor's row (wrapped rows
 // joined) must be exactly the verified prompt followed by the pasted text,
 // and the cursor must sit at the end of its own row. Otherwise no Enter (the
-// line is left as typed, no key is sent to clean it up) and the launch fails. Not distinguished: a shell builtin waiting for
+// line is left as typed, no key is sent to clean it up) and the launch fails.
+// Rows are measured in terminal cells, as cursor_x is (cell-width.js: wide
+// characters 2, combining marks 0); a prompt, command or row with a character
+// of uncertain width (East Asian ambiguous, emoji sequences) gets nothing. Not distinguished: a shell builtin waiting for
 // input (`read`, a heredoc continuation) looks exactly like an idle prompt to
 // tmux and /proc; the typed line would become that builtin's input. It cannot
 // reach an engine or its dialog, because an engine in the foreground (or as a
@@ -163,9 +167,13 @@ export async function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFi
   if (!own || !SHELL_NAMES.has(shellName(own.comm))) return { ok: false, reason: 'pane process is not a shell' };
   if ((tree.childrenOf.get(first.pid) || []).length > 0) return { ok: false, reason: 'shell is running a command' };
   const row = lastRow(first.id, execFileSyncImpl);
-  const atRowEnd = (pane, r) => r && pane.cursorY === r.y && pane.cursorX >= [...r.text].length && pane.cursorX <= [...r.text].length + 1;
+  // Cursor positions are terminal cells: a row whose width is not known with
+  // confidence (cell-width.js) is refused, nothing is typed.
+  const cells = row ? cellWidth(row.text) : null;
+  if (row && cells === null) return { ok: false, reason: 'last row has a character of uncertain width' };
+  const atRowEnd = (pane, r) => r && pane.cursorY === r.y && pane.cursorX >= cells && pane.cursorX <= cells + 1;
   if (!atRowEnd(first, row)) return { ok: false, reason: 'cursor is not at the end of the last row' };
-  if ([...row.text].length > PROMPT_ROW_MAX) return { ok: false, reason: 'last row is too long for a prompt' };
+  if (cells > PROMPT_ROW_MAX) return { ok: false, reason: 'last row is too long for a prompt' };
   await sleep(settleMs);
   const second = readPane(first.id, execFileSyncImpl);
   const again = lastRow(first.id, execFileSyncImpl);
@@ -212,7 +220,6 @@ function lineThroughRow(paneId, y, impl) {
 }
 
 const samePane = (now, pane) => Boolean(now) && now.id === pane.id && !now.dead && now.pid === pane.pid && now.command === pane.command;
-const width = (text) => [...text].length;
 
 /**
  * Paste `text` (from tmpFile) into the pane verified by
@@ -229,22 +236,26 @@ const width = (text) => [...text].length;
  */
 export async function tmuxPasteToVerifiedPane(pane, tmpFile, bufferName, text, { execFileSyncImpl = execFileSync,
   sendKeys = sendTmuxKeys, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), echoMs = 200 } = {}) {
+  const typed = String(text).replace(/\s+$/, '');
+  const promptCells = cellWidth(pane.promptRow);
+  if (promptCells === null || cellWidth(typed) === null) {
+    throw new Error(`the prompt or the command has a character of uncertain width; nothing typed`);
+  }
   const before = readPane(pane.id, execFileSyncImpl);
   const promptNow = before && rowAt(pane.id, before.cursorY, execFileSyncImpl);
   if (!samePane(before, pane) || before.cursorY !== pane.promptY || promptNow !== pane.promptRow
-      || before.cursorX < width(pane.promptRow) || before.cursorX > width(pane.promptRow) + 1) {
+      || before.cursorX < promptCells || before.cursorX > promptCells + 1) {
     throw new Error(`pane ${pane.id} is gone or changed since it was verified; nothing typed`);
   }
   execFileSyncImpl('tmux', ['load-buffer', '-b', bufferName, tmpFile], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   execFileSyncImpl('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', pane.id], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   await sleep(echoMs);
-  const typed = String(text).replace(/\s+$/, '');
   const expected = [`${pane.promptRow} ${typed}`, `${pane.promptRow}${typed}`];
   const after = readPane(pane.id, execFileSyncImpl);
   const line = after && lineThroughRow(pane.id, after.cursorY, execFileSyncImpl);
   const cursorRow = after && rowAt(pane.id, after.cursorY, execFileSyncImpl);
   if (!samePane(after, pane) || !expected.includes(line) || cursorRow === null || !cursorRow
-      || !line.endsWith(cursorRow) || after.cursorX !== width(cursorRow)) {
+      || !line.endsWith(cursorRow) || after.cursorX !== cellWidth(cursorRow)) {
     throw new Error(`pane ${pane.id} changed or does not show the pasted line at the cursor after the paste; not submitted (the line is left as typed)`);
   }
   sendKeys(pane.id, ['Enter'], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
