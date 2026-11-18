@@ -116,33 +116,72 @@ describe('single-session dispatcher delivery guard', () => {
     assert.match(keys()[0], /Escape$/);
   });
 
-  it('still sends the auto-approve Enter to a permission prompt', async () => {
-    resetLog();
-    screen(fx.PERMISSION_PROMPT_LIVE, [2, 12]);
-    const { id } = db.insertControl('[KEYSTROKE]Enter', { priority: 0, bypassState: true, appendAckSuffix: false });
-    assert.equal((await tick()).delivered, true);
-    assert.equal(control(id).status, 'done');
-    assert.equal(keys().length, 1);
+  // DELIVER-1: an unattended permission prompt takes cancellation only.
+  const promptRow = (capture) => capture.split('\n').findIndex((line) => line.includes('❯ 1. Yes'));
+  const final = (id) => db.getDb().prepare('SELECT status, last_error FROM control_queue WHERE id = ?').get(id);
+
+  it('sends no key but Escape to a permission prompt: Enter, a digit, y and text are superseded, never sent', async () => {
+    for (const capture of [fx.DANGEROUS_RM_PROMPT, fx.PERMISSION_PROMPT_LIVE]) {
+      for (const key of ['Enter', '1', 'y', 'hello']) {
+        resetLog();
+        screen(capture, [2, promptRow(capture)]);
+        const { id } = db.insertControl(`[KEYSTROKE]${key}`, { priority: 0, bypassState: true, appendAckSuffix: false });
+        assert.equal((await tick()).delivered, false);
+        assert.deepEqual(keys(), [], key);
+        assert.deepEqual(final(id), { status: 'superseded', last_error: 'PERMISSION_PROMPT' }, key);
+      }
+    }
   });
 
-  it('sends a dialog its own cancel key (Escape) although the dialog is unknown', async () => {
+  it('sends Escape to a permission prompt', async () => {
     resetLog();
-    screen(fx.UNKNOWN_DIALOG_LIVE, [2, 10]);
+    screen(fx.DANGEROUS_RM_PROMPT, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
     const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
     assert.equal((await tick()).delivered, true);
     assert.equal(control(id).status, 'done');
     assert.match(keys()[0], /Escape$/);
   });
 
-  it('never answers the dangerous-command safety prompt with Enter: the key is superseded', async () => {
+  it('pastes nothing and sends no Enter into a permission prompt: the message is held', async () => {
     resetLog();
-    const y = fx.DANGEROUS_RM_PROMPT.split('\n').findIndex((line) => line.includes('❯ 1. Yes'));
-    screen(fx.DANGEROUS_RM_PROMPT, [1, y]);
-    const { id } = db.insertControl('[KEYSTROKE]Enter', { priority: 0, bypassState: true, appendAckSuffix: false });
+    screen(fx.DANGEROUS_RM_PROMPT, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
+    const { id } = db.insertConversation('in', 'feishu', null, 'yes');
+    assert.equal((await tick()).delivered, false);
+    assert.equal(pastes().length, 0);
+    assert.deepEqual(keys(), []);
+    assert.equal(db.getDb().prepare('SELECT status FROM conversations WHERE id = ?').get(id).status, 'pending');
+    db.getDb().prepare("UPDATE conversations SET status = 'delivered' WHERE id = ?").run(id);
+  });
+
+  it('sends no key, Escape included, to an unknown dialog', async () => {
+    resetLog();
+    screen(fx.UNKNOWN_DIALOG_LIVE, [2, 10]);
+    const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
     assert.equal((await tick()).delivered, false);
     assert.deepEqual(keys(), []);
-    assert.deepEqual(db.getDb().prepare('SELECT status, last_error FROM control_queue WHERE id = ?').get(id),
-      { status: 'superseded', last_error: 'SAFETY_PROMPT' });
+    assert.equal(control(id).status, 'pending');
+    db.supersedeControl(id, 'TEST_DONE');
+  });
+
+  it('sends a dialog-bound Escape only while that very prompt is on the pane', async () => {
+    resetLog();
+    screen(fx.DANGEROUS_RM_PROMPT, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
+    const { detectModal } = await import('../tmux-input-state.js');
+    const promptId = detectModal(fx.DANGEROUS_RM_PROMPT).id;
+    const other = db.insertControl('[KEYSTROKE]Escape dialog=0123456789abcdef', { priority: 0, bypassState: true, appendAckSuffix: false });
+    await tick();
+    assert.deepEqual(keys(), [], 'another prompt id: not sent');
+    assert.deepEqual(final(other.id), { status: 'superseded', last_error: 'DIALOG_GONE' });
+    const mine = db.insertControl(`[KEYSTROKE]Escape dialog=${promptId}`, { priority: 0, bypassState: true, appendAckSuffix: false });
+    assert.equal((await tick()).delivered, true);
+    assert.equal(keys().length, 1);
+    assert.match(keys()[0], /Escape$/, 'only the key token reaches tmux');
+    assert.equal(control(mine.id).status, 'done');
+    idleComposer();
+    const late = db.insertControl(`[KEYSTROKE]Escape dialog=${promptId}`, { priority: 0, bypassState: true, appendAckSuffix: false });
+    await tick();
+    assert.equal(keys().length, 1, 'the prompt is gone: not sent');
+    assert.deepEqual(final(late.id), { status: 'superseded', last_error: 'DIALOG_GONE' });
   });
 });
 

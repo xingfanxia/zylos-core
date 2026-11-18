@@ -281,3 +281,21 @@ describe('getUnansweredDeliveredForInstance', () => {
     assert.equal(multi.getUnansweredDeliveredForInstance('group').length, 0); // already summarized
   });
 });
+
+// DELIVER-1 review: the primary instance also delivers the untargeted rows
+// (the dispatchers route them to it), so they count in its stuck backlog.
+describe('getUndeliveredInboundSummary', () => {
+  it('counts a persona\'s pending and claimed inbound rows; the primary also counts untargeted rows', () => {
+    conv({ target: 'admin' });
+    conv({ target: null });
+    conv({ target: 'user-pan', status: 'running' });
+    conv({ target: 'user-pan', status: 'delivered' });
+    conv({ dir: 'out', target: 'admin' });
+    assert.equal(dbMod.getUndeliveredInboundSummary('admin').count, 1);
+    assert.equal(dbMod.getUndeliveredInboundSummary('admin', { includeUntargeted: true }).count, 2);
+    assert.equal(dbMod.getUndeliveredInboundSummary('user-pan').count, 1);
+    assert.equal(dbMod.getUndeliveredInboundSummary(null).count, 1, 'single-session: the untargeted rows');
+    assert.equal(typeof dbMod.getUndeliveredInboundSummary('admin').oldestAt, 'number');
+    assert.deepEqual(dbMod.getUndeliveredInboundSummary('nobody'), { count: 0, oldestAt: null });
+  });
+});

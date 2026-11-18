@@ -161,7 +161,7 @@ import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scrip
 import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
 import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified,
-  getUndeliveredInboundSummary, supersedeControl } from '../../comm-bridge/scripts/c4-db.js';
+  getUndeliveredInboundSummary, getControlById, withdrawPendingControl } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
 import { createDialogWatch } from './dialog-watch.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
@@ -1280,17 +1280,29 @@ function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchA
   });
 }
 
+// The instance the dispatchers route untargeted rows to (c4-dispatcher-multi
+// multiSessionDispatch): the one marked primary, else the first.
+function routesUntargetedRows() {
+  if (!INSTANCE_ID || !_getAllInstances) return false;
+  const all = _getAllInstances() || [];
+  return (all.find(i => i.primary === true) ?? all[0])?.id === INSTANCE_ID;
+}
+
 // Dialog watch (dialog-watch.js): fed the pane read the tick already makes.
-// Keys and the decline notice go through the C4 control queue like the tool
-// watchdog's interrupt; alerts through the degraded alert's direct admin send.
+// The Escape and the decline message go through the C4 control queue, both
+// bound to the judged pane (--session-ref); the Escape also names the prompt
+// it cancels (dialog=<id>), which the dispatcher checks before sending it.
+// Alerts through the degraded alert's direct admin send.
 function createDialogWatchFor() {
   return createDialogWatch({
     instanceId: INSTANCE_ID,
-    enqueueKey: (key, sessionRef) => runC4Control(['enqueue', '--content', `[KEYSTROKE]${key}`, '--priority', '0',
-      '--bypass-state', '--no-ack-suffix', '--session-ref', sessionRef]),
-    withdrawKey: id => supersedeControl(id, 'DIALOG_GONE'),
-    enqueueNotice: text => runC4Control(['enqueue', '--content', text, '--priority', '1', '--no-ack-suffix']),
-    readUndelivered: () => getUndeliveredInboundSummary(INSTANCE_ID),
+    enqueueKey: (key, sessionRef, dialogId) => runC4Control(['enqueue', '--content', `[KEYSTROKE]${key} dialog=${dialogId}`,
+      '--priority', '0', '--bypass-state', '--no-ack-suffix', '--session-ref', sessionRef]),
+    controlStatus: id => getControlById(id)?.status ?? null,
+    withdrawKey: id => withdrawPendingControl(id, 'DIALOG_GONE'),
+    enqueueNotice: (text, sessionRef) => runC4Control(['enqueue', '--content', text, '--priority', '1', '--no-ack-suffix',
+      '--session-ref', sessionRef]),
+    readUndelivered: () => getUndeliveredInboundSummary(INSTANCE_ID, { includeUntargeted: routesUntargetedRows() }),
     notifyOperator: message => (ADMIN_CHAT_ID
       ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
       : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),

@@ -34,6 +34,7 @@ import {
   tmuxNewSession,
   getProcessName,
   hasChildProcess,
+  tmuxPaneAtShellPrompt,
 } from './tmux-helpers.js';
 import {
   buildCleanEnv,
@@ -464,6 +465,16 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     if (tmuxHasSession(SESSION)) {
       // Existing session — send command via sendMessage, no env rebuild.
+      // The command line and its Enter go only into a pane positively at an
+      // idle shell prompt. Typed into a running Claude, its composer or a
+      // permission prompt, Enter could submit or approve something
+      // (DELIVER-1, 2026-11-18). Otherwise nothing is typed: the launch fails
+      // and the guardian's failed-start handling (retry once, then hold and
+      // alert) takes over.
+      const prompt = tmuxPaneAtShellPrompt(SESSION);
+      if (!prompt.ok) {
+        throw new Error(`existing tmux session ${SESSION} is not at a shell prompt (${prompt.reason}); nothing typed`);
+      }
       // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
       const recoveryPrompt = upgradeStartupPrompt(ZYLOS_DIR);
       const envExports = [

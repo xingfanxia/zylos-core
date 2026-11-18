@@ -16,7 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getDb } from './c4-db.js';
+import { getDb, CONTROL_CLAIM_ORDER } from './c4-db.js';
 import { groupKeyFromEndpoint } from '../../multi-session/c4-helpers.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -102,18 +102,33 @@ export function getNextPendingForInstance(instanceId) {
   `).get(instanceId) || null;
 }
 
-// The dispatcher's per-call exclusions (c4-dispatcher-multi.js fair
-// selection): rows of `instances` are left out unless `allowed` (an SQL
-// predicate on the row) holds. A NULL-targeted row belongs to `primaryId`, the
-// instance it is routed to. Empty list: no clause.
-function heldClause(instances, primaryId, allowed = null) {
-  if (!instances?.length) return { sql: '', params: [] };
-  const placeholders = instances.map(() => '?').join(', ');
-  return {
-    sql: `\n      AND (COALESCE(target_instance, ?, '') NOT IN (${placeholders})${allowed ? ` OR ${allowed}` : ''})`,
-    params: [primaryId, ...instances],
-  };
+// The dispatcher's per-call holds (c4-dispatcher-multi.js fair selection):
+// once an instance has a held row of one class in a pass, the rest of that
+// class for that instance is left out of the claim queries for the pass.
+//   paste - a modal on the pane holds every pasted row: conversations and
+//           non-key controls;
+//   keys  - a modal that takes no key holds every [KEYSTROKE] control;
+//   idle  - a busy session holds every require_idle row;
+//   state - offline / unhealthy / suspended holds every non-bypass row.
+// A NULL-targeted row belongs to `primaryId`, the instance it is routed to.
+// `holds` = { paste, keys, idle, state } (instance id lists) + primaryId.
+const KEY_ROW = "substr(raw_content, 1, 11) = '[KEYSTROKE]'";
+
+function holdClauses(holds, classes) {
+  const sql = [];
+  const params = [];
+  for (const [name, predicate] of classes) {
+    const instances = holds?.[name];
+    if (!instances?.length) continue;
+    sql.push(`\n      AND NOT (COALESCE(target_instance, ?, '') IN (${instances.map(() => '?').join(', ')}) AND ${predicate})`);
+    params.push(holds.primaryId ?? null, ...instances);
+  }
+  return { sql: sql.join(''), params };
 }
+
+const CONVERSATION_CLASSES = [['paste', '1'], ['idle', 'require_idle = 1'], ['state', '1']];
+const CONTROL_CLASSES = [['paste', `NOT (${KEY_ROW})`], ['keys', KEY_ROW], ['idle', 'require_idle = 1'],
+  ['state', 'COALESCE(bypass_state, 0) = 0']];
 
 /**
  * Get the next pending conversation for any of the given online instances.
@@ -122,14 +137,12 @@ function heldClause(instances, primaryId, allowed = null) {
  * pending until the target comes online.
  *
  * @param {string[]} onlineInstanceIds - array of instance IDs currently online
- * @param {{ heldInstances?: string[], primaryId?: string|null }} [options] -
- *   instances whose rows are held for the rest of a dispatcher call: none of
- *   their rows is returned (NULL-targeted rows count as `primaryId`'s)
+ * @param {object} [holds] - this pass's holds (holdClauses above)
  * @returns {object|null} highest priority pending message for any online instance, or null
  */
-export function getNextPendingForInstances(onlineInstanceIds, { heldInstances = [], primaryId = null } = {}) {
+export function getNextPendingForInstances(onlineInstanceIds, holds = null) {
   const db = getDb();
-  const held = heldClause(heldInstances, primaryId);
+  const held = holdClauses(holds, CONVERSATION_CLASSES);
 
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     // No instances online — only return legacy NULL-targeted messages
@@ -206,34 +219,29 @@ export function getPendingTargetInstancesNeedingWake(onlineInstanceIds) {
 
 /**
  * Get the next pending control item filtered to online instances, with
- * available_at gate.
+ * available_at gate, in CONTROL_CLAIM_ORDER (an Escape key first within its
+ * priority).
  *
  * @param {number} currentTimestamp - unix seconds (for available_at comparison)
  * @param {string[]} onlineInstanceIds - array of instance IDs currently online
- * @param {{ keystrokeOnlyInstances?: string[], bypassOnlyInstances?: string[], primaryId?: string|null }} [options] -
- *   holds for the rest of a dispatcher call: a modal on the pane leaves only
- *   [KEYSTROKE] rows of that instance; offline/unhealthy/suspended leave only
- *   bypass-state rows (NULL-targeted rows count as `primaryId`'s)
+ * @param {object} [holds] - this pass's holds (holdClauses above)
  * @returns {object|null} next eligible control item, or null
  */
-export function getNextPendingControlForInstances(currentTimestamp, onlineInstanceIds,
-  { keystrokeOnlyInstances = [], bypassOnlyInstances = [], primaryId = null } = {}) {
+export function getNextPendingControlForInstances(currentTimestamp, onlineInstanceIds, holds = null) {
   const db = getDb();
-  const keystrokeOnly = heldClause(keystrokeOnlyInstances, primaryId, "substr(raw_content, 1, 11) = '[KEYSTROKE]'");
-  const bypassOnly = heldClause(bypassOnlyInstances, primaryId, 'bypass_state = 1');
-  const held = { sql: keystrokeOnly.sql + bypassOnly.sql, params: [...keystrokeOnly.params, ...bypassOnly.params] };
+  const held = holdClauses(holds, CONTROL_CLASSES);
 
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     // No instances online — only return legacy NULL-targeted controls
     return db.prepare(`
       SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
              status, retry_count, available_at, last_error, created_at, updated_at,
-             target_instance
+             target_instance, session_ref
       FROM control_queue
       WHERE status = 'pending'
         AND (available_at IS NULL OR available_at <= ?)
         AND target_instance IS NULL${held.sql}
-      ORDER BY COALESCE(priority, 3) ASC, id ASC
+      ORDER BY ${CONTROL_CLAIM_ORDER}
       LIMIT 1
     `).get(currentTimestamp, ...held.params) || null;
   }
@@ -243,12 +251,12 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
   return db.prepare(`
     SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
            status, retry_count, available_at, last_error, created_at, updated_at,
-           target_instance
+           target_instance, session_ref
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
       AND (target_instance IN (${placeholders}) OR target_instance IS NULL)${held.sql}
-    ORDER BY COALESCE(priority, 3) ASC, id ASC
+    ORDER BY ${CONTROL_CLAIM_ORDER}
     LIMIT 1
   `).get(currentTimestamp, ...onlineInstanceIds, ...held.params) || null;
 }

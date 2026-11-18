@@ -293,3 +293,21 @@ export const DANGEROUS_RM_PROMPT_WIDE = [
   '',
   ' Esc to cancel · Tab to amend',
 ].join('\n');
+
+// A benign formatted menu the assistant printed above an ordinary composer:
+// a `─` rule, a heading, dashed rules and a `❯`-marked list, all transcript.
+// No modal (base 2c37b3cd agreed); a classifier that skipped the column-0
+// dashed rules everywhere read it as an `unknown` dialog titled with the
+// heading (DELIVER-1 review, 2026-11-18).
+export const BENIGN_MENU_ABOVE_COMPOSER = [
+  ...transcript,
+  '⏺ Here is the menu you asked for:',
+  RULE,
+  '  Private Menu Heading',
+  DASHED,
+  '  ❯ Option A',
+  '    Option B',
+  DASHED,
+  '',
+  ...composer(),
+].join('\n');

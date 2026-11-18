@@ -1,5 +1,7 @@
-// Dialog watch (2026-11-18, user-pan): a dialog nobody can answer does not stay
-// in an unattended session, and delivery that does not happen is visible.
+// Dialog watch (2026-11-18, user-pan; DELIVER-1 review decisions): a
+// permission prompt nobody can answer is cancelled (Escape bound to that
+// prompt, never an approving key), any dialog that holds delivery is reported,
+// and delivery that does not happen is visible.
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
@@ -17,21 +19,30 @@ const UNKNOWN = detectModal(fx.UNKNOWN_DIALOG_LIVE);
 const FABLE = detectModal(fx.FABLE_LIMIT_LIVE);
 const T0 = Date.parse('2026-11-18T04:16:35Z');
 
-function harness({ sendOk = true, keyOk = true, keySent = true } = {}) {
+// `statusOf(id)`: what the dispatcher has done with an Escape control by now.
+function harness({ sendOk = true, keyOk = true, statusOf = () => 'done' } = {}) {
   const h = {
     t: T0, keys: [], withdrawn: [], notices: [], alerts: [], logs: [],
-    undelivered: { count: 0, oldestAt: null },
+    undelivered: { count: 0, oldestAt: null }, status: new Map(),
   };
   let nextId = 900;
   h.watch = createDialogWatch({
     instanceId: 'user-pan',
     now: () => h.t,
-    enqueueKey: (key, sessionRef) => {
-      h.keys.push({ key, sessionRef });
-      return keyOk ? { ok: true, output: `OK: enqueued control ${++nextId}` } : { ok: false, output: 'database is locked' };
+    enqueueKey: (key, sessionRef, dialogId) => {
+      h.keys.push({ key, sessionRef, dialogId });
+      if (!keyOk) return { ok: false, output: 'database is locked' };
+      const id = ++nextId;
+      h.status.set(id, 'pending');
+      return { ok: true, output: `OK: enqueued control ${id}` };
     },
-    withdrawKey: (id) => { h.withdrawn.push(id); return !keySent; },
-    enqueueNotice: (text) => { h.notices.push(text); return { ok: true, output: `OK: enqueued control ${++nextId}` }; },
+    controlStatus: (id) => statusOf(id, h),
+    withdrawKey: (id) => {
+      if (statusOf(id, h) !== 'pending') return false;
+      h.withdrawn.push(id);
+      return true;
+    },
+    enqueueNotice: (text, sessionRef) => { h.notices.push({ text, sessionRef }); return { ok: true, output: `OK: enqueued control ${++nextId}` }; },
     readUndelivered: () => h.undelivered,
     notifyOperator: async (message) => { h.alerts.push(message); return { ok: typeof sendOk === 'function' ? sendOk() : sendOk }; },
     log: (line) => h.logs.push(line),
@@ -47,38 +58,57 @@ function harness({ sendOk = true, keyOk = true, keySent = true } = {}) {
 }
 
 describe('dialog watch: a permission prompt nobody can answer', () => {
-  it('the incident prompt reads as a permission prompt with its own advice', () => {
+  it('the incident prompt is positively identified, with its own advice and an id', () => {
     assert.equal(RM_PROMPT.kind, 'permission');
     assert.equal(RM_PROMPT.text, 'Bash command');
     assert.match(RM_PROMPT.notice, /rewrite it as "\$\{D:\?\}"\/\* or use a literal path/);
+    assert.match(RM_PROMPT.id, /^[0-9a-f]{16}$/);
   });
 
-  it('is declined with one Escape bound to its pane after 60 s; never Enter, never an option number', async () => {
+  it('is cancelled after 60 s with one Escape bound to its pane and to that prompt; never any other key', async () => {
     const h = harness();
     await h.run(59 * SEC, { modal: RM_PROMPT });
     assert.deepEqual(h.keys, [], 'nothing before the grace');
     await h.run(10 * MIN, { modal: RM_PROMPT });
-    assert.deepEqual(h.keys, [{ key: 'Escape', sessionRef: PANE }]);
-    assert.ok(h.logs.some((l) => /permission dialog "Bash command" on screen 60s; Escape queued \(control 901\)/.test(l)));
+    assert.deepEqual(h.keys, [{ key: 'Escape', sessionRef: PANE, dialogId: RM_PROMPT.id }]);
+    assert.ok(h.logs.some((l) => /permission prompt "Bash command" on screen 60s; Escape queued \(control 901\)/.test(l)));
   });
 
-  it('tells the session once, after the prompt is gone, quoting only the prompt\'s own rows', async () => {
+  it('announces the decline once, bound to the same session, only after the Escape was sent and the prompt is gone', async () => {
     const h = harness();
     await h.run(61 * SEC, { modal: RM_PROMPT });
     assert.deepEqual(h.notices, [], 'not while the prompt is still up');
     await h.run(2 * MIN, { modal: null });
-    assert.deepEqual(h.withdrawn, [901], 'the Escape was already sent: nothing to withdraw');
+    assert.deepEqual(h.withdrawn, [], 'the Escape was sent: nothing to withdraw');
     assert.equal(h.notices.length, 1);
-    assert.equal(h.notices[0], formatDeclinedNotice({ title: 'Bash command', notice: fx.DANGEROUS_RM_NOTICE }));
-    assert.match(h.notices[0], /"Bash command" \/ "Dangerous rm operation on possibly-empty variable path: .*use a literal path\)"/);
-    assert.match(h.notices[0], /Rewrite the command as the prompt advised/);
+    assert.deepEqual(h.notices[0], { text: formatDeclinedNotice({ title: 'Bash command', notice: fx.DANGEROUS_RM_NOTICE }), sessionRef: PANE });
+    assert.match(h.notices[0].text, /"Bash command" \/ "Dangerous rm operation on possibly-empty variable path: .*use a literal path\)"/);
   });
 
-  it('a prompt that closes by itself before the Escape went out: the Escape is withdrawn and nothing is said', async () => {
-    const h = harness({ keySent: false });
+  it('a prompt that closes by itself while its Escape is still pending: the Escape is withdrawn and nothing is said', async () => {
+    const h = harness({ statusOf: () => 'pending' });
     await h.run(61 * SEC, { modal: RM_PROMPT });
     await h.run(70 * SEC, { modal: null });
     assert.deepEqual(h.withdrawn, [901]);
+    assert.deepEqual(h.notices, []);
+  });
+
+  it('an Escape already claimed is waited for; announced only once it is done', async () => {
+    let status = 'running';
+    const h = harness({ statusOf: () => status });
+    await h.run(61 * SEC, { modal: RM_PROMPT });
+    await h.run(90 * SEC, { modal: null });
+    assert.deepEqual(h.withdrawn, []);
+    assert.deepEqual(h.notices, [], 'not while the dispatcher is still sending it');
+    status = 'done';
+    await h.run(95 * SEC, { modal: null });
+    assert.equal(h.notices.length, 1);
+  });
+
+  it('an Escape the dispatcher superseded (its prompt was no longer on the pane) announces nothing', async () => {
+    const h = harness({ statusOf: () => 'superseded' });
+    await h.run(61 * SEC, { modal: RM_PROMPT });
+    await h.run(70 * SEC, { modal: null });
     assert.deepEqual(h.notices, []);
   });
 
@@ -89,7 +119,17 @@ describe('dialog watch: a permission prompt nobody can answer', () => {
     assert.deepEqual(h.notices, []);
   });
 
-  it('a prompt answered within the grace (an auto-approve elsewhere) gets no key and no notice', async () => {
+  it('a different prompt on the same pane is a new prompt with its own grace and Escape', async () => {
+    const h = harness();
+    const other = detectModal(fx.DANGEROUS_RM_PROMPT.replaceAll('rm -f $D/*', 'rm -f $E/*'));
+    await h.run(61 * SEC, { modal: RM_PROMPT });
+    await h.run(100 * SEC, { modal: other });
+    assert.equal(h.keys.length, 1, 'the second prompt is 39 s old');
+    await h.run(125 * SEC, { modal: other });
+    assert.deepEqual(h.keys.map((k) => k.dialogId), [RM_PROMPT.id, other.id]);
+  });
+
+  it('a prompt answered within the grace gets no key and no notice', async () => {
     const h = harness();
     await h.run(5 * SEC, { modal: RM_PROMPT });
     await h.run(3 * MIN, { modal: null });
@@ -101,7 +141,7 @@ describe('dialog watch: a permission prompt nobody can answer', () => {
     const h = harness({ keyOk: false });
     await h.run(5 * MIN, { modal: RM_PROMPT });
     assert.equal(h.keys.length, 1);
-    assert.ok(h.logs.some((l) => /Escape for permission dialog "Bash command" not queued \(database is locked\)/.test(l)));
+    assert.ok(h.logs.some((l) => /Escape for permission prompt "Bash command" not queued \(database is locked\)/.test(l)));
   });
 
   it('an unreadable frame neither ends the prompt nor restarts its clock', async () => {
@@ -109,56 +149,63 @@ describe('dialog watch: a permission prompt nobody can answer', () => {
     await h.run(30 * SEC, { modal: RM_PROMPT });
     await h.run(40 * SEC, { modal: null, captureOk: false });
     await h.run(61 * SEC, { modal: RM_PROMPT });
-    assert.deepEqual(h.keys, [{ key: 'Escape', sessionRef: PANE }], '60 s after it first appeared');
+    assert.equal(h.keys.length, 1, '60 s after it first appeared');
   });
 });
 
-describe('dialog watch: other dialogs', () => {
-  it('an unknown dialog gets one Escape after 2 min and no session notice', async () => {
-    const h = harness();
-    await h.run(119 * SEC, { modal: UNKNOWN });
-    assert.deepEqual(h.keys, []);
-    await h.run(30 * MIN, { modal: UNKNOWN });
-    assert.deepEqual(h.keys, [{ key: 'Escape', sessionRef: PANE }]);
-    await h.run(31 * MIN, { modal: null });
-    assert.deepEqual(h.notices, []);
-  });
-
-  it('the Fable guard\'s dialogs get no key from here', async () => {
-    for (const modal of [FABLE, { kind: 'credits_offer', text: 'Claude Fable 5.2 now uses usage credits' }, { kind: 'usage_overlay', text: 'usage overlay' }]) {
+describe('dialog watch: no key to any other dialog', () => {
+  it('an unknown dialog, the Fable guard\'s dialogs and the usage overlay get no key, ever', async () => {
+    for (const modal of [UNKNOWN, FABLE, { kind: 'credits_offer', text: 'Claude Fable 5.2 now uses usage credits' }, { kind: 'usage_overlay', text: 'usage overlay' }]) {
       const h = harness();
       await h.run(30 * MIN, { modal });
       assert.deepEqual(h.keys, [], modal.kind);
+      await h.run(31 * MIN, { modal: null });
+      assert.deepEqual(h.notices, [], modal.kind);
     }
+  });
+
+  it('the benign menu printed above a composer is no dialog at all', () => {
+    assert.equal(detectModal(fx.BENIGN_MENU_ABOVE_COMPOSER), null);
   });
 });
 
 describe('dialog watch: operator alert while a dialog holds delivery', () => {
-  it('5 min after the dialog first held a message, once, then at most hourly; persona, kind, title, ages, no content', async () => {
+  it('5 min after the dialog first held a message, once, then at most hourly; an unknown dialog\'s rows never quoted', async () => {
     const h = harness();
-    await h.run(2 * MIN, { modal: FABLE });
+    const secret = { kind: 'unknown', text: 'Private Menu Heading' };
+    await h.run(2 * MIN, { modal: secret });
     h.undelivered = { count: 3, oldestAt: T0 + 2 * MIN };
-    await h.run(7 * MIN - 2 * SEC, { modal: FABLE });
+    await h.run(7 * MIN - 2 * SEC, { modal: secret });
     assert.deepEqual(h.alerts, [], 'not 5 min after the dialog appeared: 5 min after it first held a message');
-    await h.run(7 * MIN + 30 * SEC, { modal: FABLE });
+    await h.run(7 * MIN + 30 * SEC, { modal: secret });
     assert.equal(h.alerts.length, 1);
     assert.match(h.alerts[0], /^🔴 pan 的会话被对话框卡住/);
-    assert.match(h.alerts[0], /fable_limit「You've reached your Fable limit」/);
+    assert.match(h.alerts[0], /对话框：unknown，已在屏幕上 7 分钟，挡住投递 5 分钟。/);
     assert.match(h.alerts[0], /等待送达：3 条/);
-    assert.match(h.alerts[0], /Fable 守护处理/);
-    await h.run(67 * MIN - 2 * SEC, { modal: FABLE });
+    assert.match(h.alerts[0], /这类对话框不会自动按键/);
+    await h.run(67 * MIN - 2 * SEC, { modal: secret });
     assert.equal(h.alerts.length, 1, 'no repeat within the hour');
-    await h.run(68 * MIN, { modal: FABLE });
+    await h.run(68 * MIN, { modal: secret });
     assert.equal(h.alerts.length, 2, 'repeated once an hour while it lasts');
+    for (const text of [...h.alerts, ...h.logs]) assert.doesNotMatch(text, /Private Menu Heading/, text);
+  });
+
+  it('a permission prompt\'s alert names its title row, never its notice', async () => {
+    const h = harness({ statusOf: () => 'superseded' });
+    h.undelivered = { count: 1, oldestAt: T0 };
+    await h.run(6 * MIN, { modal: RM_PROMPT });
+    assert.equal(h.alerts.length, 1);
+    assert.match(h.alerts[0], /permission「Bash command」/);
+    assert.match(h.alerts[0], /已自动按过一次 Esc/);
+    assert.doesNotMatch(h.alerts[0], /Dangerous|rm -f/);
   });
 
   it('a failed send is tried again a minute later, then stops once sent', async () => {
     let calls = 0;
     const h = harness({ sendOk: () => ++calls > 1 });
     h.undelivered = { count: 1, oldestAt: T0 };
-    await h.run(9 * MIN, { modal: UNKNOWN });
+    await h.run(9 * MIN, { modal: FABLE });
     assert.equal(h.alerts.length, 2, 'one failed send, one retry a minute later');
-    assert.match(h.alerts[1], /已自动按过一次 Esc/);
   });
 
   it('a dialog that held nothing raises no alert', async () => {
@@ -192,7 +239,7 @@ describe('dialog watch: stuck delivery is visible', () => {
     assert.ok(h.logs.includes('Dialog watch: undelivered backlog cleared'));
   });
 
-  it('a dialog holding the backlog: one alert (the dialog\'s), and the status names the dialog', async () => {
+  it('a dialog holding the backlog: one alert (the dialog\'s), and the status names the dialog kind', async () => {
     const h = harness();
     h.undelivered = { count: 10, oldestAt: T0 };
     await h.run(15 * MIN, { modal: UNKNOWN });
@@ -209,7 +256,7 @@ describe('dialog watch: stuck delivery is visible', () => {
     assert.deepEqual(h.alerts, []);
   });
 
-  it('logs carry kinds, titles, counts and ages only', async () => {
+  it('logs carry kinds, a permission prompt\'s title, counts and ages only', async () => {
     const h = harness();
     h.undelivered = { count: 4, oldestAt: T0 };
     await h.run(20 * MIN, { modal: RM_PROMPT });
@@ -221,7 +268,6 @@ describe('dialog watch: stuck delivery is visible', () => {
 describe('dialog watch timing', () => {
   it('is the designed timing', () => {
     assert.equal(DIALOG_WATCH_TIMING.permissionGraceMs, 60 * SEC);
-    assert.equal(DIALOG_WATCH_TIMING.otherGraceMs, 2 * MIN);
     assert.equal(DIALOG_WATCH_TIMING.heldAlertAfterMs, 5 * MIN);
     assert.equal(DIALOG_WATCH_TIMING.alertRepeatMs, 60 * MIN);
     assert.equal(DIALOG_WATCH_TIMING.stuckAfterMs, 10 * MIN);

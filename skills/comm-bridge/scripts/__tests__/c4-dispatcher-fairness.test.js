@@ -93,7 +93,10 @@ function pass(screens, { agentState = () => LIVE } = {}) {
 }
 
 const UNKNOWN = { kind: 'unknown', text: 'Something new needs your answer' };
-const SAFETY = { kind: 'permission', text: 'Bash command', notice: 'Dangerous rm operation on possibly-empty variable path: $D/* in `rm -f $D/*` (rewrite it as "${D:?}"/* or use a literal path)' };
+const { detectModal } = await import('../tmux-input-state.js');
+const fx = await import('./fixtures/claude-dialogs.js');
+// The incident prompt as the pane read classifies it (kind, title, notice, id).
+const PROMPT = detectModal(fx.DANGEROUS_RM_PROMPT);
 
 describe('fair selection across personas', () => {
   it('ten rows held behind one persona\'s dialog: a later row for another persona is delivered on the next pass', async () => {
@@ -130,33 +133,72 @@ describe('fair selection across personas', () => {
   });
 });
 
-describe('a dialog\'s own cancel key is never held behind other rows of its persona', () => {
-  it('Escape reaches an unknown dialog although a message and another key of the same persona are held', async () => {
+describe('fair selection for every row class (DELIVER-1 review)', () => {
+  it('ten deferred key controls of one persona use one attempt: another persona\'s message is delivered on the next pass', async () => {
+    const keys = Array.from({ length: 10 }, (_, i) => control('user-pan', `[KEYSTROKE]F${i + 1}`, { bypass: true }));
+    const elaine = conversation('user-elaine', '2026-11-18 07:57:00');
+    const { result, pastes, keys: sent } = await pass({ 'user-pan': UNKNOWN });
+    assert.equal(result.delivered, true);
+    assert.deepEqual(pastes.map((p) => p.deliveryId), [`conversation:${elaine}`]);
+    assert.deepEqual(sent, []);
+    for (const id of keys) assert.equal(ctl(id).status, 'pending', 'held, released, never sent');
+  });
+
+  it('ten idle-only controls of a busy persona use one attempt: its neighbour\'s message is delivered on the next pass', async () => {
+    const idle = Array.from({ length: 10 }, (_, i) => dbMod.insertControl(`/clear ${i}`, { priority: 1, requireIdle: true,
+      appendAckSuffix: false, targetInstance: 'user-pan' }).id);
+    const elaine = conversation('user-elaine', '2026-11-18 07:57:00');
+    const { result, pastes } = await pass({}, { agentState: (id) => (id === 'user-pan' ? { ...LIVE, state: 'busy', idleSeconds: 0 } : LIVE) });
+    assert.equal(result.delivered, true);
+    assert.deepEqual(pastes.map((p) => p.deliveryId), [`conversation:${elaine}`]);
+    for (const id of idle) assert.equal(ctl(id).status, 'pending');
+  });
+
+  it('the Escape for a permission prompt is claimed first: before older keys and messages of the same persona', async () => {
     conversation('user-pan', '2026-11-18 04:20:00');
-    const heartbeat = control('user-pan', 'Heartbeat check. [phase=primary]', { bypass: true });
-    const enter = control('user-pan', '[KEYSTROKE]Enter', { bypass: true });
-    const escape = control('user-pan', '[KEYSTROKE]Escape', { bypass: true });
-    const { result, keys } = await pass({ 'user-pan': UNKNOWN });
+    const older = ['Enter', '1', '2', '3', 'y', 'n', 'a', 'b', 'c', 'd'].map((k) => control('user-pan', `[KEYSTROKE]${k}`, { bypass: true }));
+    const escape = control('user-pan', `[KEYSTROKE]Escape dialog=${PROMPT.id}`, { bypass: true });
+    const { result, keys } = await pass({ 'user-pan': PROMPT });
     assert.equal(result.delivered, true);
     assert.deepEqual(keys, [{ target: '%2', key: 'Escape' }]);
     assert.equal(ctl(escape).status, 'done');
-    assert.equal(ctl(enter).status, 'pending', 'any other key stays held while the dialog is up');
-    assert.equal(ctl(heartbeat).status, 'pending');
+    for (const id of older) assert.equal(ctl(id).status, 'pending', 'not even claimed this pass');
   });
+});
 
-  it('an Enter never answers a safety prompt: it is superseded, and the Escape declines the prompt', async () => {
-    const enter = control('user-pan', '[KEYSTROKE]Enter', { bypass: true });
-    const escape = control('user-pan', '[KEYSTROKE]Escape', { bypass: true });
-    const { keys } = await pass({ 'user-pan': SAFETY });
-    assert.deepEqual(keys, [{ target: '%2', key: 'Escape' }]);
-    assert.deepEqual(ctl(enter), { status: 'superseded', last_error: 'SAFETY_PROMPT' });
-    assert.equal(ctl(escape).status, 'done');
-  });
-
-  it('no key from the queue reaches a Fable-guard dialog, Escape included', async () => {
-    const escape = control('user-pan', '[KEYSTROKE]Escape', { bypass: true });
-    const { keys } = await pass({ 'user-pan': { kind: 'fable_limit', text: "You've reached your Fable limit" } });
+describe('cancellation only, bound to its prompt', () => {
+  it('no key but Escape reaches a permission prompt: an Enter, a digit, y or text queued for it is superseded', async () => {
+    const approving = ['Enter', '1', 'y', 'hello'].map((k) => control('user-pan', `[KEYSTROKE]${k}`, { bypass: true }));
+    const { keys } = await pass({ 'user-pan': PROMPT });
     assert.deepEqual(keys, []);
-    assert.equal(ctl(escape).status, 'pending');
+    for (const id of approving) assert.deepEqual(ctl(id), { status: 'superseded', last_error: 'PERMISSION_PROMPT' });
+  });
+
+  it('a pasted message is never delivered to a permission prompt: it is held', async () => {
+    const id = conversation('user-pan', '2026-11-18 04:20:00');
+    const { pastes } = await pass({ 'user-pan': PROMPT });
+    assert.deepEqual(pastes, []);
+    assert.equal(conv(id).status, 'pending');
+  });
+
+  it('a dialog-bound Escape is superseded once its prompt is gone or replaced by another one', async () => {
+    const gone = control('user-pan', `[KEYSTROKE]Escape dialog=${PROMPT.id}`, { bypass: true });
+    let run = await pass({});
+    assert.deepEqual(run.keys, []);
+    assert.deepEqual(ctl(gone), { status: 'superseded', last_error: 'DIALOG_GONE' });
+    const other = control('user-pan', `[KEYSTROKE]Escape dialog=${PROMPT.id}`, { bypass: true });
+    run = await pass({ 'user-pan': { ...PROMPT, id: 'fedcba9876543210' } });
+    assert.deepEqual(run.keys, []);
+    assert.deepEqual(ctl(other), { status: 'superseded', last_error: 'DIALOG_GONE' });
+  });
+
+  it('no key from the queue reaches an unknown or a Fable-guard dialog, Escape included', async () => {
+    for (const modal of [UNKNOWN, { kind: 'fable_limit', text: "You've reached your Fable limit" }]) {
+      db.exec('DELETE FROM control_queue;');
+      const escape = control('user-pan', '[KEYSTROKE]Escape', { bypass: true });
+      const { keys } = await pass({ 'user-pan': modal });
+      assert.deepEqual(keys, [], modal.kind);
+      assert.equal(ctl(escape).status, 'pending');
+    }
   });
 });

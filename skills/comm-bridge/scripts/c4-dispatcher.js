@@ -418,17 +418,14 @@ export function sendTarget(paneIdentity, session) {
   return match ? match[1] : session;
 }
 
-// Dialogs owned by the Fable guard: no raw key reaches them from the queue.
-const GUARD_OWNED_MODALS = new Set(['fable_limit', 'credits_offer', 'usage_overlay']);
-
-// Raw keys are withheld while a modal owns the keyboard, with two exceptions:
-// a permission prompt (answering it is what the auto-approve [KEYSTROKE]Enter
-// is for), and Escape, the cancel key a dialog names itself ("Esc to cancel"),
-// which reaches any dialog the Fable guard does not own. The activity monitor's
-// dialog watch sends it to decline a dialog nobody can answer.
+// Raw keys while a modal owns the keyboard (2026-11-18, DELIVER-1): an
+// unattended permission prompt takes cancellation only. Escape (the cancel
+// key the prompt names) is the one key it may receive; any other key,
+// whatever its origin or age, is never sent to it (fenceKeystrokeControl
+// supersedes it). Every other modal (Fable-limit and credits dialogs, the
+// usage overlay, any unknown dialog) receives no key at all.
 export function keystrokeBlockedByModal(modal, key = null) {
-  if (!modal || modal.kind === 'permission') return false;
-  return !(key === 'Escape' && !GUARD_OWNED_MODALS.has(modal.kind));
+  return !!modal && !(modal.kind === 'permission' && key === 'Escape');
 }
 
 /**
@@ -451,11 +448,15 @@ export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl =
  *               sessionRef, or unbound and queued before this session started
  *               or in the same second (created_at and session_created are
  *               whole seconds, so a same-second key is ambiguous and fenced)
- *               An Enter for a permission prompt that shows a safety notice
- *               (a check Claude Code will not let any rule approve) is
- *               superseded too: it would select "1. Yes" (SAFETY_PROMPT)
- *   defer     - a modal owns the keyboard and does not take this key
- *               (keystrokeBlockedByModal)
+ *               Any key but Escape claimed while a permission prompt is up
+ *               is superseded too (PERMISSION_PROMPT): a prompt nobody can
+ *               answer is only ever cancelled, so no key may approve it
+ *               (Enter, a digit, y, text), however old or whoever queued it.
+ *               A dialog-bound Escape (`[KEYSTROKE]Escape dialog=<id>`, the
+ *               activity monitor's dialog watch) is superseded unless that
+ *               very prompt (same pane, same prompt id) is still on screen
+ *               (DIALOG_GONE)
+ *   defer     - any other modal owns the keyboard (keystrokeBlockedByModal)
  *   deliver   - send the key
  * An unbound key is bound to the pane read here before any deferral, so a
  * later requeue or orphan reset can never move it to a replacement session.
@@ -471,10 +472,14 @@ export function fenceKeystrokeControl(item, target, { bind = bindControlSession 
     return { action: 'supersede', reason: 'SESSION_PREDATES' };
   }
   const key = parseKeystrokeKey(item.content);
-  if (key === 'Enter' && target.modal?.kind === 'permission' && target.modal.notice) {
-    return { action: 'supersede', reason: 'SAFETY_PROMPT' };
+  const dialogId = parseKeystrokeDialog(item.content);
+  const modal = target.modal;
+  if (dialogId) {
+    return key === 'Escape' && modal?.kind === 'permission' && modal.id === dialogId
+      ? { action: 'deliver' } : { action: 'supersede', reason: 'DIALOG_GONE' };
   }
-  if (keystrokeBlockedByModal(target.modal, key)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
+  if (modal?.kind === 'permission' && key !== 'Escape') return { action: 'supersede', reason: 'PERMISSION_PROMPT' };
+  if (keystrokeBlockedByModal(modal, key)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
   return { action: 'deliver' };
 }
 
@@ -646,6 +651,14 @@ async function sendToTmux(message, options = {}) {
   if (receipts.has(receiptKey)) return receipts.get(receiptKey);
   let pending = submissions.get(session);
   let initial = readState();
+  // A row bound to one session (control_queue.session_ref, e.g. the dialog
+  // watch's decline message) goes to that pane only, never to a replacement.
+  // Decided by this first read, before anything is pasted.
+  if (options.boundSessionRef && initial.captureOk !== false && initial.paneIdentity
+      && initial.paneIdentity !== options.boundSessionRef) {
+    return 'session_replaced';
+  }
+  if (options.boundSessionRef && !initial.paneIdentity) return 'verify_failed';
   if (pending && wasReplaced(pending, initial) && pending.modalDeferred && !pending.enterSent) {
     // The old pane never got Enter for this text (a modal held it back), so it
     // cannot have run there; the replacement pane receives a fresh paste.
@@ -789,8 +802,17 @@ export function isKeystrokeControl(item) {
   return item.type === 'control' && (item.content || '').startsWith('[KEYSTROKE]');
 }
 
+// `[KEYSTROKE]<key>` optionally followed by ` dialog=<id>`: the key is the
+// first token only; the dialog id binds a cancellation to one permission
+// prompt (fenceKeystrokeControl). Older dispatchers would send the whole rest
+// as one tmux key name, so the dialog watch must never run ahead of this
+// dispatcher (DELIVER-1 deploy order).
 export function parseKeystrokeKey(content) {
-  return (content || '').slice('[KEYSTROKE]'.length).trim();
+  return (content || '').slice('[KEYSTROKE]'.length).trim().split(/\s+/)[0] || '';
+}
+
+export function parseKeystrokeDialog(content) {
+  return /\sdialog=([0-9a-f]{16})\s*$/.exec((content || '').slice('[KEYSTROKE]'.length))?.[1] ?? null;
 }
 
 /**
@@ -1170,9 +1192,16 @@ async function processNextMessage() {
     result = await sendToTmux(deliveryContent, {
       deliveryId: `${item.type}:${item.id}`,
       strictVerify: item.type === 'conversation',
-      acceptShutdownAfterSubmit: isCodexExitLifecycleControl(item)
+      acceptShutdownAfterSubmit: isCodexExitLifecycleControl(item),
+      boundSessionRef: item.type === 'control' ? item.session_ref || null : null,
     });
   } finally { deliveryTrace = {}; }
+
+  if (result === 'session_replaced') {
+    supersedeControl(item.id, 'SESSION_REPLACED');
+    log(`Superseded control id=${item.id}: bound to a session that has been replaced`);
+    return { delivered: false, state: agentState.state };
+  }
 
   if (result === 'modal_deferred') {
     // Not delivered and not a failure: no retry is consumed; the row is

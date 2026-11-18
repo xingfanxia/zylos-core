@@ -38,10 +38,10 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 /**
  * Maximum items to attempt per processWithMultiSession call before giving up.
  * Prevents unbounded looping when every claimed item is for an offline instance.
- * Held rows of one instance never use it up for the others: once a row is held
- * for an instance-wide reason (modal, offline, unhealthy, suspended), the rows
- * of that instance held for the same reason are left out of every later claim
- * in the same call (see "Fair selection" in processWithMultiSession).
+ * Held rows of one instance never use it up for the others: once an instance
+ * has a held row of one class, the rest of that class for that instance is
+ * left out of every later claim in the same call (see "Fair selection" in
+ * processWithMultiSession).
  */
 const MAX_SKIP_ATTEMPTS = 10;
 
@@ -478,27 +478,28 @@ export async function processWithMultiSession(helpers) {
   const heldReasons = {};
   let inFlight = null;
 
-  // Fair selection across instances (2026-11-18): once a row is held for a
-  // reason that holds every such row of its instance, the claim queries leave
-  // those rows out for the rest of this call, so they can neither use up
-  // MAX_SKIP_ATTEMPTS nor hide another instance's rows. Ten rows held behind
-  // user-pan's dialog had kept user-elaine's rows from ever being claimed
-  // (state=skip_exhausted for 70 min).
-  //   - a modal on the pane holds everything but raw keys: only [KEYSTROKE]
-  //     controls stay claimable (the dialog's own cancel key among them);
-  //   - offline / unhealthy / suspended hold everything but bypass-state
-  //     controls, which multiSessionDispatch delivers regardless.
+  // Fair selection across instances (2026-11-18): the same rule for every row
+  // class. Once an instance has a held row of a class in this call, the claim
+  // queries leave the rest of that class for that instance out (the held rows
+  // stay held), so they can neither use up MAX_SKIP_ATTEMPTS nor hide another
+  // instance's rows. Ten rows held behind user-pan's dialog had kept
+  // user-elaine's rows from ever being claimed (state=skip_exhausted, 70 min).
+  //   paste - a modal on the pane: conversations and non-key controls;
+  //   keys  - a modal that takes no key: [KEYSTROKE] controls;
+  //   idle  - the session is not idle: require_idle rows;
+  //   state - offline / unhealthy / suspended: non-bypass rows.
+  // An Escape is claimed before any other control of its priority
+  // (CONTROL_CLAIM_ORDER), and a permission prompt never defers it, so the
+  // cancellation of a prompt is never held behind that prompt's other rows.
   // Untargeted rows route to the primary instance and share its holds.
   const allInstances = getAllInstances();
   const primaryId = (allInstances.find((i) => i.primary === true) ?? allInstances[0])?.id ?? null;
-  const modalHeld = new Set();
-  const stateHeld = new Set();
-  const holdInstance = (item, set) => set.add(item.target_instance || primaryId);
+  const holds = { paste: new Set(), keys: new Set(), idle: new Set(), state: new Set() };
+  const holdClass = (item, name) => holds[name].add(item.target_instance || primaryId);
+  const holdLists = () => ({ primaryId, ...Object.fromEntries(Object.entries(holds).map(([k, v]) => [k, [...v]])) });
   const claimQueries = {
-    getNextPendingForInstances: (ids) => getNextPendingForInstances(ids,
-      { heldInstances: [...new Set([...modalHeld, ...stateHeld])], primaryId }),
-    getNextPendingControlForInstances: (now, ids) => getNextPendingControlForInstances(now, ids,
-      { keystrokeOnlyInstances: [...modalHeld], bypassOnlyInstances: [...stateHeld], primaryId }),
+    getNextPendingForInstances: (ids) => getNextPendingForInstances(ids, holdLists()),
+    getNextPendingControlForInstances: (now, ids) => getNextPendingControlForInstances(now, ids, holdLists()),
   };
 
   // Additive result summary so the dispatcher heartbeat can report WHY nothing
@@ -508,12 +509,10 @@ export async function processWithMultiSession(helpers) {
   const noteHeld = (category) => { heldReasons[category] = (heldReasons[category] || 0) + 1; };
   // A modal owns that instance's keyboard: hold the row for this cycle (no
   // retry consumed, never marked delivered) and keep serving other instances.
-  // A raw key the modal does not take is held for itself only: the next key
-  // of the same instance may be the dialog's own cancel key.
-  const holdForModal = (item, kind, { instanceWide = true } = {}) => {
+  const holdForModal = (item, kind, holdClassName) => {
     heldItems.push(item);
     noteHeld('modal');
-    if (instanceWide) holdInstance(item, modalHeld);
+    holdClass(item, holdClassName);
     inFlight = null;
     log(`Held ${item.type} id=${item.id} for ${item.target_instance || 'default'}: modal${kind ? `=${kind}` : ''} owns the keyboard`);
   };
@@ -550,7 +549,7 @@ export async function processWithMultiSession(helpers) {
       if (decision.action === 'requeue') {
         heldItems.push(item);
         noteHeld(decision.reasonCategory);
-        holdInstance(item, stateHeld);
+        holdClass(item, 'state');
         inFlight = null;
         log(`Held for requeue ${item.type} id=${item.id}: ${decision.reason}`);
         continue;
@@ -560,7 +559,7 @@ export async function processWithMultiSession(helpers) {
       if (decision.action === 'skip') {
         heldItems.push(item);
         noteHeld(decision.reasonCategory);
-        holdInstance(item, stateHeld);
+        holdClass(item, 'state');
         inFlight = null;
         continue;
       }
@@ -574,6 +573,7 @@ export async function processWithMultiSession(helpers) {
       if (item.require_idle === 1 && (claudeState.state !== 'idle' || claudeState.idleSeconds < 3)) {
         heldItems.push(item);
         noteHeld('require_idle');
+        holdClass(item, 'idle');
         inFlight = null;
         continue;
       }
@@ -607,7 +607,7 @@ export async function processWithMultiSession(helpers) {
         const target = readKeystrokeTarget ? readKeystrokeTarget(session) : null;
         const fence = target ? fenceKeystrokeControl(item, target) : { action: 'deliver' };
         if (fence.action === 'defer') {
-          holdForModal(item, target.modal?.kind, { instanceWide: false });
+          holdForModal(item, target.modal?.kind, 'keys');
           continue;
         }
         if (fence.action === 'supersede') {
@@ -674,10 +674,20 @@ export async function processWithMultiSession(helpers) {
         session,
         statusFile,
         strictVerify: item.type === 'conversation',
+        // A control bound to one session (e.g. the dialog watch's decline
+        // message) goes to that pane only.
+        boundSessionRef: item.type === 'control' ? item.session_ref || null : null,
       });
 
       if (result === 'modal_deferred') {
-        holdForModal(item);
+        holdForModal(item, null, 'paste');
+        continue;
+      }
+
+      if (result === 'session_replaced') {
+        supersedeControl(item.id, 'SESSION_REPLACED');
+        inFlight = null;
+        log(`Superseded control id=${item.id}${targetInstance ? ` for ${targetInstance}` : ''}: bound to a session that has been replaced`);
         continue;
       }
 

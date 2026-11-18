@@ -407,14 +407,19 @@ export function getPendingCount() {
 /**
  * Inbound messages of one instance not yet handed to its session (pending, or
  * claimed by a dispatcher pass right now): how many, and when the oldest
- * arrived. `instanceId` null means unattributed rows (single-session). Read by
- * the activity monitor's dialog watch; ids and counts only, never content.
+ * arrived. `instanceId` null means unattributed rows (single-session). The
+ * primary instance of a multi-session host also delivers the untargeted rows
+ * (the dispatchers route them to it): pass `includeUntargeted`. Read by the
+ * activity monitor's dialog watch; ids and counts only, never content.
+ * @param {string|null} instanceId
+ * @param {{ includeUntargeted?: boolean }} [options]
  * @returns {{ count: number, oldestAt: number|null }} oldestAt in epoch ms
  */
-export function getUndeliveredInboundSummary(instanceId) {
+export function getUndeliveredInboundSummary(instanceId, { includeUntargeted = false } = {}) {
   const row = getDb().prepare(`
     SELECT COUNT(*) AS count, MIN(timestamp) AS oldest FROM conversations
-    WHERE direction = 'in' AND status IN ('pending', 'running') AND target_instance IS ?
+    WHERE direction = 'in' AND status IN ('pending', 'running')
+      AND (target_instance IS ?${includeUntargeted ? ' OR target_instance IS NULL' : ''})
   `).get(instanceId ?? null);
   const oldestAt = row?.oldest ? Date.parse(`${String(row.oldest).replace(' ', 'T')}Z`) : NaN;
   return { count: row?.count || 0, oldestAt: Number.isFinite(oldestAt) ? oldestAt : null };
@@ -652,13 +657,34 @@ export function getNextPendingControl(current = nowSeconds()) {
   const database = getDb();
   return database.prepare(`
     SELECT id, raw_content, content, priority, require_idle, bypass_state, ack_deadline_at,
-           status, retry_count, available_at, last_error, created_at, updated_at, target_instance
+           status, retry_count, available_at, last_error, created_at, updated_at, target_instance, session_ref
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
-    ORDER BY COALESCE(priority, 3) ASC, id ASC
+    ORDER BY ${CONTROL_CLAIM_ORDER}
     LIMIT 1
   `).get(current) || null;
+}
+
+/**
+ * Claim order of control rows, shared with c4-db-multi.js: priority, then an
+ * Escape key before any other row of its priority (the cancellation of a
+ * permission prompt is never queued behind keys or messages it would hold),
+ * then age.
+ */
+export const CONTROL_CLAIM_ORDER =
+  "COALESCE(priority, 3) ASC, (substr(raw_content, 1, 17) = '[KEYSTROKE]Escape') DESC, id ASC";
+
+/**
+ * Withdraw one control that is still pending (never one already claimed by a
+ * dispatcher, which may be sending it right now). Final: superseded.
+ * @returns {boolean} true if it was pending and is now superseded
+ */
+export function withdrawPendingControl(id, reason) {
+  return getDb().prepare(`
+    UPDATE control_queue SET status = 'superseded', last_error = ?, updated_at = ?
+    WHERE id = ? AND status = 'pending'
+  `).run(reason || 'WITHDRAWN', nowSeconds(), id).changes > 0;
 }
 
 /**

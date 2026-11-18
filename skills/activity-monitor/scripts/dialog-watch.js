@@ -1,6 +1,7 @@
 /**
- * Dialog watch: in an unattended persona session a dialog nobody can answer
- * does not stay, and delivery that does not happen is visible.
+ * Dialog watch: in an unattended persona session a permission prompt nobody
+ * can answer does not stay, any dialog that holds delivery is reported, and
+ * delivery that does not happen is visible.
  *
  * 2026-11-18, user-pan: Claude Code 2.1.326 asked "Do you want to proceed?"
  * about the session's own `rm -f $D/*` ("Dangerous rm operation on possibly-
@@ -10,42 +11,44 @@
  *
  * The monitor ticks this with the pane read it already makes every second
  * (readTmuxInputState: modal, paneIdentity), so it costs no extra tmux call.
- *   - permission prompt on screen for 60 s: one Escape, the cancel key the
- *     prompt names ("Esc to cancel"), never "Yes" or an option number. Once the
- *     prompt is gone the session is told, once, that its command was declined
- *     and to rewrite it as the prompt advised (the prompt's title and notice
- *     rows are quoted: Claude Code's own text).
- *   - any other dialog on screen for 2 min: one Escape. The Fable guard's
- *     dialogs (fable_limit, credits_offer, usage_overlay) get no key here.
- *   - a dialog still on screen 5 min after it first held a message: one
- *     operator alert (persona, dialog kind, title, how long, how many waiting),
- *     repeated at most once an hour while it lasts.
+ *   - a positively identified permission prompt (detectModal kind
+ *     'permission', with its id) on screen for 60 s: one Escape, the cancel
+ *     key the prompt names, queued as `[KEYSTROKE]Escape dialog=<id>` bound to
+ *     the pane. The dispatcher sends it only while that very prompt is still
+ *     on that pane (otherwise it supersedes it), and sends no other key to a
+ *     permission prompt. Never "Yes", an option number or text.
+ *   - the decline is announced to the session once, and only when it is
+ *     certain: the Escape control is `done` (sent to that prompt) and the
+ *     prompt is gone. The message quotes the prompt's title and notice rows
+ *     (Claude Code's own text) and is bound to the same session through
+ *     delivery. An Escape still pending when the prompt closes by itself is
+ *     withdrawn; one already claimed is waited for.
+ *   - any other dialog (unknown, the Fable guard's fable_limit / credits_offer
+ *     / usage_overlay) gets no key from here.
+ *   - a dialog of any kind still on screen 5 min after it first held an
+ *     inbound message: one operator alert (persona, kind, minutes, counts; the
+ *     title row only for a permission prompt), repeated at most once an hour.
  *   - inbound messages undelivered for more than 10 min while the session is
  *     idle or held by a dialog: agent-status.json shows health 'unavailable',
  *     unavailable_reason 'delivery_stuck' (deliveryStuck, status-writer.js)
- *     instead of ok, and the operator gets the same alert, once.
- * Keys and the session notice go through the C4 control queue
- * ([KEYSTROKE]Escape bound to the judged pane, like the tool watchdog's
- * interrupt); the dispatcher delivers them. An Escape still queued when its
- * dialog closes by itself is withdrawn, so it can never interrupt the work that
- * follows. Alerts use the direct admin send of the degraded and start-held
- * alerts; a failed send is tried again a minute later. Logs and alerts carry
- * ids, counts, kinds, ages and the dialog's title row only, never message
- * content.
+ *     instead of ok, and the operator gets the same alert, once per backlog.
+ * Alerts use the direct admin send of the degraded and start-held alerts; a
+ * failed send is tried again a minute later. Logs and alerts carry ids,
+ * counts, kinds and ages; a dialog's title row only for a permission prompt;
+ * never message content or other pane rows.
  */
 
 export const DIALOG_WATCH_TIMING = Object.freeze({
   permissionGraceMs: 60_000,
-  otherGraceMs: 120_000,
   heldAlertAfterMs: 5 * 60_000,
   alertRepeatMs: 60 * 60_000,
   stuckAfterMs: 10 * 60_000,
   pendingCheckMs: 30_000,
   alertRetryMs: 60_000,
+  // A claimed Escape is acknowledged within seconds; give up waiting after this.
+  declineResolveMs: 5 * 60_000,
 });
 
-// Owned by the Fable guard (fable-guard.js / health-engine limitDialogActive).
-const GUARD_OWNED_KINDS = new Set(['fable_limit', 'credits_offer', 'usage_overlay']);
 const MAX_TITLE = 120;
 
 const minutes = (ms) => Math.max(1, Math.round(ms / 60_000));
@@ -56,6 +59,7 @@ const clip = (text, max = MAX_TITLE) => {
 };
 const personaName = (instanceId) => String(instanceId || 'primary').replace(/^user-/, '');
 const controlId = (output) => Number(/enqueued control (\d+)/.exec(String(output ?? ''))?.[1]) || null;
+const isPermission = (d) => d.kind === 'permission';
 
 /** The one notice a session gets after its permission prompt was declined. */
 export function formatDeclinedNotice({ title, notice }) {
@@ -66,17 +70,18 @@ export function formatDeclinedNotice({ title, notice }) {
     + 'Do not repeat it unchanged.';
 }
 
-/** Operator alert: a dialog holds the session's delivery. */
+/** Operator alert: a dialog holds the session's delivery. Title only for a permission prompt. */
 export function formatDialogAlert({ instanceId, kind, title, onScreenMs, heldMs, pending, oldestAgeMs, escape }) {
   const action = {
-    queued: '已自动按过一次 Esc，对话框仍在。',
+    queued: '已自动按过一次 Esc，权限确认框仍在。',
     failed: 'Esc 未能放入队列。',
     pending: '还没到自动按 Esc 的时间。',
-    guard: '这是 Fable 额度对话框，按键由 Fable 守护处理，这里不发送按键。',
+    none: '这类对话框不会自动按键。',
   }[escape] || '';
+  const named = kind === 'permission' ? `${kind}「${clip(title)}」` : kind;
   return [
     `🔴 ${personaName(instanceId)} 的会话被对话框卡住，消息无法送达`,
-    `对话框：${kind}「${clip(title)}」，已在屏幕上 ${minutes(onScreenMs)} 分钟，挡住投递 ${minutes(heldMs)} 分钟。`,
+    `对话框：${named}，已在屏幕上 ${minutes(onScreenMs)} 分钟，挡住投递 ${minutes(heldMs)} 分钟。`,
     `等待送达：${pending} 条，最早一条已等 ${minutes(oldestAgeMs)} 分钟。`,
     `${action}需要人工到该会话处理。对话框仍在时每小时提醒一次。`,
   ].join('\n');
@@ -93,19 +98,23 @@ export function formatStuckAlert({ instanceId, pending, oldestAgeMs }) {
 /**
  * @param {object} deps
  * @param {string|null} deps.instanceId
- * @param {(key: string, sessionRef: string) => {ok: boolean, output?: string}} deps.enqueueKey
- *   queue a [KEYSTROKE] control bound to the pane (c4-control enqueue output)
- * @param {(id: number) => boolean} deps.withdrawKey - supersede a still-queued key; false once sent
- * @param {(text: string) => {ok: boolean, output?: string}} deps.enqueueNotice
+ * @param {(key: string, sessionRef: string, dialogId: string) => {ok: boolean, output?: string}} deps.enqueueKey
+ *   queue `[KEYSTROKE]<key> dialog=<id>` bound to the pane (c4-control enqueue output)
+ * @param {(id: number) => string|null} deps.controlStatus - the control row's status now
+ * @param {(id: number) => boolean} deps.withdrawKey - supersede the key if still pending; false otherwise
+ * @param {(text: string, sessionRef: string) => {ok: boolean, output?: string}} deps.enqueueNotice
+ *   queue a control message bound to that session
  * @param {() => {count: number, oldestAt: number|null}} deps.readUndelivered
  * @param {(message: string) => Promise<{ok: boolean, output?: string}>} deps.notifyOperator
  * @param {(message: string) => void} deps.log
  * @param {() => number} [deps.now]
  * @param {object} [deps.timing]
  */
-export function createDialogWatch({ instanceId = null, enqueueKey, withdrawKey, enqueueNotice, readUndelivered,
-  notifyOperator, log, now = Date.now, timing = DIALOG_WATCH_TIMING }) {
+export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus, withdrawKey, enqueueNotice,
+  readUndelivered, notifyOperator, log, now = Date.now, timing = DIALOG_WATCH_TIMING }) {
   let dialog = null;
+  // Declines whose prompt is gone, waiting for their Escape control to be final.
+  let declines = [];
   let undelivered = { count: 0, oldestAt: null, checkedAt: -Infinity };
   // Undelivered messages older than stuckAfterMs: one episode (one alert)
   // until none is that old any more.
@@ -113,7 +122,8 @@ export function createDialogWatch({ instanceId = null, enqueueKey, withdrawKey, 
   let stuckNow = false;
   let alertInFlight = null;
 
-  const describe = (d) => `${d.kind} dialog "${clip(d.title)}"`;
+  // Log/alert name of a dialog: the title row only for a permission prompt.
+  const describe = (d) => (isPermission(d) ? `permission prompt "${clip(d.title)}"` : `${d.kind} dialog`);
 
   // Sends at most one alert at a time; `onSent` runs only after a verified send.
   function send(message, onSent, what) {
@@ -129,32 +139,51 @@ export function createDialogWatch({ instanceId = null, enqueueKey, withdrawKey, 
     return true;
   }
 
-  function endDialog(sessionRef, t) {
+  function endDialog(t) {
     const d = dialog;
     dialog = null;
-    if (d.escape !== 'queued') return;
-    // Closed before the dispatcher sent our Escape (answered or auto-blocked
-    // by the CLI): withdraw the key, nothing was declined by us.
-    if (d.escapeId && withdrawKey(d.escapeId)) {
-      log(`Dialog watch: ${describe(d)} closed by itself after ${seconds(t - d.since)}s; Escape control ${d.escapeId} withdrawn`);
-      return;
-    }
-    log(`Dialog watch: ${describe(d)} gone ${seconds(t - d.escapeAt)}s after its Escape`);
-    // Only the session whose prompt was declined is told; a replacement
-    // session never ran that command.
-    if (d.kind !== 'permission' || sessionRef !== d.sessionRef) return;
-    const res = enqueueNotice(formatDeclinedNotice({ title: d.title, notice: d.notice }));
-    log(res?.ok ? `Dialog watch: session told its command was declined (${clip(res.output, 80)})`
-      : `Dialog watch: decline notice not queued (${clip(res?.output, 160)})`);
+    if (d.escape === 'queued' && d.escapeId) declines.push({ ...d, goneAt: t });
+  }
+
+  // A decline is announced only once its Escape is acknowledged as sent to
+  // that prompt (`done`) and the prompt is gone; a still-pending Escape is
+  // withdrawn instead, a claimed one waited for.
+  function resolveDeclines(sessionRef, t) {
+    declines = declines.filter((d) => {
+      let status;
+      try { status = controlStatus(d.escapeId); } catch { return true; }
+      if (status === 'running' || (status === 'pending' && !withdrawKey(d.escapeId))) {
+        if (t - d.goneAt < timing.declineResolveMs) return true;
+        log(`Dialog watch: Escape control ${d.escapeId} still ${status} ${seconds(t - d.goneAt)}s after its prompt closed; no decline message`);
+        return false;
+      }
+      if (status === 'pending') {
+        log(`Dialog watch: ${describe(d)} closed by itself after ${seconds(d.goneAt - d.since)}s; Escape control ${d.escapeId} withdrawn`);
+        return false;
+      }
+      if (status !== 'done') {
+        log(`Dialog watch: Escape control ${d.escapeId} ended ${status || 'missing'}; no decline message`);
+        return false;
+      }
+      // Only the session whose prompt was declined is told; the message is
+      // bound to it through delivery.
+      if (sessionRef !== d.sessionRef) {
+        log(`Dialog watch: session replaced after the decline of control ${d.escapeId}; no decline message`);
+        return false;
+      }
+      const res = enqueueNotice(formatDeclinedNotice({ title: d.title, notice: d.notice }), d.sessionRef);
+      log(res?.ok ? `Dialog watch: session told its tool call was declined (control ${controlId(res.output) ?? '?'})`
+        : `Dialog watch: decline message not queued (${clip(res?.output, 160)})`);
+      return false;
+    });
   }
 
   function maybeEscape(t) {
-    if (dialog.escape !== 'pending' || !dialog.sessionRef) return;
-    const grace = dialog.kind === 'permission' ? timing.permissionGraceMs : timing.otherGraceMs;
-    if (t - dialog.since < grace) return;
-    // One attempt per dialog. A failed enqueue is not repeated; the alert
-    // says so if the dialog then holds delivery.
-    const res = enqueueKey('Escape', dialog.sessionRef);
+    if (dialog.escape !== 'pending' || !dialog.sessionRef || !dialog.id) return;
+    if (t - dialog.since < timing.permissionGraceMs) return;
+    // One attempt per prompt. A failed enqueue is not repeated; the alert
+    // says so if the prompt then holds delivery.
+    const res = enqueueKey('Escape', dialog.sessionRef, dialog.id);
     dialog.escape = res?.ok ? 'queued' : 'failed';
     dialog.escapeAt = t;
     dialog.escapeId = res?.ok ? controlId(res.output) : null;
@@ -222,15 +251,16 @@ export function createDialogWatch({ instanceId = null, enqueueKey, withdrawKey, 
       const t = now();
       // An unreadable frame neither starts nor ends a dialog.
       if (captureOk !== false) {
-        const key = modal ? `${modal.kind}\0${modal.text}\0${sessionRef}` : null;
-        if (dialog && dialog.key !== key) endDialog(sessionRef, t);
+        const key = modal ? `${modal.kind}\0${modal.kind === 'permission' ? modal.id : modal.text}\0${sessionRef}` : null;
+        if (dialog && dialog.key !== key) endDialog(t);
         if (modal && !dialog) {
-          dialog = { key, kind: modal.kind, title: modal.text, notice: modal.notice || null, sessionRef, since: t,
-            escape: GUARD_OWNED_KINDS.has(modal.kind) ? 'guard' : 'pending', escapeAt: 0, escapeId: null,
+          dialog = { key, kind: modal.kind, title: modal.text, notice: modal.notice || null, id: modal.id || null,
+            sessionRef, since: t, escape: modal.kind === 'permission' ? 'pending' : 'none', escapeAt: 0, escapeId: null,
             heldSince: 0, alertDueAt: 0, alerted: false };
           log(`Dialog watch: ${describe(dialog)} on screen`);
         }
-        if (dialog) maybeEscape(t);
+        if (dialog && isPermission(dialog)) maybeEscape(t);
+        if (declines.length) resolveDeclines(sessionRef, t);
       }
       refreshUndelivered(t);
       if (dialog) maybeAlertDialog(t);

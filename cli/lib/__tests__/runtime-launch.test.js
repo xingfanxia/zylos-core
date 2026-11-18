@@ -65,6 +65,10 @@ for (const script of [
 
 const calls = { execSync: [], execFileSync: [], execFile: [] };
 let tmuxSessionExists = false;
+// The retained session's pane as tmux and ps report it: by default an idle
+// login shell at its prompt (pid 4242, no child process).
+let paneProbe = '0 4242 bash';
+let psTable = '4242 1 bash -bash\n';
 const resolvedCodex = "/selected codex/it's/bin/codex";
 let codexHelp = '  --no-daemon  Run without the shared background server';
 let codexHelpError = null;
@@ -84,6 +88,8 @@ mock.module('node:child_process', {
         if (!tmuxSessionExists) throw new Error('no session');
         return '';
       }
+      if (file === 'tmux' && args?.[0] === 'display-message') return paneProbe;
+      if (file === 'ps' && args?.[0] === '-e') return psTable;
       if (file === 'which' && args?.[0] === 'codex') return resolvedCodex + '\n';
       if (file === resolvedCodex && args?.[0] === '--help') {
         if (codexHelpError) throw codexHelpError;
@@ -885,6 +891,35 @@ describe('Claude launch — existing session', () => {
     await adapter.launch({ bypassPermissions: false });
 
     assert.ok(sent.includes(" '--model' 'claude-opus-5-5[1m]' '--effort' 'high'"));
+  });
+
+  // DELIVER-1: the command line and its Enter are typed only into a pane
+  // positively at an idle shell prompt; never into a running Claude, its
+  // composer or a permission prompt (where Enter could approve).
+  it('types nothing into a retained pane that is not at an idle shell prompt; the launch fails', async () => {
+    const cases = {
+      'Claude in the foreground': ['0 4242 claude', '4242 1 claude claude\n'],
+      'node launcher in the foreground': ['0 4242 node', '4242 1 node node tmux-launcher.js\n'],
+      'shell running a child': ['0 4242 bash', '4242 1 bash -bash\n4300 4242 claude claude\n'],
+      'dead pane': ['1 4242 bash', '4242 1 bash -bash\n'],
+      'unreadable pane': ['', ''],
+    };
+    try {
+      for (const [name, [probe, table]] of Object.entries(cases)) {
+        tmuxSessionExists = true;
+        paneProbe = probe;
+        psTable = table;
+        let sent = null;
+        const adapter = makeAdapter(ClaudeAdapter);
+        adapter.sendMessage = async (text) => { sent = text; };
+        await assert.rejects(adapter.launch({ bypassPermissions: false }), /is not at a shell prompt/, name);
+        assert.equal(sent, null, `${name}: nothing typed`);
+        assert.equal(findTmuxNewSession(), undefined, `${name}: no new session either`);
+      }
+    } finally {
+      paneProbe = '0 4242 bash';
+      psTable = '4242 1 bash -bash\n';
+    }
   });
 });
 

@@ -141,23 +141,44 @@ describe('sendToTmux delivery guard', () => {
   });
 });
 
-describe('keystroke policy', () => {
-  it('blocks raw keys for any modal except a permission prompt', () => {
+describe('keystroke policy (DELIVER-1: a permission prompt takes cancellation only)', () => {
+  it('a permission prompt takes Escape and nothing else; every other modal takes no key', () => {
+    const permission = { kind: 'permission', text: 'Bash command', id: '0123456789abcdef' };
     assert.equal(keystrokeBlockedByModal(null), false);
-    assert.equal(keystrokeBlockedByModal(LIMIT), true);
-    assert.equal(keystrokeBlockedByModal({ kind: 'credits_offer', text: '' }), true);
-    assert.equal(keystrokeBlockedByModal({ kind: 'unknown', text: '' }), true);
-    assert.equal(keystrokeBlockedByModal({ kind: 'permission', text: '' }), false);
+    assert.equal(keystrokeBlockedByModal(permission, 'Escape'), false);
+    for (const key of [null, 'Enter', '1', 'y', 'Tab']) assert.equal(keystrokeBlockedByModal(permission, key), true, key);
+    for (const modal of [LIMIT, { kind: 'credits_offer', text: '' }, { kind: 'unknown', text: '' }, { kind: 'usage_overlay', text: '' }]) {
+      for (const key of ['Escape', 'Enter']) assert.equal(keystrokeBlockedByModal(modal, key), true, `${modal.kind} ${key}`);
+    }
   });
 
-  it('the permission exception holds for every permission variant and never for a limit dialog (Astra #5)', () => {
-    for (const capture of [fx.PERMISSION_PROMPT_LIVE, fx.PERMISSION_ECHO_LIMIT, fx.PERMISSION_DIFF_LIMIT, fx.TOOL_OUTPUT_ABOVE_PERMISSION]) {
-      assert.equal(keystrokeBlockedByModal(detectModal(capture)), false);
+  it('every recorded permission prompt layout supersedes an approving key and delivers Escape', () => {
+    const target = (capture) => ({ ok: true, sessionRef: '$1:1000:%2:123', modal: detectModal(capture), sessionCreatedAt: 1000 });
+    for (const capture of [fx.PERMISSION_PROMPT_LIVE, fx.PERMISSION_ECHO_LIMIT, fx.PERMISSION_DIFF_LIMIT, fx.TOOL_OUTPUT_ABOVE_PERMISSION,
+      fx.DANGEROUS_RM_PROMPT, fx.DANGEROUS_RM_PROMPT_COUNTDOWN, fx.DANGEROUS_RM_PROMPT_WIDE]) {
+      for (const key of ['Enter', '1', '2', 'y', 'n', 'C-m']) {
+        assert.deepEqual(fenceKeystrokeControl({ id: 1, content: `[KEYSTROKE]${key}` }, target(capture), { bind: noBinding }),
+          { action: 'supersede', reason: 'PERMISSION_PROMPT' });
+      }
+      assert.deepEqual(fenceKeystrokeControl({ id: 2, content: '[KEYSTROKE]Escape' }, target(capture), { bind: noBinding }),
+        { action: 'deliver' });
     }
     for (const capture of [fx.FABLE_LIMIT_LIVE, fx.FABLE_LIMIT_ABOVE_COMPOSER, fx.CREDITS_OFFER_LIVE, fx.CREDITS_CHECKING_LIVE,
       fx.ASK_QUESTION_LIMIT, fx.TOOL_OUTPUT_ABOVE_SELECT, fx.UNKNOWN_DIALOG_LIVE]) {
-      assert.equal(keystrokeBlockedByModal(detectModal(capture)), true);
+      assert.deepEqual(fenceKeystrokeControl({ id: 3, content: '[KEYSTROKE]Escape' }, target(capture), { bind: noBinding }),
+        { action: 'defer', reason: 'MODAL_DEFERRED' });
     }
+  });
+
+  it('a dialog-bound Escape goes only to that very prompt', () => {
+    const modal = detectModal(fx.DANGEROUS_RM_PROMPT);
+    const at = (m) => ({ ok: true, sessionRef: '$1:1000:%2:123', modal: m, sessionCreatedAt: 1000 });
+    const bound = { id: 4, content: `[KEYSTROKE]Escape dialog=${modal.id}` };
+    assert.deepEqual(fenceKeystrokeControl(bound, at(modal), { bind: noBinding }), { action: 'deliver' });
+    for (const other of [null, detectModal(fx.PERMISSION_PROMPT_LIVE), detectModal(fx.UNKNOWN_DIALOG_LIVE), LIMIT]) {
+      assert.deepEqual(fenceKeystrokeControl(bound, at(other), { bind: noBinding }), { action: 'supersede', reason: 'DIALOG_GONE' });
+    }
+    assert.equal(parseKeystrokeKey(bound.content), 'Escape');
   });
 });
 
@@ -280,15 +301,48 @@ describe('multi-session delivery guard', () => {
     assert.deepEqual(queue.acked, [8]);
   });
 
-  it('still lets the auto-approve Enter answer a permission prompt', async () => {
+  it('never lets an Enter answer a permission prompt: it is superseded, never sent', async () => {
     const queue = rowQueue([{ id: 9, type: 'control', priority: 0, bypass_state: 1, target_instance: 'user-pan', content: '[KEYSTROKE]Enter' }]);
     const keys = [];
+    const superseded = [];
     const res = await processWithMultiSession(multiHelpers(queue, {
-      readKeystrokeTarget: () => paneTarget({ kind: 'permission', text: 'Bash command' }),
+      readKeystrokeTarget: () => paneTarget({ kind: 'permission', text: 'Bash command', id: '0123456789abcdef' }),
       sendKeystroke: (session, key) => keys.push(key),
+      supersedeControl: (id, reason) => { superseded.push([id, reason]); queue.byId.get(id).status = 'superseded'; return true; },
     }));
-    assert.equal(res.delivered, true);
-    assert.deepEqual(keys, ['Enter']);
+    assert.equal(res.delivered, false);
+    assert.deepEqual(keys, []);
+    assert.deepEqual(superseded, [[9, 'PERMISSION_PROMPT']]);
+  });
+});
+
+// DELIVER-1: the dialog watch's decline message is bound to the session whose
+// prompt was declined (control_queue.session_ref); a relaunched session never
+// receives it.
+describe('a control bound to one session', () => {
+  it('is never pasted into a replacement pane (sendToTmux)', async () => {
+    const h = harness([st('empty', { paneIdentity: 'pane-two' })]);
+    assert.equal(await sendToTmux('decline notice', { ...h.options, boundSessionRef: 'pane-one' }), 'session_replaced');
+    assert.equal(h.calls.length, 0);
+  });
+
+  it('is delivered to its own pane', async () => {
+    const h = harness([st('empty'), st('has_content'), st('empty')]);
+    assert.equal(await sendToTmux('decline notice', { ...h.options, boundSessionRef: 'pane-one' }), 'submitted');
+    assert.equal(h.pastes(), 1);
+  });
+
+  it('multi-session: superseded (SESSION_REPLACED) when its session was replaced, never pasted', async () => {
+    const queue = rowQueue([{ id: 31, type: 'control', priority: 1, target_instance: 'user-pan', content: 'decline notice', session_ref: 'pane-one' }]);
+    const h = harness([st('empty', { paneIdentity: 'pane-two' })]);
+    const superseded = [];
+    const res = await processWithMultiSession(multiHelpers(queue, {
+      sendToTmux: (message, opts) => sendToTmux(message, { ...h.options, ...opts }),
+      supersedeControl: (id, reason) => { superseded.push([id, reason]); queue.byId.get(id).status = 'superseded'; return true; },
+    }));
+    assert.equal(res.delivered, false);
+    assert.deepEqual(superseded, [[31, 'SESSION_REPLACED']]);
+    assert.equal(h.pastes(), 0);
   });
 });
 

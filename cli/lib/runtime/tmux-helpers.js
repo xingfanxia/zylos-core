@@ -7,7 +7,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { sendTmuxKeys } from '../tmux-send-keys.js';
-import { hasDescendantProcess } from './process-tree.js';
+import { buildProcessTree, hasDescendantProcess } from './process-tree.js';
 
 const CMD_TIMEOUT = 3000;
 const LAUNCH_TIMEOUT = 10_000;
@@ -86,6 +86,42 @@ export function tmuxPasteBuffer(session, tmpFile, bufferName) {
     timeout: CMD_TIMEOUT,
     stdio: 'ignore',
   });
+}
+
+const SHELL_NAMES = new Set(['bash', 'zsh', 'sh', 'dash', 'ksh', 'fish']);
+const shellName = (name) => String(name || '').replace(/^-/, '').split('/').pop();
+
+/**
+ * Positive evidence that a session's pane sits at an idle shell prompt, the
+ * only state in which typing a command line and Enter into it is safe. All of:
+ * the pane is alive, tmux reports a shell as its foreground command, the pane
+ * process is that shell, and the shell has no child process at all. Anything
+ * else (Claude or another program running, a dialog, a launcher, an unreadable
+ * pane) is not a prompt, and the caller must type nothing.
+ * @param {string} session
+ * @returns {{ ok: boolean, reason: string }}
+ */
+export function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFileSync, buildTree = buildProcessTree } = {}) {
+  let out;
+  try {
+    out = String(execFileSyncImpl('tmux', ['display-message', '-p', '-t', session, '#{pane_dead} #{pane_pid} #{pane_current_command}'], {
+      encoding: 'utf8',
+      timeout: CMD_TIMEOUT,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })).trim();
+  } catch {
+    return { ok: false, reason: 'pane unreadable' };
+  }
+  const m = /^(\d+) (\d+) (\S+)$/.exec(out);
+  if (!m) return { ok: false, reason: 'pane unreadable' };
+  if (m[1] !== '0') return { ok: false, reason: 'pane is dead' };
+  const pid = Number(m[2]);
+  if (!SHELL_NAMES.has(shellName(m[3]))) return { ok: false, reason: `foreground is ${shellName(m[3]).slice(0, 32)}, not a shell` };
+  const tree = buildTree();
+  const own = tree.infoOf.get(pid);
+  if (!own || !SHELL_NAMES.has(shellName(own.comm))) return { ok: false, reason: 'pane process is not a shell' };
+  if ((tree.childrenOf.get(pid) || []).length > 0) return { ok: false, reason: 'shell is running a command' };
+  return { ok: true, reason: 'shell prompt' };
 }
 
 /**
