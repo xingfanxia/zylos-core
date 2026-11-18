@@ -36,7 +36,8 @@ function conversation(target, timestamp) {
     VALUES ('in', 'feishu', 'oc_x', 'm', 'pending', 3, ?, ?)`).run(target, timestamp).lastInsertRowid);
 }
 function control(target, content, { bypass = false, priority = 0, dialogRef = null } = {}) {
-  return dbMod.insertControl(content, { priority, bypassState: bypass, appendAckSuffix: false, targetInstance: target, dialogRef }).id;
+  return dbMod.insertControl(content, { priority, bypassState: bypass, appendAckSuffix: false, targetInstance: target, dialogRef,
+    sessionRef: dialogRef ? '$1:1000:%2:123' : null }).id;
 }
 const conv = (id) => db.prepare('SELECT status, retry_count FROM conversations WHERE id = ?').get(id);
 const ctl = (id) => db.prepare('SELECT status, last_error FROM control_queue WHERE id = ?').get(id);
@@ -181,15 +182,26 @@ describe('cancellation only, bound to its prompt', () => {
     assert.equal(conv(id).status, 'pending');
   });
 
-  it('a dialog-bound Escape is superseded once its prompt is gone or replaced by another one', async () => {
+  it('a dialog-bound Escape is superseded once its prompt is gone', async () => {
     const gone = control('user-pan', '[KEYSTROKE]Escape', { bypass: true, dialogRef: PROMPT.id });
-    let run = await pass({});
+    const run = await pass({});
     assert.deepEqual(run.keys, []);
     assert.deepEqual(ctl(gone), { status: 'superseded', last_error: 'DIALOG_GONE' });
+  });
+
+  it('a dialog-bound Escape is superseded when another prompt replaced its prompt', async () => {
     const other = control('user-pan', '[KEYSTROKE]Escape', { bypass: true, dialogRef: PROMPT.id });
-    run = await pass({ 'user-pan': { ...PROMPT, id: 'fedcba9876543210' } });
+    const run = await pass({ 'user-pan': { ...PROMPT, id: 'fedcba9876543210' } });
     assert.deepEqual(run.keys, []);
     assert.deepEqual(ctl(other), { status: 'superseded', last_error: 'DIALOG_GONE' });
+  });
+
+  it('an unbound Escape never replaces a bound one (dedupe respects the binding)', async () => {
+    const bound = control('user-pan', '[KEYSTROKE]Escape', { bypass: true, dialogRef: PROMPT.id });
+    const plain = dbMod.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false,
+      targetInstance: 'user-pan', sessionRef: '$1:1000:%2:123' });
+    assert.equal(plain.superseded_count, 0);
+    assert.equal(ctl(bound).status, 'pending');
   });
 
   it('no key from the queue reaches an unknown or a Fable-guard dialog, Escape included', async () => {

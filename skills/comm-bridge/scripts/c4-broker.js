@@ -50,6 +50,10 @@ import {
   setSendStatus,
   getRecentSends,
   close as closeDb,
+  waitForVerifiedDb,
+  publishCapabilities,
+  refreshCapabilities,
+  withdrawCapabilities,
 } from './c4-db.js';
 import {
   getUnsummarizedRangeForInstance,
@@ -827,6 +831,7 @@ function shutdown() {
   if (isShuttingDown) return;
   isShuttingDown = true;
   log('Shutting down...');
+  try { withdrawCapabilities(BROKER_PROCESS); } catch { /* best effort */ }
   for (const id of [...servers.keys()]) {
     try { servers.get(id).close(); } catch { /* best effort */ }
     try { fs.unlinkSync(socketPathFor(id)); } catch { /* already gone */ }
@@ -839,9 +844,27 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 process.on('SIGHUP', () => { log('SIGHUP — re-scanning instances'); scanInstances(); });
 
-function main() {
+// What this broker understands, published for the activity monitor's dialog
+// watch (c4_process_capabilities): its control inserts keep a dialog-bound row
+// (control_queue.dialog_ref) apart from an ordinary equivalent one, so an
+// isolated persona's unbound Escape never replaces the watch's bound Escape.
+// The watch of an isolated persona queues nothing until a live broker has
+// published it.
+const BROKER_PROCESS = 'c4-broker';
+export const BROKER_CAPABILITIES = Object.freeze(['dialog_ref']);
+const CAPABILITY_REFRESH_MS = 60_000;
+
+async function main() {
   if (!acquireSingletonLock()) process.exit(1);
-  log('=== C4 Broker Started ===');
+  // Serve only on a verified schema (every migration recorded, dialog_ref
+  // present); until then no socket is opened and no capability published.
+  await waitForVerifiedDb({ log });
+  publishCapabilities(BROKER_PROCESS, BROKER_CAPABILITIES);
+  process.on('exit', () => { try { withdrawCapabilities(BROKER_PROCESS); } catch { /* best effort */ } });
+  setInterval(() => {
+    try { refreshCapabilities(BROKER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
+  }, CAPABILITY_REFRESH_MS).unref();
+  log(`=== C4 Broker Started === (schema verified; capabilities: ${BROKER_CAPABILITIES.join(' ')})`);
   scanInstances();
   // Fallback re-scan (SIGHUP from c4-approve is primary; this also keeps the
   // event loop alive when zero isolated instances exist yet).

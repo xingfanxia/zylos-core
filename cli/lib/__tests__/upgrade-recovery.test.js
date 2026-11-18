@@ -180,7 +180,8 @@ for(const legacy of ['group-writable','backup-alias'])test(`completed upgrade pe
  assert.equal(fs.existsSync(path.join(f.root,'.zylos/upgrade/active.json')),false);
  assert.equal(f.load().terminalEvidence.verified,true);
  // Deploy the actual owner openers only after code verification has finished.
- for(const item of CORE_DATABASES)fs.cpSync(path.resolve('skills',item.owner,'scripts'),path.join(f.j.skillsDir,item.owner,'scripts'),{recursive:true});
+ // An owner's migrations ship with its scripts: c4-db serves only once every migration is recorded.
+ for(const item of CORE_DATABASES)for(const part of ['scripts','migrations'])if(fs.existsSync(path.resolve('skills',item.owner,part)))fs.cpSync(path.resolve('skills',item.owner,part),path.join(f.j.skillsDir,item.owner,part),{recursive:true});
  const monitor=path.join(f.j.skillsDir,'activity-monitor');fs.mkdirSync(path.join(monitor,'scripts'),{recursive:true});
  fs.writeFileSync(path.join(monitor,'package.json'),'{"type":"module"}');
  fs.copyFileSync(path.resolve('skills/activity-monitor/scripts/shard-registry.js'),path.join(monitor,'scripts/shard-registry.js'));

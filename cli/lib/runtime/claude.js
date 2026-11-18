@@ -335,7 +335,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     try {
       fs.writeFileSync(tmpFile, text);
-      if (pane) tmuxPasteToVerifiedPane(pane, tmpFile, bufferName);
+      if (pane) await tmuxPasteToVerifiedPane(pane, tmpFile, bufferName, text);
       else tmuxPasteBuffer(SESSION, tmpFile, bufferName);
     } finally {
       try { fs.unlinkSync(tmpFile); fs.rmdirSync(tmpDir); } catch { }

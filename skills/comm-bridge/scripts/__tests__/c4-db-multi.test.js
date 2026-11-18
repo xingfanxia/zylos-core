@@ -310,7 +310,7 @@ describe('getHeldWorkSummary', () => {
     control({ target: 'user-pan', content: 'later', availableAt: now + 3600 });
     control({ target: 'user-pan', content: 'waiting for its ack', status: 'running' });
     dbMod.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, targetInstance: 'user-pan',
-      dialogRef: '0123456789abcdef' });
+      sessionRef: '$5:1763400000:%7:4242', dialogRef: '0123456789abcdef' });
     assert.deepEqual(dbMod.getHeldWorkSummary('user-pan').count, 1);
     assert.equal(dbMod.getHeldWorkSummary('user-pan').controls, 1);
     conv({ target: 'user-pan' });

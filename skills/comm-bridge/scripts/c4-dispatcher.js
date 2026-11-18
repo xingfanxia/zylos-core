@@ -36,7 +36,11 @@ import {
   bindControlSession,
   supersedeControl,
   recordUncertainDelivery,
-  stripTrailingAckSuffix
+  stripTrailingAckSuffix,
+  waitForVerifiedDb,
+  publishCapabilities,
+  refreshCapabilities,
+  withdrawCapabilities,
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -1252,6 +1256,9 @@ function maybeEmitHeartbeat(result) {
   const now = Date.now();
   if (!shouldEmitHeartbeat(now, lastHeartbeatMs, HEARTBEAT_INTERVAL_MS)) return;
   lastHeartbeatMs = now;
+  // Keep the published capability fresh while this process runs (it goes
+  // stale for the dialog watch within minutes after a hang or a kill).
+  try { refreshCapabilities(DISPATCHER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
   try {
     log(formatHeartbeatLine({
       pendingConv: getPendingCount(),
@@ -1366,12 +1373,24 @@ function acquireSingletonLock() {
   return false;
 }
 
+// What this dispatcher understands, published for the activity monitor's
+// dialog watch (c4_process_capabilities): it enforces control_queue.dialog_ref
+// (the prompt binding of a dialog-watch Escape) and session_ref on text
+// controls. The watch queues nothing until a live dispatcher has published it.
+const DISPATCHER_PROCESS = 'c4-dispatcher';
+export const DISPATCHER_CAPABILITIES = Object.freeze(['dialog_ref']);
+
 async function main() {
   if (!acquireSingletonLock()) {
     close();
     process.exit(1);
   }
-  log('=== C4 Dispatcher Started ===');
+  // Serve only on a verified schema (every migration recorded, dialog_ref
+  // present); until then nothing is claimed and no capability is published.
+  await waitForVerifiedDb({ log });
+  publishCapabilities(DISPATCHER_PROCESS, DISPATCHER_CAPABILITIES);
+  process.on('exit', () => { try { withdrawCapabilities(DISPATCHER_PROCESS); } catch { /* best effort */ } });
+  log(`=== C4 Dispatcher Started === (schema verified; capabilities: ${DISPATCHER_CAPABILITIES.join(' ')})`);
   log(`Tmux session: ${TMUX_SESSION}`);
   trace('delivery_config', { bracketedPasteEnabled: BRACKETED_PASTE_ENABLED });
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);

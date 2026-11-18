@@ -39,6 +39,19 @@
  * next alert time) and unresolved declines are saved through `saveState` and
  * resumed on start, so a monitor restart sends no second Escape to the same
  * prompt and no alert within the hour. It is cleared once the dialog is gone.
+ * The database is the authority. Whether an Escape or a decline message
+ * exists, its id and status always come from the queue, through reads and
+ * withdrawals scoped in SQL to this persona, pane, prompt and control kind
+ * (bindDialogWatchQueue); at most one of each exists per persona, pane and
+ * prompt (c4-db insertDialogControl). What the queue cannot hold (first-seen
+ * time, next alert time, the prompt's title and notice rows) is kept in the
+ * service-owned table dialog_watch_state, which personas cannot write; even
+ * that is re-validated (shapes, times clamped, the dialog must match the live
+ * pane). Nothing is read from a persona-writable directory.
+ * Capability gate: nothing is queued until the running dispatcher (and, for an
+ * isolated persona, the broker) have published that they understand the
+ * prompt binding (c4_process_capabilities); until then the watch only
+ * observes and alerts.
  * Alerts use the direct admin send of the degraded and start-held alerts; a
  * failed send is tried again a minute later. Logs and alerts carry ids,
  * counts, kinds and ages; a dialog's title row only for a permission prompt;
@@ -87,6 +100,7 @@ export function formatDialogAlert({ instanceId, kind, title, onScreenMs, held, o
   const action = {
     sent: `已自动按过一次 Esc（${minutes(escapeSentMs)} 分钟前送达），权限确认框仍在。`,
     queued: 'Esc 已排队但还没有送达。',
+    withheld: '没有发送 Esc：正在运行的 c4-dispatcher / c4-broker 还不支持对话框绑定（先重启它们）。',
     failed: 'Esc 未能放入队列。',
     pending: '还没到自动按 Esc 的时间。',
     none: '这类对话框不会自动按键。',
@@ -111,12 +125,71 @@ export function formatStuckAlert({ instanceId, held, oldestAgeMs }) {
   ].join('\n');
 }
 
-function validState(state) {
-  if (!state || state.version !== STATE_VERSION) return null;
-  const d = state.dialog;
-  const dialogOk = d === null || (d && typeof d.key === 'string' && typeof d.kind === 'string' && Number.isFinite(d.since));
-  if (!dialogOk || !Array.isArray(state.declines)) return null;
-  return state;
+const SESSION_REF_RE = /^\$\d+:\d+:%\d+:\d+$/;
+const PROMPT_ID_RE = /^[0-9a-f]{16}$/;
+const str = (v, max) => (typeof v === 'string' && v.length <= max ? v : null);
+const time = (v, now) => (Number.isFinite(v) && v > 0 && v <= now ? v : 0);
+
+// The saved state, re-validated field by field: only shapes the watch itself
+// writes, times not in the future (next alert at most one repeat ahead), and
+// no Escape facts at all (those come from the queue).
+function restoredState(state, now, timing) {
+  if (!state || state.version !== STATE_VERSION || !Array.isArray(state.declines)) return null;
+  const restoreDialog = (d) => {
+    if (!d || typeof d !== 'object' || !SESSION_REF_RE.test(d.sessionRef || '') || typeof d.kind !== 'string') return null;
+    const permission = d.kind === 'permission';
+    if (permission && !PROMPT_ID_RE.test(d.id || '')) return null;
+    const since = time(d.since, now);
+    // The key is rebuilt from the validated fields (the same form dialogKey
+    // gives a live modal), never taken as written.
+    const other = /^[a-z_]{1,32}:([0-9a-f]{16}):/.exec(typeof d.key === 'string' ? d.key : '')?.[1];
+    if (!since || !/^[a-z_]{1,32}$/.test(d.kind) || (!permission && !other)) return null;
+    const key = `${d.kind}:${permission ? d.id : other}:${d.sessionRef}`;
+    return { key, kind: d.kind, id: permission ? d.id : null,
+      title: permission ? str(d.title, 400) : null, notice: permission ? str(d.notice, 800) : null,
+      sessionRef: d.sessionRef, since, escape: permission ? 'pending' : 'none', escapeAt: 0, escapeId: null,
+      escapeSentAt: 0, savedEscapeSentAt: time(d.escapeSentAt, now), escapeEnded: null,
+      heldSince: time(d.heldSince, now), alertDueAt: Math.min(Number(d.alertDueAt) || 0, now + timing.alertRepeatMs),
+      alerted: d.alerted === true };
+  };
+  const dialog = state.dialog == null ? null : restoreDialog(state.dialog);
+  const declines = state.declines.slice(0, 10).map((d) => {
+    if (!d || !SESSION_REF_RE.test(d.sessionRef || '') || !PROMPT_ID_RE.test(d.id || '')) return null;
+    return { sessionRef: d.sessionRef, id: d.id, title: str(d.title, 400), notice: str(d.notice, 800),
+      since: time(d.since, now), goneAt: time(d.goneAt, now) || now };
+  }).filter(Boolean);
+  return { dialog, declines };
+}
+
+/**
+ * The dialog watch's queue access for one instance, every read and write
+ * scoped in SQL to that instance, the pane, the prompt and the control kind
+ * (c4-db.js findDialogControl / withdrawDialogControl). `db` holds the c4-db
+ * functions.
+ */
+export function bindDialogWatchQueue({ instanceId = null, isolated = false, routesUntargeted = () => false, db }) {
+  const insert = (kind, content, priority, bypassState, sessionRef, dialogRef) => {
+    try {
+      const row = db.insertDialogControl({ instanceId, sessionRef, dialogRef, kind, content, priority, bypassState });
+      return { ok: true, id: row.id, existing: row.existing };
+    } catch (err) {
+      return { ok: false, output: err.message };
+    }
+  };
+  // The dispatcher always delivers; the broker writes rows for isolated
+  // personas only, so only their watch also needs a capable broker.
+  const required = isolated ? ['c4-dispatcher', 'c4-broker'] : ['c4-dispatcher'];
+  return {
+    enqueueKey: (key, sessionRef, dialogRef) => insert('escape', `[KEYSTROKE]${key}`, 0, true, sessionRef, dialogRef),
+    enqueueNotice: (text, sessionRef, dialogRef) => insert('notice', text, 1, false, sessionRef, dialogRef),
+    findOwnControl: ({ sessionRef, dialogRef, kind }) => db.findDialogControl({ instanceId, sessionRef, dialogRef, kind }),
+    withdrawOwnControl: ({ id, sessionRef, dialogRef, kind }) => db.withdrawDialogControl({ id, instanceId, sessionRef, dialogRef, kind,
+      reason: 'DIALOG_GONE' }),
+    deliveryCapable: () => required.every((name) => db.hasLiveCapability(name, 'dialog_ref')),
+    readHeld: () => db.getHeldWorkSummary(instanceId, { includeUntargeted: routesUntargeted() }),
+    loadState: () => db.loadDialogWatchState(instanceId),
+    saveState: (state) => db.saveDialogWatchState(instanceId, state),
+  };
 }
 
 /**
@@ -124,8 +197,10 @@ function validState(state) {
  * @param {string|null} deps.instanceId
  * @param {(key: string, sessionRef: string, dialogId: string) => {ok: boolean, id?: number, output?: string}} deps.enqueueKey
  *   queue a plain `[KEYSTROKE]<key>` bound to the pane (session_ref) and prompt (dialog_ref)
- * @param {(id: number) => string|null} deps.controlStatus - the control row's status now
- * @param {(id: number) => boolean} deps.withdrawKey - supersede the key if still pending; false otherwise
+ * @param {(scope: {sessionRef: string, dialogRef: string, kind: 'escape'|'notice'}) => {id: number, status: string}|null} deps.findOwnControl
+ *   this instance's newest control of that kind for that pane and prompt (scoped in SQL)
+ * @param {(scope: {id: number, sessionRef: string, dialogRef: string, kind: string}) => boolean} deps.withdrawOwnControl
+ *   supersede that control if it is still pending and matches the whole scope
  * @param {(text: string, sessionRef: string, dialogId: string) => {ok: boolean, id?: number, output?: string}} deps.enqueueNotice
  *   queue a control message bound the same way
  * @param {() => {count: number, oldestAt: number|null, conversations: number, controls: number}} deps.readHeld
@@ -134,12 +209,13 @@ function validState(state) {
  * @param {(message: string) => void} deps.log
  * @param {() => object|null} [deps.loadState] - the saved state, read once at start
  * @param {(state: object|null) => void} [deps.saveState] - persist (null: nothing active)
+ * @param {() => boolean} [deps.deliveryCapable] - the running dispatcher (and broker) enforce the binding
  * @param {() => number} [deps.now]
  * @param {object} [deps.timing]
  */
-export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus, withdrawKey, enqueueNotice,
-  readHeld, notifyOperator, log, loadState = () => null, saveState = () => {}, now = Date.now,
-  timing = DIALOG_WATCH_TIMING }) {
+export function createDialogWatch({ instanceId = null, enqueueKey, findOwnControl, withdrawOwnControl, enqueueNotice,
+  readHeld, notifyOperator, log, loadState = () => null, saveState = () => {}, deliveryCapable = () => true,
+  now = Date.now, timing = DIALOG_WATCH_TIMING }) {
   let dialog = null;
   // Declines whose prompt is gone, waiting for their Escape control to be final.
   let declines = [];
@@ -151,7 +227,7 @@ export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus
   let dirty = false;
 
   try {
-    const saved = validState(loadState());
+    const saved = restoredState(loadState(), now(), timing);
     if (saved) {
       dialog = saved.dialog;
       declines = saved.declines;
@@ -159,6 +235,26 @@ export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus
     }
   } catch (err) {
     log(`Dialog watch: saved state unreadable (${clip(err?.message, 160)}); starting clean`);
+  }
+
+  // Whether the running dispatcher (and broker) enforce the prompt binding;
+  // asked at most every 10 s.
+  let capable = { value: false, at: -Infinity };
+  function canQueue(t) {
+    if (t - capable.at >= 10_000) {
+      let value = false;
+      try { value = deliveryCapable() === true; } catch { value = false; }
+      if (value !== capable.value) log(value ? 'Dialog watch: dispatcher (and broker) enforce the prompt binding; Escapes may be queued'
+        : 'Dialog watch: the running dispatcher or broker does not enforce the prompt binding; nothing is queued, only alerts');
+      capable = { value, at: t };
+    }
+    return capable.value;
+  }
+
+  // This instance's own control of `kind` for that pane and prompt, from the
+  // queue (scoped in SQL); null when there is none or the scope is invalid.
+  function ownControl(sessionRef, dialogRef, kind) {
+    try { return findOwnControl({ sessionRef, dialogRef, kind }); } catch { return null; }
   }
 
   const describe = (d) => (isPermission(d) ? `permission prompt "${clip(d.title)}"` : `${d.kind} dialog`);
@@ -192,8 +288,8 @@ export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus
     const d = dialog;
     dialog = null;
     changed();
-    if (d.escape === 'queued' && d.escapeId) declines.push({ escapeId: d.escapeId, sessionRef: d.sessionRef, id: d.id,
-      title: d.title, notice: d.notice, since: d.since, goneAt: t });
+    if (d.escape === 'queued') declines.push({ sessionRef: d.sessionRef, id: d.id, title: d.title, notice: d.notice,
+      since: d.since, goneAt: t });
   }
 
   // A decline is announced only once its Escape is acknowledged as sent to
@@ -202,30 +298,42 @@ export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus
   function resolveDeclines(sessionRef, t) {
     const before = declines.length;
     declines = declines.filter((d) => {
-      let status;
-      try { status = controlStatus(d.escapeId); } catch { return true; }
-      if (status === 'running' || (status === 'pending' && !withdrawKey(d.escapeId))) {
+      // The Escape, its id and status come from the queue, scoped to this
+      // persona, pane and prompt; never from saved state.
+      const own = ownControl(d.sessionRef, d.id, 'escape');
+      if (!own) {
+        log('Dialog watch: a decline\'s Escape is not confirmed by the queue (kind escape); ignored');
+        return false;
+      }
+      const { id: escapeId, status } = own;
+      if (status === 'running' || (status === 'pending' && !withdrawOwnControl({ id: escapeId, sessionRef: d.sessionRef, dialogRef: d.id, kind: 'escape' }))) {
         if (t - d.goneAt < timing.declineResolveMs) return true;
-        log(`Dialog watch: Escape control ${d.escapeId} still ${status} ${seconds(t - d.goneAt)}s after its prompt closed; no decline message`);
+        log(`Dialog watch: Escape control ${escapeId} still ${status} ${seconds(t - d.goneAt)}s after its prompt closed; no decline message`);
         return false;
       }
       if (status === 'pending') {
-        log(`Dialog watch: permission prompt closed by itself after ${seconds(d.goneAt - d.since)}s; Escape control ${d.escapeId} withdrawn`);
+        log(`Dialog watch: permission prompt closed by itself after ${seconds(d.goneAt - d.since)}s; Escape control ${escapeId} withdrawn`);
         return false;
       }
       if (status !== 'done') {
-        log(`Dialog watch: Escape control ${d.escapeId} ended ${status || 'missing'}; no decline message`);
+        log(`Dialog watch: Escape control ${escapeId} ended ${status}; no decline message`);
         return false;
       }
       // Only the session whose prompt was declined is told; the message is
-      // bound to it through delivery.
+      // bound to it through delivery. Not before the binding is enforced.
+      if (!canQueue(t)) {
+        if (t - d.goneAt < timing.declineResolveMs) return true;
+        log(`Dialog watch: decline of control ${escapeId} not announced: the binding is not enforced by the running processes`);
+        return false;
+      }
       if (sessionRef !== d.sessionRef) {
-        log(`Dialog watch: session replaced after the decline of control ${d.escapeId}; no decline message`);
+        log(`Dialog watch: session replaced after the decline of control ${escapeId}; no decline message`);
         return false;
       }
       const res = enqueueNotice(formatDeclinedNotice({ title: d.title, notice: d.notice }), d.sessionRef, d.id);
-      log(res?.ok ? `Dialog watch: session told its tool call was declined (control ${res.id ?? '?'})`
-        : `Dialog watch: decline message not queued (${clip(res?.output, 160)})`);
+      log(!res?.ok ? `Dialog watch: decline message not queued (${clip(res?.output, 160)})`
+        : res.existing ? `Dialog watch: decline already announced (control ${res.id})`
+          : `Dialog watch: session told its tool call was declined (control ${res.id ?? '?'})`);
       return false;
     });
     if (declines.length !== before) changed();
@@ -233,26 +341,45 @@ export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus
 
   function maybeEscape(t) {
     if (dialog.escape !== 'pending' || !dialog.sessionRef || !dialog.id) return;
+    // One Escape per prompt, decided by the queue: an Escape already queued
+    // for this persona, pane and prompt (before a monitor restart) is adopted.
+    const existing = ownControl(dialog.sessionRef, dialog.id, 'escape');
+    if (existing) {
+      Object.assign(dialog, { escape: 'queued', escapeId: existing.id, escapeAt: dialog.escapeAt || t });
+      changed();
+      log(`Dialog watch: ${describe(dialog)}: Escape control ${existing.id} already queued; not queued again`);
+      return;
+    }
     if (t - dialog.since < timing.permissionGraceMs) return;
+    if (!canQueue(t)) {
+      if (!dialog.withheld) { dialog.withheld = true; changed(); log(`Dialog watch: Escape for ${describe(dialog)} withheld (binding not enforced)`); }
+      return;
+    }
     // One attempt per prompt. A failed enqueue is not repeated; the alert
-    // says so if the prompt stays.
+    // says so if the prompt stays. The queue keeps at most one Escape per
+    // persona, pane and prompt: an existing one is adopted, never doubled.
     const res = enqueueKey('Escape', dialog.sessionRef, dialog.id);
     dialog.escape = res?.ok ? 'queued' : 'failed';
+    dialog.withheld = false;
     dialog.escapeAt = t;
     dialog.escapeId = res?.ok ? res.id ?? null : null;
     changed();
-    log(res?.ok
-      ? `Dialog watch: ${describe(dialog)} on screen ${seconds(t - dialog.since)}s; Escape queued (control ${dialog.escapeId ?? '?'})`
-      : `Dialog watch: Escape for ${describe(dialog)} not queued (${clip(res?.output, 160)})`);
+    log(!res?.ok ? `Dialog watch: Escape for ${describe(dialog)} not queued (${clip(res?.output, 160)})`
+      : res.existing ? `Dialog watch: ${describe(dialog)}: Escape control ${res.id} already queued; not queued again`
+        : `Dialog watch: ${describe(dialog)} on screen ${seconds(t - dialog.since)}s; Escape queued (control ${dialog.escapeId ?? '?'})`);
   }
 
-  // Whether the queued Escape went out, while its prompt is still up.
+  // Whether the queued Escape went out, while its prompt is still up (from
+  // the queue, scoped). A sent time saved before a restart is kept only once
+  // the queue confirms the Escape was sent.
   function trackEscape(t) {
-    if (dialog.escape !== 'queued' || !dialog.escapeId || dialog.escapeSentAt || dialog.escapeEnded) return;
-    let status;
-    try { status = controlStatus(dialog.escapeId); } catch { return; }
-    if (status === 'done') { dialog.escapeSentAt = t; changed(); }
-    else if (status && status !== 'pending' && status !== 'running') { dialog.escapeEnded = status; changed(); }
+    if (dialog.escape !== 'queued' || dialog.escapeSentAt || dialog.escapeEnded) return;
+    const own = ownControl(dialog.sessionRef, dialog.id, 'escape');
+    const status = own?.status ?? 'missing';
+    if (status === 'done') {
+      dialog.escapeSentAt = dialog.savedEscapeSentAt && dialog.savedEscapeSentAt >= dialog.since ? dialog.savedEscapeSentAt : t;
+      changed();
+    } else if (status !== 'pending' && status !== 'running') { dialog.escapeEnded = status; changed(); }
   }
 
   function refreshHeld(t) {
@@ -272,12 +399,13 @@ export function createDialogWatch({ instanceId = null, enqueueKey, controlStatus
     if (held.count > 0 && !d.heldSince) { d.heldSince = Math.max(d.since, held.oldestAt ?? t); changed(); }
     const due = [];
     if (d.heldSince) due.push(d.heldSince + timing.heldAlertAfterMs);
-    // A permission prompt that survived its Escape blocks the session even
-    // with nothing queued: alert 5 min after the Escape went out (or was
-    // queued, if it never went out).
-    if (isPermission(d) && d.escape === 'queued') due.push((d.escapeSentAt || d.escapeAt) + timing.heldAlertAfterMs);
+    // A permission prompt blocks the session even with nothing queued: alert
+    // 5 min after its Escape went out (or was queued, or, when none could be
+    // queued, would have been).
+    if (isPermission(d)) due.push((d.escapeSentAt || d.escapeAt || d.since + timing.permissionGraceMs) + timing.heldAlertAfterMs);
     if (!due.length || t < Math.min(...due) || (d.alertDueAt || 0) > t) return;
-    const escape = d.escape === 'queued' ? (d.escapeSentAt ? 'sent' : 'queued') : d.escape;
+    const escape = d.escape === 'queued' ? (d.escapeSentAt ? 'sent' : 'queued')
+      : d.escape === 'pending' && d.withheld ? 'withheld' : d.escape;
     const sent = send(formatDialogAlert({
       instanceId, kind: d.kind, title: d.title, onScreenMs: t - d.since, held,
       oldestAgeMs: held.oldestAt ? t - held.oldestAt : 0, escape, escapeSentMs: d.escapeSentAt ? t - d.escapeSentAt : 0,

@@ -163,25 +163,42 @@ describe('single-session dispatcher delivery guard', () => {
     db.supersedeControl(id, 'TEST_DONE');
   });
 
-  it('sends a dialog-bound Escape only while that very prompt is on the pane', async () => {
-    resetLog();
-    screen(fx.DANGEROUS_RM_PROMPT, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
+  it('sends a dialog-bound Escape only while that very prompt is on that pane', async () => {
     const { detectModal } = await import('../tmux-input-state.js');
     const promptId = detectModal(fx.DANGEROUS_RM_PROMPT).id;
-    const other = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, dialogRef: '0123456789abcdef' });
+    const bound = (dialogRef, sessionRef) => db.insertControl('[KEYSTROKE]Escape',
+      { priority: 0, bypassState: true, appendAckSuffix: false, dialogRef, sessionRef }).id;
+    const PANE = '$1:1000:%2:123';
+
+    resetLog();
+    idleComposer();
+    const gone = bound(promptId, PANE);
     await tick();
-    assert.deepEqual(keys(), [], 'another prompt id: not sent');
-    assert.deepEqual(final(other.id), { status: 'superseded', last_error: 'DIALOG_GONE' });
-    const mine = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, dialogRef: promptId });
+    assert.deepEqual(keys(), [], 'the prompt is not on screen: not sent');
+    assert.deepEqual(final(gone), { status: 'superseded', last_error: 'DIALOG_GONE' });
+
+    resetLog();
+    screen(fx.DANGEROUS_RM_PROMPT, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
+    const other = bound('0123456789abcdef', PANE);
+    await tick();
+    assert.deepEqual(keys(), [], 'bound to another prompt: not sent');
+    assert.deepEqual(final(other), { status: 'superseded', last_error: 'DIALOG_GONE' });
+
+    // The same prompt in a (replacement) pane the watch judged: sent, as the plain key.
+    const NEW = `$7:${Math.floor(Date.now() / 1000) - 5}:%9:777`;
+    resetLog();
+    screen(fx.DANGEROUS_RM_PROMPT, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
+    onPane(NEW, [1, promptRow(fx.DANGEROUS_RM_PROMPT)]);
+    const mine = bound(promptId, NEW);
     assert.equal((await tick()).delivered, true);
     assert.equal(keys().length, 1);
     assert.match(keys()[0], /Escape$/, 'the plain key reaches tmux');
-    assert.equal(control(mine.id).status, 'done');
-    idleComposer();
-    const late = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false, dialogRef: promptId });
-    await tick();
-    assert.equal(keys().length, 1, 'the prompt is gone: not sent');
-    assert.deepEqual(final(late.id), { status: 'superseded', last_error: 'DIALOG_GONE' });
+    assert.equal(control(mine).status, 'done');
+  });
+
+  it('a dialog binding always comes with its pane', () => {
+    assert.throws(() => db.insertControl('[KEYSTROKE]Escape', { priority: 0, appendAckSuffix: false, dialogRef: '0123456789abcdef' }),
+      /needs its sessionRef/);
   });
 });
 

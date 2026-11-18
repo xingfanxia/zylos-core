@@ -161,9 +161,10 @@ import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scrip
 import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
 import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified,
-  getHeldWorkSummary, getControlById, withdrawPendingControl, insertControl } from '../../comm-bridge/scripts/c4-db.js';
+  getHeldWorkSummary, findDialogControl, withdrawDialogControl, insertDialogControl, hasLiveCapability,
+  loadDialogWatchState, saveDialogWatchState } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
-import { createDialogWatch } from './dialog-watch.js';
+import { createDialogWatch, bindDialogWatchQueue } from './dialog-watch.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -1289,35 +1290,22 @@ function routesUntargetedRows() {
 }
 
 // Dialog watch (dialog-watch.js): fed the pane read the tick already makes.
-// Its Escape and decline message are queued in-process (this monitor already
-// writes C4 rows directly) as plain rows bound out of band: session_ref to the
-// judged pane, dialog_ref to the prompt; the dispatcher checks both before it
-// sends. Its state survives a monitor restart in dialog-watch.json (same
-// atomic write as the other state files). Alerts through the degraded
-// alert's direct admin send.
-const DIALOG_WATCH_STATE_FILE = path.join(MONITOR_DIR, 'dialog-watch.json');
-
-function enqueueBoundControl(content, { priority, bypassState = false, sessionRef, dialogRef }) {
-  try {
-    const row = insertControl(content, { priority, bypassState, appendAckSuffix: false,
-      targetInstance: INSTANCE_ID || null, sessionRef, dialogRef });
-    return { ok: true, id: row.id };
-  } catch (err) {
-    return { ok: false, output: err.message };
-  }
-}
-
+// The database is its authority: its Escape and decline message are plain
+// rows bound out of band (session_ref to the judged pane, dialog_ref to the
+// prompt), at most one of each per persona, pane and prompt; every read or
+// withdrawal is scoped in SQL to this instance, pane, prompt and kind; what the
+// queue cannot hold is kept in the service-owned table dialog_watch_state
+// (c4.db, which personas cannot write; their monitor dir is dual-writer and is
+// not used). It queues nothing until the running dispatcher (and, for an
+// isolated persona, the broker) published that they enforce the binding.
+// Alerts through the degraded alert's direct admin send.
 function createDialogWatchFor() {
   return createDialogWatch({
     instanceId: INSTANCE_ID,
-    enqueueKey: (key, sessionRef, dialogRef) => enqueueBoundControl(`[KEYSTROKE]${key}`,
-      { priority: 0, bypassState: true, sessionRef, dialogRef }),
-    controlStatus: id => getControlById(id)?.status ?? null,
-    withdrawKey: id => withdrawPendingControl(id, 'DIALOG_GONE'),
-    enqueueNotice: (text, sessionRef, dialogRef) => enqueueBoundControl(text, { priority: 1, sessionRef, dialogRef }),
-    readHeld: () => getHeldWorkSummary(INSTANCE_ID, { includeUntargeted: routesUntargetedRows() }),
-    loadState: () => readJsonFileSafe(DIALOG_WATCH_STATE_FILE),
-    saveState: state => (state ? atomicWriteJson(DIALOG_WATCH_STATE_FILE, state) : safeUnlink(DIALOG_WATCH_STATE_FILE)),
+    ...bindDialogWatchQueue({ instanceId: INSTANCE_ID, isolated: Boolean(INSTANCE_ID && _getInstanceDef?.(INSTANCE_ID)?.os_user),
+      routesUntargeted: routesUntargetedRows,
+      db: { insertDialogControl, findDialogControl, withdrawDialogControl, getHeldWorkSummary, hasLiveCapability,
+        loadDialogWatchState, saveDialogWatchState } }),
     notifyOperator: message => (ADMIN_CHAT_ID
       ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
       : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),

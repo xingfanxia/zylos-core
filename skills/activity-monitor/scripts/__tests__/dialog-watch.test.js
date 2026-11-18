@@ -20,10 +20,12 @@ const FABLE = detectModal(fx.FABLE_LIMIT_LIVE);
 const T0 = Date.parse('2026-11-18T04:16:35Z');
 
 // `statusOf(id)`: what the dispatcher has done with an Escape control by now.
-// `store`: the saved state, shared across watches to simulate a monitor restart.
-function harness({ sendOk = true, keyOk = true, statusOf = () => 'done', store = { state: null }, t = T0, startId = 900 } = {}) {
+// `store`: the saved state, and `queue`: the Escape rows (pane|prompt → id),
+// both shared across watches to simulate a monitor restart.
+function harness({ sendOk = true, keyOk = true, statusOf = () => 'done', store = { state: null }, queue = new Map(),
+  t = T0, startId = 900 } = {}) {
   const h = {
-    t, keys: [], withdrawn: [], notices: [], alerts: [], logs: [], store,
+    t, keys: [], withdrawn: [], notices: [], alerts: [], logs: [], store, queue,
     undelivered: { count: 0, oldestAt: null, conversations: 0, controls: 0 },
   };
   let nextId = startId;
@@ -32,11 +34,17 @@ function harness({ sendOk = true, keyOk = true, statusOf = () => 'done', store =
     now: () => h.t,
     enqueueKey: (key, sessionRef, dialogId) => {
       h.keys.push({ key, sessionRef, dialogId });
-      return keyOk ? { ok: true, id: ++nextId } : { ok: false, output: 'database is locked' };
+      if (!keyOk) return { ok: false, output: 'database is locked' };
+      const id = ++nextId;
+      queue.set(`${sessionRef}|${dialogId}`, id);
+      return { ok: true, id };
     },
-    controlStatus: (id) => statusOf(id, h),
-    withdrawKey: (id) => {
-      if (statusOf(id, h) !== 'pending') return false;
+    findOwnControl: ({ sessionRef, dialogRef, kind }) => {
+      const id = kind === 'escape' ? queue.get(`${sessionRef}|${dialogRef}`) : undefined;
+      return id ? { id, status: statusOf(id, h) } : null;
+    },
+    withdrawOwnControl: ({ id, sessionRef, dialogRef, kind }) => {
+      if (kind !== 'escape' || queue.get(`${sessionRef}|${dialogRef}`) !== id || statusOf(id, h) !== 'pending') return false;
       h.withdrawn.push(id);
       return true;
     },
@@ -304,7 +312,7 @@ describe('dialog watch: a monitor restart keeps one Escape per prompt and one al
     assert.ok(store.state.dialog.escapeSentAt > 0);
 
     // The monitor restarts with the same prompt still on the same pane.
-    const second = harness({ store, t: first.t + 30 * SEC, startId: 950 });
+    const second = harness({ store, queue: first.queue, t: first.t + 30 * SEC, startId: 950 });
     await second.run(40 * MIN, { modal: RM_PROMPT });
     assert.deepEqual(second.keys, [], 'no second Escape for the same prompt');
     assert.deepEqual(second.alerts, [], 'no alert within the hour of the last one');

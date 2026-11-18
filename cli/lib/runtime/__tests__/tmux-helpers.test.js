@@ -137,42 +137,66 @@ describe('isTimeoutError classifier', () => {
 });
 
 // DELIVER-1: the retained-session launch pastes and submits only to the pane
-// it verified, by pane id, after one more read shows the same pane.
+// it verified, by pane id: one read before the paste, and one between paste
+// and Enter that must show the same pane and, on the cursor's line, the
+// verified prompt followed by the pasted text.
 describe('tmuxPasteToVerifiedPane', async () => {
   const { tmuxPasteToVerifiedPane } = await import('../tmux-helpers.js');
-  const pane = { id: '%7', pid: 4242, command: 'bash' };
-  const run = (probe) => {
+  const pane = { id: '%7', pid: 4242, command: 'bash', promptRow: 'user@host:~$' };
+  const TEXT = 'cd "/x"; claude --model y';
+  const SAME = '%7 0 4242 13 3 bash';
+  // probes: what display-message answers on each read; capture: the screen after the paste.
+  const run = async (probes, capture = `user@host:~$ ${TEXT}\n`) => {
     const calls = [];
     const keys = [];
+    let reads = 0;
     const execFileSyncImpl = (file, args) => {
       calls.push([file, ...args]);
       if (args[0] === 'display-message') {
+        const probe = probes[Math.min(reads++, probes.length - 1)];
         if (probe === null) throw new Error("can't find pane: %7");
         return probe;
       }
+      if (args[0] === 'capture-pane') return capture;
       return '';
     };
     let error = null;
     try {
-      tmuxPasteToVerifiedPane(pane, '/tmp/msg.txt', 'zylos-buf', { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]) });
+      await tmuxPasteToVerifiedPane(pane, '/tmp/msg.txt', 'zylos-buf', TEXT,
+        { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]), sleep: async () => {} });
     } catch (err) { error = err; }
-    return { calls, keys, error };
+    return { calls, keys, error, pasted: calls.some((c) => c[1] === 'paste-buffer') };
   };
 
-  it('pastes and submits to the verified pane id when the same shell is still there', () => {
-    const got = run('%7 0 4242 13 3 bash');
+  it('pastes to the verified pane id and submits once the pane shows the prompt and the pasted line', async () => {
+    const got = await run([SAME, SAME]);
     assert.equal(got.error, null);
-    assert.deepEqual(got.calls.slice(1), [['tmux', 'load-buffer', '-b', 'zylos-buf', '/tmp/msg.txt'],
-      ['tmux', 'paste-buffer', '-p', '-r', '-b', 'zylos-buf', '-t', '%7']]);
+    assert.deepEqual(got.calls.filter((c) => c[1] === 'load-buffer' || c[1] === 'paste-buffer'),
+      [['tmux', 'load-buffer', '-b', 'zylos-buf', '/tmp/msg.txt'], ['tmux', 'paste-buffer', '-p', '-r', '-b', 'zylos-buf', '-t', '%7']]);
     assert.deepEqual(got.keys, [['%7', 'Enter']]);
   });
 
-  it('types nothing when the pane is gone or its foreground or process changed', () => {
+  it('types nothing when the pane is gone or its foreground or process changed before the paste', async () => {
     for (const probe of [null, '%7 1 4242 13 3 bash', '%7 0 4242 13 3 claude', '%7 0 5151 13 3 bash']) {
-      const got = run(probe);
+      const got = await run([probe]);
       assert.match(got.error?.message || '', /gone or changed since it was verified; nothing typed/, String(probe));
-      assert.deepEqual(got.calls.filter((c) => c[1] !== 'display-message'), [], String(probe));
+      assert.equal(got.pasted, false, String(probe));
       assert.deepEqual(got.keys, [], String(probe));
+    }
+  });
+
+  it('pastes but never presses Enter when the pane changed between paste and Enter, or the line is not the pasted one', async () => {
+    const cases = {
+      'pane gone': [[SAME, null]],
+      'engine took the foreground': [[SAME, '%7 0 4242 40 3 claude']],
+      'line differs': [[SAME, SAME], `user@host:~$ ${TEXT}x\n`],
+      'text went elsewhere': [[SAME, SAME], 'user@host:~$\n'],
+    };
+    for (const [name, [probes, capture]] of Object.entries(cases)) {
+      const got = await run(probes, capture);
+      assert.match(got.error?.message || '', /not submitted \(the line is left as typed\)/, name);
+      assert.equal(got.pasted, true, name);
+      assert.deepEqual(got.keys, [], `${name}: no Enter and no other key`);
     }
   });
 });
