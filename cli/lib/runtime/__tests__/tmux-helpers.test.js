@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 
 // We test the module's behavior by importing it and verifying that
 // the functions handle various child_process outcomes correctly.
@@ -174,8 +175,10 @@ describe('tmuxPasteToVerifiedPane', async () => {
     const keys = [];
     let reads = 0;
     let pasted = false;
+    let buffer = null;
     const execFileSyncImpl = (file, args) => {
       calls.push([file, ...args]);
+      if (args[0] === 'load-buffer') buffer = fs.readFileSync(args.at(-1), 'utf8');
       if (args[0] === 'display-message') {
         const probe = probes[Math.min(reads++, probes.length - 1)];
         if (probe === null) throw new Error("can't find pane: %7");
@@ -187,17 +190,19 @@ describe('tmuxPasteToVerifiedPane', async () => {
     };
     let error = null;
     try {
-      await tmuxPasteToVerifiedPane(target, '/tmp/msg.txt', 'zylos-buf', text,
+      await tmuxPasteToVerifiedPane(target, 'zylos-buf', text,
         { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]), sleep: async () => {} });
     } catch (err) { error = err; }
-    return { calls, keys, error, pasted };
+    return { calls, keys, error, pasted, buffer, loaded: calls.some((c) => c[1] === 'load-buffer') };
   };
 
   it('pastes to the verified pane id and submits once the pane shows the prompt and the pasted line', async () => {
     const got = await run([SAME, AFTER]);
     assert.equal(got.error, null);
-    assert.deepEqual(got.calls.filter((c) => c[1] === 'load-buffer' || c[1] === 'paste-buffer'),
-      [['tmux', 'load-buffer', '-b', 'zylos-buf', '/tmp/msg.txt'], ['tmux', 'paste-buffer', '-p', '-r', '-b', 'zylos-buf', '-t', '%7']]);
+    assert.deepEqual(got.calls.filter((c) => c[1] === 'load-buffer' || c[1] === 'paste-buffer').map((c) => c.slice(0, 4)),
+      [['tmux', 'load-buffer', '-b', 'zylos-buf'], ['tmux', 'paste-buffer', '-p', '-r']]);
+    assert.equal(got.calls.find((c) => c[1] === 'paste-buffer').at(-1), '%7');
+    assert.equal(got.buffer, TEXT, 'the buffer holds exactly the validated command');
     assert.deepEqual(got.keys, [['%7', 'Enter']]);
   });
 
@@ -208,6 +213,16 @@ describe('tmuxPasteToVerifiedPane', async () => {
       rows('Last login: today', '', `${PROMPT} ls`, `${head}\\`, tail, ''));
     assert.equal(got.error, null);
     assert.deepEqual(got.keys, [['%7', 'Enter']]);
+  });
+
+  it('refuses a command ending in a tab, ending in a newline, or with an embedded newline: nothing is pasted', async () => {
+    for (const text of [`${TEXT}\t`, `${TEXT}\n`, 'cd "/x"\nclaude --model y', `${TEXT}\r`, `${TEXT} `]) {
+      const got = await run([SAME, AFTER], AFTER_SCREEN, BEFORE_SCREEN, { text });
+      assert.match(got.error?.message || '', /^the command (contains a control character|ends with whitespace).*; nothing typed$/, JSON.stringify(text));
+      assert.equal(got.loaded, false, `${JSON.stringify(text)}: no buffer`);
+      assert.equal(got.pasted, false, JSON.stringify(text));
+      assert.deepEqual(got.keys, [], JSON.stringify(text));
+    }
   });
 
   it('types nothing when the pane is gone or its foreground or process changed before the paste', async () => {

@@ -74,6 +74,8 @@ const IDLE_CAPTURE = 'Last login: today\n\nuser@host:~$ ls\nuser@host:~$\n\n\n';
 let paneProbe = IDLE_PROBE;
 let psTable = IDLE_TABLE;
 let paneCapture = IDLE_CAPTURE;
+// Optional per-test hook for tmux calls (returns undefined to fall through).
+let tmuxHook = null;
 const resolvedCodex = "/selected codex/it's/bin/codex";
 let codexHelp = '  --no-daemon  Run without the shared background server';
 let codexHelpError = null;
@@ -89,6 +91,10 @@ mock.module('node:child_process', {
     }),
     execFileSync: mock.fn((file, args, opts) => {
       calls.execFileSync.push({ file, args: args ? [...args] : [], opts });
+      if (file === 'tmux' && tmuxHook) {
+        const answer = tmuxHook(args);
+        if (answer !== undefined) return answer;
+      }
       if (file === 'tmux' && args?.[0] === 'has-session') {
         if (!tmuxSessionExists) throw new Error('no session');
         return '';
@@ -965,6 +971,39 @@ for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => Cod
       await adapter.launch({ bypassPermissions: false });
       assert.ok(sent && sent.length > 0);
       assert.deepEqual(options, { pane: { id: '%7', pid: 4242, command: 'bash', promptRow: 'user@host:~$', promptY: 3 } });
+    });
+
+    it(`${label}: the generated launch line goes into the paste buffer exactly as validated and is submitted`, async () => {
+      const { launchLineProblem } = await import('../runtime/tmux-helpers.js');
+      const { cellWidth } = await import('../runtime/cell-width.js');
+      let loaded = null;
+      let pasted = false;
+      const rows = () => ['Last login: today', '', 'user@host:~$ ls', pasted ? `user@host:~$ ${loaded}` : 'user@host:~$', '', ''];
+      try {
+        tmuxSessionExists = true;
+        paneProbe = () => (pasted ? `%7 0 4242 ${cellWidth(rows()[3])} 3 bash` : IDLE_PROBE);
+        // A wide pane: no row wraps, so -J and plain captures agree.
+        tmuxHook = (args) => {
+          if (args[0] === 'load-buffer') { loaded = fs.readFileSync(args.at(-1), 'utf8'); return ''; }
+          if (args[0] === 'paste-buffer') { pasted = true; return ''; }
+          if (args[0] === 'capture-pane' && args.includes('-S')) {
+            const from = Math.max(0, Number(args[args.indexOf('-S') + 1]));
+            return `${rows().slice(from, Number(args[args.indexOf('-E') + 1]) + 1).join('\n')}\n`;
+          }
+          if (args[0] === 'capture-pane') return `${rows().join('\n')}\n`;
+          return undefined;
+        };
+        calls.execFileSync.length = 0;
+        await makeAdapter(Cls()).launch({ bypassPermissions: false });
+        assert.ok(loaded && /\b(claude|codex)\b/.test(loaded), 'the generated launch line was pasted');
+        assert.equal(launchLineProblem(loaded), null);
+        const enter = calls.execFileSync.filter((c) => c.file === 'tmux' && c.args[0] === 'send-keys');
+        assert.ok(enter.length >= 1 && enter.at(-1).args.includes('%7') && enter.at(-1).args.includes('Enter'),
+          JSON.stringify(enter.map((c) => c.args)));
+      } finally {
+        tmuxHook = null;
+        paneProbe = IDLE_PROBE;
+      }
     });
   });
 }

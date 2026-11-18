@@ -262,14 +262,18 @@ export class CodexAdapter extends RuntimeAdapter {
   // Enter then go to that pane id only (tmuxPasteToVerifiedPane).
   async sendMessage(text, { pane = null } = {}) {
     const msgId = `${Date.now()}-${process.pid}`;
+    const bufferName = `zylos-${msgId}`;
+    if (pane) {
+      // The helper validates `text` as it is and pastes exactly that string.
+      try { await tmuxPasteToVerifiedPane(pane, bufferName, text); } finally { tmuxDeleteBuffer(bufferName); }
+      return;
+    }
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-'));
     const tmpFile = path.join(tmpDir, 'msg.txt');
-    const bufferName = `zylos-${msgId}`;
 
     try {
       fs.writeFileSync(tmpFile, text);
-      if (pane) await tmuxPasteToVerifiedPane(pane, tmpFile, bufferName, text);
-      else tmuxPasteBuffer(SESSION, tmpFile, bufferName);
+      tmuxPasteBuffer(SESSION, tmpFile, bufferName);
     } finally {
       try { fs.unlinkSync(tmpFile); fs.rmdirSync(tmpDir); } catch { }
       tmuxDeleteBuffer(bufferName);

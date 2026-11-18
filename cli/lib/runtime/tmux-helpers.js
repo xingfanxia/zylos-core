@@ -6,6 +6,9 @@
  */
 
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { sendTmuxKeys } from '../tmux-send-keys.js';
 import { buildProcessTree, hasDescendantProcess } from './process-tree.js';
 import { cellWidth } from './cell-width.js';
@@ -222,35 +225,62 @@ function lineThroughRow(paneId, y, impl) {
 const samePane = (now, pane) => Boolean(now) && now.id === pane.id && !now.dead && now.pid === pane.pid && now.command === pane.command;
 
 /**
- * Paste `text` (from tmpFile) into the pane verified by
- * requirePaneAtShellPrompt, by its pane id, then submit it.
+ * Why a command line cannot be typed into a shell prompt and verified, or
+ * null: it must be a non-empty string with no control character anywhere
+ * (tab, newline, carriage return, escape, ...), no trailing whitespace (a row
+ * capture trims it, so it could never be verified), and only characters whose
+ * terminal width is known (cell-width.js).
+ * @param {unknown} command
+ * @returns {string|null}
+ */
+export function launchLineProblem(command) {
+  if (typeof command !== 'string' || command.length === 0) return 'is empty';
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(command)) return 'contains a control character (tab, newline or other)';
+  if (/\s$/u.test(command)) return 'ends with whitespace';
+  if (cellWidth(command) === null) return 'has a character of uncertain width';
+  return null;
+}
+
+/**
+ * Paste `command` into the pane verified by requirePaneAtShellPrompt, by its
+ * pane id, then submit it. The command is received once and validated as it
+ * is (launchLineProblem, no trimming); that same string is what this writes
+ * to the paste buffer and what the row is compared against. A command that
+ * fails validation, or a prompt of uncertain width, gets nothing typed.
  * Before the paste one read must show the same pane alive with the same pane
  * process and shell in the foreground, the cursor on the checked prompt row
  * (same y) and that row, read at the cursor's y, still the checked prompt
  * with the cursor at its end. Before Enter another read must show the same
  * pane, process and shell; at the cursor's coordinates the logical line ending
- * on the cursor's row must be the verified prompt followed by `text`, and the
- * cursor must be at the end of its row. On any difference nothing more is
- * sent (before the paste: nothing at all; after it: no Enter, the line stays
- * as typed) and this throws.
+ * on the cursor's row must be the verified prompt followed by the command,
+ * and the cursor must be at the end of its row. On any difference nothing
+ * more is sent (before the paste: nothing at all; after it: no Enter, the line
+ * stays as typed) and this throws.
  */
-export async function tmuxPasteToVerifiedPane(pane, tmpFile, bufferName, text, { execFileSyncImpl = execFileSync,
+export async function tmuxPasteToVerifiedPane(pane, bufferName, command, { execFileSyncImpl = execFileSync,
   sendKeys = sendTmuxKeys, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), echoMs = 200 } = {}) {
-  const typed = String(text).replace(/\s+$/, '');
+  const problem = launchLineProblem(command);
+  if (problem) throw new Error(`the command ${problem}; nothing typed`);
   const promptCells = cellWidth(pane.promptRow);
-  if (promptCells === null || cellWidth(typed) === null) {
-    throw new Error(`the prompt or the command has a character of uncertain width; nothing typed`);
-  }
+  if (promptCells === null) throw new Error('the prompt has a character of uncertain width; nothing typed');
   const before = readPane(pane.id, execFileSyncImpl);
   const promptNow = before && rowAt(pane.id, before.cursorY, execFileSyncImpl);
   if (!samePane(before, pane) || before.cursorY !== pane.promptY || promptNow !== pane.promptRow
       || before.cursorX < promptCells || before.cursorX > promptCells + 1) {
     throw new Error(`pane ${pane.id} is gone or changed since it was verified; nothing typed`);
   }
-  execFileSyncImpl('tmux', ['load-buffer', '-b', bufferName, tmpFile], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
+  // The buffer holds exactly the validated string, written here and nowhere else.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-launch-'));
+  const file = path.join(dir, 'command.txt');
+  try {
+    fs.writeFileSync(file, command, { mode: 0o600 });
+    execFileSyncImpl('tmux', ['load-buffer', '-b', bufferName, file], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
   execFileSyncImpl('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', pane.id], { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   await sleep(echoMs);
-  const expected = [`${pane.promptRow} ${typed}`, `${pane.promptRow}${typed}`];
+  const expected = [`${pane.promptRow} ${command}`, `${pane.promptRow}${command}`];
   const after = readPane(pane.id, execFileSyncImpl);
   const line = after && lineThroughRow(pane.id, after.cursorY, execFileSyncImpl);
   const cursorRow = after && rowAt(pane.id, after.cursorY, execFileSyncImpl);

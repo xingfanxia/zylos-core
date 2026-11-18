@@ -7,7 +7,7 @@
 //     U+2060-U+2064, U+FEFF): 0;
 //   - East Asian Wide and Fullwidth (W, F): 2;
 //   - every other assigned, visible character outside the ambiguous set: 1;
-//   - unknown (null): control characters, East Asian Ambiguous (A: their
+//   - unknown (null): control characters, line and paragraph separators, East Asian Ambiguous (A: their
 //     width depends on the terminal and locale), emoji and their components
 //     (joiners, variation selectors, modifiers, regional indicators, tags),
 //     other format characters, conjoining Hangul vowels and finals,
@@ -73,7 +73,7 @@ function inRanges(table, cp) {
 }
 
 const EMOJI = /\p{Extended_Pictographic}|\p{Emoji_Component}/u;
-const UNKNOWN_CATEGORY = /\p{Cn}|\p{Cs}|\p{Co}|\p{Cc}/u;
+const UNKNOWN_CATEGORY = /\p{Cn}|\p{Cs}|\p{Co}|\p{Cc}|\p{Zl}|\p{Zp}/u;
 const COMBINING = /\p{Mn}|\p{Me}/u;
 const FORMAT = /\p{Cf}/u;
 const ZERO_WIDTH = new Set([0x200b, 0x200c, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0xfeff]);
