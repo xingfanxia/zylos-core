@@ -199,6 +199,20 @@ When Claude Code shows a permission prompt (PermissionRequest event), the `hook-
 3. If `auto_approve_permission` is true (default), it enqueues a `[KEYSTROKE]Enter` control at priority 0 with bypass-state and 1-second delay. When `TMUX_PANE` is set it reads its own pane identity (`tmux display-message -t "$TMUX_PANE"`) and binds the key with `--session-ref`; if that read fails the key is enqueued unbound, as before
 4. The C4 dispatcher delivers the Enter keystroke to the pane id of the read that decided it (a bound key for a replaced session is superseded, never sent to the replacement), auto-confirming the prompt
 
+**Never in bypass-permissions mode, never for a safety check.** In a `--dangerously-skip-permissions` session (hook input `permission_mode: bypassPermissions`) Claude Code asks only for what it will not let any rule approve, such as `Dangerous rm operation on possibly-empty variable path` (CLI 2.1.326 asks even then); Enter would select `1. Yes`. The hook enqueues nothing there and logs `mode=bypassPermissions`. The dispatcher also supersedes (`SAFETY_PROMPT`) any Enter claimed while a permission prompt shows such a safety notice row (`│ …`). Those prompts are declined by the dialog watch below.
+
+## Dialog Watch
+
+`dialog-watch.js`, ticked by every Claude persona's monitor with the pane read it already makes each second (no extra tmux call). After 2026-11-18, when user-pan's own `rm -f $D/*` raised a dangerous-command prompt that nobody answered for 4 h 48 min while every message to Pan was held:
+
+- **Permission prompt** on screen for 60 s: one `[KEYSTROKE]Escape` bound to that pane (`--session-ref`), the cancel key the prompt names; never "Yes", never an option number. Once the prompt is gone the session gets one control message: its last tool call was declined, quoting the prompt's title and notice rows (Claude Code's own text), and to rewrite the command as the prompt advised.
+- **Any other dialog** (`unknown`) on screen for 2 min: one Escape, no message. The Fable guard's dialogs (`fable_limit`, `credits_offer`, `usage_overlay`) get no key here.
+- An Escape still queued when its dialog closes by itself is superseded (`DIALOG_GONE`), so it never interrupts the work that follows, and no decline message is sent. A failed enqueue is not repeated.
+- **Operator alert** (the degraded alert's direct admin send, `health-alert`): a dialog still on screen 5 min after it first held an inbound message (persona, dialog kind, title row, minutes on screen and held, count and oldest age), at most once an hour while it lasts; or inbound messages undelivered for more than 10 min while the session is idle, once per backlog. A failed send is tried again a minute later.
+- **Status**: while inbound messages are undelivered for more than 10 min and the session is idle or held by a dialog, `agent-status.json` shows `health: unavailable`, `unavailable_reason: delivery_stuck`, `delivery_stuck: { cause, pending, oldest_age_seconds }` instead of `ok` (only over an engine health of `ok`). The dispatcher never holds delivery on this reason and a monitor never starts its health engine from it (`DELIVERY_STUCK_REASON` in `comm-bridge/scripts/c4-config.js`).
+
+Logs and alerts carry ids, counts, kinds, ages and the dialog's title row only, never message content.
+
 ### Configuration
 
 ```bash

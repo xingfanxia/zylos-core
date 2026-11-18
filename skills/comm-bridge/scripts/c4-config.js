@@ -84,6 +84,14 @@ export const SESSION_INIT_GROUP_PER_GROUP = 10;
 export const SESSION_INIT_GROUP_MAX_GROUPS = 8;
 export const SESSION_INIT_RECENT_COUNT = 6;  // max conversations returned by session-init when above threshold
 
+// Inbound messages undelivered for more than 10 minutes while the session is
+// free are published by the activity monitor as health 'unavailable' with this
+// unavailable_reason (activity-monitor dialog-watch.js, status-writer.js). It
+// reports the dispatcher's own backlog: the dispatcher never holds delivery on
+// it (holding would keep the backlog forever), and a monitor never starts its
+// health engine from it.
+export const DELIVERY_STUCK_REASON = 'delivery_stuck';
+
 export const STALE_STATUS_THRESHOLD = 5000; // ms
 export const TMUX_MISSING_WARN_THRESHOLD = 30;
 

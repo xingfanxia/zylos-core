@@ -67,6 +67,7 @@ import {
   TMUX_MISSING_WARN_THRESHOLD,
   HEARTBEAT_INTERVAL_MS,
   WATCHDOG_MAX_TICK_MS,
+  DELIVERY_STUCK_REASON,
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
@@ -194,6 +195,14 @@ export function readJsonFileWithRetry(filePath, attempts = 3) {
   throw lastErr;
 }
 
+/**
+ * Health holds delivery unless it is 'ok', or it reports this dispatcher's own
+ * backlog (DELIVERY_STUCK_REASON: holding on it would keep the backlog forever).
+ */
+export function healthHoldsDelivery(agentState) {
+  return agentState?.health !== 'ok' && agentState?.reason !== DELIVERY_STUCK_REASON;
+}
+
 function getAgentState(statusFile = AGENT_STATUS_FILE) {
   try {
     if (!existsSync(statusFile)) {
@@ -218,7 +227,8 @@ function getAgentState(statusFile = AGENT_STATUS_FILE) {
 
     const health = typeof status.health === 'string' ? status.health : 'ok';
     const idleSeconds = typeof status.idle_seconds === 'number' ? status.idle_seconds : 0;
-    return { state, health, healthy: true, idleSeconds };
+    const reason = typeof status.unavailable_reason === 'string' ? status.unavailable_reason : null;
+    return { state, health, healthy: true, idleSeconds, reason };
   } catch (err) {
     log(`Warning: Error reading agent status (${err.message})`);
     // health is fail-open by design; state still degrades to offline on read failure.
@@ -1072,7 +1082,7 @@ async function processNextMessage() {
     return { delivered: false, state: agentState.state };
   }
 
-  if (agentState.health !== 'ok' && !bypass) {
+  if (healthHoldsDelivery(agentState) && !bypass) {
     releaseItem(item);
     return { delivered: false, state: agentState.state };
   }

@@ -160,8 +160,10 @@ import { rotateDailyLog } from './log-rotation.js';
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
-import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified } from '../../comm-bridge/scripts/c4-db.js';
+import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified,
+  getUndeliveredInboundSummary, supersedeControl } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
+import { createDialogWatch } from './dialog-watch.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -356,6 +358,7 @@ let orchestrator;    // initialized in init()
 let messageRouterServer; // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
 let fableMonitor = null; // Fable guard lease enforcement (guard-tracked personas only)
+let dialogWatch = null; // dialogs nobody can answer, stuck delivery (dialog-watch.js)
 
 // Timezone: reuse scheduler's tz.js (.env TZ → process.env.TZ → UTC)
 import { loadTimezone } from '../../scheduler/scripts/tz.js';
@@ -475,6 +478,8 @@ function writeStatusFile(statusObj) {
       ...(orchestrator?.components?.guardian?.startStatus?.() || {}),
     },
     healthEngine: engine,
+    // Only a running session's status reports a delivery backlog.
+    deliveryStuck: statusObj.state === 'idle' || statusObj.state === 'busy' ? dialogWatch?.deliveryStuck() : null,
   });
 }
 
@@ -1275,9 +1280,28 @@ function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchA
   });
 }
 
+// Dialog watch (dialog-watch.js): fed the pane read the tick already makes.
+// Keys and the decline notice go through the C4 control queue like the tool
+// watchdog's interrupt; alerts through the degraded alert's direct admin send.
+function createDialogWatchFor() {
+  return createDialogWatch({
+    instanceId: INSTANCE_ID,
+    enqueueKey: (key, sessionRef) => runC4Control(['enqueue', '--content', `[KEYSTROKE]${key}`, '--priority', '0',
+      '--bypass-state', '--no-ack-suffix', '--session-ref', sessionRef]),
+    withdrawKey: id => supersedeControl(id, 'DIALOG_GONE'),
+    enqueueNotice: text => runC4Control(['enqueue', '--content', text, '--priority', '1', '--no-ack-suffix']),
+    readUndelivered: () => getUndeliveredInboundSummary(INSTANCE_ID),
+    notifyOperator: message => (ADMIN_CHAT_ID
+      ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
+      : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),
+    log,
+  });
+}
+
 async function monitorLoop() {
   const currentTime = Math.floor(Date.now() / 1000);
   const currentTimeHuman = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  let paneFrame = null;
 
   const tickState = await orchestrator.handleMonitorTick({
     currentTime,
@@ -1302,7 +1326,7 @@ async function monitorLoop() {
     getConversationFileModTime,
     getTmuxActivity,
     getTmuxClaudePid,
-    readTmuxInputState,
+    readTmuxInputState: (options) => (paneFrame = readTmuxInputState(options)),
     canTreatPaneAsRecovered,
     runC4Control,
   });
@@ -1311,6 +1335,16 @@ async function monitorLoop() {
   idleSince = tickState.idleSince;
   watchdogState = tickState.watchdogState;
   try { fableMonitor?.tick(); } catch (err) { log(`Fable guard monitor tick failed: ${err.message}`); }
+  // A running session only (its status is idle or busy). Only Claude panes are
+  // read for dialogs; a Claude tick without a pane read (startup grace) is no
+  // evidence that a dialog closed.
+  if (lastState === 'idle' || lastState === 'busy') {
+    const framed = adapter?.runtimeId !== 'claude' || paneFrame !== null;
+    try {
+      dialogWatch?.tick({ modal: paneFrame?.modal ?? null, sessionRef: paneFrame?.paneIdentity ?? null,
+        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok' });
+    } catch (err) { log(`Dialog watch tick failed: ${err.message}`); }
+  }
 }
 
 function init() {
@@ -1348,6 +1382,7 @@ function init() {
     engine,
     contextMonitor,
   } = orchestrator.start());
+  dialogWatch = createDialogWatchFor();
 }
 
 // REL-9b seam: gate the daemon side-effects (init, process handlers, schedule

@@ -28,6 +28,7 @@ import {
 import {
   TMUX_SESSION,
   AGENT_STATUS_FILE,
+  DELIVERY_STUCK_REASON,
 } from './c4-config.js';
 
 // ── Constants ──────────────────────────────────────────────────────────
@@ -320,8 +321,9 @@ export function multiSessionDispatch(item, helpers) {
     return { action: 'skip', reason: `instance target offline (state=${claudeState.state})`, reasonCategory: 'offline' };
   }
 
-  // 5. Unhealthy → skip.
-  if (claudeState.health !== 'ok' && !bypass) {
+  // 5. Unhealthy → skip. A reported delivery backlog (DELIVERY_STUCK_REASON)
+  // is this dispatcher's own and never holds delivery.
+  if (claudeState.health !== 'ok' && claudeState.reason !== DELIVERY_STUCK_REASON && !bypass) {
     return { action: 'skip', reason: `instance unhealthy (health=${claudeState.health})`, reasonCategory: 'unhealthy' };
   }
 

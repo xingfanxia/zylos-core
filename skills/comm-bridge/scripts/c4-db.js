@@ -405,6 +405,22 @@ export function getPendingCount() {
 }
 
 /**
+ * Inbound messages of one instance not yet handed to its session (pending, or
+ * claimed by a dispatcher pass right now): how many, and when the oldest
+ * arrived. `instanceId` null means unattributed rows (single-session). Read by
+ * the activity monitor's dialog watch; ids and counts only, never content.
+ * @returns {{ count: number, oldestAt: number|null }} oldestAt in epoch ms
+ */
+export function getUndeliveredInboundSummary(instanceId) {
+  const row = getDb().prepare(`
+    SELECT COUNT(*) AS count, MIN(timestamp) AS oldest FROM conversations
+    WHERE direction = 'in' AND status IN ('pending', 'running') AND target_instance IS ?
+  `).get(instanceId ?? null);
+  const oldestAt = row?.oldest ? Date.parse(`${String(row.oldest).replace(' ', 'T')}Z`) : NaN;
+  return { count: row?.count || 0, oldestAt: Number.isFinite(oldestAt) ? oldestAt : null };
+}
+
+/**
  * Get count of pending control items
  * @returns {number}
  */
