@@ -417,6 +417,40 @@ describe('Claude launch — new session', () => {
 
     assert.deepEqual(readSpecArgs(), ['--settings', '/home/zylos-shared/auth/claude-ax-cl.settings.json', '--model', 'claude-opus-5-5[1m]']);
   });
+
+  // Claude Code 2.1.327 takes no login from project settings: on 2026-11-18
+  // every isolated persona moved to claude-ax-main started "Not logged in".
+  const launchWithSharedSettings = async (settings, runtimeProfile) => {
+    const shared = path.join(fakeZylosDir, '.claude', 'settings.local.json');
+    const original = fs.existsSync(shared) ? fs.readFileSync(shared) : null;
+    fs.mkdirSync(path.dirname(shared), { recursive: true });
+    fs.writeFileSync(shared, JSON.stringify(settings));
+    try {
+      const adapter = makeAdapter(ClaudeAdapter);
+      adapter.config.runtimeProfile = runtimeProfile;
+      await adapter.launch({ bypassPermissions: false });
+      return { shared, args: readSpecArgs() };
+    } finally {
+      if (original) fs.writeFileSync(shared, original); else fs.rmSync(shared, { force: true });
+    }
+  };
+  const SHARED_TOKEN = { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' } };
+
+  it('names the shared project token with --settings for a profile without its own file', async () => {
+    const { shared, args } = await launchWithSharedSettings(SHARED_TOKEN, { id: 'claude-ax-main', model: 'claude-opus-5-5[1m]' });
+    assert.deepEqual(args, ['--settings', shared, '--model', 'claude-opus-5-5[1m]']);
+  });
+
+  it('keeps the profile account file ahead of the shared project token', async () => {
+    const own = '/home/zylos-shared/auth/claude-ax-cl.settings.json';
+    const { args } = await launchWithSharedSettings(SHARED_TOKEN, { id: 'claude-ax-cl', claudeSettingsFile: own });
+    assert.deepEqual(args, ['--settings', own]);
+  });
+
+  it('passes no --settings for project settings that hold no token', async () => {
+    const { args } = await launchWithSharedSettings({ permissions: { allow: [] } }, { id: 'claude-ax-main', model: 'claude-opus-5-5[1m]' });
+    assert.deepEqual(args, ['--model', 'claude-opus-5-5[1m]']);
+  });
 });
 
 describe('Claude launch — relay credentials from .env', () => {
