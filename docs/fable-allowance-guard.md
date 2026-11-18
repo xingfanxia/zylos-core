@@ -56,8 +56,12 @@ Out-of-range numbers fall back to the default; they never disable the guard.
 its current `runtime_profile`.
 
 **Unsupported accounts.** A profile without its own settings file (on
-ax-devbox: `claude-ax-main`, the host-default credential) cannot be probed, so
-Fable is **unsupported** there, not pending: a `fable_enabled` persona on such
+ax-devbox: `claude-ax-main`, which launches on the shared project token) is
+never probed by the guard, so Fable is **unsupported** there, not pending. The
+provider-usage updater does read that account's quota through the same shared
+token file (`sharedProjectTokenFile` in `runtime-files.js`), for the account
+failover only; that reading never makes the account Fable-eligible, and the
+profile must not gain a `claude_settings_file` for it. A `fable_enabled` persona on such
 an account always runs Opus (with the subagent pin), its commit reason and
 launch reason are `unsupported_account`, the guard state marks it
 `unsupported: account_without_settings_file`, and `fable-guard-cli.js status`

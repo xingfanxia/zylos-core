@@ -98,6 +98,23 @@ export function readFableGuardConfig(document) {
   return config;
 }
 
+/**
+ * The shared project settings file, when it holds the host's Claude token. A
+ * Claude profile without claude_settings_file launches on this account
+ * (cli/lib/runtime/claude.js), and the provider-usage updater reads the
+ * `claude` usage provider through the same file. It never makes an account
+ * Fable-eligible: fableAccountSettingsFile reads only the profile field.
+ */
+export function sharedProjectTokenFile(zylosDir = DEFAULT_ZYLOS_DIR) {
+  const file = path.join(zylosDir, '.claude', 'settings.local.json');
+  try {
+    const token = JSON.parse(fs.readFileSync(file, 'utf8'))?.env?.CLAUDE_CODE_OAUTH_TOKEN;
+    return typeof token === 'string' && token ? file : null;
+  } catch {
+    return null; // absent or unreadable: the host logs in some other way
+  }
+}
+
 /** Settings file of a probe-able Fable account (a Claude profile), else null. */
 export function fableAccountSettingsFile(document, profileId) {
   const raw = document?.runtime_profiles?.[profileId];

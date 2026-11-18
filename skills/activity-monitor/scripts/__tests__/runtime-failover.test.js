@@ -248,6 +248,64 @@ describe('policy hold_profiles for a Claude -> Codex subscription -> Azure chain
   });
 });
 
+// ax-devbox 2026-11-18: ax-main (usage_provider `claude`) had only a native
+// reading from a July statusline. Unknown ax-main usage must neither strand a
+// persona there nor pull one back into it; a probed reading drives both ways.
+describe('devbox chain with the ax-main reading', () => {
+  const nowMs = Date.parse('2026-11-18T18:50:00Z');
+  const claude = (account, extra = {}) => ({ runtime: 'claude', usage_provider: account, model: 'claude-opus-5-5[1m]',
+    reasoning_effort: 'high', ...extra });
+  const chainProfiles = {
+    'claude-ax-backup': claude('claude-ax-backup', { claude_settings_file: '/home/zylos-shared/auth/claude-ax-backup.settings.json' }),
+    'claude-ax-cl': claude('claude-ax-cl', { claude_settings_file: '/home/zylos-shared/auth/claude-ax-cl.settings.json' }),
+    'claude-ax-main': claude('claude'),
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const seen = used => ({ available: true, quota_authoritative: true, observed_at: new Date(nowMs).toISOString(),
+    secondary: { used_percent: used, resets_at: '2026-11-19T17:00:00Z' } });
+  // What fetchClaudeNativeUsage now publishes for the July statusline.
+  const julyNative = { available: true, quota_authoritative: false, source: 'zylos-native',
+    observed_at: '2026-07-01T06:32:14.000Z', fetched_at: '2026-07-01T06:32:14.000Z',
+    primary: { used_percent: 10, resets_at: '2026-07-01T11:00:00.000Z' },
+    secondary: { used_percent: 53, resets_at: '2026-07-02T17:00:00.000Z' } };
+  const plan = (main, health = {}) => planRuntimeFailover({
+    document: {
+      runtime_profiles: chainProfiles,
+      runtime_failover: { enabled: true, chain: Object.keys(chainProfiles), switch_threshold: 95, recover_threshold: 90,
+        min_dwell_sec: 300, auto_recover: true, required_model: 'gpt-6-astra', required_reasoning_effort: 'medium',
+        usage_max_age_sec: 180 },
+      instances: Object.fromEntries([['admin', 'claude-ax-main'], ['group', 'codex-subscription'], ['sean', 'claude-ax-cl']]
+        .map(([id, profile]) => [id, { runtime_profile: profile, runtime_failover_enabled: true, tmux_session: `x-${id}`,
+          runtime_profile_changed_at: new Date(nowMs - 600_000).toISOString() }])),
+    },
+    providerUsage: { providers: { 'claude-ax-backup': seen(95), 'claude-ax-cl': seen(96), codex: seen(20),
+      ...(main === undefined ? {} : { claude: main }) } },
+    healthByInstance: health,
+    nowMs,
+  }).changes.map(c => [c.instanceId, c.toProfile, c.reason]);
+
+  it('unknown ax-main usage: stays until health fails, allows the one forward hop, never recovers into it', () => {
+    for (const main of [julyNative, undefined, { available: false, error: 'probe timed out' }]) {
+      assert.deepEqual(plan(main), [['sean', 'claude-ax-main', 'usage_exhausted:claude-ax-cl']]);
+      assert.deepEqual(plan(main, { admin: 'rate_limited' }).filter(([id]) => id === 'admin'),
+        [['admin', 'codex-subscription', 'health_rate_limited:claude-ax-main']]);
+    }
+  });
+
+  it('a probed ax-main reading switches at 95% and recovers below 90%', () => {
+    assert.deepEqual(plan(seen(96)), [
+      ['admin', 'codex-subscription', 'usage_exhausted:claude'],
+      ['sean', 'codex-subscription', 'usage_exhausted:claude-ax-cl'],
+    ]);
+    assert.deepEqual(plan(seen(40)), [
+      ['group', 'claude-ax-main', 'preferred_provider_recovered:claude'],
+      ['sean', 'claude-ax-main', 'usage_exhausted:claude-ax-cl'],
+    ]);
+    assert.deepEqual(plan(seen(92)), [['sean', 'claude-ax-main', 'usage_exhausted:claude-ax-cl']]);
+  });
+});
+
 describe('policy ineligible_profiles for lapsed Claude subscriptions', () => {
   const nowMs = Date.parse('2026-09-29T12:00:00Z');
   const chain = {

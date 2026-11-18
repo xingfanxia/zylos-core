@@ -200,6 +200,7 @@ describe('fetchClaudeNativeUsage', () => {
     // provider payload must carry the rate-limit window plus its reset epoch.
     const result = fetchClaudeNativeUsage({
       now: '2026-07-16T15:00:00.000Z',
+      statImpl: () => ({ mtimeMs: Date.parse('2026-07-16T14:59:00.000Z') }),
       readImpl: () => ({
         sessionPercent: null,
         sessionResets: null,
@@ -228,6 +229,7 @@ describe('fetchClaudeNativeUsage', () => {
     // weeklyAllPercent: 99 → secondary.left_percent: 1.
     const result = fetchClaudeNativeUsage({
       now: '2026-04-01T13:13:46.846Z',
+      statImpl: () => ({ mtimeMs: Date.parse('2026-04-01T13:12:46.846Z') }),
       readImpl: () => ({
         sessionPercent: 1,
         weeklyAllPercent: 99,
@@ -241,6 +243,53 @@ describe('fetchClaudeNativeUsage', () => {
     assert.equal(result.available, true);
     assert.equal(result.source, 'zylos-native');
     assert.equal(result.secondary.left_percent, 1);
+  });
+});
+
+describe('fetchClaudeNativeUsage observation time', () => {
+  const now = '2026-11-18T18:44:13.587Z';
+  const monitorDir = (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'native-claude-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(dir, 'activity-monitor'));
+    return dir;
+  };
+  const writeAt = (file, data, iso) => {
+    fs.writeFileSync(file, JSON.stringify(data));
+    fs.utimesSync(file, new Date(iso), new Date(iso));
+  };
+
+  it('dates a statusline reading by the file, not by the poll (2026-11-18 ax-main at 53% from July)', (t) => {
+    const dir = monitorDir(t);
+    const epoch = iso => Date.parse(iso) / 1000;
+    writeAt(path.join(dir, 'activity-monitor', 'statusline.json'), { rate_limits: {
+      five_hour: { used_percentage: 10, resets_at: epoch('2026-07-01T11:00:00Z') },
+      seven_day: { used_percentage: 53, resets_at: epoch('2026-07-02T17:00:00Z') },
+    } }, '2026-07-01T06:32:14Z');
+    const usage = fetchClaudeNativeUsage({ zylosDir: dir, now });
+    assert.equal(usage.secondary.used_percent, 53);
+    assert.equal(usage.observed_at, '2026-07-01T06:32:14.000Z');
+    assert.equal(usage.fetched_at, '2026-07-01T06:32:14.000Z');
+    assert.equal(usage.checked_at, now);
+    assert.equal(usage.quota_authoritative, false);
+  });
+
+  it('dates a usage.json fallback by usage.json', (t) => {
+    const dir = monitorDir(t);
+    writeAt(path.join(dir, 'activity-monitor', 'usage.json'),
+      { session: { percent: 4 }, weeklyAll: { percent: 30 } }, '2026-03-28T21:22:37Z');
+    const usage = fetchClaudeNativeUsage({ zylosDir: dir, now });
+    assert.equal(usage.secondary.used_percent, 30);
+    assert.equal(usage.fetched_at, '2026-03-28T21:22:37.000Z');
+  });
+
+  it('reports a reading without a file time as unavailable', () => {
+    const usage = fetchClaudeNativeUsage({ zylosDir: '/nonexistent', now,
+      readImpl: () => ({ weeklyAllPercent: 53, statusShape: 'statusline_rate_limits' }),
+      statImpl: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); } });
+    assert.equal(usage.available, false);
+    assert.equal(usage.primary, null);
+    assert.equal(usage.secondary, null);
   });
 });
 
@@ -309,5 +358,98 @@ describe('runProviderUsageOnce', () => {
     assert.equal(result.providers.codex.fetched_at, null);
     assert.equal(result.providers.codex.observed_at, '2026-09-05T01:02:20Z');
     assert.equal(result.providers.codex.api_error, 'quota_probe_timeout');
+  });
+});
+
+describe('runProviderUsageOnce: the claude provider is the account a launch without its own file uses', () => {
+  const MAIN_ONLY = { runtime_profiles: { 'claude-ax-main': { runtime: 'claude', usage_provider: 'claude' } } };
+  const hostDir = (t, { settings, instances } = {}) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-claude-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    if (settings) {
+      fs.mkdirSync(path.join(dir, '.claude'));
+      fs.writeFileSync(path.join(dir, '.claude', 'settings.local.json'), JSON.stringify(settings));
+    }
+    if (instances) fs.writeFileSync(path.join(dir, 'instances.json'), JSON.stringify(instances));
+    return dir;
+  };
+  const run = (dir, overrides) => runProviderUsageOnce({ zylosDir: dir, filePath: path.join(dir, 'provider-usage.json'),
+    log: () => {}, refreshQuotaRecoveryProofsImpl: async () => ({}),
+    fetchCodexAccountUsageImpl: async () => ({ provider: 'codex', available: true, quota_authoritative: true }),
+    fetchCodexNativeUsageImpl: () => { throw new Error('unused'); },
+    ...overrides });
+  const probeOutput = used => JSON.stringify([{ provider: 'claude', source: 'claude',
+    usage: { secondary: { usedPercent: used, windowMinutes: 10080, resetsAt: '2026-11-19T17:00:00Z' } } }]);
+
+  it('reads ax-main through the account probe with the shared project token file', async (t) => {
+    const dir = hostDir(t, { settings: { env: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-main-fixture' } }, instances: MAIN_ONLY });
+    const calls = [];
+    const payload = await run(dir, {
+      execFileSyncImpl: (_bin, args, opts) => {
+        assert.ok(opts?.env?.CLAUDE_CONFIG_DIR, 'the operator default login must not be probed');
+        const creds = JSON.parse(fs.readFileSync(path.join(opts.env.CLAUDE_CONFIG_DIR, '.credentials.json'), 'utf8'));
+        assert.equal(creds.claudeAiOauth.accessToken, 'sk-ant-oat01-main-fixture');
+        assert.ok(!args.join(' ').includes('sk-ant'), 'token must not reach argv');
+        return probeOutput(61);
+      },
+      fetchClaudeAccountUsageImpl: (provider, settingsFile, options) => {
+        calls.push([provider, settingsFile]);
+        return fetchClaudeAccountUsage(provider, settingsFile, { ...options, homeDir: dir });
+      },
+      fetchClaudeNativeUsageImpl: () => { throw new Error('native files must not be read after a good probe'); },
+    });
+    assert.deepEqual(calls, [['claude', path.join(dir, '.claude', 'settings.local.json')]]);
+    const claude = payload.providers.claude;
+    assert.equal(claude.provider, 'claude');
+    assert.equal(claude.secondary.used_percent, 61);
+    assert.equal(claude.quota_authoritative, true);
+    assert.equal(claude.observed_at, payload.updated_at);
+  });
+
+  it('runs no token-file probe when the shared project file holds no token', async (t) => {
+    const dir = hostDir(t, { settings: { permissions: { allow: [] } } });
+    const calls = [];
+    const payload = await run(dir, {
+      execFileSyncImpl: (_bin, args, opts) => {
+        assert.deepEqual(args, ['usage', '--provider', 'claude', '--source', 'cli', '--json-only']);
+        assert.equal(opts.env, undefined, 'the default probe runs with the daemon environment');
+        return probeOutput(12);
+      },
+      fetchClaudeAccountUsageImpl: (...args) => { calls.push(args); throw new Error('no token-file probe'); },
+    });
+    assert.deepEqual(calls, []);
+    assert.equal(payload.providers.claude.secondary.used_percent, 12);
+  });
+
+  it('never publishes top-level monitor files on a multi-instance host', async (t) => {
+    const dir = hostDir(t, { settings: { env: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-main-fixture' } }, instances: MAIN_ONLY });
+    const payload = await run(dir, {
+      execFileSyncImpl: () => { throw new Error('Claude usage probe timed out.'); },
+      fetchClaudeAccountUsageImpl: (provider, settingsFile, options) =>
+        fetchClaudeAccountUsage(provider, settingsFile, { ...options, homeDir: dir }),
+      fetchClaudeNativeUsageImpl: () => { throw new Error('top-level monitor files belong to no instance'); },
+    });
+    const claude = payload.providers.claude;
+    assert.equal(claude.available, false);
+    assert.notEqual(claude.quota_authoritative, true);
+    assert.match(claude.error, /timed out/);
+    assert.match(claude.fallback_error, /Multi-instance host/);
+  });
+
+  it('keeps the dated native reading on a single-session host and records why the probe failed', async (t) => {
+    const dir = hostDir(t);
+    let nativeDir;
+    const payload = await run(dir, {
+      execFileSyncImpl: () => { throw new Error('Claude usage probe timed out.'); },
+      fetchClaudeNativeUsageImpl: ({ zylosDir }) => {
+        nativeDir = zylosDir;
+        return { provider: 'claude', available: true, quota_authoritative: false, source: 'zylos-native',
+          observed_at: '2026-11-18T18:40:00.000Z', fetched_at: '2026-11-18T18:40:00.000Z', secondary: { used_percent: 20 } };
+      },
+    });
+    assert.equal(nativeDir, dir);
+    assert.equal(payload.providers.claude.source, 'zylos-native');
+    assert.equal(payload.providers.claude.fetched_at, '2026-11-18T18:40:00.000Z');
+    assert.match(payload.providers.claude.probe_error, /timed out/);
   });
 });

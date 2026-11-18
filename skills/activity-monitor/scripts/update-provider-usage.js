@@ -8,6 +8,7 @@ import { readClaudeUsageFromMonitorFiles } from './usage-monitor-file-reader.js'
 import { readCodexUsageFromActiveRollout } from './usage-codex-rollout-reader.js';
 import { fetchCodexAccountUsage, rawCodexQuotaProbeBin } from './codex-account-usage.js';
 import { refreshQuotaRecoveryProofs } from './codex-quota-recovery.js';
+import { sharedProjectTokenFile } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
@@ -200,20 +201,29 @@ export function fetchClaudeNativeUsage({
   zylosDir = ZYLOS_DIR,
   now = new Date().toISOString(),
   readImpl = readClaudeUsageFromMonitorFiles,
+  statImpl = fs.statSync,
 } = {}) {
   const monitorDir = path.join(zylosDir, 'activity-monitor');
-  const usage = readImpl({
-    statuslineFile: path.join(monitorDir, 'statusline.json'),
-    usageStateFile: path.join(monitorDir, 'usage.json'),
-  });
+  const statuslineFile = path.join(monitorDir, 'statusline.json');
+  const usageStateFile = path.join(monitorDir, 'usage.json');
+  const usage = readImpl({ statuslineFile, usageStateFile });
+  // The reading is as old as the monitor file it came from. Stamping it with
+  // the poll time made a file nothing writes any more look current.
+  let observedAt = null;
+  if (usage) {
+    try {
+      observedAt = new Date(statImpl(usage.statusShape === 'usage_json' ? usageStateFile : statuslineFile).mtimeMs)
+        .toISOString();
+    } catch { /* removed between read and stat */ }
+  }
 
-  if (!usage) {
+  if (!usage || !observedAt) {
     return {
       provider: 'claude',
       available: false,
       fetched_at: now,
       source: 'zylos-native',
-      error: 'No Claude usage data found in monitor files',
+      error: usage ? 'Claude monitor file has no observation time' : 'No Claude usage data found in monitor files',
       primary: null,
       secondary: null,
       tertiary: null,
@@ -227,7 +237,7 @@ export function fetchClaudeNativeUsage({
   // Prefer the rate-limit window so the published primary never mistakes
   // context fill for provider usage; older shapes keep their session window.
   const hasFiveHour = usage.fiveHourPercent != null;
-  return normalizeNativeClaudeUsage({
+  const native = normalizeNativeClaudeUsage({
     session: hasFiveHour ? usage.fiveHourPercent : usage.sessionPercent,
     sessionResets: hasFiveHour ? usage.fiveHourResets : usage.sessionResets,
     sessionResetsAt: hasFiveHour ? usage.fiveHourResetsAt : usage.sessionResetsAt,
@@ -236,7 +246,11 @@ export function fetchClaudeNativeUsage({
     weeklyAllResetsAt: usage.weeklyAllResetsAt,
     weeklySonnet: usage.weeklySonnetPercent,
     weeklySonnetResets: usage.weeklySonnetResets,
-  }, now);
+  }, observedAt);
+  // fetched_at and observed_at carry the file time, which every age check
+  // reads; checked_at is this poll. Never authoritative: the files freeze
+  // when the session leaves Claude.
+  return { ...native, observed_at: observedAt, checked_at: now, quota_authoritative: false };
 }
 
 export function fetchCodexNativeUsage({
@@ -313,11 +327,22 @@ export async function runProviderUsageOnce({
 } = {}) {
   const fetchedAt = new Date().toISOString();
   const codexbarBin = resolveCodexBarBin();
-  let claude = fetchProviderUsage('claude', { execFileSyncImpl, codexbarBin, now: fetchedAt });
+  // `claude` is the account a Claude launch without its own account file runs
+  // on: the shared project token when that file holds one (the launch passes
+  // the same file with --settings), else the operator's own login.
+  const sharedTokenFile = sharedProjectTokenFile(zylosDir);
+  let claude = sharedTokenFile
+    ? fetchClaudeAccountUsageImpl('claude', sharedTokenFile, { execFileSyncImpl, codexbarBin, now: fetchedAt })
+    : fetchProviderUsage('claude', { execFileSyncImpl, codexbarBin, now: fetchedAt });
   if (!claude.available) {
-    const nativeClaude = fetchClaudeNativeUsageImpl({ zylosDir: ZYLOS_DIR, now: fetchedAt });
+    // The top-level monitor files are the live session's only on a
+    // single-session host. With instances.json every instance writes its own,
+    // and the top-level ones belong to no account.
+    const nativeClaude = fs.existsSync(path.join(zylosDir, 'instances.json'))
+      ? { available: false, error: 'Multi-instance host: top-level monitor files belong to no account' }
+      : fetchClaudeNativeUsageImpl({ zylosDir, now: fetchedAt });
     if (nativeClaude.available) {
-      claude = nativeClaude;
+      claude = { ...nativeClaude, probe_error: claude.error || null };
     } else {
       claude = {
         ...claude,

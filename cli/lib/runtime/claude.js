@@ -57,7 +57,7 @@ const { getMonitorDir: _getMonitorDir } =
   await import('../../../skills/multi-session/instance-config.js').catch(() => ({}));
 
 import { upgradeStartupPrompt, shellArgument } from './upgrade-context.js';
-import { prepareFableLaunch } from '../../../skills/multi-session/runtime-files.js';
+import { prepareFableLaunch, sharedProjectTokenFile } from '../../../skills/multi-session/runtime-files.js';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -173,17 +173,6 @@ function _resolveInstalledCredential(homeDir = os.homedir()) {
   }
 
   return { found: false };
-}
-
-/** The shared project settings file, when it holds the fleet Claude token. */
-function sharedProjectTokenFile() {
-  const file = path.join(ZYLOS_DIR, '.claude', 'settings.local.json');
-  try {
-    const token = JSON.parse(fs.readFileSync(file, 'utf8'))?.env?.CLAUDE_CODE_OAUTH_TOKEN;
-    return typeof token === 'string' && token ? file : null;
-  } catch {
-    return null; // absent or unreadable: the host logs in some other way
-  }
 }
 
 // ── ClaudeAdapter ─────────────────────────────────────────────────────────────
@@ -416,7 +405,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
     // A profile without its own file names the shared project token the same
     // way: Claude Code 2.1.327 takes no login from project settings, so a
     // persona with no login of its own started "Not logged in" without it.
-    const settingsFile = profile.claudeSettingsFile || sharedProjectTokenFile();
+    const settingsFile = profile.claudeSettingsFile || sharedProjectTokenFile(ZYLOS_DIR);
     const profileFlags = [
       ...(settingsFile ? ['--settings', settingsFile] : []),
       ...(model ? ['--model', model] : []),

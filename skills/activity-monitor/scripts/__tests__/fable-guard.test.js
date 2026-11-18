@@ -18,6 +18,7 @@ import { baseModel, recordProbeResult } from '../fable-probe.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 import {
   FABLE_GUARD_DEFAULTS,
+  fableAccountSettingsFile,
   fableDowngradeDeferral,
   fableGuardStatePath,
   fableUsagePath,
@@ -25,6 +26,7 @@ import {
   readFableGuardConfig,
   resolveFableLaunch,
   resolveRuntimeProfile,
+  sharedProjectTokenFile,
 } from '../../../multi-session/runtime-files.js';
 
 const MIN = 60_000;
@@ -927,6 +929,22 @@ describe('Fable guard on an account without its own settings file (verdict e)', 
       assert.doesNotMatch(text, /recover/i);
       const json = JSON.parse(spawnSync(process.execPath, [cli, 'status', '--json'], { env, encoding: 'utf8' }).stdout);
       assert.equal(json.personas['user-pan'].unsupported, 'account_without_settings_file');
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  it('the shared project token that ax-main launches and is measured with does not make it Fable-eligible', () => {
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-shared-'));
+    try {
+      fs.mkdirSync(path.join(zylosDir, '.claude'));
+      fs.writeFileSync(path.join(zylosDir, '.claude', 'settings.local.json'),
+        JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-main-fixture' } }));
+      assert.equal(sharedProjectTokenFile(zylosDir), path.join(zylosDir, '.claude', 'settings.local.json'));
+      const document = documentFixture();
+      assert.equal(fableAccountSettingsFile(document, 'claude-ax-main'), null);
+      assert.ok(!fableProbeAccounts(document).has('claude-ax-main'));
+      assert.equal(document.runtime_profiles['claude-ax-main'].claude_settings_file, undefined);
     } finally {
       fs.rmSync(zylosDir, { recursive: true, force: true });
     }
