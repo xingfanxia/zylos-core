@@ -124,6 +124,26 @@ describe('single-session dispatcher delivery guard', () => {
     assert.equal(control(id).status, 'done');
     assert.equal(keys().length, 1);
   });
+
+  it('sends a dialog its own cancel key (Escape) although the dialog is unknown', async () => {
+    resetLog();
+    screen(fx.UNKNOWN_DIALOG_LIVE, [2, 10]);
+    const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
+    assert.equal((await tick()).delivered, true);
+    assert.equal(control(id).status, 'done');
+    assert.match(keys()[0], /Escape$/);
+  });
+
+  it('never answers the dangerous-command safety prompt with Enter: the key is superseded', async () => {
+    resetLog();
+    const y = fx.DANGEROUS_RM_PROMPT.split('\n').findIndex((line) => line.includes('❯ 1. Yes'));
+    screen(fx.DANGEROUS_RM_PROMPT, [1, y]);
+    const { id } = db.insertControl('[KEYSTROKE]Enter', { priority: 0, bypassState: true, appendAckSuffix: false });
+    assert.equal((await tick()).delivered, false);
+    assert.deepEqual(keys(), []);
+    assert.deepEqual(db.getDb().prepare('SELECT status, last_error FROM control_queue WHERE id = ?').get(id),
+      { status: 'superseded', last_error: 'SAFETY_PROMPT' });
+  });
 });
 
 // ── B: [KEYSTROKE] controls are fenced to the session they were meant for ──
@@ -154,7 +174,8 @@ describe('single-session keystroke session fence (Astra #5)', () => {
   it('an already-claimed key held back by a modal is not delivered to the replacement after a restart', async () => {
     resetLog();
     screen(fx.UNKNOWN_DIALOG_LIVE, [2, 10]);
-    const { id } = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false });
+    // Any key but the dialog's own cancel key (Escape) is held back by it.
+    const { id } = db.insertControl('[KEYSTROKE]Enter', { priority: 0, bypassState: true, appendAckSuffix: false });
     await tick(); // claimed in the old session, bound to it, released back to pending
     assert.deepEqual(keys(), []);
     assert.equal(fenced(id).status, 'pending');

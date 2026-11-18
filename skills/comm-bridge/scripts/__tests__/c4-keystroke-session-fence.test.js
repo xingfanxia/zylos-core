@@ -69,9 +69,10 @@ async function drain() { for (let i = 0; i < 6; i++) await processWithMultiSessi
 
 describe('multi-session: --apply restart interleaved with claimed keys', () => {
   it('no key of the old session reaches the replacement; the replacement keeps its own keys', async () => {
-    // 1. Old session A shows a dialog: an unbound watchdog key is claimed, bound to A and held.
+    // 1. Old session A shows a dialog: an unbound key it does not take (any key
+    //    but its own cancel key, Escape) is claimed, bound to A and held.
     panes['claude-user-pan'] = { sessionRef: A, modal: UNKNOWN };
-    const watchdog = enqueue('Escape');
+    const watchdog = enqueue('Tab');
     await processWithMultiSession(helpers);
     assert.deepEqual(sent, []);
     assert.equal(row(watchdog.id).status, 'pending');

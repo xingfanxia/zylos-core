@@ -198,15 +198,15 @@ printf '%s\\n' "$FAKE_TMUX_OUT"
 `, { mode: 0o755 });
   after(() => fs.rmSync(home, { recursive: true, force: true }));
 
-  function runReal(env) {
+  function runReal(env, input = sampleInput) {
     for (const f of [argsFile, tmuxLog]) fs.rmSync(f, { force: true });
     const base = { ...process.env, HOME: home, PATH: `${bin}:${path.dirname(process.execPath)}:${process.env.PATH}` };
     delete base.TMUX_PANE;
     delete base.FAKE_TMUX_FAIL;
-    execFileSync(process.execPath, [hookScript], { input: JSON.stringify(sampleInput), env: { ...base, ...env },
+    execFileSync(process.execPath, [hookScript], { input: JSON.stringify(input), env: { ...base, ...env },
       stdio: ['pipe', 'pipe', 'pipe'], timeout: 10000 });
     return {
-      args: JSON.parse(fs.readFileSync(argsFile, 'utf8')),
+      args: fs.existsSync(argsFile) ? JSON.parse(fs.readFileSync(argsFile, 'utf8')) : null,
       tmux: fs.existsSync(tmuxLog) ? fs.readFileSync(tmuxLog, 'utf8').trim().split('\n') : [],
     };
   }
@@ -232,5 +232,25 @@ printf '%s\\n' "$FAKE_TMUX_OUT"
 
   it('enqueues unbound when tmux answers something that is not a pane identity', () => {
     assert.deepEqual(runReal({ TMUX_PANE: '%12', FAKE_TMUX_OUT: 'garbage' }).args, UNBOUND);
+  });
+
+  // 2026-11-18 user-pan: in a --dangerously-skip-permissions session the only
+  // prompts are the ones Claude Code will not let a rule approve (the
+  // dangerous rm check). Its PermissionRequest hook input carries
+  // permission_mode=bypassPermissions (observed on CLI 2.1.326); an Enter would
+  // select "1. Yes".
+  it('never enqueues the approving Enter in bypass-permissions mode, and still logs the event', () => {
+    const logPath = path.join(zylos, 'activity-monitor', 'hook-timing.log');
+    fs.rmSync(logPath, { force: true });
+    const got = runReal({ TMUX_PANE: '%12', FAKE_TMUX_OUT: REF },
+      { ...sampleInput, permission_mode: 'bypassPermissions', hook_event_name: 'PermissionRequest' });
+    assert.equal(got.args, null, 'no c4-control enqueue');
+    assert.deepEqual(got.tmux, [], 'no pane read either');
+    assert.match(fs.readFileSync(logPath, 'utf8'), /event=PermissionRequest tool=Bash input_keys=\[command\] mode=bypassPermissions/);
+  });
+
+  it('still auto-approves in the other permission modes', () => {
+    assert.deepEqual(runReal({ TMUX_PANE: '%12', FAKE_TMUX_OUT: REF },
+      { ...sampleInput, permission_mode: 'default' }).args, [...UNBOUND, '--session-ref', REF]);
   });
 });

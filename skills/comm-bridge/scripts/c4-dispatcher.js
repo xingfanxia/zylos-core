@@ -408,10 +408,17 @@ export function sendTarget(paneIdentity, session) {
   return match ? match[1] : session;
 }
 
-// Raw keys are withheld while a modal owns the keyboard. A permission prompt is
-// the exception: answering it is what the auto-approve [KEYSTROKE]Enter is for.
-export function keystrokeBlockedByModal(modal) {
-  return !!modal && modal.kind !== 'permission';
+// Dialogs owned by the Fable guard: no raw key reaches them from the queue.
+const GUARD_OWNED_MODALS = new Set(['fable_limit', 'credits_offer', 'usage_overlay']);
+
+// Raw keys are withheld while a modal owns the keyboard, with two exceptions:
+// a permission prompt (answering it is what the auto-approve [KEYSTROKE]Enter
+// is for), and Escape, the cancel key a dialog names itself ("Esc to cancel"),
+// which reaches any dialog the Fable guard does not own. The activity monitor's
+// dialog watch sends it to decline a dialog nobody can answer.
+export function keystrokeBlockedByModal(modal, key = null) {
+  if (!modal || modal.kind === 'permission') return false;
+  return !(key === 'Escape' && !GUARD_OWNED_MODALS.has(modal.kind));
 }
 
 /**
@@ -434,7 +441,11 @@ export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl =
  *               sessionRef, or unbound and queued before this session started
  *               or in the same second (created_at and session_created are
  *               whole seconds, so a same-second key is ambiguous and fenced)
- *   defer     - a modal other than a permission prompt owns the keyboard
+ *               An Enter for a permission prompt that shows a safety notice
+ *               (a check Claude Code will not let any rule approve) is
+ *               superseded too: it would select "1. Yes" (SAFETY_PROMPT)
+ *   defer     - a modal owns the keyboard and does not take this key
+ *               (keystrokeBlockedByModal)
  *   deliver   - send the key
  * An unbound key is bound to the pane read here before any deferral, so a
  * later requeue or orphan reset can never move it to a replacement session.
@@ -449,7 +460,11 @@ export function fenceKeystrokeControl(item, target, { bind = bindControlSession 
       && item.created_at <= target.sessionCreatedAt) {
     return { action: 'supersede', reason: 'SESSION_PREDATES' };
   }
-  if (keystrokeBlockedByModal(target.modal)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
+  const key = parseKeystrokeKey(item.content);
+  if (key === 'Enter' && target.modal?.kind === 'permission' && target.modal.notice) {
+    return { action: 'supersede', reason: 'SAFETY_PROMPT' };
+  }
+  if (keystrokeBlockedByModal(target.modal, key)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
   return { action: 'deliver' };
 }
 

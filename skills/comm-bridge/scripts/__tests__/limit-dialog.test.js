@@ -159,3 +159,39 @@ describe('dialog identity, not wording (Astra #5)', () => {
   });
 });
 
+
+// 2026-11-18 user-pan: the CLI 2.1.326 dangerous-command prompt read as kind
+// 'unknown' titled "│ Dangerous rm …". The dashed rules framing the command
+// start at column 0 and were taken for transcript rows, so the scan never
+// reached the pane divider and the prompt read as an untitled select list.
+describe('CLI 2.1.326 dangerous-command prompt', () => {
+  const expected = { kind: 'permission', text: 'Bash command', notice: fx.DANGEROUS_RM_NOTICE };
+
+  it('is a permission prompt titled by its title row, with the safety notice kept apart', () => {
+    assert.deepEqual(detectModal(fx.DANGEROUS_RM_PROMPT), expected);
+  });
+
+  it('is the same prompt while the CLI draws its auto-block countdown', () => {
+    assert.deepEqual(detectModal(fx.DANGEROUS_RM_PROMPT_COUNTDOWN), expected);
+  });
+
+  it('is the same prompt at 160 columns, where the notice is one row', () => {
+    assert.deepEqual(detectModal(fx.DANGEROUS_RM_PROMPT_WIDE), expected);
+  });
+
+  it('owns the keyboard: no composer is read while it is up', () => {
+    const lines = fx.DANGEROUS_RM_PROMPT.split('\n');
+    const state = stateFor(fx.DANGEROUS_RM_PROMPT, 1, lines.findIndex((line) => line.includes('❯ 1. Yes')));
+    assert.equal(state.modal.kind, 'permission');
+    assert.equal(state.promptVisible, false);
+  });
+
+  it('a permission prompt without a notice row has no notice', () => {
+    assert.deepEqual(detectModal(fx.PERMISSION_PROMPT_LIVE), { kind: 'permission', text: 'Bash command' });
+  });
+
+  it('dashed rules quoted in transcript output above a live composer are no dialog', () => {
+    const capture = ['⏺ Here is the frame:', '╌'.repeat(80), '  rm -f x', '╌'.repeat(80), '', ...fx.PLAIN_COMPOSER.split('\n')].join('\n');
+    assert.equal(detectModal(capture), null);
+  });
+});

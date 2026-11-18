@@ -46,8 +46,14 @@ export function findPromptY(capture) {
 // the keyboard. A dialog is live only when it is the last thing on screen, or
 // the last thing directly above the composer box; text quoted in conversation
 // output is bounded by transcript rows at column 0, not by a divider.
+//
+// CLI 2.1.326 frames the command of a Bash permission prompt with dashed rules
+// (`╌╌╌`) drawn from column 0 inside the pane. They belong to the dialog: read
+// as transcript rows they cut the scan off below the divider, and the prompt
+// then read as an untitled select list of kind 'unknown' (2026-11-18, user-pan).
 
 const RULE_RE = /^─{10,}$/;
+const INNER_RULE_RE = /^╌{10,}$/;
 const GUIDE_RE = /\b(?:Esc|Enter) to (?:cancel|close|go back|exit|select|confirm|continue)\b|↑\/↓ to navigate/i;
 const MAX_DIALOG_ROWS = 40;
 
@@ -62,8 +68,10 @@ const MAX_DIALOG_ROWS = 40;
 //   - question: the row directly above the option block.
 // Tracks the Claude Code CLI 2.1.322 text, extracted from the shipped binary;
 // CLI auto-update can change it. A miss is safe: the dialog still reads as kind
-// 'unknown' in detectModal(), which keeps paste, Enter and raw keys deferred;
-// only the quota-hold classification (or the permission auto-approve) is lost.
+// 'unknown' in detectModal(), which keeps paste, Enter and raw keys deferred
+// except its own cancel key (Escape: the activity monitor's dialog watch sends
+// it once after 2 min); only the quota-hold classification (or the permission
+// handling) is lost.
 export const LIMIT_DIALOG_TITLES = Object.freeze({
   fable_limit: Object.freeze([/^You['’]ve reached your Fable limit$/]),
   credits_offer: Object.freeze([/^\S.* now uses usage credits$/, /^Switch to \S.*\?$/]),
@@ -113,7 +121,7 @@ function findLiveDialogRows(lines) {
   while (top >= 0 && bottom - top < MAX_DIALOG_ROWS) {
     const line = lines[top];
     if (RULE_RE.test(line)) { bounded = true; break; }
-    if (line && !/^\s/.test(line)) break; // transcript row at column 0
+    if (line && !/^\s/.test(line) && !INNER_RULE_RE.test(line)) break; // transcript row at column 0
     top--;
   }
   const rows = lines.slice(top + 1, bottom + 1).filter(Boolean);
@@ -133,12 +141,25 @@ function dialogTitle(rows) {
   return rows[0].trim().replace(/^❯\s*/, '');
 }
 
+// A prompt Claude Code will not let any permission rule approve states why in
+// notice rows marked `│` between the title and the question, wrapped over as
+// many rows as the pane needs ("│ Dangerous rm operation on possibly-empty
+// variable path: $D/* in `rm -f $D/*`" / "│ (rewrite it as "${D:?}"/* or use a
+// literal path)"). Joined into one line; null when the prompt has none.
+const NOTICE_ROW_RE = /^\s*│\s?/;
+function dialogNotice(rows, end) {
+  const notice = rows.slice(1, end).filter((line) => NOTICE_ROW_RE.test(line))
+    .map((line) => line.replace(NOTICE_ROW_RE, '').trim()).filter(Boolean).join(' ');
+  return notice || null;
+}
+
 // The dialog's structural parts: title, the option block around the focused
-// select row, and the question row directly above that block.
+// select row, the question row directly above that block, and the notice rows
+// above the question.
 function dialogStructure(rows) {
   const title = dialogTitle(rows);
   const focused = rows.findIndex(isSelectRow);
-  if (focused < 0) return { title, options: [], question: null };
+  if (focused < 0) return { title, options: [], question: null, notice: null };
   const optionIndent = indentOf(rows[focused]) + 2;
   const isOption = (line) => indentOf(line) === optionIndent && !GUIDE_RE.test(line);
   let first = focused;
@@ -149,7 +170,7 @@ function dialogStructure(rows) {
     if (i === focused || isOption(rows[i])) block.push(rows[i].trim().replace(/^❯\s*/, ''));
   }
   const question = first > 0 && first - 1 !== 0 ? rows[first - 1].trim() : null;
-  return { title, options: block, question };
+  return { title, options: block, question, notice: dialogNotice(rows, question === null ? first : first - 1) };
 }
 
 function limitKind({ title, options }, rows) {
@@ -172,8 +193,10 @@ function isPermissionPrompt({ options, question }) {
 }
 
 /**
- * Detect any modal (dialog or select list) that owns the keyboard.
- * @returns {null | { kind: 'fable_limit'|'credits_offer'|'permission'|'usage_overlay'|'unknown', text: string }}
+ * Detect any modal (dialog or select list) that owns the keyboard. `text` is
+ * the dialog's title row (UI text). A permission prompt that carries a notice
+ * (a safety check Claude Code will not let a rule approve) also has `notice`.
+ * @returns {null | { kind: 'fable_limit'|'credits_offer'|'permission'|'usage_overlay'|'unknown', text: string, notice?: string }}
  */
 export function detectModal(paneText) {
   if (!paneText) return null;
@@ -188,7 +211,9 @@ export function detectModal(paneText) {
   // the limit dialog nor a permission prompt, both of which are panes.
   if (!bounded) return { kind: 'unknown', text: title };
   const structure = dialogStructure(rows);
-  if (isPermissionPrompt(structure)) return { kind: 'permission', text: title };
+  if (isPermissionPrompt(structure)) {
+    return structure.notice ? { kind: 'permission', text: title, notice: structure.notice } : { kind: 'permission', text: title };
+  }
   const kind = limitKind(structure, rows);
   return { kind: kind || 'unknown', text: title };
 }

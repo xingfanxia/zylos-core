@@ -15,6 +15,13 @@
  * this one. Without TMUX_PANE, or when the read fails (e.g. an os_user-isolated
  * CLI cannot reach the service user's tmux socket), it is enqueued unbound.
  *
+ * Never in bypass-permissions mode (permission_mode = bypassPermissions, the
+ * --dangerously-skip-permissions sessions): there Claude Code asks only for
+ * what it will not let any rule approve, such as "Dangerous rm operation on
+ * possibly-empty variable path", and Enter would select "1. Yes". Nobody can
+ * answer such a prompt in an unattended session; the activity monitor's dialog
+ * watch declines it (Escape) and tells the session why (2026-11-18, user-pan).
+ *
  * Log file: ~/zylos/activity-monitor/hook-timing.log (shared with other hooks)
  */
 
@@ -54,7 +61,8 @@ async function main() {
   const tool = hookData.tool_name || '(unknown)';
   const inputKeys = hookData.tool_input ? Object.keys(hookData.tool_input).join(',') : '';
   const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const line = `[${ts}] hook=auth-prompt event=PermissionRequest tool=${tool} input_keys=[${inputKeys}]\n`;
+  const mode = typeof hookData.permission_mode === 'string' ? hookData.permission_mode.replace(/[^\w-]/g, '').slice(0, 32) : 'unknown';
+  const line = `[${ts}] hook=auth-prompt event=PermissionRequest tool=${tool} input_keys=[${inputKeys}] mode=${mode}\n`;
 
   try {
     fs.appendFileSync(LOG_FILE, line);
@@ -67,8 +75,9 @@ async function main() {
   const config = readConfig();
   const autoApprove = config.auto_approve_permission !== false; // default: true
   const runtime = config.runtime || 'claude';
+  const safetyCheckOnly = hookData.permission_mode === 'bypassPermissions';
 
-  if (autoApprove && runtime === 'claude') {
+  if (autoApprove && runtime === 'claude' && !safetyCheckOnly) {
     // `display-message -p -t $TMUX_PANE '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'`,
     // validated as ^\$\d+:\d+:%\d+:\d+$; null when unset or unreadable.
     const sessionRef = process.env.TMUX_PANE ? readSessionRef(process.env.TMUX_PANE) : null;
