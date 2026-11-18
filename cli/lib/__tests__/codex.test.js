@@ -152,6 +152,45 @@ describe('Codex auth checks', () => {
     assert.equal(result.reason, 'http_probe_network_error');
   });
 
+  // Regression (CL Azure fallback): the key belongs to a custom model provider
+  // with only model_providers.<id>.base_url set. The old probe sent it to
+  // api.openai.com, got 401 and parked a working fallback in auth_failed.
+  it('API key auth for a non-OpenAI model provider is credential-based and makes no probe', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-codex-auth-test-'));
+    tmpDirs.push(tmpHome);
+    process.env.HOME = tmpHome;
+    const codexHome = path.join(tmpHome, '.codex-azure');
+    fs.mkdirSync(codexHome);
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), [
+      'model_provider = "azurefoundry"',
+      'model = "gpt-6.1-sol"',
+      '',
+      '[model_providers.azurefoundry]',
+      'name = "Azure AI Foundry"',
+      'base_url = "https://azure.example.test/openai/v1"',
+      'wire_api = "responses"',
+      'env_key = "AZURE_FOUNDRY_KEY"',
+      '',
+    ].join('\n'));
+    process.env.CODEX_HOME = codexHome;
+    let calls = 0;
+    global.fetch = async () => { calls++; return { status: 401 }; };
+    const adapter = new CodexAdapter({});
+
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: 'azure-fixture-key' }));
+    assert.deepEqual(await adapter.checkAuth(), { status: 'success', reason: 'custom_provider_key_present' });
+
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: '' }));
+    assert.deepEqual(await adapter.checkAuth(), { status: 'failure', reason: 'apikey_mode_but_no_key' });
+    assert.equal(calls, 0, 'a custom provider key must never be probed against OpenAI');
+
+    // An explicit built-in provider keeps the live probe.
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), 'model_provider = "openai"\n');
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-test' }));
+    assert.deepEqual(await adapter.checkAuth(), { status: 'failure', reason: 'http_probe_401' });
+    assert.equal(calls, 1);
+  });
+
   // Covers actual auth/config path selection with private files and a bounded
   // fetch observation. Run for Codex auth-directory changes; unrelated launch
   // changes may skip. No real credentials, network, PM2 or tmux are used.

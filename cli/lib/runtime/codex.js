@@ -19,6 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { parse as parseToml } from 'smol-toml';
 
 const execFileAsync = promisify(execFile);
 import { RuntimeAdapter } from './base.js';
@@ -67,6 +68,17 @@ function getCodexApiBaseUrl() {
   return 'https://api.openai.com/v1';
 }
 
+// The top-level `model_provider` when it is not the built-in OpenAI provider
+// (for example Azure AI Foundry through `[model_providers.<id>]`), else null.
+function getCodexCustomProvider() {
+  try {
+    const configPath = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'config.toml');
+    const provider = parseToml(fs.readFileSync(configPath, 'utf8')).model_provider;
+    if (typeof provider === 'string' && provider && provider !== 'openai') return provider;
+  } catch { /* missing or unreadable config: the built-in provider */ }
+  return null;
+}
+
 // ── CodexAdapter ──────────────────────────────────────────────────────────────
 
 export class CodexAdapter extends RuntimeAdapter {
@@ -91,6 +103,7 @@ export class CodexAdapter extends RuntimeAdapter {
    *
    *   auth_mode = "apikey"  → live HTTP probe to OpenAI /v1/models with the stored key.
    *                           Detects revoked/expired keys that local file checks cannot catch.
+   *                           With a non-OpenAI model_provider: no probe; key present = success.
    *   auth_mode = "chatgpt" → skip HTTP probe entirely; use `codex login status` (OAuth/device auth).
    *   auth.json absent      → fall through to `codex login status`.
    *
@@ -141,6 +154,11 @@ export class CodexAdapter extends RuntimeAdapter {
     // auth_mode = "apikey" — live HTTP probe to OpenAI API.
     // Guard against corrupted auth.json (mode set to "apikey" but key missing).
     if (!apiKey) return { status: 'failure', reason: 'apikey_mode_but_no_key' };
+    // A non-OpenAI provider's key does not authenticate at OpenAI's /models,
+    // and its endpoint lives in model_providers.<id>.base_url, not
+    // openai_base_url. Probing would return 401 and park a working fallback in
+    // auth_failed, so the check is credential-based: the key is present.
+    if (getCodexCustomProvider()) return { status: 'success', reason: 'custom_provider_key_present' };
     try {
       const baseUrl = getCodexApiBaseUrl();
       const res = await fetch(`${baseUrl}/models`, {
