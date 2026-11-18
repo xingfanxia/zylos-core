@@ -102,6 +102,19 @@ export function getNextPendingForInstance(instanceId) {
   `).get(instanceId) || null;
 }
 
+// The dispatcher's per-call exclusions (c4-dispatcher-multi.js fair
+// selection): rows of `instances` are left out unless `allowed` (an SQL
+// predicate on the row) holds. A NULL-targeted row belongs to `primaryId`, the
+// instance it is routed to. Empty list: no clause.
+function heldClause(instances, primaryId, allowed = null) {
+  if (!instances?.length) return { sql: '', params: [] };
+  const placeholders = instances.map(() => '?').join(', ');
+  return {
+    sql: `\n      AND (COALESCE(target_instance, ?, '') NOT IN (${placeholders})${allowed ? ` OR ${allowed}` : ''})`,
+    params: [primaryId, ...instances],
+  };
+}
+
 /**
  * Get the next pending conversation for any of the given online instances.
  * Prefers messages explicitly targeting an online instance, then falls back to
@@ -109,10 +122,14 @@ export function getNextPendingForInstance(instanceId) {
  * pending until the target comes online.
  *
  * @param {string[]} onlineInstanceIds - array of instance IDs currently online
+ * @param {{ heldInstances?: string[], primaryId?: string|null }} [options] -
+ *   instances whose rows are held for the rest of a dispatcher call: none of
+ *   their rows is returned (NULL-targeted rows count as `primaryId`'s)
  * @returns {object|null} highest priority pending message for any online instance, or null
  */
-export function getNextPendingForInstances(onlineInstanceIds) {
+export function getNextPendingForInstances(onlineInstanceIds, { heldInstances = [], primaryId = null } = {}) {
   const db = getDb();
+  const held = heldClause(heldInstances, primaryId);
 
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     // No instances online — only return legacy NULL-targeted messages
@@ -121,10 +138,10 @@ export function getNextPendingForInstances(onlineInstanceIds) {
              priority, require_idle, retry_count, target_instance
       FROM conversations
       WHERE direction = 'in' AND status = 'pending'
-        AND target_instance IS NULL
+        AND target_instance IS NULL${held.sql}
       ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
       LIMIT 1
-    `).get() || null;
+    `).get(...held.params) || null;
   }
 
   // Parameterized IN clause — safe against SQL injection
@@ -134,10 +151,10 @@ export function getNextPendingForInstances(onlineInstanceIds) {
            priority, require_idle, retry_count, target_instance
     FROM conversations
     WHERE direction = 'in' AND status = 'pending'
-      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)
+      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)${held.sql}
     ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
     LIMIT 1
-  `).get(...onlineInstanceIds) || null;
+  `).get(...onlineInstanceIds, ...held.params) || null;
 }
 
 /**
@@ -193,10 +210,18 @@ export function getPendingTargetInstancesNeedingWake(onlineInstanceIds) {
  *
  * @param {number} currentTimestamp - unix seconds (for available_at comparison)
  * @param {string[]} onlineInstanceIds - array of instance IDs currently online
+ * @param {{ keystrokeOnlyInstances?: string[], bypassOnlyInstances?: string[], primaryId?: string|null }} [options] -
+ *   holds for the rest of a dispatcher call: a modal on the pane leaves only
+ *   [KEYSTROKE] rows of that instance; offline/unhealthy/suspended leave only
+ *   bypass-state rows (NULL-targeted rows count as `primaryId`'s)
  * @returns {object|null} next eligible control item, or null
  */
-export function getNextPendingControlForInstances(currentTimestamp, onlineInstanceIds) {
+export function getNextPendingControlForInstances(currentTimestamp, onlineInstanceIds,
+  { keystrokeOnlyInstances = [], bypassOnlyInstances = [], primaryId = null } = {}) {
   const db = getDb();
+  const keystrokeOnly = heldClause(keystrokeOnlyInstances, primaryId, "substr(raw_content, 1, 11) = '[KEYSTROKE]'");
+  const bypassOnly = heldClause(bypassOnlyInstances, primaryId, 'bypass_state = 1');
+  const held = { sql: keystrokeOnly.sql + bypassOnly.sql, params: [...keystrokeOnly.params, ...bypassOnly.params] };
 
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     // No instances online — only return legacy NULL-targeted controls
@@ -207,10 +232,10 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
       FROM control_queue
       WHERE status = 'pending'
         AND (available_at IS NULL OR available_at <= ?)
-        AND target_instance IS NULL
+        AND target_instance IS NULL${held.sql}
       ORDER BY COALESCE(priority, 3) ASC, id ASC
       LIMIT 1
-    `).get(currentTimestamp) || null;
+    `).get(currentTimestamp, ...held.params) || null;
   }
 
   // Parameterized IN clause — safe against SQL injection
@@ -222,10 +247,10 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
-      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)
+      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)${held.sql}
     ORDER BY COALESCE(priority, 3) ASC, id ASC
     LIMIT 1
-  `).get(currentTimestamp, ...onlineInstanceIds) || null;
+  `).get(currentTimestamp, ...onlineInstanceIds, ...held.params) || null;
 }
 
 // ---------------------------------------------------------------------------

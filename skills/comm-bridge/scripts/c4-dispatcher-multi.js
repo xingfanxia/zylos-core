@@ -37,6 +37,10 @@ const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 /**
  * Maximum items to attempt per processWithMultiSession call before giving up.
  * Prevents unbounded looping when every claimed item is for an offline instance.
+ * Held rows of one instance never use it up for the others: once a row is held
+ * for an instance-wide reason (modal, offline, unhealthy, suspended), the rows
+ * of that instance held for the same reason are left out of every later claim
+ * in the same call (see "Fair selection" in processWithMultiSession).
  */
 const MAX_SKIP_ATTEMPTS = 10;
 
@@ -472,6 +476,29 @@ export async function processWithMultiSession(helpers) {
   const heldReasons = {};
   let inFlight = null;
 
+  // Fair selection across instances (2026-11-18): once a row is held for a
+  // reason that holds every such row of its instance, the claim queries leave
+  // those rows out for the rest of this call, so they can neither use up
+  // MAX_SKIP_ATTEMPTS nor hide another instance's rows. Ten rows held behind
+  // user-pan's dialog had kept user-elaine's rows from ever being claimed
+  // (state=skip_exhausted for 70 min).
+  //   - a modal on the pane holds everything but raw keys: only [KEYSTROKE]
+  //     controls stay claimable (the dialog's own cancel key among them);
+  //   - offline / unhealthy / suspended hold everything but bypass-state
+  //     controls, which multiSessionDispatch delivers regardless.
+  // Untargeted rows route to the primary instance and share its holds.
+  const allInstances = getAllInstances();
+  const primaryId = (allInstances.find((i) => i.primary === true) ?? allInstances[0])?.id ?? null;
+  const modalHeld = new Set();
+  const stateHeld = new Set();
+  const holdInstance = (item, set) => set.add(item.target_instance || primaryId);
+  const claimQueries = {
+    getNextPendingForInstances: (ids) => getNextPendingForInstances(ids,
+      { heldInstances: [...new Set([...modalHeld, ...stateHeld])], primaryId }),
+    getNextPendingControlForInstances: (now, ids) => getNextPendingControlForInstances(now, ids,
+      { keystrokeOnlyInstances: [...modalHeld], bypassOnlyInstances: [...stateHeld], primaryId }),
+  };
+
   // Additive result summary so the dispatcher heartbeat can report WHY nothing
   // (or only some) shipped this tick. Existing callers read only .delivered /
   // .state / .legacy — held / heldReasons are ignored by them.
@@ -479,16 +506,19 @@ export async function processWithMultiSession(helpers) {
   const noteHeld = (category) => { heldReasons[category] = (heldReasons[category] || 0) + 1; };
   // A modal owns that instance's keyboard: hold the row for this cycle (no
   // retry consumed, never marked delivered) and keep serving other instances.
-  const holdForModal = (item, kind) => {
+  // A raw key the modal does not take is held for itself only: the next key
+  // of the same instance may be the dialog's own cancel key.
+  const holdForModal = (item, kind, { instanceWide = true } = {}) => {
     heldItems.push(item);
     noteHeld('modal');
+    if (instanceWide) holdInstance(item, modalHeld);
     inFlight = null;
     log(`Held ${item.type} id=${item.id} for ${item.target_instance || 'default'}: modal${kind ? `=${kind}` : ''} owns the keyboard`);
   };
 
   try {
     for (let attempt = 0; attempt < MAX_SKIP_ATTEMPTS; attempt++) {
-      const item = claimNextItem(onlineIds, { getNextPendingForInstances, getNextPendingControlForInstances });
+      const item = claimNextItem(onlineIds, claimQueries);
       if (!item) {
         // No claimable item left — but items held earlier this cycle are still
         // in `running` (released in finally), so surface their reasons.
@@ -518,6 +548,7 @@ export async function processWithMultiSession(helpers) {
       if (decision.action === 'requeue') {
         heldItems.push(item);
         noteHeld(decision.reasonCategory);
+        holdInstance(item, stateHeld);
         inFlight = null;
         log(`Held for requeue ${item.type} id=${item.id}: ${decision.reason}`);
         continue;
@@ -527,6 +558,7 @@ export async function processWithMultiSession(helpers) {
       if (decision.action === 'skip') {
         heldItems.push(item);
         noteHeld(decision.reasonCategory);
+        holdInstance(item, stateHeld);
         inFlight = null;
         continue;
       }
@@ -573,7 +605,7 @@ export async function processWithMultiSession(helpers) {
         const target = readKeystrokeTarget ? readKeystrokeTarget(session) : null;
         const fence = target ? fenceKeystrokeControl(item, target) : { action: 'deliver' };
         if (fence.action === 'defer') {
-          holdForModal(item, target.modal?.kind);
+          holdForModal(item, target.modal?.kind, { instanceWide: false });
           continue;
         }
         if (fence.action === 'supersede') {
