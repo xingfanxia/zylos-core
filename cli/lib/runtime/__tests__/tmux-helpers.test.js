@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 
 // We test the module's behavior by importing it and verifying that
 // the functions handle various child_process outcomes correctly.
@@ -133,5 +134,202 @@ describe('isTimeoutError classifier', () => {
 
   it('returns false for generic errors', () => {
     assert.equal(isTimeoutError(new Error('ENOENT')), false);
+  });
+});
+
+// DELIVER-1: the retained-session launch pastes and submits only to the pane
+// it verified, by pane id: one read before the paste, and one between paste
+// and Enter. Lines are read at the cursor's coordinates: before the paste the
+// cursor's row must be the checked prompt row; after it the logical line
+// through the cursor's row must be the prompt followed by the pasted text,
+// with the cursor at the end of its row.
+describe('tmuxPasteToVerifiedPane', async () => {
+  const { tmuxPasteToVerifiedPane } = await import('../tmux-helpers.js');
+  const PROMPT = 'user@host:~$';
+  const pane = { id: '%7', pid: 4242, command: 'bash', promptRow: PROMPT, promptY: 3 };
+  const TEXT = 'cd "/x"; claude --model y';
+  const LINE = `${PROMPT} ${TEXT}`;
+  const SAME = '%7 0 4242 13 3 bash';
+  const AFTER = `%7 0 4242 ${LINE.length} 3 bash`;
+  // A screen is a list of rows; a row ending in '\\' wraps into the next one
+  // (capture-pane -J joins them). -S/-E select visible rows (negative: from 0).
+  const rows = (...r) => r;
+  const BEFORE_SCREEN = rows('Last login: today', '', `${PROMPT} ls`, PROMPT, '', '');
+  const AFTER_SCREEN = rows('Last login: today', '', `${PROMPT} ls`, LINE, '', '');
+  function capture(screen, args) {
+    const at = (flag) => Number(args[args.indexOf(flag) + 1]);
+    const from = Math.max(0, at('-S'));
+    const to = Math.min(screen.length - 1, at('-E'));
+    const out = [];
+    for (let y = from; y <= to; y++) {
+      const wraps = screen[y].endsWith('\\');
+      const text = wraps ? screen[y].slice(0, -1) : screen[y];
+      if (args.includes('-J') && y > from && screen[y - 1].endsWith('\\')) out[out.length - 1] += text;
+      else out.push(text);
+    }
+    return `${out.join('\n')}\n`;
+  }
+  // probes: what display-message answers on each read; screens: before and after the paste.
+  const run = async (probes, after = AFTER_SCREEN, before = BEFORE_SCREEN, { target = pane, text = TEXT } = {}) => {
+    const calls = [];
+    const keys = [];
+    let reads = 0;
+    let pasted = false;
+    let buffer = null;
+    const execFileSyncImpl = (file, args) => {
+      calls.push([file, ...args]);
+      if (args[0] === 'load-buffer') buffer = fs.readFileSync(args.at(-1), 'utf8');
+      if (args[0] === 'display-message') {
+        const probe = probes[Math.min(reads++, probes.length - 1)];
+        if (probe === null) throw new Error("can't find pane: %7");
+        return probe;
+      }
+      if (args[0] === 'capture-pane') return capture(pasted ? after : before, args);
+      if (args[0] === 'paste-buffer') pasted = true;
+      return '';
+    };
+    let error = null;
+    try {
+      await tmuxPasteToVerifiedPane(target, 'zylos-buf', text,
+        { execFileSyncImpl, sendKeys: (target, k) => keys.push([target, ...k]), sleep: async () => {} });
+    } catch (err) { error = err; }
+    return { calls, keys, error, pasted, buffer, loaded: calls.some((c) => c[1] === 'load-buffer') };
+  };
+
+  it('pastes to the verified pane id and submits once the pane shows the prompt and the pasted line', async () => {
+    const got = await run([SAME, AFTER]);
+    assert.equal(got.error, null);
+    assert.deepEqual(got.calls.filter((c) => c[1] === 'load-buffer' || c[1] === 'paste-buffer').map((c) => c.slice(0, 4)),
+      [['tmux', 'load-buffer', '-b', 'zylos-buf'], ['tmux', 'paste-buffer', '-p', '-r']]);
+    assert.equal(got.calls.find((c) => c[1] === 'paste-buffer').at(-1), '%7');
+    assert.equal(got.buffer, TEXT, 'the buffer holds exactly the validated command');
+    assert.deepEqual(got.keys, [['%7', 'Enter']]);
+  });
+
+  it('submits a long line wrapped over several rows when the cursor ends it on the last one', async () => {
+    const head = LINE.slice(0, 20);
+    const tail = LINE.slice(20);
+    const got = await run([SAME, `%7 0 4242 ${tail.length} 4 bash`],
+      rows('Last login: today', '', `${PROMPT} ls`, `${head}\\`, tail, ''));
+    assert.equal(got.error, null);
+    assert.deepEqual(got.keys, [['%7', 'Enter']]);
+  });
+
+  it('refuses a command ending in a tab, ending in a newline, or with an embedded newline: nothing is pasted', async () => {
+    for (const text of [`${TEXT}\t`, `${TEXT}\n`, 'cd "/x"\nclaude --model y', `${TEXT}\r`, `${TEXT} `]) {
+      const got = await run([SAME, AFTER], AFTER_SCREEN, BEFORE_SCREEN, { text });
+      assert.match(got.error?.message || '', /^the command (contains a control character|ends with whitespace).*; nothing typed$/, JSON.stringify(text));
+      assert.equal(got.loaded, false, `${JSON.stringify(text)}: no buffer`);
+      assert.equal(got.pasted, false, JSON.stringify(text));
+      assert.deepEqual(got.keys, [], JSON.stringify(text));
+    }
+  });
+
+  it('types nothing when the pane is gone or its foreground or process changed before the paste', async () => {
+    for (const probe of [null, '%7 1 4242 13 3 bash', '%7 0 4242 13 3 claude', '%7 0 5151 13 3 bash']) {
+      const got = await run([probe]);
+      assert.match(got.error?.message || '', /gone or changed since it was verified; nothing typed/, String(probe));
+      assert.equal(got.pasted, false, String(probe));
+      assert.deepEqual(got.keys, [], String(probe));
+    }
+  });
+
+  it('types nothing when the cursor is no longer on the checked prompt row, or that row changed', async () => {
+    const cases = {
+      'cursor moved to another row': [['%7 0 4242 13 2 bash']],
+      'cursor not at the end of the prompt': [['%7 0 4242 4 3 bash']],
+      'prompt row changed': [[SAME], AFTER_SCREEN, rows('Last login: today', '', `${PROMPT} ls`, `${PROMPT} x`, '', '')],
+    };
+    for (const [name, [probes, after, before]] of Object.entries(cases)) {
+      const got = await run(probes, after, before);
+      assert.match(got.error?.message || '', /nothing typed/, name);
+      assert.equal(got.pasted, false, name);
+      assert.deepEqual(got.keys, [], name);
+    }
+  });
+
+  it('pastes but never presses Enter when the pane changed between paste and Enter, or the line is not the pasted one', async () => {
+    const cases = {
+      'pane gone': [[SAME, null]],
+      'engine took the foreground': [[SAME, `%7 0 4242 ${LINE.length} 3 claude`]],
+      'line differs': [[SAME, `%7 0 4242 ${LINE.length + 1} 3 bash`], rows('', '', '', `${LINE}x`, '', '')],
+      'text went elsewhere': [[SAME, SAME], BEFORE_SCREEN],
+    };
+    for (const [name, [probes, after]] of Object.entries(cases)) {
+      const got = await run(probes, after);
+      assert.match(got.error?.message || '', /not submitted \(the line is left as typed\)/, name);
+      assert.equal(got.pasted, true, name);
+      assert.deepEqual(got.keys, [], `${name}: no Enter and no other key`);
+    }
+  });
+
+  it('never presses Enter when the pasted line is the last row but the cursor sits on an earlier, different row, or not at the end', async () => {
+    const cases = {
+      'cursor on an earlier row': [[SAME, '%7 0 4242 15 2 bash']],
+      'cursor on the pasted row, not at its end': [[SAME, `%7 0 4242 ${LINE.length - 3} 3 bash`]],
+      'cursor below the pasted line': [[SAME, '%7 0 4242 0 4 bash']],
+    };
+    for (const [name, [probes]] of Object.entries(cases)) {
+      const got = await run(probes);
+      assert.match(got.error?.message || '', /not submitted \(the line is left as typed\)/, name);
+      assert.equal(got.pasted, true, name);
+      assert.deepEqual(got.keys, [], `${name}: no Enter`);
+    }
+  });
+
+  // DELIVER-1 fifth review: cursor_x counts terminal cells, not code points.
+  const shell = { id: '%7', pid: 4242, command: 'bash', promptRow: '$', promptY: 0 };
+  const shellRun = (text, cursorX, row) => run(['%7 0 4242 2 0 bash', `%7 0 4242 ${cursorX} 0 bash`],
+    rows(row, '', ''), rows('$', '', ''), { target: shell, text });
+
+  it('measures rows in display cells: after "$ 中abcdefghi" the cursor at cell 13 submits, at 12 (code points) it does not', async () => {
+    const row = '$ 中abcdefghi';
+    assert.equal([...row].length, 12);
+    const right = await shellRun('中abcdefghi', 13, row);
+    assert.equal(right.error, null);
+    assert.deepEqual(right.keys, [['%7', 'Enter']]);
+    const short = await shellRun('中abcdefghi', 12, row);
+    assert.match(short.error?.message || '', /not submitted/);
+    assert.deepEqual(short.keys, [], 'one cell short: no Enter');
+  });
+
+  it('a combining mark takes no cell: the cursor at the cell count submits, at the code point count it does not', async () => {
+    const text = 'touch cafe\u0301';
+    const row = `$ ${text}`;
+    assert.equal([...row].length, 13);
+    assert.deepEqual((await shellRun(text, 12, row)).keys, [['%7', 'Enter']]);
+    assert.deepEqual((await shellRun(text, 13, row)).keys, []);
+  });
+
+  it('types nothing when the command or the prompt has a character of uncertain width (ambiguous, emoji sequence)', async () => {
+    for (const text of ['echo 25°C', 'echo ─', 'echo λ', 'echo 👍🏽', 'echo ❤\uFE0F', 'echo a\u200Db']) {
+      const got = await shellRun(text, 2 + [...text].length, `$ ${text}`);
+      assert.match(got.error?.message || '', /uncertain width; nothing typed/, text);
+      assert.equal(got.pasted, false, text);
+      assert.deepEqual(got.keys, [], text);
+    }
+    const ambiguousPrompt = await run(['%7 0 4242 3 0 bash'], rows('λ$ x'), rows('λ$', ''),
+      { target: { ...shell, promptRow: 'λ$' }, text: 'x' });
+    assert.match(ambiguousPrompt.error?.message || '', /uncertain width; nothing typed/);
+    assert.equal(ambiguousPrompt.pasted, false);
+  });
+});
+
+describe('cellWidth (terminal cells, or null when not known with confidence)', async () => {
+  const { cellWidth } = await import('../cell-width.js');
+  it('counts ASCII 1, wide and fullwidth East Asian 2, combining and zero-width 0', () => {
+    assert.equal(cellWidth('abc'), 3);
+    assert.equal(cellWidth('中a'), 3);
+    assert.equal(cellWidth('한글'), 4);
+    assert.equal(cellWidth('Ａ\u3000'), 4);
+    assert.equal(cellWidth('ｱ'), 1, 'halfwidth katakana');
+    assert.equal(cellWidth('e\u0301'), 1);
+    assert.equal(cellWidth('a\u200Bb'), 2);
+    assert.equal(cellWidth('ñ'), 1);
+  });
+  it('is null for ambiguous width, emoji and their components, controls, format and unassigned characters', () => {
+    for (const s of ['°', '─', 'é', 'λ', 'Я', '👍', '👍🏽', '❤\uFE0F', 'a\u200Db', '🇯🇵', '\t', '\u00AD', '\uE000', '\u{10FFFD}', '\u0378']) {
+      assert.equal(cellWidth(s), null, JSON.stringify(s));
+    }
   });
 });

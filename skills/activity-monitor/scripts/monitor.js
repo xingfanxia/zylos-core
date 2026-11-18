@@ -160,8 +160,11 @@ import { rotateDailyLog } from './log-rotation.js';
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
-import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified } from '../../comm-bridge/scripts/c4-db.js';
+import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified,
+  getHeldWorkSummary, findDialogControl, withdrawDialogControl, insertDialogControl, hasLiveCapability,
+  loadDialogWatchState, saveDialogWatchState } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
+import { createDialogWatch, bindDialogWatchQueue } from './dialog-watch.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -356,6 +359,7 @@ let orchestrator;    // initialized in init()
 let messageRouterServer; // initialized in init()
 let contextMonitor;  // initialized in init() if adapter provides one (Codex only)
 let fableMonitor = null; // Fable guard lease enforcement (guard-tracked personas only)
+let dialogWatch = null; // dialogs nobody can answer, stuck delivery (dialog-watch.js)
 
 // Timezone: reuse scheduler's tz.js (.env TZ → process.env.TZ → UTC)
 import { loadTimezone } from '../../scheduler/scripts/tz.js';
@@ -475,6 +479,8 @@ function writeStatusFile(statusObj) {
       ...(orchestrator?.components?.guardian?.startStatus?.() || {}),
     },
     healthEngine: engine,
+    // Only a running session's status reports a delivery backlog.
+    deliveryStuck: statusObj.state === 'idle' || statusObj.state === 'busy' ? dialogWatch?.deliveryStuck() : null,
   });
 }
 
@@ -1275,9 +1281,42 @@ function createGuardian(activeAdapter, activeToolPipeline, initialRuntimeLaunchA
   });
 }
 
+// The instance the dispatchers route untargeted rows to (c4-dispatcher-multi
+// multiSessionDispatch): the one marked primary, else the first.
+function routesUntargetedRows() {
+  if (!INSTANCE_ID || !_getAllInstances) return false;
+  const all = _getAllInstances() || [];
+  return (all.find(i => i.primary === true) ?? all[0])?.id === INSTANCE_ID;
+}
+
+// Dialog watch (dialog-watch.js): fed the pane read the tick already makes.
+// The database is its authority: its Escape and decline message are plain
+// rows bound out of band (session_ref to the judged pane, dialog_ref to the
+// prompt), at most one of each per persona, pane and prompt; every read or
+// withdrawal is scoped in SQL to this instance, pane, prompt and kind; what the
+// queue cannot hold is kept in the service-owned table dialog_watch_state
+// (c4.db, which personas cannot write; their monitor dir is dual-writer and is
+// not used). It queues nothing until the running dispatcher (and, for an
+// isolated persona, the broker) published that they enforce the binding.
+// Alerts through the degraded alert's direct admin send.
+function createDialogWatchFor() {
+  return createDialogWatch({
+    instanceId: INSTANCE_ID,
+    ...bindDialogWatchQueue({ instanceId: INSTANCE_ID, isolated: Boolean(INSTANCE_ID && _getInstanceDef?.(INSTANCE_ID)?.os_user),
+      routesUntargeted: routesUntargetedRows,
+      db: { insertDialogControl, findDialogControl, withdrawDialogControl, getHeldWorkSummary, hasLiveCapability,
+        loadDialogWatchState, saveDialogWatchState } }),
+    notifyOperator: message => (ADMIN_CHAT_ID
+      ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
+      : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),
+    log,
+  });
+}
+
 async function monitorLoop() {
   const currentTime = Math.floor(Date.now() / 1000);
   const currentTimeHuman = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  let paneFrame = null;
 
   const tickState = await orchestrator.handleMonitorTick({
     currentTime,
@@ -1302,7 +1341,7 @@ async function monitorLoop() {
     getConversationFileModTime,
     getTmuxActivity,
     getTmuxClaudePid,
-    readTmuxInputState,
+    readTmuxInputState: (options) => (paneFrame = readTmuxInputState(options)),
     canTreatPaneAsRecovered,
     runC4Control,
   });
@@ -1311,6 +1350,16 @@ async function monitorLoop() {
   idleSince = tickState.idleSince;
   watchdogState = tickState.watchdogState;
   try { fableMonitor?.tick(); } catch (err) { log(`Fable guard monitor tick failed: ${err.message}`); }
+  // A running session only (its status is idle or busy). Only Claude panes are
+  // read for dialogs; a Claude tick without a pane read (startup grace) is no
+  // evidence that a dialog closed.
+  if (lastState === 'idle' || lastState === 'busy') {
+    const framed = adapter?.runtimeId !== 'claude' || paneFrame !== null;
+    try {
+      dialogWatch?.tick({ modal: paneFrame?.modal ?? null, sessionRef: paneFrame?.paneIdentity ?? null,
+        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok' });
+    } catch (err) { log(`Dialog watch tick failed: ${err.message}`); }
+  }
 }
 
 function init() {
@@ -1348,6 +1397,7 @@ function init() {
     engine,
     contextMonitor,
   } = orchestrator.start());
+  dialogWatch = createDialogWatchFor();
 }
 
 // REL-9b seam: gate the daemon side-effects (init, process handlers, schedule

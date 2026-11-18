@@ -159,3 +159,89 @@ describe('dialog identity, not wording (Astra #5)', () => {
   });
 });
 
+
+// 2026-11-18 user-pan: the CLI 2.1.326 dangerous-command prompt read as kind
+// 'unknown' titled "│ Dangerous rm …". The dashed rules framing the command
+// start at column 0 and were taken for transcript rows, so the scan never
+// reached the pane divider and the prompt read as an untitled select list.
+// A permission prompt is now identified positively (guide row last, numbered
+// Yes/No options, question row, divider), dashed rules accepted only there.
+describe('CLI 2.1.326 dangerous-command prompt', () => {
+  const withoutId = ({ id, ...rest }) => rest;
+  const expected = { kind: 'permission', text: 'Bash command', notice: fx.DANGEROUS_RM_NOTICE };
+
+  it('is a permission prompt titled by its title row, with the safety notice kept apart', () => {
+    assert.deepEqual(withoutId(detectModal(fx.DANGEROUS_RM_PROMPT)), expected);
+    assert.match(detectModal(fx.DANGEROUS_RM_PROMPT).id, /^[0-9a-f]{16}$/);
+  });
+
+  it('is the same prompt, with the same id, while the CLI draws and counts down its auto-block line', () => {
+    assert.deepEqual(withoutId(detectModal(fx.DANGEROUS_RM_PROMPT_COUNTDOWN)), expected);
+    const id = detectModal(fx.DANGEROUS_RM_PROMPT).id;
+    assert.equal(detectModal(fx.DANGEROUS_RM_PROMPT_COUNTDOWN).id, id);
+    assert.equal(detectModal(fx.DANGEROUS_RM_PROMPT_COUNTDOWN.replace('in 1:58', 'in 0:07')).id, id);
+  });
+
+  it('a prompt for another command in the same pane has another id', () => {
+    const other = detectModal(fx.DANGEROUS_RM_PROMPT.replaceAll('rm -f $D/*', 'rm -f $E/*'));
+    assert.equal(other.kind, 'permission');
+    assert.notEqual(other.id, detectModal(fx.DANGEROUS_RM_PROMPT).id);
+  });
+
+  it('is the same prompt at 160 columns, where the notice is one row', () => {
+    assert.deepEqual(withoutId(detectModal(fx.DANGEROUS_RM_PROMPT_WIDE)), expected);
+  });
+
+  it('owns the keyboard: no composer is read while it is up', () => {
+    const lines = fx.DANGEROUS_RM_PROMPT.split('\n');
+    const state = stateFor(fx.DANGEROUS_RM_PROMPT, 1, lines.findIndex((line) => line.includes('❯ 1. Yes')));
+    assert.equal(state.modal.kind, 'permission');
+    assert.equal(state.promptVisible, false);
+  });
+
+  it('a permission prompt without a notice row has no notice', () => {
+    assert.deepEqual(withoutId(detectModal(fx.PERMISSION_PROMPT_LIVE)), { kind: 'permission', text: 'Bash command' });
+  });
+});
+
+describe('a permission prompt is identified positively, never by elimination', () => {
+  it('a benign menu printed above an ordinary composer is no modal (as on base)', () => {
+    assert.equal(detectModal(fx.BENIGN_MENU_ABOVE_COMPOSER), null);
+    const lines = fx.BENIGN_MENU_ABOVE_COMPOSER.split('\n');
+    const state = stateFor(fx.BENIGN_MENU_ABOVE_COMPOSER, 2, lines.findLastIndex((line) => line.startsWith('❯')));
+    assert.equal(state.modal, null);
+    assert.equal(state.inputState, 'empty');
+  });
+
+  it('dashed rules quoted in transcript output above a live composer are no dialog', () => {
+    const capture = ['⏺ Here is the frame:', '╌'.repeat(80), '  rm -f x', '╌'.repeat(80), '', ...fx.PLAIN_COMPOSER.split('\n')].join('\n');
+    assert.equal(detectModal(capture), null);
+  });
+
+  it('the prompt\'s rows quoted above a live composer are not a prompt', () => {
+    const quoted = [...fx.DANGEROUS_RM_PROMPT.trimEnd().split('\n'), '', ...fx.PLAIN_COMPOSER.split('\n')].join('\n');
+    assert.notEqual(detectModal(quoted)?.kind, 'permission');
+  });
+
+  it('without its guide row last, its question, a Yes and a No, or its divider, it is not a permission prompt', () => {
+    const lines = fx.DANGEROUS_RM_PROMPT.trimEnd().split('\n');
+    const variants = {
+      noGuide: lines.filter((l) => !l.includes('Esc to cancel')),
+      noQuestion: lines.filter((l) => !l.includes('Do you want')),
+      noNo: lines.map((l) => l.replace('2. No', '2. Later')),
+      noYes: lines.map((l) => l.replace('1. Yes', '1. Sure')),
+      twoFocused: lines.map((l) => l.replace('   2. No', ' ❯ 2. No')),
+      noDivider: lines.map((l) => (/^─+$/.test(l) ? '' : l)),
+      textAtColumnZero: lines.map((l) => (l === ' rm -f $D/*' ? 'rm -f $D/*' : l)),
+    };
+    for (const [name, rows] of Object.entries(variants)) {
+      assert.notEqual(detectModal(rows.join('\n'))?.kind, 'permission', name);
+    }
+  });
+
+  it('an AskUserQuestion select asking "Do you want …?" with Yes/No options is not a permission prompt', () => {
+    const ask = ['⏺ Asking', '', fx.RULE, '  Deploy now?', '', '  Do you want to deploy?', '  ❯ 1. Yes',
+      '    2. No', '', '  Enter to select · ↑/↓ to navigate · Esc to cancel'].join('\n');
+    assert.equal(detectModal(ask)?.kind, 'unknown');
+  });
+});

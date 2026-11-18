@@ -123,6 +123,27 @@ describe('status-writer', () => {
     });
   });
 
+  // 2026-11-18: user-elaine's agent-status.json said ok/idle for 70 minutes
+  // while 13 of her messages stayed undelivered.
+  it('a delivery backlog over a healthy engine is published as unavailable / delivery_stuck', () => {
+    const deliveryStuck = { cause: 'session_idle', pending: 13, oldest_age_seconds: 4200 };
+    assert.deepEqual(buildStatusPayload({ statusObj: { state: 'idle' }, healthEngine: { health: 'ok' }, deliveryStuck }), {
+      state: 'idle', health: 'unavailable', unavailable_reason: 'delivery_stuck', delivery_stuck: deliveryStuck,
+    });
+    // Never over an engine state with its own handling.
+    assert.deepEqual(buildStatusPayload({ statusObj: { state: 'idle' },
+      healthEngine: { health: 'rate_limited', healthReason: 'rate_limit_detected' }, deliveryStuck }), {
+      state: 'idle', unavailable_reason: 'rate_limit_detected', rate_limit_reset: null, cooldown_until: null, health: 'rate_limited',
+    });
+  });
+
+  it('a monitor never starts its health engine from a reported delivery backlog', () => {
+    const statusFile = tempStatusFile();
+    fs.writeFileSync(statusFile, JSON.stringify({ state: 'idle', health: 'unavailable', unavailable_reason: 'delivery_stuck',
+      delivery_stuck: { cause: 'session_idle', pending: 2, oldest_age_seconds: 700 }, runtime_launch_at: 99 }));
+    assert.deepEqual(readInitialStatus({ statusFile }), { state: 'idle', health: 'ok', runtime_launch_at: 99 });
+  });
+
   it('writes status atomically to the target file', () => {
     const statusFile = tempStatusFile();
     const ok = writeStatus({

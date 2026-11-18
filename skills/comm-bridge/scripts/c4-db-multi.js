@@ -16,7 +16,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { getDb } from './c4-db.js';
+import { getDb, CONTROL_CLAIM_ORDER, dialogRefSelect } from './c4-db.js';
 import { groupKeyFromEndpoint } from '../../multi-session/c4-helpers.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -102,6 +102,34 @@ export function getNextPendingForInstance(instanceId) {
   `).get(instanceId) || null;
 }
 
+// The dispatcher's per-call holds (c4-dispatcher-multi.js fair selection):
+// once an instance has a held row of one class in a pass, the rest of that
+// class for that instance is left out of the claim queries for the pass.
+//   paste - a modal on the pane holds every pasted row: conversations and
+//           non-key controls;
+//   keys  - a modal that takes no key holds every [KEYSTROKE] control;
+//   idle  - a busy session holds every require_idle row;
+//   state - offline / unhealthy / suspended holds every non-bypass row.
+// A NULL-targeted row belongs to `primaryId`, the instance it is routed to.
+// `holds` = { paste, keys, idle, state } (instance id lists) + primaryId.
+const KEY_ROW = "substr(raw_content, 1, 11) = '[KEYSTROKE]'";
+
+function holdClauses(holds, classes) {
+  const sql = [];
+  const params = [];
+  for (const [name, predicate] of classes) {
+    const instances = holds?.[name];
+    if (!instances?.length) continue;
+    sql.push(`\n      AND NOT (COALESCE(target_instance, ?, '') IN (${instances.map(() => '?').join(', ')}) AND ${predicate})`);
+    params.push(holds.primaryId ?? null, ...instances);
+  }
+  return { sql: sql.join(''), params };
+}
+
+const CONVERSATION_CLASSES = [['paste', '1'], ['idle', 'require_idle = 1'], ['state', '1']];
+const CONTROL_CLASSES = [['paste', `NOT (${KEY_ROW})`], ['keys', KEY_ROW], ['idle', 'require_idle = 1'],
+  ['state', 'COALESCE(bypass_state, 0) = 0']];
+
 /**
  * Get the next pending conversation for any of the given online instances.
  * Prefers messages explicitly targeting an online instance, then falls back to
@@ -109,10 +137,12 @@ export function getNextPendingForInstance(instanceId) {
  * pending until the target comes online.
  *
  * @param {string[]} onlineInstanceIds - array of instance IDs currently online
+ * @param {object} [holds] - this pass's holds (holdClauses above)
  * @returns {object|null} highest priority pending message for any online instance, or null
  */
-export function getNextPendingForInstances(onlineInstanceIds) {
+export function getNextPendingForInstances(onlineInstanceIds, holds = null) {
   const db = getDb();
+  const held = holdClauses(holds, CONVERSATION_CLASSES);
 
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     // No instances online — only return legacy NULL-targeted messages
@@ -121,10 +151,10 @@ export function getNextPendingForInstances(onlineInstanceIds) {
              priority, require_idle, retry_count, target_instance
       FROM conversations
       WHERE direction = 'in' AND status = 'pending'
-        AND target_instance IS NULL
+        AND target_instance IS NULL${held.sql}
       ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
       LIMIT 1
-    `).get() || null;
+    `).get(...held.params) || null;
   }
 
   // Parameterized IN clause — safe against SQL injection
@@ -134,10 +164,10 @@ export function getNextPendingForInstances(onlineInstanceIds) {
            priority, require_idle, retry_count, target_instance
     FROM conversations
     WHERE direction = 'in' AND status = 'pending'
-      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)
+      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)${held.sql}
     ORDER BY COALESCE(priority, 3) ASC, timestamp ASC
     LIMIT 1
-  `).get(...onlineInstanceIds) || null;
+  `).get(...onlineInstanceIds, ...held.params) || null;
 }
 
 /**
@@ -189,28 +219,31 @@ export function getPendingTargetInstancesNeedingWake(onlineInstanceIds) {
 
 /**
  * Get the next pending control item filtered to online instances, with
- * available_at gate.
+ * available_at gate, in CONTROL_CLAIM_ORDER (an Escape key first within its
+ * priority).
  *
  * @param {number} currentTimestamp - unix seconds (for available_at comparison)
  * @param {string[]} onlineInstanceIds - array of instance IDs currently online
+ * @param {object} [holds] - this pass's holds (holdClauses above)
  * @returns {object|null} next eligible control item, or null
  */
-export function getNextPendingControlForInstances(currentTimestamp, onlineInstanceIds) {
+export function getNextPendingControlForInstances(currentTimestamp, onlineInstanceIds, holds = null) {
   const db = getDb();
+  const held = holdClauses(holds, CONTROL_CLASSES);
 
   if (!onlineInstanceIds || onlineInstanceIds.length === 0) {
     // No instances online — only return legacy NULL-targeted controls
     return db.prepare(`
       SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
              status, retry_count, available_at, last_error, created_at, updated_at,
-             target_instance
+             target_instance, session_ref, ${dialogRefSelect(db)}
       FROM control_queue
       WHERE status = 'pending'
         AND (available_at IS NULL OR available_at <= ?)
-        AND target_instance IS NULL
-      ORDER BY COALESCE(priority, 3) ASC, id ASC
+        AND target_instance IS NULL${held.sql}
+      ORDER BY ${CONTROL_CLAIM_ORDER}
       LIMIT 1
-    `).get(currentTimestamp) || null;
+    `).get(currentTimestamp, ...held.params) || null;
   }
 
   // Parameterized IN clause — safe against SQL injection
@@ -218,14 +251,14 @@ export function getNextPendingControlForInstances(currentTimestamp, onlineInstan
   return db.prepare(`
     SELECT id, content, priority, require_idle, bypass_state, ack_deadline_at,
            status, retry_count, available_at, last_error, created_at, updated_at,
-           target_instance
+           target_instance, session_ref, ${dialogRefSelect(db)}
     FROM control_queue
     WHERE status = 'pending'
       AND (available_at IS NULL OR available_at <= ?)
-      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)
-    ORDER BY COALESCE(priority, 3) ASC, id ASC
+      AND (target_instance IN (${placeholders}) OR target_instance IS NULL)${held.sql}
+    ORDER BY ${CONTROL_CLAIM_ORDER}
     LIMIT 1
-  `).get(currentTimestamp, ...onlineInstanceIds) || null;
+  `).get(currentTimestamp, ...onlineInstanceIds, ...held.params) || null;
 }
 
 // ---------------------------------------------------------------------------

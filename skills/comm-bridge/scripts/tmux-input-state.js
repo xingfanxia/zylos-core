@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 
 const CURSOR_EMPTY_THRESHOLD = 2;
 const IN_PROGRESS_CAPTURE_PATTERNS = [
@@ -63,7 +64,7 @@ const MAX_DIALOG_ROWS = 40;
 // Tracks the Claude Code CLI 2.1.322 text, extracted from the shipped binary;
 // CLI auto-update can change it. A miss is safe: the dialog still reads as kind
 // 'unknown' in detectModal(), which keeps paste, Enter and raw keys deferred;
-// only the quota-hold classification (or the permission auto-approve) is lost.
+// only the quota-hold classification (or the permission-prompt handling) is lost.
 export const LIMIT_DIALOG_TITLES = Object.freeze({
   fable_limit: Object.freeze([/^You['’]ve reached your Fable limit$/]),
   credits_offer: Object.freeze([/^\S.* now uses usage credits$/, /^Switch to \S.*\?$/]),
@@ -80,11 +81,6 @@ export const LIMIT_DIALOG_OPTIONS = Object.freeze([
   /^Upgrade to \S.*$/,
 ]);
 
-// Permission prompts are the one modal the [KEYSTROKE] auto-approve path is
-// meant to answer: a numbered option list whose question row asks for consent,
-// or whose options include the fixed "No, and tell Claude …" answer.
-const PERMISSION_QUESTION_RE = /^Do you want to .+\?$/;
-const PERMISSION_DECLINE_OPTION_RE = /^\d+\. No, and tell Claude what to do differently\b/;
 const NUMBERED_OPTION_RE = /^\d+\.\s/;
 
 function trimRight(line) {
@@ -165,19 +161,106 @@ function limitKind({ title, options }, rows) {
   return rows.some((line) => GUIDE_RE.test(line)) ? kind : null;
 }
 
-function isPermissionPrompt({ options, question }) {
-  if (!options.length || !NUMBERED_OPTION_RE.test(options[0])) return false;
-  return (question !== null && PERMISSION_QUESTION_RE.test(question))
-    || options.some((label) => PERMISSION_DECLINE_OPTION_RE.test(label));
+// ── Permission prompt: positive identification ──────────────────────────
+//
+// A pane counts as a permission prompt only when every part of the prompt is
+// where Claude Code draws it, read upward from the bottom of the screen:
+//   - no composer anywhere on screen (the prompt owns the keyboard);
+//   - the last row is the prompt's own guide (`Esc to cancel …`);
+//   - directly above it (blank rows aside) its numbered option block: exactly
+//     one focused row (`❯ 1. Yes`), numbers 1..n in order, option 1 a "Yes",
+//     some option a "No"; a deeper-indented row continues the option above;
+//   - directly above the options the question row (`Do you want to …?`);
+//   - above that only indented rows, blank rows and the dashed rules (`╌`)
+//     with which CLI 2.1.326 frames a Bash command from column 0, up to the
+//     pane divider (`─`) within MAX_DIALOG_ROWS; the first row under it is the
+//     title.
+// Anything else is not a permission prompt (it may still be another modal).
+// On 2026-11-18 the dashed rules made the dangerous-command prompt read as an
+// untitled 'unknown' list (user-pan, 4 h 48 min); they are accepted here only,
+// so text in the transcript that merely looks like a menu stays no modal.
+//
+// `notice`: the `│` rows between title and question, the reason a safety check
+// gives ("│ Dangerous rm operation on possibly-empty variable path: …" /
+// "│ (rewrite it as "${D:?}"/* or use a literal path)"), joined. `id`: a hash
+// of the prompt's rows except Claude Code's own auto-block countdown (`⚠ …`
+// paragraph, which changes every second), so one prompt keeps its id while it
+// is up and a different prompt in the same pane gets another one.
+const DASHED_RULE_RE = /^╌{10,}$/;
+const PERMISSION_GUIDE_RE = /^\s+Esc to cancel\b/;
+const PERMISSION_QUESTION_RE = /^\s+Do you want to .+\?$/;
+const OPTION_ROW_RE = /^(\s+)(❯\s+)?(\d+)\.\s+(.*)$/;
+const NOTICE_ROW_RE = /^\s*│\s?/;
+const COUNTDOWN_RE = /^\s+⚠\s/;
+
+function permissionOptions(lines, bottom) {
+  let i = bottom;
+  const options = [];
+  let numberIndent = -1;
+  while (i >= 0 && lines[i]) {
+    const m = OPTION_ROW_RE.exec(lines[i]);
+    const indent = m ? m[1].length + (m[2] ? m[2].length : 0) : -1;
+    if (m && (numberIndent < 0 || indent === numberIndent)) {
+      numberIndent = indent;
+      options.unshift({ number: Number(m[3]), label: m[4], focused: Boolean(m[2]) });
+    } else if (!m && numberIndent >= 0 && indentOf(lines[i]) > numberIndent) {
+      // continuation of the option below it in reading order: keep scanning
+    } else break;
+    i--;
+  }
+  const first = i + 1;
+  if (!options.length || options.filter((o) => o.focused).length !== 1) return null;
+  if (options.some((o, k) => o.number !== k + 1)) return null;
+  if (!/^Yes\b/.test(options[0].label) || !options.some((o) => /^No\b/.test(o.label))) return null;
+  return { first };
+}
+
+function matchPermissionPrompt(lines) {
+  if (findComposerTop(lines) >= 0) return null;
+  let guide = lines.length - 1;
+  while (guide >= 0 && !lines[guide]) guide--;
+  if (guide < 0 || !PERMISSION_GUIDE_RE.test(lines[guide])) return null;
+  let bottom = guide - 1;
+  while (bottom >= 0 && !lines[bottom]) bottom--;
+  const block = bottom >= 0 ? permissionOptions(lines, bottom) : null;
+  if (!block) return null;
+  const question = block.first - 1;
+  if (question < 0 || !PERMISSION_QUESTION_RE.test(lines[question])) return null;
+  let divider = -1;
+  for (let i = question - 1; i >= 0 && guide - i < MAX_DIALOG_ROWS; i--) {
+    const line = lines[i];
+    if (RULE_RE.test(line)) { divider = i; break; }
+    if (line && !/^\s/.test(line) && !DASHED_RULE_RE.test(line)) return null;
+  }
+  if (divider < 0) return null;
+  const body = lines.slice(divider + 1, guide + 1);
+  const titleRow = body.find((line) => line && !DASHED_RULE_RE.test(line));
+  if (!titleRow || titleRow === lines[question]) return null;
+  const notice = lines.slice(divider + 1, question).filter((line) => NOTICE_ROW_RE.test(line))
+    .map((line) => line.replace(NOTICE_ROW_RE, '').trim()).filter(Boolean).join(' ');
+  const stable = [];
+  let inCountdown = false;
+  for (const line of body) {
+    if (COUNTDOWN_RE.test(line)) inCountdown = true;
+    else if (!line) inCountdown = false;
+    if (!inCountdown) stable.push(line);
+  }
+  const id = createHash('sha256').update(stable.join('\n')).digest('hex').slice(0, 16);
+  return { kind: 'permission', text: titleRow.trim(), ...(notice ? { notice } : {}), id };
 }
 
 /**
- * Detect any modal (dialog or select list) that owns the keyboard.
- * @returns {null | { kind: 'fable_limit'|'credits_offer'|'permission'|'usage_overlay'|'unknown', text: string }}
+ * Detect any modal (dialog or select list) that owns the keyboard. `text` is
+ * the dialog's title row. Kind 'permission' only on positive identification
+ * (matchPermissionPrompt above), which also gives `id` and, for a safety
+ * check, `notice`.
+ * @returns {null | { kind: 'fable_limit'|'credits_offer'|'permission'|'usage_overlay'|'unknown', text: string, notice?: string, id?: string }}
  */
 export function detectModal(paneText) {
   if (!paneText) return null;
   const lines = String(paneText).split('\n').map(trimRight);
+  const permission = matchPermissionPrompt(lines);
+  if (permission) return permission;
   const live = findLiveDialogRows(lines);
   if (!live) {
     return isUsageOverlayCapture(paneText) ? { kind: 'usage_overlay', text: 'usage overlay' } : null;
@@ -187,9 +270,7 @@ export function detectModal(paneText) {
   // A bare select list (no pane divider) has no title row: it can be neither
   // the limit dialog nor a permission prompt, both of which are panes.
   if (!bounded) return { kind: 'unknown', text: title };
-  const structure = dialogStructure(rows);
-  if (isPermissionPrompt(structure)) return { kind: 'permission', text: title };
-  const kind = limitKind(structure, rows);
+  const kind = limitKind(dialogStructure(rows), rows);
   return { kind: kind || 'unknown', text: title };
 }
 

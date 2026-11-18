@@ -34,6 +34,8 @@ import {
   tmuxNewSession,
   getProcessName,
   hasChildProcess,
+  requirePaneAtShellPrompt,
+  tmuxPasteToVerifiedPane,
 } from './tmux-helpers.js';
 import {
   buildCleanEnv,
@@ -334,11 +336,18 @@ export class ClaudeAdapter extends RuntimeAdapter {
    * @param {string} text
    * @returns {Promise<void>}
    */
-  async sendMessage(text) {
+  // `pane`: the pane verified by requirePaneAtShellPrompt; the text and its
+  // Enter then go to that pane id only (tmuxPasteToVerifiedPane).
+  async sendMessage(text, { pane = null } = {}) {
     const msgId = `${Date.now()}-${process.pid}`;
+    const bufferName = `zylos-${msgId}`;
+    if (pane) {
+      // The helper validates `text` as it is and pastes exactly that string.
+      try { await tmuxPasteToVerifiedPane(pane, bufferName, text); } finally { tmuxDeleteBuffer(bufferName); }
+      return;
+    }
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zylos-'));
     const tmpFile = path.join(tmpDir, 'msg.txt');
-    const bufferName = `zylos-${msgId}`;
 
     try {
       fs.writeFileSync(tmpFile, text);
@@ -479,6 +488,10 @@ export class ClaudeAdapter extends RuntimeAdapter {
 
     if (tmuxHasSession(SESSION)) {
       // Existing session — send command via sendMessage, no env rebuild.
+      // Typed only into the one pane positively found at an idle shell prompt,
+      // by its pane id; otherwise nothing is typed and the launch fails
+      // (requirePaneAtShellPrompt, tmuxPasteToVerifiedPane).
+      const pane = await requirePaneAtShellPrompt(SESSION);
       // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
       const recoveryPrompt = upgradeStartupPrompt(ZYLOS_DIR);
       const envExports = [
@@ -491,7 +504,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
       ].filter(Boolean).join('; ');
       const envPrefix = envExports ? `${envExports}; ` : '';
       const cmd = `${envPrefix}cd "${instanceCwd}"; ${claudeCmd}${recoveryPrompt ? " " + shellArgument(recoveryPrompt) : ""}; ${exitLogSnippet}`;
-      await this.sendMessage(cmd);
+      await this.sendMessage(cmd, { pane });
     } else {
       // New session — launcher pipeline
       // Shared ~/zylos/.env, manifest, stripped vars and the built-in Claude

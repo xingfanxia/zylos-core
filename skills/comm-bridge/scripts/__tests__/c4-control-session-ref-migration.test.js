@@ -29,7 +29,9 @@ it('adds session_ref and delivery_uncertain to a pre-003 database without touchi
   // A database as the previous release leaves it: everything but 003 and 004.
   inChild(`${db('c4-db.js')} db.getDb(); db.close();`);
   const old = new Database(dbPath);
-  old.exec(`DROP INDEX idx_control_queue_session_ref; ALTER TABLE control_queue DROP COLUMN session_ref;
+  old.exec(`DROP INDEX idx_control_queue_dialog_escape; DROP INDEX idx_control_queue_dialog_notice;
+    DELETE FROM _migrations WHERE name = '006-add-dialog-watch-state.sql';
+    DROP INDEX idx_control_queue_session_ref; ALTER TABLE control_queue DROP COLUMN session_ref;
     DELETE FROM _migrations WHERE name = '003-add-control-session-ref.sql';
     DROP TABLE delivery_uncertain; DELETE FROM _migrations WHERE name = '004-add-delivery-uncertain.sql';`);
   const now = Math.floor(Date.now() / 1000);
@@ -65,4 +67,37 @@ it('adds session_ref and delivery_uncertain to a pre-003 database without touchi
     db.close();
     console.log(JSON.stringify({ claimed, bound, acked, applied }));`);
   assert.deepEqual(reused, { claimed: true, bound: { sessionRef: '$1:1000:%2:123', stamped: true }, acked: 'done', applied: 1 });
+});
+
+// DELIVER-1: migrations/005 adds control_queue.dialog_ref (the prompt a dialog
+// watch Escape or decline message is bound to) the same way: additive,
+// idempotent, applied by whichever process opens the database first, strict
+// inspection accepts it, and rows written before it keep NULL.
+it('adds dialog_ref to a pre-005 database without touching existing rows; a bound Escape stays a plain key', () => {
+  inChild(`${db('c4-db.js')} db.getDb(); db.close();`);
+  const old = new Database(dbPath);
+  old.exec(`DELETE FROM control_queue; DROP INDEX idx_control_queue_dialog_escape; DROP INDEX idx_control_queue_dialog_notice;
+    DROP TABLE dialog_watch_state; DROP TABLE c4_process_capabilities;
+    ALTER TABLE control_queue DROP COLUMN dialog_ref;
+    DELETE FROM _migrations WHERE name IN ('005-add-control-dialog-ref.sql', '006-add-dialog-watch-state.sql');`);
+  const now = Math.floor(Date.now() / 1000);
+  old.prepare(`INSERT INTO control_queue (raw_content, content, priority, bypass_state, status, created_at, updated_at, target_instance)
+    VALUES ('[KEYSTROKE]Escape', '[KEYSTROKE]Escape', 0, 1, 'pending', ?, ?, 'user-pan')`).run(now, now);
+  const migrated = inChild(`${db('c4-db.js')} import * as schema from ${JSON.stringify(path.join(SCRIPTS, 'c4-schema.js'))};
+    const d = db.getDb();
+    const strict = schema.inspectSchema(d, { strict: true });
+    const bound = db.insertControl('[KEYSTROKE]Escape', { priority: 0, bypassState: true, appendAckSuffix: false,
+      targetInstance: 'user-pan', sessionRef: '$1:1000:%2:123', dialogRef: '0123456789abcdef' });
+    const rows = d.prepare('SELECT raw_content, content, dialog_ref, status FROM control_queue ORDER BY id').all();
+    const applied = d.prepare("SELECT COUNT(*) AS n FROM _migrations WHERE name IN ('005-add-control-dialog-ref.sql', '006-add-dialog-watch-state.sql')").get().n;
+    db.close();
+    console.log(JSON.stringify({ rows, applied, extensions: strict.extensions, boundId: bound.id }));`);
+  assert.equal(migrated.applied, 2);
+  assert.deepEqual(migrated.extensions, { tables: [], columns: [] }, 'strict inspection accepts the fork column and tables');
+  assert.deepEqual(migrated.rows, [
+    { raw_content: '[KEYSTROKE]Escape', content: '[KEYSTROKE]Escape', dialog_ref: null, status: 'pending' },
+    { raw_content: '[KEYSTROKE]Escape', content: '[KEYSTROKE]Escape', dialog_ref: '0123456789abcdef', status: 'pending' },
+  ], 'the bound row is the plain key a dispatcher without the column sends as any Escape; the older equivalent row is not superseded by it');
+  assert.equal(old.prepare('PRAGMA table_info(control_queue)').all().some((c) => c.name === 'dialog_ref'), true);
+  old.close();
 });

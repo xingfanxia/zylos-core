@@ -509,12 +509,10 @@ the previous process are not told apart from the new one. Guard restarts and
 the lease enforcement kill the tmux session, so they always get a new
 `sessionRef`.
 
-The watchdog interrupt and the permission auto-approve Enter are enqueued
-bound: the watchdog reads the adapter session's ref (`readSessionRef`) right
-before the enqueue, and the auth-prompt hook reads its own pane with `tmux
-display-message -t "$TMUX_PANE"`; each passes it as `--session-ref`. A key
-whose identity cannot be read (no `TMUX_PANE`, or an os_user-isolated CLI that
-cannot reach the service user's tmux socket) is enqueued unbound. The
+The watchdog interrupt is enqueued bound: the watchdog reads the adapter
+session's ref (`readSessionRef`) right before the enqueue and passes it as
+`--session-ref` (the auth-prompt hook no longer queues any key, DELIVER-1). A
+key whose identity cannot be read is enqueued unbound. The
 dispatcher fences an unbound key at claim time: it is bound to the pane it
 reads then, and superseded (`SESSION_PREDATES`) when its `created_at` is at or
 before that session's `session_created`; a same-second key is ambiguous and

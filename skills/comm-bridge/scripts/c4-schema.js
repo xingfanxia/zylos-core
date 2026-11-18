@@ -59,10 +59,12 @@ export const MIGRATIONS = Object.freeze({
 });
 // Fork: multi-session routing columns, the [KEYSTROKE] session fence
 // (control_queue.session_ref, migrations/003), uncertain delivery outcomes
-// (delivery_uncertain, migrations/004) and the fork migration ledger.
+// (delivery_uncertain, migrations/004), the dialog binding of a control
+// (control_queue.dialog_ref, migrations/005), the dialog watch's state and the
+// processes' published capabilities (migrations/006) and the fork migration ledger.
 export const FORK_EXTENSIONS = Object.freeze({
-  tables: ['_migrations', 'delivery_uncertain'],
-  columns: { checkpoints: ['target_instance'], conversations: ['target_instance'], control_queue: ['target_instance', 'session_ref'] },
+  tables: ['_migrations', 'delivery_uncertain', 'dialog_watch_state', 'c4_process_capabilities'],
+  columns: { checkpoints: ['target_instance'], conversations: ['target_instance'], control_queue: ['target_instance', 'session_ref', 'dialog_ref'] },
 });
 export function inspectSchema(db, { allowNew = false, strict = true, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions = strict } = {}) {
   return inspectWithForkExtensions(db, 'c4', SUPPORTED_SCHEMA_VERSION, TABLES, FORK_EXTENSIONS, { allowNew, strict, allowExtraTables, allowExtraColumns, rejectUnsafeExtensions, definitions: COLUMN_DEFINITIONS, migrateFromOlder: true });

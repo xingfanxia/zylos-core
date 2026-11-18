@@ -115,6 +115,17 @@ describe('multiSessionDispatch', () => {
     assert.match(r.reason, /unhealthy/);
   });
 
+  // The monitor reports a delivery backlog as unavailable / delivery_stuck
+  // (dialog-watch.js). Holding on it would keep that backlog forever.
+  it('a reported delivery backlog never holds delivery; any other unavailable reason still does', () => {
+    const stuck = disp.multiSessionDispatch({ target_instance: 'user-betty', type: 'conversation' },
+      helpers({ state: 'idle', health: 'unavailable', reason: 'delivery_stuck' }));
+    assert.equal(stuck.action, 'deliver');
+    const recovering = disp.multiSessionDispatch({ target_instance: 'user-betty', type: 'conversation' },
+      helpers({ state: 'idle', health: 'unavailable', reason: 'heartbeat_timeout' }));
+    assert.equal(recovering.action, 'skip');
+  });
+
   it('bypass state delivers even when offline', () => {
     const r = disp.multiSessionDispatch(
       { target_instance: 'user-betty', type: 'conversation' },

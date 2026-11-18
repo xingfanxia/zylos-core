@@ -36,7 +36,11 @@ import {
   bindControlSession,
   supersedeControl,
   recordUncertainDelivery,
-  stripTrailingAckSuffix
+  stripTrailingAckSuffix,
+  startDialogSchemaCheck,
+  publishCapabilities,
+  refreshCapabilities,
+  withdrawCapabilities,
 } from './c4-db.js';
 import {
   POLL_INTERVAL_BASE,
@@ -67,6 +71,7 @@ import {
   TMUX_MISSING_WARN_THRESHOLD,
   HEARTBEAT_INTERVAL_MS,
   WATCHDOG_MAX_TICK_MS,
+  DELIVERY_STUCK_REASON,
 } from './c4-config.js';
 import {
   findPromptY as sharedFindPromptY,
@@ -194,6 +199,14 @@ export function readJsonFileWithRetry(filePath, attempts = 3) {
   throw lastErr;
 }
 
+/**
+ * Health holds delivery unless it is 'ok', or it reports this dispatcher's own
+ * backlog (DELIVERY_STUCK_REASON: holding on it would keep the backlog forever).
+ */
+export function healthHoldsDelivery(agentState) {
+  return agentState?.health !== 'ok' && agentState?.reason !== DELIVERY_STUCK_REASON;
+}
+
 function getAgentState(statusFile = AGENT_STATUS_FILE) {
   try {
     if (!existsSync(statusFile)) {
@@ -218,7 +231,8 @@ function getAgentState(statusFile = AGENT_STATUS_FILE) {
 
     const health = typeof status.health === 'string' ? status.health : 'ok';
     const idleSeconds = typeof status.idle_seconds === 'number' ? status.idle_seconds : 0;
-    return { state, health, healthy: true, idleSeconds };
+    const reason = typeof status.unavailable_reason === 'string' ? status.unavailable_reason : null;
+    return { state, health, healthy: true, idleSeconds, reason };
   } catch (err) {
     log(`Warning: Error reading agent status (${err.message})`);
     // health is fail-open by design; state still degrades to offline on read failure.
@@ -408,10 +422,14 @@ export function sendTarget(paneIdentity, session) {
   return match ? match[1] : session;
 }
 
-// Raw keys are withheld while a modal owns the keyboard. A permission prompt is
-// the exception: answering it is what the auto-approve [KEYSTROKE]Enter is for.
-export function keystrokeBlockedByModal(modal) {
-  return !!modal && modal.kind !== 'permission';
+// Raw keys while a modal owns the keyboard (2026-11-18, DELIVER-1): an
+// unattended permission prompt takes cancellation only. Escape (the cancel
+// key the prompt names) is the one key it may receive; any other key,
+// whatever its origin or age, is never sent to it (fenceKeystrokeControl
+// supersedes it). Every other modal (Fable-limit and credits dialogs, the
+// usage overlay, any unknown dialog) receives no key at all.
+export function keystrokeBlockedByModal(modal, key = null) {
+  return !!modal && !(modal.kind === 'permission' && key === 'Escape');
 }
 
 /**
@@ -434,7 +452,17 @@ export function readKeystrokeTarget(session = TMUX_SESSION, { execFileSyncImpl =
  *               sessionRef, or unbound and queued before this session started
  *               or in the same second (created_at and session_created are
  *               whole seconds, so a same-second key is ambiguous and fenced)
- *   defer     - a modal other than a permission prompt owns the keyboard
+ *               Any key but Escape claimed while a permission prompt is up
+ *               is superseded too (PERMISSION_PROMPT): a prompt nobody can
+ *               answer is only ever cancelled, so no key may approve it
+ *               (Enter, a digit, y, text), however old or whoever queued it.
+ *               A dialog-bound key (control_queue.dialog_ref: the activity
+ *               monitor's dialog watch Escape) is superseded unless that very
+ *               prompt (same pane, same prompt id) is still on screen
+ *               (DIALOG_GONE). The binding travels out of band: the row's
+ *               content is the plain `[KEYSTROKE]Escape`, which a dispatcher
+ *               without this column treats as any other Escape
+ *   defer     - any other modal owns the keyboard (keystrokeBlockedByModal)
  *   deliver   - send the key
  * An unbound key is bound to the pane read here before any deferral, so a
  * later requeue or orphan reset can never move it to a replacement session.
@@ -449,7 +477,15 @@ export function fenceKeystrokeControl(item, target, { bind = bindControlSession 
       && item.created_at <= target.sessionCreatedAt) {
     return { action: 'supersede', reason: 'SESSION_PREDATES' };
   }
-  if (keystrokeBlockedByModal(target.modal)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
+  const key = parseKeystrokeKey(item.content);
+  const dialogId = item.dialog_ref || null;
+  const modal = target.modal;
+  if (dialogId) {
+    return key === 'Escape' && modal?.kind === 'permission' && modal.id === dialogId
+      ? { action: 'deliver' } : { action: 'supersede', reason: 'DIALOG_GONE' };
+  }
+  if (modal?.kind === 'permission' && key !== 'Escape') return { action: 'supersede', reason: 'PERMISSION_PROMPT' };
+  if (keystrokeBlockedByModal(modal, key)) return { action: 'defer', reason: 'MODAL_DEFERRED' };
   return { action: 'deliver' };
 }
 
@@ -621,6 +657,14 @@ async function sendToTmux(message, options = {}) {
   if (receipts.has(receiptKey)) return receipts.get(receiptKey);
   let pending = submissions.get(session);
   let initial = readState();
+  // A row bound to one session (control_queue.session_ref, e.g. the dialog
+  // watch's decline message) goes to that pane only, never to a replacement.
+  // Decided by this first read, before anything is pasted.
+  if (options.boundSessionRef && initial.captureOk !== false && initial.paneIdentity
+      && initial.paneIdentity !== options.boundSessionRef) {
+    return 'session_replaced';
+  }
+  if (options.boundSessionRef && !initial.paneIdentity) return 'verify_failed';
   if (pending && wasReplaced(pending, initial) && pending.modalDeferred && !pending.enterSent) {
     // The old pane never got Enter for this text (a modal held it back), so it
     // cannot have run there; the replacement pane receives a fresh paste.
@@ -1057,7 +1101,7 @@ async function processNextMessage() {
     return { delivered: false, state: agentState.state };
   }
 
-  if (agentState.health !== 'ok' && !bypass) {
+  if (healthHoldsDelivery(agentState) && !bypass) {
     releaseItem(item);
     return { delivered: false, state: agentState.state };
   }
@@ -1145,9 +1189,16 @@ async function processNextMessage() {
     result = await sendToTmux(deliveryContent, {
       deliveryId: `${item.type}:${item.id}`,
       strictVerify: item.type === 'conversation',
-      acceptShutdownAfterSubmit: isCodexExitLifecycleControl(item)
+      acceptShutdownAfterSubmit: isCodexExitLifecycleControl(item),
+      boundSessionRef: item.type === 'control' ? item.session_ref || null : null,
     });
   } finally { deliveryTrace = {}; }
+
+  if (result === 'session_replaced') {
+    supersedeControl(item.id, 'SESSION_REPLACED');
+    log(`Superseded control id=${item.id}: bound to a session that has been replaced`);
+    return { delivered: false, state: agentState.state };
+  }
 
   if (result === 'modal_deferred') {
     // Not delivered and not a failure: no retry is consumed; the row is
@@ -1205,6 +1256,11 @@ function maybeEmitHeartbeat(result) {
   const now = Date.now();
   if (!shouldEmitHeartbeat(now, lastHeartbeatMs, HEARTBEAT_INTERVAL_MS)) return;
   lastHeartbeatMs = now;
+  // Keep the published capability fresh while this process runs (it goes
+  // stale for the dialog watch within minutes after a hang or a kill).
+  if (dialogSchemaCheck?.ready()) {
+    try { refreshCapabilities(DISPATCHER_PROCESS); } catch (err) { log(`Capability refresh failed: ${err.message}`); }
+  }
   try {
     log(formatHeartbeatLine({
       pendingConv: getPendingCount(),
@@ -1319,12 +1375,24 @@ function acquireSingletonLock() {
   return false;
 }
 
+// What this dispatcher understands, published for the activity monitor's
+// dialog watch (c4_process_capabilities): it enforces control_queue.dialog_ref
+// (the prompt binding of a dialog-watch Escape) and session_ref on text
+// controls. The watch queues nothing until a live dispatcher has published it.
+const DISPATCHER_PROCESS = 'c4-dispatcher';
+export const DISPATCHER_CAPABILITIES = Object.freeze(['dialog_ref']);
+let dialogSchemaCheck = null;
+
 async function main() {
   if (!acquireSingletonLock()) {
     close();
     process.exit(1);
   }
   log('=== C4 Dispatcher Started ===');
+  process.on('exit', () => {
+    dialogSchemaCheck?.stop();
+    try { withdrawCapabilities(DISPATCHER_PROCESS); } catch { /* best effort */ }
+  });
   log(`Tmux session: ${TMUX_SESSION}`);
   trace('delivery_config', { bracketedPasteEnabled: BRACKETED_PASTE_ENABLED });
   log(`Poll interval: ${POLL_INTERVAL_BASE}ms (adaptive up to ${POLL_INTERVAL_MAX}ms)`);
@@ -1365,6 +1433,15 @@ async function main() {
   }, WATCHDOG_CHECK_INTERVAL_MS);
   watchdog.unref();
 
+  // Delivery does not wait for the dialog-binding schema: without
+  // control_queue.dialog_ref no row is bound to a dialog (nothing queues one
+  // before this capability is published) and every row is delivered as
+  // before. The check starts with the loop (its first attempt a second after
+  // the first tick began), fails fast on a busy database, and retries with
+  // backoff, logging once a minute; the capability is published only once the
+  // schema is verified.
+  dialogSchemaCheck = startDialogSchemaCheck({ processName: DISPATCHER_PROCESS, log, firstDelayMs: 1000,
+    onReady: () => publishCapabilities(DISPATCHER_PROCESS, DISPATCHER_CAPABILITIES) });
   await dispatcherLoop();
   close();
   process.exit(0);

@@ -186,30 +186,26 @@ Both daily tasks (upgrade, memory commit) use the same `DailySchedule` class:
 - **Dedup**: Date-based (`last_date === today`) ensures exactly-once per day, even with imprecise timing
 - **Persistence**: State files survive activity monitor restarts
 
-## Permission Auto-Approve
+## Permission Prompts: Cancelled, Never Approved
 
-When Claude Code shows a permission prompt (PermissionRequest event), the `hook-auth-prompt.js` hook automatically sends an Enter keystroke to approve it.
+Unattended sessions never answer a permission prompt with an approving key. `hook-auth-prompt.js` (the PermissionRequest hook) only logs the event to `hook-timing.log` (tool, input keys, `mode=` permission mode; never input values). It used to queue a `[KEYSTROKE]Enter` (`auto_approve_permission`, now without effect): on 2026-11-18 that Enter was queued for Claude Code 2.1.326's dangerous-command prompt about user-pan's own `rm -f $D/*` (asked even under `--dangerously-skip-permissions`) and would have selected "1. Yes" had the prompt been read correctly. The dispatcher sends nothing but Escape to a pane showing a permission prompt (comm-bridge SKILL.md, Session fence), and the dialog watch below cancels it.
 
-**This is intentional by design.** Zylos operates in a full-delegation model where the machine's permissions are entirely granted to the AI agent. Auto-approving permission prompts is the expected behavior, not a security gap.
+A host that runs Claude without bypass mode now gets every ordinary permission prompt cancelled after 60 s (with a message to the session) instead of approved: tools that need approval do not run unattended there. Such a host needs bypass mode (`zylos` default) or allow rules in its Claude settings.
 
-### How It Works
+## Dialog Watch
 
-1. Claude Code fires a PermissionRequest hook when a tool call requires user approval
-2. `hook-auth-prompt.js` logs the event to `hook-timing.log`
-3. If `auto_approve_permission` is true (default), it enqueues a `[KEYSTROKE]Enter` control at priority 0 with bypass-state and 1-second delay. When `TMUX_PANE` is set it reads its own pane identity (`tmux display-message -t "$TMUX_PANE"`) and binds the key with `--session-ref`; if that read fails the key is enqueued unbound, as before
-4. The C4 dispatcher delivers the Enter keystroke to the pane id of the read that decided it (a bound key for a replaced session is superseded, never sent to the replacement), auto-confirming the prompt
+`dialog-watch.js`, ticked by every Claude persona's monitor with the pane read it already makes each second (no extra tmux call). After 2026-11-18, when user-pan's own `rm -f $D/*` raised a dangerous-command prompt that nobody answered for 4 h 48 min while every message to Pan was held:
 
-### Configuration
+- **Permission prompt** (positively identified by `detectModal`: guide row last, numbered Yes/No options, question row, divider; with its `id`) on screen for 60 s: one plain `[KEYSTROKE]Escape`, queued in-process and bound out of band to that pane (`session_ref`) and that prompt (`dialog_ref`, migrations/005). The dispatcher sends it only while that very prompt is still on that pane, otherwise supersedes it (`DIALOG_GONE`).
+- **One per prompt, decided by the database**: at most one Escape and one decline message exist per instance, pane and prompt, in any status (unique partial indexes, migrations/006; `insertDialogControl` returns the existing row instead of a second). The watch finds and withdraws its own rows by (instance, pane, prompt, kind) in SQL, never by an id it remembered. So an identical prompt that comes back in the same session gets no second Escape, only the alert.
+- **Capability gate**: nothing is queued until the running `c4-dispatcher` (and, for an os_user-isolated persona, `c4-broker`) has published `dialog_ref` in `c4_process_capabilities`, which each does only after verifying the dialog-binding schema (migrations/005, 006). A row counts only while it is younger than 3 min and the process with its pid is running and started exactly at the published start time (from the operating system: a dead or reused pid does not count). Every insert the watch makes (Escape or decline) is authorized inside its own write transaction from the rows as they are then (`insertDialogControl({ requires })`); no cached answer authorizes anything, and only a refusal is remembered (10 s, observe-only). Until then, and on a database without that schema, the watch only observes and alerts ("没有发送 Esc"): it queues nothing and reads or saves no state. A mixed-version deploy, a withdrawn capability or a blocked migration never queues a bound row that a process would treat as an ordinary one.
+- **Decline message**, once, only when certain: the Escape control is `done` and the prompt is gone. It quotes the prompt's title and notice rows (Claude Code's own text), says to rewrite the command as the prompt advised, and is bound the same way: a relaunched session never gets it (`SESSION_REPLACED`). An Escape still pending when the prompt closes by itself is withdrawn (`DIALOG_GONE`, pending rows only); a claimed one is waited for. A failed enqueue is not repeated.
+- **Any other dialog** (`unknown`, the Fable guard's `fable_limit` / `credits_offer` / `usage_overlay`) gets no key.
+- **Operator alert** (the degraded alert's direct admin send, `health-alert`), at most once an hour while the dialog lasts: when a dialog of any kind has held work for 5 min (every row waiting for that persona, inbound messages and controls, except the watch's own bound rows and ack-waiting controls: `getHeldWorkSummary`), or when a permission prompt is still on screen 5 min after its Escape went out (or was queued, if it never went out), even with nothing queued. Persona, kind, minutes, counts; the title row only for a permission prompt. Also once per backlog when work waits more than 10 min while the session is idle. A failed send is tried again a minute later.
+- **Restarts**: what the queue cannot hold (prompt id or a hash of an unknown dialog's title, pane, first seen, next alert, the prompt's title and notice rows, unresolved declines) is kept in the service-owned table `dialog_watch_state` in `c4.db` (one row per instance, migrations/006), never in a persona-writable directory. On start it is a hint only: the key is rebuilt, times are clamped, Escape facts come from the queue, and the dialog must match the live pane. One Escape per prompt and one alert per hour hold across monitor restarts. Cleared once the dialog is gone. A save waits at most 250 ms for the write lock; a failed one is tried again 30 s later (logged once a minute).
+- **Status**: while work has waited more than 10 min and the session is idle or held by a dialog, `agent-status.json` shows `health: unavailable`, `unavailable_reason: delivery_stuck`, `delivery_stuck: { cause, pending, oldest_age_seconds }` instead of `ok` (only over an engine health of `ok`). The primary instance counts the untargeted rows it delivers. The dispatcher never holds delivery on this reason and a monitor never starts its health engine from it (`DELIVERY_STUCK_REASON` in `comm-bridge/scripts/c4-config.js`).
 
-```bash
-# Disable auto-approve (require manual confirmation)
-zylos config set auto_approve_permission false
-
-# Re-enable (default)
-zylos config set auto_approve_permission true
-```
-
-Config key: `auto_approve_permission` in `~/.zylos/config.json` (default: `true`).
+Logs and alerts carry ids, counts, kinds and ages; a dialog's title row only for a permission prompt; never message content or other pane rows.
 
 ## Log File
 

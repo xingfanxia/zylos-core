@@ -65,6 +65,17 @@ for (const script of [
 
 const calls = { execSync: [], execFileSync: [], execFile: [] };
 let tmuxSessionExists = false;
+// The retained session's pane as tmux and ps report it: by default an idle
+// login shell at its prompt (pane %7, pid 4242, no child process, cursor right
+// after the prompt `user@host:~$ ` on row 3).
+const IDLE_PROBE = '%7 0 4242 13 3 bash';
+const IDLE_TABLE = '4242 1 bash -bash\n';
+const IDLE_CAPTURE = 'Last login: today\n\nuser@host:~$ ls\nuser@host:~$\n\n\n';
+let paneProbe = IDLE_PROBE;
+let psTable = IDLE_TABLE;
+let paneCapture = IDLE_CAPTURE;
+// Optional per-test hook for tmux calls (returns undefined to fall through).
+let tmuxHook = null;
 const resolvedCodex = "/selected codex/it's/bin/codex";
 let codexHelp = '  --no-daemon  Run without the shared background server';
 let codexHelpError = null;
@@ -80,10 +91,17 @@ mock.module('node:child_process', {
     }),
     execFileSync: mock.fn((file, args, opts) => {
       calls.execFileSync.push({ file, args: args ? [...args] : [], opts });
+      if (file === 'tmux' && tmuxHook) {
+        const answer = tmuxHook(args);
+        if (answer !== undefined) return answer;
+      }
       if (file === 'tmux' && args?.[0] === 'has-session') {
         if (!tmuxSessionExists) throw new Error('no session');
         return '';
       }
+      if (file === 'tmux' && args?.[0] === 'display-message') return typeof paneProbe === 'function' ? paneProbe() : paneProbe;
+      if (file === 'tmux' && args?.[0] === 'capture-pane') return paneCapture;
+      if (file === 'ps' && args?.[0] === '-e') return psTable;
       if (file === 'which' && args?.[0] === 'codex') return resolvedCodex + '\n';
       if (file === resolvedCodex && args?.[0] === '--help') {
         if (codexHelpError) throw codexHelpError;
@@ -920,7 +938,109 @@ describe('Claude launch — existing session', () => {
 
     assert.ok(sent.includes(" '--model' 'claude-opus-5-5[1m]' '--effort' 'high'"));
   });
+
 });
+
+// DELIVER-1: both adapters' retained-session launch types its command line and
+// Enter only into one pane positively found at an idle shell prompt (shared
+// tmux-helpers.js requirePaneAtShellPrompt), and passes that pane on, so the
+// paste and Enter go to its pane id; never into a running runtime, its
+// composer or a permission prompt, where Enter could approve. The failover
+// chain can relaunch any ax-devbox persona on Codex in its tmux session.
+const NOT_A_SHELL_PROMPT = {
+  'Claude in the foreground': ['%7 0 4242 13 3 claude', '4242 1 claude claude\n', IDLE_CAPTURE],
+  'Codex in the foreground': ['%7 0 4242 13 3 codex', '4242 1 codex codex\n', IDLE_CAPTURE],
+  'node launcher in the foreground': ['%7 0 4242 13 3 node', '4242 1 node node tmux-launcher.js\n', IDLE_CAPTURE],
+  'shell running a child': ['%7 0 4242 13 3 bash', '4242 1 bash -bash\n4300 4242 codex codex\n', IDLE_CAPTURE],
+  'dead pane': ['%7 1 4242 13 3 bash', IDLE_TABLE, IDLE_CAPTURE],
+  'unreadable pane': ['', '', ''],
+  'cursor not at the end of the last row': ['%7 0 4242 2 4 bash', IDLE_TABLE, IDLE_CAPTURE],
+  'last row too long for a prompt': ['%7 0 4242 90 3 bash', IDLE_TABLE, `x\n\n\n${'y'.repeat(90)}\n`],
+};
+for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => CodexAdapter]]) {
+  describe(`${label} launch — retained session only at a shell prompt`, () => {
+    it(`${label}: types nothing into a retained pane that is not at an idle shell prompt; the launch fails`, async () => {
+      try {
+        for (const [name, [probe, table, capture]] of Object.entries(NOT_A_SHELL_PROMPT)) {
+          tmuxSessionExists = true;
+          paneProbe = probe;
+          psTable = table;
+          paneCapture = capture;
+          calls.execFileSync.length = 0;
+          let sent = null;
+          const adapter = makeAdapter(Cls());
+          adapter.sendMessage = async (text) => { sent = text; };
+          await assert.rejects(adapter.launch({ bypassPermissions: false }), /is not at a shell prompt/, name);
+          assert.equal(sent, null, `${name}: nothing typed`);
+          assert.equal(findTmuxNewSession(), undefined, `${name}: no new session either`);
+        }
+      } finally {
+        paneProbe = IDLE_PROBE;
+        psTable = IDLE_TABLE;
+        paneCapture = IDLE_CAPTURE;
+      }
+    });
+
+    it(`${label}: types nothing when the pane changes between the two reads 300 ms apart`, async () => {
+      let reads = 0;
+      try {
+        tmuxSessionExists = true;
+        paneProbe = () => (++reads === 1 ? IDLE_PROBE : '%7 0 4242 15 3 bash');
+        let sent = null;
+        const adapter = makeAdapter(Cls());
+        adapter.sendMessage = async (text) => { sent = text; };
+        await assert.rejects(adapter.launch({ bypassPermissions: false }), /pane changed while it was checked/);
+        assert.equal(sent, null);
+      } finally {
+        paneProbe = IDLE_PROBE;
+      }
+    });
+
+    it(`${label}: types into a retained pane at an idle shell prompt, bound to its pane id`, async () => {
+      tmuxSessionExists = true;
+      let sent = null;
+      let options = null;
+      const adapter = makeAdapter(Cls());
+      adapter.sendMessage = async (text, opts) => { sent = text; options = opts; };
+      await adapter.launch({ bypassPermissions: false });
+      assert.ok(sent && sent.length > 0);
+      assert.deepEqual(options, { pane: { id: '%7', pid: 4242, command: 'bash', promptRow: 'user@host:~$', promptY: 3 } });
+    });
+
+    it(`${label}: the generated launch line goes into the paste buffer exactly as validated and is submitted`, async () => {
+      const { launchLineProblem } = await import('../runtime/tmux-helpers.js');
+      const { cellWidth } = await import('../runtime/cell-width.js');
+      let loaded = null;
+      let pasted = false;
+      const rows = () => ['Last login: today', '', 'user@host:~$ ls', pasted ? `user@host:~$ ${loaded}` : 'user@host:~$', '', ''];
+      try {
+        tmuxSessionExists = true;
+        paneProbe = () => (pasted ? `%7 0 4242 ${cellWidth(rows()[3])} 3 bash` : IDLE_PROBE);
+        // A wide pane: no row wraps, so -J and plain captures agree.
+        tmuxHook = (args) => {
+          if (args[0] === 'load-buffer') { loaded = fs.readFileSync(args.at(-1), 'utf8'); return ''; }
+          if (args[0] === 'paste-buffer') { pasted = true; return ''; }
+          if (args[0] === 'capture-pane' && args.includes('-S')) {
+            const from = Math.max(0, Number(args[args.indexOf('-S') + 1]));
+            return `${rows().slice(from, Number(args[args.indexOf('-E') + 1]) + 1).join('\n')}\n`;
+          }
+          if (args[0] === 'capture-pane') return `${rows().join('\n')}\n`;
+          return undefined;
+        };
+        calls.execFileSync.length = 0;
+        await makeAdapter(Cls()).launch({ bypassPermissions: false });
+        assert.ok(loaded && /\b(claude|codex)\b/.test(loaded), 'the generated launch line was pasted');
+        assert.equal(launchLineProblem(loaded), null);
+        const enter = calls.execFileSync.filter((c) => c.file === 'tmux' && c.args[0] === 'send-keys');
+        assert.ok(enter.length >= 1 && enter.at(-1).args.includes('%7') && enter.at(-1).args.includes('Enter'),
+          JSON.stringify(enter.map((c) => c.args)));
+      } finally {
+        tmuxHook = null;
+        paneProbe = IDLE_PROBE;
+      }
+    });
+  });
+}
 
 describe('Claude launch — compat mode PATH dedupe', () => {
   it('spec.env.PATH is deduplicated in compat mode', async () => {

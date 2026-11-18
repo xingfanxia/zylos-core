@@ -233,3 +233,81 @@ export const TOOL_OUTPUT_ABOVE_PERMISSION = [
   '',
   '  Esc to cancel',
 ].join('\n');
+
+// ── CLI 2.1.326: the built-in dangerous-command prompt (2026-11-18) ────────
+// Captured from 2.1.326 at the persona pane size (80x24) in a scratch session
+// with --dangerously-skip-permissions: the dialog is the bottom of the screen
+// byte for byte (capture-pane -p). The pane padding is one column; the command
+// is framed by dashed rules drawn from column 0; the safety check's reason is
+// a `│` notice wrapped over two rows. The incident pane on user-pan showed the
+// same prompt for 4 h 48 min; the CLI's own "automatically block" countdown
+// (two rows) is drawn only when its remote auto-deny window applies, so the
+// prompt is given both with and without it.
+const DASHED = '╌'.repeat(80);
+const dangerousRmPrompt = ({ countdown }) => [
+  '⏺ Running 1 shell command…',
+  '  ⎿  $ rm -f $D/*',
+  '',
+  RULE,
+  ' Bash command',
+  ' Delete the dummy files in the scratch directory',
+  DASHED,
+  ' rm -f $D/*',
+  DASHED,
+  ' │ Dangerous rm operation on possibly-empty variable path: $D/* in `rm -f $D/*`',
+  ' │ (rewrite it as "${D:?}"/* or use a literal path)',
+  ...(countdown ? [
+    ' ⚠ Claude Code will automatically block this request in 1:58, to avoid holding',
+    ' up an unattended session',
+  ] : []),
+  '',
+  '',
+  ' Do you want to proceed?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel · Tab to amend',
+  '',
+].join('\n');
+export const DANGEROUS_RM_PROMPT = dangerousRmPrompt({ countdown: false });
+export const DANGEROUS_RM_PROMPT_COUNTDOWN = dangerousRmPrompt({ countdown: true });
+export const DANGEROUS_RM_NOTICE = 'Dangerous rm operation on possibly-empty variable path: $D/* in `rm -f $D/*`'
+  + ' (rewrite it as "${D:?}"/* or use a literal path)';
+
+// The same prompt at 160 columns: the notice fits on one row.
+export const DANGEROUS_RM_PROMPT_WIDE = [
+  '  ⎿  $ rm -f $D/*',
+  '',
+  '─'.repeat(160),
+  ' Bash command',
+  ' Delete all files in the $D directory',
+  '╌'.repeat(160),
+  ' rm -f $D/*',
+  '╌'.repeat(160),
+  ' │ Dangerous rm operation on possibly-empty variable path: $D/* in `rm -f $D/*` (rewrite it as "${D:?}"/* or use a literal path)',
+  '',
+  '',
+  ' Do you want to proceed?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel · Tab to amend',
+].join('\n');
+
+// A benign formatted menu the assistant printed above an ordinary composer:
+// a `─` rule, a heading, dashed rules and a `❯`-marked list, all transcript.
+// No modal (base 2c37b3cd agreed); a classifier that skipped the column-0
+// dashed rules everywhere read it as an `unknown` dialog titled with the
+// heading (DELIVER-1 review, 2026-11-18).
+export const BENIGN_MENU_ABOVE_COMPOSER = [
+  ...transcript,
+  '⏺ Here is the menu you asked for:',
+  RULE,
+  '  Private Menu Heading',
+  DASHED,
+  '  ❯ Option A',
+  '    Option B',
+  DASHED,
+  '',
+  ...composer(),
+].join('\n');

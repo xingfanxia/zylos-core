@@ -1,19 +1,20 @@
 #!/usr/bin/env node
 
 /**
- * Auth Prompt Hook — logs PermissionRequest events and optionally auto-approves
- * by sending an Enter keystroke via the C4 control channel.
+ * Auth Prompt Hook — logs PermissionRequest events. It never answers them.
  *
  * Registered as a PermissionRequest hook. Claude Code fires this only
  * when a tool call requires user permission (not for auto-allowed tools).
  *
- * Auto-approve: when config.auto_approve_permission is true (default),
- * enqueues a [KEYSTROKE]Enter control at priority 0 with bypass-state
- * and 1s delay. The C4 dispatcher sends the Enter key to auto-confirm.
- * The key is bound (--session-ref) to the pane this hook runs in, read via
- * $TMUX_PANE, so it is superseded instead of reaching a session that replaced
- * this one. Without TMUX_PANE, or when the read fails (e.g. an os_user-isolated
- * CLI cannot reach the service user's tmux socket), it is enqueued unbound.
+ * It used to auto-approve by queueing a [KEYSTROKE]Enter. On 2026-11-18 that
+ * Enter was queued for Claude Code 2.1.326's dangerous-command prompt about
+ * user-pan's own `rm -f $D/*` (asked even with --dangerously-skip-permissions)
+ * and was only held back because the prompt was misread; read correctly, it
+ * would have selected "1. Yes". An unattended session's permission prompt is
+ * now only ever cancelled: the activity monitor's dialog watch sends Escape
+ * after 60 s and tells the session why, and the dispatcher sends no other key
+ * to a permission prompt. The `auto_approve_permission` config key no longer
+ * has any effect.
  *
  * Log file: ~/zylos/activity-monitor/hook-timing.log (shared with other hooks)
  */
@@ -21,22 +22,9 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { execFileSync } from 'child_process';
-import { readSessionRef } from '../../comm-bridge/scripts/tmux-input-state.js';
 
 const ZYLOS_DIR = path.join(os.homedir(), 'zylos');
 const LOG_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'hook-timing.log');
-const CONFIG_FILE = path.join(ZYLOS_DIR, '.zylos', 'config.json');
-const C4_CONTROL = path.join(ZYLOS_DIR, '.claude', 'skills', 'comm-bridge', 'scripts', 'c4-control.js');
-const AUTO_APPROVE_AVAILABLE_IN_SEC = 1;
-
-function readConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
 
 async function main() {
   let input = '';
@@ -53,38 +41,14 @@ async function main() {
 
   const tool = hookData.tool_name || '(unknown)';
   const inputKeys = hookData.tool_input ? Object.keys(hookData.tool_input).join(',') : '';
+  const mode = typeof hookData.permission_mode === 'string' ? hookData.permission_mode.replace(/[^\w-]/g, '').slice(0, 32) : 'unknown';
   const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
-  const line = `[${ts}] hook=auth-prompt event=PermissionRequest tool=${tool} input_keys=[${inputKeys}]\n`;
+  const line = `[${ts}] hook=auth-prompt event=PermissionRequest tool=${tool} input_keys=[${inputKeys}] mode=${mode}\n`;
 
   try {
     fs.appendFileSync(LOG_FILE, line);
   } catch {
     // best-effort — don't crash hook pipeline
-  }
-
-  // Auto-approve: enqueue Enter keystroke via C4 control channel.
-  // Claude-only — Codex runtime has no permission prompt UI.
-  const config = readConfig();
-  const autoApprove = config.auto_approve_permission !== false; // default: true
-  const runtime = config.runtime || 'claude';
-
-  if (autoApprove && runtime === 'claude') {
-    // `display-message -p -t $TMUX_PANE '#{session_id}:#{session_created}:#{pane_id}:#{pane_pid}'`,
-    // validated as ^\$\d+:\d+:%\d+:\d+$; null when unset or unreadable.
-    const sessionRef = process.env.TMUX_PANE ? readSessionRef(process.env.TMUX_PANE) : null;
-    try {
-      execFileSync('node', [
-        C4_CONTROL, 'enqueue',
-        '--content', '[KEYSTROKE]Enter',
-        '--priority', '0',
-        '--bypass-state',
-        '--available-in', String(AUTO_APPROVE_AVAILABLE_IN_SEC),
-        '--no-ack-suffix',
-        ...(sessionRef ? ['--session-ref', sessionRef] : []),
-      ], { stdio: 'pipe', timeout: 5000 });
-    } catch {
-      // best-effort — don't block permission flow
-    }
   }
 }
 

@@ -586,3 +586,21 @@ describe('isCodexExitLifecycleControl', () => {
     );
   });
 });
+
+// The monitor reports a delivery backlog as unavailable / delivery_stuck
+// (activity-monitor dialog-watch.js); the single-session gate must not hold on it.
+describe('healthHoldsDelivery', () => {
+  it('holds on any health but ok, except a reported delivery backlog', () => {
+    const { healthHoldsDelivery, getAgentState } = mod;
+    assert.equal(healthHoldsDelivery({ health: 'ok' }), false);
+    assert.equal(healthHoldsDelivery({ health: 'unavailable', reason: 'delivery_stuck' }), false);
+    assert.equal(healthHoldsDelivery({ health: 'unavailable', reason: 'heartbeat_timeout' }), true);
+    assert.equal(healthHoldsDelivery({ health: 'rate_limited', reason: null }), true);
+
+    const statusFile = path.join(tmpDir, 'agent-status-stuck.json');
+    fs.writeFileSync(statusFile, JSON.stringify({ state: 'idle', health: 'unavailable', unavailable_reason: 'delivery_stuck', idle_seconds: 900 }));
+    const state = getAgentState(statusFile);
+    assert.equal(state.reason, 'delivery_stuck');
+    assert.equal(healthHoldsDelivery(state), false);
+  });
+});

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { HOOK_ERRORS } from './health-evidence.js';
+import { DELIVERY_STUCK_REASON } from '../../comm-bridge/scripts/c4-config.js';
 
 function ensureParentDir(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -16,6 +17,11 @@ export function readInitialStatus({ statusFile }) {
   try {
     if (!fs.existsSync(statusFile)) return { health: 'ok' };
     const status = JSON.parse(fs.readFileSync(statusFile, 'utf8'));
+    // A delivery backlog was reported over a healthy engine: start healthy.
+    if (status?.unavailable_reason === DELIVERY_STUCK_REASON) {
+      const { unavailable_reason: _reason, delivery_stuck: _stuck, ...rest } = status;
+      return { ...rest, health: 'ok' };
+    }
     if (status && typeof status.health === 'string') {
       return status;
     }
@@ -34,7 +40,7 @@ export function publicHealth(health) {
   return 'unavailable';
 }
 
-export function buildStatusPayload({ statusObj, healthEngine }) {
+export function buildStatusPayload({ statusObj, healthEngine, deliveryStuck = null }) {
   const health = publicHealth(healthEngine.health);
   const extra = {};
   const evidence=healthEngine.evidence?.store.read();
@@ -69,13 +75,22 @@ export function buildStatusPayload({ statusObj, healthEngine }) {
   if (health === 'unavailable' && healthEngine.unavailableSince) {
     extra.unavailable_since = healthEngine.unavailableSince;
   }
+  // Inbound messages undelivered for > 10 min while the session is free
+  // (dialog-watch.js): a healthy engine is not reported as ok. Only over 'ok',
+  // so an engine state with its own handling is never masked. The dispatcher
+  // does not hold delivery on this reason (c4-config DELIVERY_STUCK_REASON).
+  if (health === 'ok' && deliveryStuck) {
+    delete extra.health_notice;
+    return { ...statusObj, ...extra, health: 'unavailable', unavailable_reason: DELIVERY_STUCK_REASON,
+      delivery_stuck: deliveryStuck };
+  }
   return { ...statusObj, ...extra, health };
 }
 
-export function writeStatus({ statusFile, statusObj, healthEngine }) {
+export function writeStatus({ statusFile, statusObj, healthEngine, deliveryStuck = null }) {
   try {
     ensureParentDir(statusFile);
-    atomicWriteJson(statusFile, buildStatusPayload({ statusObj, healthEngine }));
+    atomicWriteJson(statusFile, buildStatusPayload({ statusObj, healthEngine, deliveryStuck }));
     return true;
   } catch {
     return false;
