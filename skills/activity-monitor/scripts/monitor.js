@@ -1305,7 +1305,7 @@ function createDialogWatchFor() {
     ...bindDialogWatchQueue({ instanceId: INSTANCE_ID, isolated: Boolean(INSTANCE_ID && _getInstanceDef?.(INSTANCE_ID)?.os_user),
       routesUntargeted: routesUntargetedRows,
       db: { insertDialogControl, findDialogControl, withdrawDialogControl, getHeldWorkSummary, hasLiveCapability,
-        loadDialogWatchState, saveDialogWatchState } }),
+        loadDialogWatchState, saveDialogWatchState, getDb: getHealthDatabase } }),
     notifyOperator: message => (ADMIN_CHAT_ID
       ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
       : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),
@@ -1357,7 +1357,8 @@ async function monitorLoop() {
     const framed = adapter?.runtimeId !== 'claude' || paneFrame !== null;
     try {
       dialogWatch?.tick({ modal: paneFrame?.modal ?? null, sessionRef: paneFrame?.paneIdentity ?? null,
-        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok' });
+        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok',
+        composer: paneFrame?.inputState ?? null });
     } catch (err) { log(`Dialog watch tick failed: ${err.message}`); }
   }
 }

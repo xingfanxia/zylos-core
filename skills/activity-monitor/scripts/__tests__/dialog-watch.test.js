@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { createDialogWatch, formatDeclinedNotice, DIALOG_WATCH_TIMING } from '../dialog-watch.js';
-import { detectModal } from '../../../comm-bridge/scripts/tmux-input-state.js';
+import { detectModal, readTmuxInputState } from '../../../comm-bridge/scripts/tmux-input-state.js';
 import * as fx from '../../../comm-bridge/scripts/__tests__/fixtures/claude-dialogs.js';
 
 const PANE = '$5:1763400000:%7:4242';
@@ -23,7 +23,7 @@ const T0 = Date.parse('2026-11-18T04:16:35Z');
 // `store`: the saved state, and `queue`: the Escape rows (pane|prompt → id),
 // both shared across watches to simulate a monitor restart.
 function harness({ sendOk = true, keyOk = true, statusOf = () => 'done', store = { state: null }, queue = new Map(),
-  t = T0, startId = 900 } = {}) {
+  t = T0, startId = 900, countFailedSince } = {}) {
   const h = {
     t, keys: [], withdrawn: [], notices: [], alerts: [], logs: [], store, queue,
     undelivered: { count: 0, oldestAt: null, conversations: 0, controls: 0 },
@@ -54,6 +54,7 @@ function harness({ sendOk = true, keyOk = true, statusOf = () => 'done', store =
     saveState: (state) => { store.state = state ? JSON.parse(JSON.stringify(state)) : null; },
     notifyOperator: async (message) => { h.alerts.push(message); return { ok: typeof sendOk === 'function' ? sendOk() : sendOk }; },
     log: (line) => h.logs.push(line),
+    countFailedSince: countFailedSince || (() => h.failed ?? null),
   });
   // One monitor tick per second from now up to `until` (ms after T0).
   h.run = async (until, frame) => {
@@ -271,6 +272,84 @@ describe('dialog watch: stuck delivery is visible', () => {
     await h.run(20 * MIN, { modal: RM_PROMPT });
     await h.run(21 * MIN, { modal: null });
     for (const line of h.logs) assert.doesNotMatch(line, /rm -f|Dangerous|\$D/, line);
+  });
+});
+
+// 2026-11-19 (PASTE-STRAND-1): an 80x24 window scrolled Claude Code's
+// composer past its prompt row. The deployed reader reads that frame as
+// `indeterminate`; the dispatcher pasted nothing more into it and every
+// message to user-pan, user-elaine and the scheduler failed for hours, with
+// nothing pending long enough for the 10-minute rule and no one told.
+// The frame as CLI 2.1.327 / 2.1.328 drew it (fixture text harmless).
+const RULE = '─'.repeat(80);
+const FIXTURE = 'harmless fixture words harmless fixture words harmless fixture words';
+const SCROLLED = [
+  '', ' ▐▛███▛█   Claude Code v2.1.327', '▝▜██████▀  Opus 5.5 · API Usage Billing', ' ▝▝   ▝▝   /…/work', '',
+  ...Array(8).fill(''), '                                                            ◐ medium · /effort',
+  `─── ↑ 4 more ${'─'.repeat(67)}`, ...Array(6).fill(`  ${FIXTURE}`), `  ${FIXTURE} h`,
+  RULE, '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+];
+const incidentFrame = readTmuxInputState({ sessionName: 's', execFileSyncImpl: () =>
+  `${SCROLLED.join('\n')}\n__ZYLOS_CURSOR__ 72 21 $5 1763400000 %7 4242\n` });
+
+describe('dialog watch: an idle composer that is not empty', () => {
+  it('the incident frame, read by the deployed reader, is not empty', () => {
+    assert.equal(incidentFrame.modal, null);
+    assert.equal(incidentFrame.inputState, 'indeterminate');
+  });
+
+  it('the incident frame with nothing pending: delivery_stuck after a minute and one alert with what a person does', async () => {
+    const h = harness();
+    h.failed = 0;
+    await h.run(59 * SEC, { modal: null, composer: incidentFrame.inputState });
+    assert.equal(h.watch.deliveryStuck(), null, 'not within the first minute');
+    assert.deepEqual(h.alerts, []);
+    await h.run(90 * SEC, { modal: null, composer: incidentFrame.inputState });
+    assert.deepEqual(h.watch.deliveryStuck(), { cause: 'composer:indeterminate', pending: 0, oldest_age_seconds: 0 });
+    assert.equal(h.alerts.length, 1);
+    assert.match(h.alerts[0], /^🔴 pan 的输入框 1 分钟没有清空（画面无法识别（例如窗口太小，输入框被卷动）），会话空闲，屏幕上没有对话框/);
+    assert.match(h.alerts[0], /不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。这段时间已有 0 条/);
+    assert.match(h.alerts[0], /至少 200x60/);
+    assert.match(h.alerts[0], /清空输入框（按两次 Esc），不要按回车/);
+    assert.match(h.alerts[0], /重新投递从 2026-11-18 04:15:35 UTC 起失败的消息/);
+    await h.run(10 * MIN, { modal: null, composer: 'has_content' });
+    assert.equal(h.alerts.length, 1, 'one alert per episode');
+    assert.equal(h.watch.deliveryStuck().cause, 'composer:has_content');
+  });
+
+  it('the alert counts the inbound rows of that persona that failed since the episode began (from a minute earlier)', async () => {
+    const asked = [];
+    const h = harness({ countFailedSince: (sec) => { asked.push(sec); return 3; } });
+    await h.run(61 * SEC, { modal: null, composer: 'has_content' });
+    assert.match(h.alerts[0], /这段时间已有 3 条发给 pan 的消息送达失败/);
+    assert.deepEqual(asked, [Math.floor((T0 - MIN) / SEC)]);
+  });
+
+  it('a second episode alerts again, even while a backlog episode is open; an unreadable count is left out', async () => {
+    const h = harness({ countFailedSince: () => { throw new Error('database is locked'); } });
+    h.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
+    await h.run(11 * MIN, { modal: null, composer: 'empty' });
+    assert.equal(h.alerts.length, 1, 'the 10-minute backlog alert');
+    await h.run(13 * MIN, { modal: null, composer: 'indeterminate' });
+    await h.run(13 * MIN + 2 * SEC, { modal: null, composer: 'empty' });
+    await h.run(16 * MIN, { modal: null, composer: 'has_content' });
+    const composerAlerts = h.alerts.filter((a) => /的输入框/.test(a));
+    assert.equal(composerAlerts.length, 2, 'one per composer episode, independent of the backlog episode');
+    assert.doesNotMatch(composerAlerts[0], /送达失败。/);
+  });
+
+  it('no alert for a dialog, a busy session, or a composer that empties within the minute', async () => {
+    const dialog = harness();
+    await dialog.run(3 * MIN, { modal: UNKNOWN, composer: 'indeterminate' });
+    const busy = harness();
+    await busy.run(5 * MIN, { modal: null, composer: 'indeterminate', sessionState: 'busy' });
+    const typing = harness();
+    for (let i = 0; i < 4; i++) {
+      await typing.run((i * 50 + 45) * SEC, { modal: null, composer: 'has_content' });
+      await typing.run((i * 50 + 50) * SEC, { modal: null, composer: 'empty' });
+    }
+    for (const h of [dialog, busy, typing]) assert.equal(h.watch.deliveryStuck(), null);
+    assert.deepEqual([...dialog.alerts.filter((a) => /的输入框/.test(a)), ...busy.alerts, ...typing.alerts], []);
   });
 });
 

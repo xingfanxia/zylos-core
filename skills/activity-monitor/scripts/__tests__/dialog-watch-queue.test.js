@@ -186,3 +186,25 @@ describe('capability gate', () => {
       'announced once the broker enforces the binding again');
   });
 });
+
+// PASTE-STRAND-1: the composer alert's count of failed inbound rows comes from
+// the store the monitor already reads, read-only.
+describe('dialog watch queue: failed inbound rows of a persona since a time', () => {
+  it('counts that persona\'s failed inbound rows that arrived since then; the primary also counts untargeted ones', () => {
+    const d = db.getDb();
+    d.exec("DELETE FROM conversations");
+    const add = (target, status, at) => d.prepare(`INSERT INTO conversations (timestamp, direction, channel, endpoint_id, content, status, target_instance)
+      VALUES (datetime(?, 'unixepoch'), 'in', 'telegram', 'chat', 'harmless', ?, ?)`).run(at, status, target);
+    const since = Math.floor(T0 / 1000);
+    add('user-pan', 'failed', since + 5);
+    add('user-pan', 'failed', since + 600);
+    add('user-pan', 'failed', since - 5);      // before the episode
+    add('user-pan', 'delivered', since + 10);
+    add('user-elaine', 'failed', since + 5);   // another persona
+    add(null, 'failed', since + 5);            // untargeted: the primary's
+    const pan = bindDialogWatchQueue({ instanceId: 'user-pan', db });
+    assert.equal(pan.countFailedSince(since), 2);
+    const primary = bindDialogWatchQueue({ instanceId: 'admin', routesUntargeted: () => true, db });
+    assert.equal(primary.countFailedSince(since), 1);
+  });
+});

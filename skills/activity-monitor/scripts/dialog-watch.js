@@ -35,6 +35,15 @@
  *     dialog: agent-status.json shows health 'unavailable', unavailable_reason
  *     'delivery_stuck' (deliveryStuck, status-writer.js) instead of ok, and the
  *     operator gets the same alert, once per backlog.
+ *   - the session idle, no dialog, and its composer not read as empty for 60 s
+ *     (`has_content`, or `indeterminate`: the reader cannot place the frame),
+ *     whether or not anything waits: delivery_stuck with cause
+ *     composer:<state>, and one alert per episode, each episode on its own.
+ *     The dispatcher does not paste into an occupied composer and sends no key
+ *     to clear it; every row that arrives meanwhile fails after two retries.
+ *     2026-11-19: an 80x24 window scrolled the composer past its prompt row
+ *     (the reader: `indeterminate`); user-pan, user-elaine and the scheduler
+ *     received nothing for hours and no one was told.
  * The active dialog's state (prompt id, pane, first seen, Escape queued / sent,
  * next alert time) and unresolved declines are saved through `saveState` and
  * resumed on start, so a monitor restart sends no second Escape to the same
@@ -66,6 +75,8 @@ export const DIALOG_WATCH_TIMING = Object.freeze({
   heldAlertAfterMs: 5 * 60_000,
   alertRepeatMs: 60 * 60_000,
   stuckAfterMs: 10 * 60_000,
+  // An idle composer that is not empty (no dialog) holds every paste.
+  composerHeldAfterMs: 60_000,
   pendingCheckMs: 30_000,
   alertRetryMs: 60_000,
   // A claimed Escape is acknowledged within seconds; give up waiting after this.
@@ -119,6 +130,22 @@ export function formatDialogAlert({ instanceId, kind, title, onScreenMs, held, o
   ].join('\n');
 }
 
+/**
+ * Operator alert: an idle composer that is not empty holds every paste.
+ * `failed`: inbound rows of this persona that failed since the episode began
+ * (null when unreadable).
+ */
+export function formatComposerAlert({ instanceId, composer, heldMs, failed, since }) {
+  const seen = composer === 'has_content' ? '里面有文字' : '画面无法识别（例如窗口太小，输入框被卷动）';
+  const lost = failed === null ? '' : `这段时间已有 ${failed} 条发给 ${personaName(instanceId)} 的消息送达失败。`;
+  return [
+    `🔴 ${personaName(instanceId)} 的输入框 ${minutes(heldMs)} 分钟没有清空（${seen}），会话空闲，屏幕上没有对话框`,
+    `c4-dispatcher 不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。${lost}`,
+    '需要人工处理：1. 把该会话窗口调到至少 200x60（tmux resize-window -t <会话> -x 200 -y 60）；2. 清空输入框（按两次 Esc），不要按回车；'
+      + `3. 重新投递从 ${since} UTC 起失败的消息（查询和重新排队的命令见 activity-monitor SKILL.md「输入框没有清空」）。`,
+  ].join('\n');
+}
+
 /** Operator alert: work waiting while the session is free. */
 export function formatStuckAlert({ instanceId, held, oldestAgeMs }) {
   return [
@@ -169,6 +196,14 @@ function restoredState(state, now, timing) {
  * (c4-db.js findDialogControl / withdrawDialogControl). `db` holds the c4-db
  * functions.
  */
+// Inbound rows of one persona that are failed and arrived since `sinceSec`
+// (epoch seconds): the rows a person re-delivers after clearing a held
+// composer. Read-only, counts only; conversations keep no failure time, and
+// on the deployed dispatcher a row fails within seconds of its arrival.
+export const FAILED_SINCE_SQL = `SELECT COUNT(*) AS count FROM conversations
+  WHERE direction = 'in' AND status = 'failed' AND timestamp >= datetime(?, 'unixepoch')
+    AND (target_instance IS ? OR (? = 1 AND target_instance IS NULL))`;
+
 export function bindDialogWatchQueue({ instanceId = null, isolated = false, routesUntargeted = () => false, db }) {
   // The dispatcher always delivers; the broker writes rows for isolated
   // personas only, so only their watch also needs a capable broker.
@@ -193,6 +228,8 @@ export function bindDialogWatchQueue({ instanceId = null, isolated = false, rout
     readHeld: () => db.getHeldWorkSummary(instanceId, { includeUntargeted: routesUntargeted() }),
     loadState: () => db.loadDialogWatchState(instanceId),
     saveState: (state) => db.saveDialogWatchState(instanceId, state),
+    countFailedSince: (sinceSec) => db.getDb().prepare(FAILED_SINCE_SQL)
+      .get(Math.floor(sinceSec), instanceId ?? null, routesUntargeted() ? 1 : 0).count,
   };
 }
 
@@ -219,7 +256,7 @@ export function bindDialogWatchQueue({ instanceId = null, isolated = false, rout
  */
 export function createDialogWatch({ instanceId = null, enqueueKey, findOwnControl, withdrawOwnControl, enqueueNotice,
   readHeld, notifyOperator, log, loadState = () => null, saveState = () => {}, deliveryCapable = () => true,
-  now = Date.now, timing = DIALOG_WATCH_TIMING }) {
+  countFailedSince = () => null, now = Date.now, timing = DIALOG_WATCH_TIMING }) {
   let dialog = null;
   // Declines whose prompt is gone, waiting for their Escape control to be final.
   let declines = [];
@@ -227,6 +264,11 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
   // Work older than stuckAfterMs: one episode (one alert) until none is that old.
   let overdue = null;
   let stuckNow = false;
+  // Since when this pane's composer has not been read as empty (since 0: it
+  // is empty, a dialog owns the screen, or it was not read); one alert per
+  // episode, each episode on its own.
+  let composer = { since: 0, state: null, sessionRef: null, alerted: false, retryAt: 0 };
+  let composerStuck = false;
   let alertInFlight = null;
   let dirty = false;
 
@@ -471,16 +513,37 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
       () => { episode.alerted = true; }, 'waiting-work')) episode.retryAt = t + timing.alertRetryMs;
   }
 
+  function updateComposer(t, sessionState) {
+    composerStuck = !dialog && sessionState === 'idle' && composer.since > 0 && t - composer.since >= timing.composerHeldAfterMs;
+    if (!composerStuck || composer.alerted || composer.retryAt > t) return;
+    const episode = composer;
+    // The episode may have begun with the paste of a row that arrived just
+    // before it: rows are counted from a minute earlier.
+    const fromSec = Math.floor((episode.since - timing.composerHeldAfterMs) / 1000);
+    let failed = null;
+    try { failed = countFailedSince(fromSec); } catch (err) { log(`Dialog watch: failed rows unreadable (${clip(err?.message, 160)})`); }
+    const since = new Date(fromSec * 1000).toISOString().replace('T', ' ').slice(0, 19);
+    if (send(formatComposerAlert({ instanceId, composer: episode.state, heldMs: t - episode.since, failed: failed ?? null, since }),
+      () => { episode.alerted = true; }, `composer (${episode.state}, ${failed ?? '?'} failed since ${since})`)) {
+      episode.retryAt = t + timing.alertRetryMs;
+    }
+  }
+
   return {
     /**
      * One monitor tick with the pane read of this tick.
      * @param {{ modal: object|null, sessionRef: string|null, captureOk?: boolean,
-     *   sessionState: string, healthOk?: boolean }} frame
+     *   sessionState: string, healthOk?: boolean,
+     *   composer?: 'empty'|'has_content'|'indeterminate'|null }} frame
+     *   composer: the reader's inputState for this pane; null when not read
      */
-    tick({ modal = null, sessionRef = null, captureOk = true, sessionState = 'idle', healthOk = true } = {}) {
+    tick({ modal = null, sessionRef = null, captureOk = true, sessionState = 'idle', healthOk = true, composer: input = null } = {}) {
       const t = now();
-      // An unreadable frame neither starts nor ends a dialog.
+      // An unreadable frame neither starts nor ends a dialog or a composer episode.
       if (captureOk !== false) {
+        if (modal || !input || input === 'empty') composer = { since: 0, state: null, sessionRef: null, alerted: false, retryAt: 0 };
+        else if (!composer.since || composer.sessionRef !== sessionRef) composer = { since: t, state: input, sessionRef, alerted: false, retryAt: 0 };
+        else composer.state = input;
         const key = modal ? dialogKey(modal, sessionRef) : null;
         if (dialog && dialog.key !== key) endDialog(t);
         if (modal && !dialog) {
@@ -498,6 +561,7 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
       refreshHeld(t);
       if (dialog) maybeAlertDialog(t);
       updateOverdue(t, sessionState, healthOk);
+      updateComposer(t, sessionState);
       persist();
     },
 
@@ -507,9 +571,9 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
      * @returns {null | { cause: string, pending: number, oldest_age_seconds: number }}
      */
     deliveryStuck() {
-      if (!stuckNow) return null;
+      if (!stuckNow && !composerStuck) return null;
       return {
-        cause: dialog ? `dialog:${dialog.kind}` : 'session_idle',
+        cause: dialog ? `dialog:${dialog.kind}` : composerStuck ? `composer:${composer.state}` : 'session_idle',
         pending: held.count,
         oldest_age_seconds: held.oldestAt ? seconds(now() - held.oldestAt) : 0,
       };
