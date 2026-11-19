@@ -1051,20 +1051,49 @@ for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => Cod
     const order = () => calls.execFileSync.filter((c) => c.file === 'tmux').map((c) => c.args[0]);
     const windowOf = (sizes) => { tmuxHook = (args) => (args[0] === 'list-panes' && args[2] in sizes ? `${sizes[args[2]]}\n` : undefined); };
 
-    it(`${label}: a new session is created at 200x60 and its window pinned there by its id`, async () => {
+    it(`${label}: a new session is created at 200x60 and the window new-session reports is pinned there by its id`, async () => {
       try {
         tmuxSessionExists = false;
-        tmuxHook = (args) => (args[0] === 'list-panes' ? '@4 200 60\n' : undefined);
+        calls.execFileSync.length = 0;
+        // new-session reports the window it created (@4); the session name now
+        // resolves to another window (@9, a hook moved the focus there).
+        tmuxHook = (args) => {
+          if (args[0] === 'new-session') return '@4\n';
+          if (args[0] === 'list-panes') return args[2] === '@4' ? '@4 200 60\n' : '@9 90 30\n';
+          return undefined;
+        };
         await makeAdapter(Cls()).launch({ bypassPermissions: false });
         const tmux = findTmuxNewSession();
+        assert.deepEqual(tmux.args.slice(1, 4), ['-P', '-F', '#{window_id}'], 'new-session prints the created window id');
         const at = tmux.args.indexOf('-x');
         assert.deepEqual(tmux.args.slice(at, at + 4), ['-x', '200', '-y', '60']);
-        const [resize] = tmuxCalls('resize-window');
+        assert.deepEqual(tmuxCalls('list-panes').map((c) => c.args.slice(0, 3)), [['list-panes', '-t', '@4']], 'measured by the created window id, never by the session name');
+        const [resize, ...more] = tmuxCalls('resize-window');
+        assert.deepEqual(more, []);
         assert.ok(calls.execFileSync.indexOf(resize) > calls.execFileSync.indexOf(tmux), 'pinned (window-size manual) once it exists');
         assert.deepEqual(resize.args, ['resize-window', '-t', '@4', '-x', '200', '-y', '60']);
       } finally {
         tmuxHook = null;
       }
+    });
+
+    it(`${label}: no window id from new-session: nothing is measured or resized, and the log says so`, async () => {
+      const writes = [];
+      const write = process.stderr.write;
+      try {
+        tmuxSessionExists = false;
+        calls.execFileSync.length = 0;
+        tmuxHook = (args) => (args[0] === 'new-session' ? '' : args[0] === 'list-panes' ? '@9 90 30\n' : undefined);
+        process.stderr.write = (chunk, ...rest) => { writes.push(String(chunk)); return true; };
+        await makeAdapter(Cls()).launch({ bypassPermissions: false });
+      } finally {
+        process.stderr.write = write;
+        tmuxHook = null;
+      }
+      assert.ok(findTmuxNewSession(), 'the session was created (at -x/-y)');
+      assert.deepEqual(tmuxCalls('list-panes'), []);
+      assert.deepEqual(tmuxCalls('resize-window'), []);
+      assert.ok(writes.some((w) => /reported no window id; its window is not pinned/.test(w)), writes.join(''));
     });
 
     it(`${label}: a retained session: the pane resolved for the prompt check is the one whose window is resized, then checked and typed into; a larger one keeps its size`, async () => {

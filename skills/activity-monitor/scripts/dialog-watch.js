@@ -271,7 +271,8 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
   // The current composer episode: since when every tick read the pane, saw
   // the session idle, no dialog and a composer not read as empty (since 0:
   // none). One alert per episode, each episode on its own. Advisory only.
-  let composer = { since: 0, state: null, sessionRef: null, alerted: false, retryAt: 0 };
+  const noComposer = () => ({ since: 0, state: null, sessionRef: null, alerted: false, retryAt: 0 });
+  let composer = noComposer();
   let alertInFlight = null;
   let dirty = false;
 
@@ -546,8 +547,8 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
       // pane, see the session idle, no dialog and a composer not read as
       // empty; any other tick ends it.
       const occupied = captureOk !== false && !modal && sessionState === 'idle' && !!input && input !== 'empty';
-      if (!occupied) composer = { since: 0, state: null, sessionRef: null, alerted: false, retryAt: 0 };
-      else if (!composer.since || composer.sessionRef !== sessionRef) composer = { since: t, state: input, sessionRef, alerted: false, retryAt: 0 };
+      if (!occupied) composer = noComposer();
+      else if (!composer.since || composer.sessionRef !== sessionRef) composer = { ...noComposer(), since: t, state: input, sessionRef };
       else composer.state = input;
       // An unreadable frame neither starts nor ends a dialog.
       if (captureOk !== false) {
@@ -586,7 +587,41 @@ export function createDialogWatch({ instanceId = null, enqueueKey, findOwnContro
       };
     },
 
+    /**
+     * A monitor tick that did not reach the watch (the session not running,
+     * starting or frozen, a failed tick): the composer observation starts
+     * over. Nothing else of the watch's state changes.
+     */
+    resetComposer() {
+      composer = noComposer();
+    },
+
     /** For tests: the alert send in flight, if any. */
     settled: () => alertInFlight || Promise.resolve(),
   };
+}
+
+/**
+ * The monitor loop's step after each tick (monitor.js monitorLoop): only a
+ * running session's tick (status idle or busy) reaches the watch, as on the
+ * deployed monitor; every other tick, and a tick that failed, resets the
+ * composer observation, so the advisory needs a minute of uninterrupted
+ * ticks. Only Claude panes are read for dialogs; a Claude tick without a
+ * pane read (startup grace) is no evidence that a dialog closed.
+ */
+export function stepDialogWatch(watch, { lastState, paneFrame = null, runtimeId, healthOk = true, failed = false, log = () => {} } = {}) {
+  if (!watch) return;
+  if (failed || (lastState !== 'idle' && lastState !== 'busy')) {
+    watch.resetComposer();
+    return;
+  }
+  const framed = runtimeId !== 'claude' || paneFrame !== null;
+  try {
+    watch.tick({ modal: paneFrame?.modal ?? null, sessionRef: paneFrame?.paneIdentity ?? null,
+      captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk,
+      composer: paneFrame?.inputState ?? null });
+  } catch (err) {
+    watch.resetComposer();
+    log(`Dialog watch tick failed: ${err.message}`);
+  }
 }

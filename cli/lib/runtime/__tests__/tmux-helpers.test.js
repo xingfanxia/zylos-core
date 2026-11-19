@@ -366,6 +366,39 @@ describe('tmuxPinAgentWindow (private tmux server)', () => {
   });
 });
 
+// PASTE-STRAND-1 review of 218daf77 (ii) 2: a private after-new-session hook
+// opens and selects an operator window at 90x30 while the agent session is
+// created. The pin goes to the window new-session created, by its id.
+describe('tmuxNewSession with a focus-moving after-new-session hook (private tmux server)', () => {
+  const socket = `fresh-${process.pid}`;
+  const tmux = (...args) => execFileSync('tmux', ['-L', socket, '-f', '/dev/null', ...args], { encoding: 'utf8' });
+  const viaSocket = (file, args, opts) => execFileSync(file, file === 'tmux' ? ['-L', socket, ...args] : args, opts);
+  const size = (target) => tmux('display-message', '-p', '-t', target, '#{window_width}x#{window_height}').trim();
+  const manual = (target) => tmux('show-window-options', '-v', '-t', target, 'window-size').trim();
+  let available = true;
+  try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); } catch { available = false; }
+
+  it('the new agent window is 200x60 and pinned; the hook\'s window keeps 90x30', { skip: !available }, async () => {
+    const { tmuxNewSession } = await import('../tmux-helpers.js');
+    try {
+      tmux('new-session', '-d', '-s', 'operator', '-x', '80', '-y', '24', 'sleep 30');
+      tmux('set-hook', '-g', 'after-new-session', "new-window 'sleep 30' ; resize-window -x 90 -y 30");
+      const agentWindow = tmuxNewSession(['new-session', '-d', '-s', 'agent', 'sleep 30'], { execFileSyncImpl: viaSocket });
+      const windows = tmux('list-windows', '-t', 'agent', '-F', '#{window_id} #{window_active}').trim().split('\n').map((l) => l.split(' '));
+      assert.equal(windows.length, 2, 'the hook opened a second window');
+      const [other] = windows.find(([, active]) => active === '1');
+      assert.notEqual(other, agentWindow, 'the hook moved the focus off the created window');
+      assert.equal(tmux('list-panes', '-t', 'agent', '-F', '#{window_id}').trim().split('\n')[0], other, 'the session name now resolves to the hook\'s window');
+      assert.match(agentWindow, /^@\d+$/);
+      assert.equal(size(agentWindow), '200x60');
+      assert.equal(manual(agentWindow), 'manual', 'pinned');
+      assert.equal(size(other), '90x30', 'the other window keeps its size');
+    } finally {
+      try { tmux('kill-server'); } catch { /* already gone */ }
+    }
+  });
+});
+
 // PASTE-STRAND-1 review (ii) 3: during a retained relaunch the focus moves
 // from window A to window B 150 ms into the launch. The deployed check and
 // the pinned one verify, and would type into, the same pane: the one the

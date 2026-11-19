@@ -164,7 +164,7 @@ import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControl
   getHeldWorkSummary, findDialogControl, withdrawDialogControl, insertDialogControl, hasLiveCapability,
   loadDialogWatchState, saveDialogWatchState } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
-import { createDialogWatch, bindDialogWatchQueue } from './dialog-watch.js';
+import { createDialogWatch, bindDialogWatchQueue, stepDialogWatch } from './dialog-watch.js';
 import { CHECKPOINT_THRESHOLD } from '../../comm-bridge/scripts/c4-config.js';
 // activity-monitor runs as a deployed skill at ~/zylos/.claude/skills/activity-monitor/scripts/.
 // A relative import to cli/lib/runtime/ resolves correctly in the repo (dev) but NOT from
@@ -1344,23 +1344,19 @@ async function monitorLoop() {
     readTmuxInputState: (options) => (paneFrame = readTmuxInputState(options)),
     canTreatPaneAsRecovered,
     runC4Control,
+  }).catch((err) => {
+    // A failed tick does not reach the dialog watch: its composer observation starts over.
+    stepDialogWatch(dialogWatch, { failed: true });
+    throw err;
   });
   runtimeLaunchAtMs = tickState.runtimeLaunchAtMs;
   lastState = tickState.lastState;
   idleSince = tickState.idleSince;
   watchdogState = tickState.watchdogState;
   try { fableMonitor?.tick(); } catch (err) { log(`Fable guard monitor tick failed: ${err.message}`); }
-  // A running session only (its status is idle or busy). Only Claude panes are
-  // read for dialogs; a Claude tick without a pane read (startup grace) is no
-  // evidence that a dialog closed.
-  if (lastState === 'idle' || lastState === 'busy') {
-    const framed = adapter?.runtimeId !== 'claude' || paneFrame !== null;
-    try {
-      dialogWatch?.tick({ modal: paneFrame?.modal ?? null, sessionRef: paneFrame?.paneIdentity ?? null,
-        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok',
-        composer: paneFrame?.inputState ?? null });
-    } catch (err) { log(`Dialog watch tick failed: ${err.message}`); }
-  }
+  // A running session only (its status is idle or busy) reaches the watch;
+  // any other tick resets its composer observation (stepDialogWatch).
+  stepDialogWatch(dialogWatch, { lastState, paneFrame, runtimeId: adapter?.runtimeId, healthOk: engine?.health === 'ok', log });
 }
 
 function init() {

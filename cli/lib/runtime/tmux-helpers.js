@@ -355,13 +355,25 @@ export function tmuxSendKeys(session, ...keys) {
 export const AGENT_WINDOW = Object.freeze({ width: 200, height: 60 });
 
 /**
- * Create a new agent tmux session, its window at AGENT_WINDOW.
+ * Create a new agent tmux session, its window at AGENT_WINDOW, and pin the
+ * window it created by the id new-session reports (`-P -F '#{window_id}'`,
+ * the created window even when a hook moved the focus elsewhere); never
+ * resolved by the session name. When tmux reports no id, nothing is resized
+ * (logged; the window keeps the -x/-y size). Returns the id or null.
  * @param {string[]} args - Full argument list for `tmux new-session`
+ * @returns {string|null}
  */
-export function tmuxNewSession(args) {
+export function tmuxNewSession(args, { execFileSyncImpl = execFileSync } = {}) {
   const [command, ...rest] = args;
-  execFileSync('tmux', [command, '-x', String(AGENT_WINDOW.width), '-y', String(AGENT_WINDOW.height), ...rest],
-    { timeout: LAUNCH_TIMEOUT });
+  const out = execFileSyncImpl('tmux', [command, '-P', '-F', '#{window_id}', '-x', String(AGENT_WINDOW.width),
+    '-y', String(AGENT_WINDOW.height), ...rest], { encoding: 'utf8', timeout: LAUNCH_TIMEOUT });
+  const windowId = /^@\d+$/.exec(String(out ?? '').trim())?.[0] ?? null;
+  if (!windowId) {
+    process.stderr.write('[tmux-helpers] the new session reported no window id; its window is not pinned (it keeps the -x/-y size)\n');
+    return null;
+  }
+  tmuxPinAgentWindow(windowId, { execFileSyncImpl });
+  return windowId;
 }
 
 /**

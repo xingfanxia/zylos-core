@@ -565,12 +565,12 @@ export class ClaudeAdapter extends RuntimeAdapter {
       ];
 
       try {
+        // Creates the session and pins the window it created, by its id.
         tmuxNewSession(tmuxArgs);
       } catch (e) {
         try { fs.unlinkSync(specPath); } catch { }
         throw new Error(`Failed to create tmux session: ${e.message}`);
       }
-      tmuxPinAgentWindow(SESSION);
       this.lastLaunchRecord = launchRecord;
     }
   }
