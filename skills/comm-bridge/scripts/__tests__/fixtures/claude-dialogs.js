@@ -139,6 +139,8 @@ export const PLAIN_COMPOSER_PROMPT_Y = transcript.length + 1;
 
 // Composer holding the pasted (not yet submitted) message.
 export const COMPOSER_WITH_TEXT = [...transcript, ...composer('hello from feishu')].join('\n');
+// Composer holding `text` as its draft (the dispatcher Enters only its own draft).
+export const composerWithText = (text) => [...transcript, ...composer(text)].join('\n');
 
 // ── Limit wording inside OTHER dialogs (classifier identity, Astra #5) ─────
 // The limit sentence appears as content of a dialog that is not the limit

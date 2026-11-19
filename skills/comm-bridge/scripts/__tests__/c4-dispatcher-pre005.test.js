@@ -75,7 +75,11 @@ const row = (table, id) => db.getDb().prepare(`SELECT status${table === 'control
 
 it('on a pre-005 database with a blocked migration the dispatcher delivers a message and a key as with the schema', async () => {
   resetLog();
-  idleComposer();
+  // The composer shows the pasted draft (the dispatcher Enters only its own).
+  screen(fx.PLAIN_COMPOSER, [2, promptY], {
+    onPaste: [fx.composerWithText('hello while 005 is blocked'), [28, promptY]],
+    onEnter: [fx.PLAIN_COMPOSER, [2, promptY]],
+  });
   const { id: message } = db.insertConversation('in', 'feishu', null, 'hello while 005 is blocked');
   assert.equal((await tick()).delivered, true);
   assert.equal(row('conversations', message).status, 'delivered');

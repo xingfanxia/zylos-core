@@ -59,20 +59,81 @@ const LABELLED_RULE_RE = /^─{3,} \S(?:.*\S)? ─{3,}$/;
 const isComposerRule = (line) => RULE_RE.test(line) || LABELLED_RULE_RE.test(line);
 const isIndentedOrBlank = (line) => !line || /^\s/.test(line);
 
+// The composer box around the cursor: { top, bottom, rows, prompt } (rows
+// strictly between the two rules; `prompt`: its first row is the `❯` row), or
+// null when the cursor is not inside such a box.
+function composerBox(lines, cursorY) {
+  if (cursorY < 1 || cursorY >= lines.length - 1) return null;
+  let top = cursorY;
+  while (top >= 0 && !isComposerRule(lines[top])) top--;
+  let bottom = cursorY;
+  while (bottom < lines.length && !RULE_RE.test(lines[bottom])) bottom++;
+  if (top < 0 || top === cursorY || bottom >= lines.length || bottom === cursorY) return null;
+  const rows = lines.slice(top + 1, bottom);
+  const prompt = /^❯/.test(rows[0]);
+  if (!rows.every((row, i) => (i === 0 && prompt) || isIndentedOrBlank(row))) return null;
+  if (!lines.slice(bottom + 1).every(isIndentedOrBlank)) return null;
+  return { top, bottom, rows, prompt };
+}
+
 function cursorInScrolledComposer(lines, cursorY) {
-  if (cursorY < 1 || cursorY >= lines.length - 1 || !isIndentedOrBlank(lines[cursorY])) return false;
-  let top = cursorY - 1;
-  while (top >= 0 && !isComposerRule(lines[top])) {
-    if (!isIndentedOrBlank(lines[top])) return false;
-    top--;
-  }
-  let bottom = cursorY + 1;
-  while (bottom < lines.length && !RULE_RE.test(lines[bottom])) {
-    if (!isIndentedOrBlank(lines[bottom])) return false;
-    bottom++;
-  }
-  if (top < 0 || bottom >= lines.length) return false;
-  return lines.slice(bottom + 1).every(isIndentedOrBlank);
+  const box = composerBox(lines, cursorY);
+  return Boolean(box && !box.prompt);
+}
+
+// ── The dispatcher's own draft ──────────────────────────────────────────
+//
+// After a paste, Enter is sent only when the composer on screen shows the
+// complete draft and it equals the text that was pasted. A draft typed over
+// it, a blank panel between two rules, a composer scrolled past part of the
+// draft (the hidden rows cannot be read, so whose text Enter would send is
+// not known), or any other text gets no key (PASTE-STRAND-1 review). Compared
+// with all whitespace removed, so wrapping, indentation and blank lines do
+// not matter:
+//   Claude: the composer box (composerBox) with its `❯` prompt row on screen;
+//     the rows from the prompt row to the bottom rule hold exactly the text,
+//     or that one row is Claude Code's collapsed paste placeholder
+//     `[Pasted text #N +M lines]`. A placeholder shows only that some paste
+//     is there, not whose: the deployed head accepted any non-empty prompt
+//     row; this accepts only the placeholder as the whole draft.
+//   Codex: the rows from the `›` row down to the first blank row hold exactly
+//     the text, and neither Codex scroll mark (`↑` / `↓` ending a row) is
+//     there (0.170.0 keeps the prompt row on screen and marks hidden lines).
+const squash = (text) => String(text ?? '').replace(/\s+/g, '');
+const PASTE_PLACEHOLDER_RE = /^\[Pasted text #\d+(?: \+\d+ lines)?\]$/;
+
+function claudeDraftMatches(lines, cursorY, want) {
+  const box = composerBox(lines, cursorY);
+  if (!box || !box.prompt) return false;
+  const text = [box.rows[0].replace(/^❯ ?/, ''), ...box.rows.slice(1)].join('\n');
+  return squash(text) === want || (box.rows.length === 1 && PASTE_PLACEHOLDER_RE.test(text.trim()));
+}
+
+function codexDraftMatches(lines, cursorY, want) {
+  const promptY = findPromptY(lines.join('\n'));
+  if (promptY < 0 || cursorY < promptY) return false;
+  let end = promptY;
+  while (end + 1 < lines.length && lines[end + 1] && /^\s/.test(lines[end + 1])) end++;
+  if (cursorY > end) return false;
+  const rows = lines.slice(promptY, end + 1);
+  if (rows.some((row) => /\s[↑↓]$/.test(row))) return false;
+  return squash([rows[0].replace(/^\s*[›❯] ?/, ''), ...rows.slice(1)].join('\n')) === want;
+}
+
+/**
+ * Whether a pane read shows the dispatcher's own pasted text in the composer
+ * (see above): the only evidence on which an Enter after a paste is sent.
+ * @param {object} state - a readTmuxInputState() result
+ * @param {string} pasted - the text as pasted
+ * @param {'claude'|'codex'|string} runtime
+ */
+export function ownDraftOnScreen(state, pasted, runtime = 'claude') {
+  if (!state || state.captureOk === false || state.modal || state.usageOverlay || state.inputState !== 'has_content') return false;
+  if (typeof state.capture !== 'string' || !Number.isInteger(state.cursorY)) return false;
+  const want = squash(pasted);
+  if (!want) return false;
+  const lines = state.capture.split('\n').map(trimRight);
+  return runtime === 'claude' ? claudeDraftMatches(lines, state.cursorY, want) : codexDraftMatches(lines, state.cursorY, want);
 }
 
 // ── Modal / limit-dialog detection ──────────────────────────────────────
@@ -411,10 +472,11 @@ export function readTmuxInputState({
   // row (a transcript message or a hidden-behind composer) is on screen.
   const promptY = captureOk && !modal ? findPromptY(capture) : -1;
   const promptVisible = promptY >= 0;
-  // The cursor inside a composer whose prompt row scrolled away: text is in
-  // it, so it is never `empty` and never lets a paste proceed. A `❯` row
-  // still on screen above it is a transcript row (a submitted message).
-  const composerScrolled = captureOk && !modal && cursorX >= 0 && cursorY >= 0
+  // The cursor inside a Claude composer whose prompt row scrolled away: text
+  // is in it, so it is never `empty` and never lets a paste proceed. A `❯` row
+  // still on screen above it is a transcript row (a submitted message). Not
+  // for other runtimes: Codex keeps its prompt row on screen when it scrolls.
+  const composerScrolled = detectModals && captureOk && !modal && cursorX >= 0 && cursorY >= 0
     && cursorInScrolledComposer(String(capture).split('\n').map(trimRight), cursorY);
 
   let inputState = 'indeterminate';

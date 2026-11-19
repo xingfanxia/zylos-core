@@ -21,6 +21,9 @@ function harness(states) {
   const calls = [];
   const options = { session: 'claude-group', pendingSubmissions: new Map(), submissionReceipts: new Map(), sleepImpl: async () => {},
     readInputStateImpl: () => states[Math.min(i++, states.length - 1)],
+    // Synthetic frames carry no capture: `has_content` stands for the pasted
+    // draft (own-draft identification is tested on real frames).
+    ownDraftImpl: (state) => state.inputState === 'has_content' && !state.usageOverlay && state.draft !== 'other',
     execFileSyncImpl: (command, args) => { calls.push({ command, args }); return ''; } };
   return { options, calls, count: (name) => calls.filter((c) => c.args[0] === name).length,
     useStates: (next) => { states = next; i = 0; } };
@@ -40,15 +43,17 @@ test('native paste preserves LF and waits through stale empty frames before one 
   assert.equal(h.count('send-keys'), 1);
 });
 
-test('stale empty frames cannot verify controls and retry never repeats the paste', async () => {
+test('stale empty frames cannot verify controls; a paste never seen is uncertain and never repeated', async () => {
   const h = harness([state('empty')]);
-  assert.equal(await sendToTmux('owned message', { ...h.options, strictVerify: false }), 'held');
+  assert.equal(await sendToTmux('owned message', { ...h.options, strictVerify: false }), 'uncertain');
   assert.equal(h.count('send-keys'), 0);
   assert.equal(h.count('paste-buffer'), 1);
+  // PASTE-STRAND-1: the base kept the paste and sent Enter once its text
+  // showed up; now the row is uncertain and nothing more is sent.
   h.useStates([state('has_content'), state('empty')]);
-  assert.equal(await sendToTmux('owned message', h.options), 'submitted');
+  assert.equal(await sendToTmux('owned message', h.options), 'uncertain');
   assert.equal(h.count('paste-buffer'), 1);
-  assert.equal(h.count('send-keys'), 1);
+  assert.equal(h.count('send-keys'), 0);
 });
 
 test('working model receives no extra Enter or duplicate paste during observation retry', async () => {
@@ -66,42 +71,40 @@ test('working model receives no extra Enter or duplicate paste during observatio
 
 test('unknown submission cannot inject Escape or be treated as submitted merely because controls are permissive', async () => {
   const h = harness([state('empty'), state('has_content'), state('indeterminate', { usageOverlay: true })]);
-  assert.equal(await sendToTmux('owned message', { ...h.options, strictVerify: false }), 'held');
+  assert.equal(await sendToTmux('owned message', { ...h.options, strictVerify: false }), 'uncertain');
   assert.equal(h.count('send-keys'), 1);
 });
 
 test('pre-existing composer text is never overwritten or submitted by a new delivery', async () => {
   const h = harness([state('has_content')]);
-  assert.equal(await sendToTmux('new message', h.options), 'held');
+  assert.equal(await sendToTmux('new message', h.options), 'held', 'not attempted, no retry consumed');
   assert.equal(h.calls.length, 0);
 });
 
 test('replacement pane releases old ownership without replaying the old payload', async () => {
   const h = harness([state('empty')]);
-  assert.equal(await sendToTmux('old payload', { ...h.options, deliveryId: 'control:1' }), 'held');
-  // Never seen in the composer: the runtime may have taken it, so it is not
-  // replayed into the replacement.
+  assert.equal(await sendToTmux('old payload', { ...h.options, deliveryId: 'control:1' }), 'uncertain');
   h.useStates([state('empty', { paneIdentity: 'pane-two' })]);
-  assert.equal(await sendToTmux('old payload', { ...h.options, deliveryId: 'control:1' }), 'verify_failed');
+  assert.equal(await sendToTmux('old payload', { ...h.options, deliveryId: 'control:1' }), 'uncertain');
   assert.equal(h.count('paste-buffer'), 1);
   h.useStates([state('empty', { paneIdentity: 'pane-two' }), state('has_content', { paneIdentity: 'pane-two' }), state('empty', { paneIdentity: 'pane-two' })]);
   assert.equal(await sendToTmux('new payload', { ...h.options, deliveryId: 'control:2' }), 'submitted');
   assert.equal(h.count('paste-buffer'), 2);
 });
 
-test('later delivery reconciles a manually submitted old message and old retry uses its receipt', async () => {
+test('an Enter that is not confirmed makes its row uncertain; the next delivery proceeds, the old row is never retried', async () => {
   const h = harness([state('empty'), state('has_content'), state('indeterminate')]);
-  assert.equal(await sendToTmux('same text', { ...h.options, deliveryId: 'conversation:1' }), 'held');
+  assert.equal(await sendToTmux('same text', { ...h.options, deliveryId: 'conversation:1' }), 'uncertain');
   h.useStates([state('empty'), state('empty'), state('has_content'), state('empty')]);
   assert.equal(await sendToTmux('same text', { ...h.options, deliveryId: 'conversation:2' }), 'submitted');
   assert.equal(h.count('paste-buffer'), 2);
-  assert.equal(await sendToTmux('same text', { ...h.options, deliveryId: 'conversation:1' }), 'submitted');
+  assert.equal(await sendToTmux('same text', { ...h.options, deliveryId: 'conversation:1' }), 'uncertain');
   assert.equal(h.count('paste-buffer'), 2);
 });
 
 test('terminal retries release confirmed empty input but never erase occupied text', async () => {
   const h = harness([state('empty')]);
-  assert.equal(await sendToTmux('old', { ...h.options, deliveryId: 'control:1' }), 'held');
+  assert.equal(await sendToTmux('old', { ...h.options, deliveryId: 'control:1' }), 'uncertain');
   retireSubmission('control:1', h.options);
   h.useStates([state('has_content')]);
   assert.equal(await sendToTmux('new', { ...h.options, deliveryId: 'control:2' }), 'held');
@@ -158,8 +161,8 @@ test('only /exit itself, with or without its ack suffix, is a session-ending con
 test('/exit without observed paste or Enter remains unsubmitted after replacement', async () => {
   const h = harness([state('empty'), state('empty', { paneIdentity: 'replacement' })]);
   const options = { ...h.options, deliveryId: 'control:exit', runtime: 'codex' };
-  assert.equal(await sendToTmux('/exit', options), 'verify_failed');
-  assert.equal(await sendToTmux('/exit', options), 'verify_failed');
+  assert.equal(await sendToTmux('/exit', options), 'uncertain');
+  assert.equal(await sendToTmux('/exit', options), 'uncertain');
   assert.equal(h.count('paste-buffer'), 1);
   assert.equal(h.count('send-keys'), 0);
 });

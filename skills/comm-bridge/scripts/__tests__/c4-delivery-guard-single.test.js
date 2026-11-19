@@ -39,7 +39,7 @@ fs.mkdirSync(path.join(root, '.zylos'));
 fs.writeFileSync(path.join(root, '.zylos/config.json'), JSON.stringify({ runtime: 'claude' }));
 fs.mkdirSync(path.join(root, 'activity-monitor'), { recursive: true });
 
-const { runDispatcherTick } = await import('../c4-dispatcher.js');
+const { runDispatcherTick, getDeliveryContent } = await import('../c4-dispatcher.js');
 const db = await import('../c4-db.js');
 after(() => { db.close(); fs.rmSync(root, { recursive: true, force: true }); });
 
@@ -91,7 +91,7 @@ describe('single-session dispatcher delivery guard', () => {
   it('a quoted limit text above a plain composer does not block delivery', async () => {
     resetLog();
     screen(fx.QUOTED_LIMIT_TEXT, [2, fx.QUOTED_LIMIT_TEXT.split('\n').length - 3], {
-      onPaste: [fx.COMPOSER_WITH_TEXT, [19, promptY]],
+      onPaste: [fx.composerWithText('second message'), [16, promptY]],
       onEnter: [fx.PLAIN_COMPOSER, [2, promptY]],
     });
     const { id } = db.insertConversation('in', 'feishu', null, 'second message');
@@ -305,11 +305,13 @@ describe('single-session [KEYSTROKE]: session replaced between the read and the 
 describe('single-session: limit dialog right after Enter (Astra (h))', () => {
   it('records the message identity as uncertain, never delivered or replayed, and exposes it', async () => {
     resetLog();
+    const { id } = db.insertConversation('in', 'feishu', 'chat-42', 'please run the report');
+    // The composer shows what was pasted: the text with its reply-via suffix.
+    const pasted = getDeliveryContent({ ...db.getDb().prepare('SELECT * FROM conversations WHERE id = ?').get(id), type: 'conversation' });
     screen(fx.PLAIN_COMPOSER, [2, promptY], {
-      onPaste: [fx.COMPOSER_WITH_TEXT, [19, promptY]],
+      onPaste: [fx.composerWithText(pasted), [2 + pasted.length, promptY]],
       onEnter: [fx.FABLE_LIMIT_LIVE, [2, 10]],
     });
-    const { id } = db.insertConversation('in', 'feishu', 'chat-42', 'please run the report');
     assert.equal((await tick()).delivered, false);
     assert.equal(conversation(id).status, 'uncertain');
     assert.equal(keys().length, 1);

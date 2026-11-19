@@ -457,7 +457,11 @@ export function resetOrphanedRunning() {
  */
 export function markDelivered(id) {
   const db = getDb();
-  db.prepare('UPDATE conversations SET status = ? WHERE id = ?').run('delivered', id);
+  db.transaction(() => {
+    db.prepare('UPDATE conversations SET status = ? WHERE id = ?').run('delivered', id);
+    // Its success is recorded: the delivery record written before its paste goes.
+    if (hasLedger(db)) db.prepare(`DELETE FROM delivery_uncertain WHERE item_type = 'conversation' AND item_id = ? AND outcome = 'in_flight'`).run(id);
+  })();
 }
 
 /**
@@ -957,23 +961,6 @@ export function getControlById(id) {
 }
 
 /**
- * Whether a delivery id (`conversation:<id>` / `control:<id>`) names a row
- * that is still to be delivered: an inbound conversation or a control, pending
- * or claimed. The dispatcher submits text it left in a composer only for such
- * a row (c4-dispatcher.js sendToTmux).
- * @param {string} deliveryId
- * @returns {boolean}
- */
-export function isOpenDelivery(deliveryId) {
-  const match = /^(conversation|control):(\d+)$/.exec(String(deliveryId));
-  if (!match) return false;
-  const sql = match[1] === 'conversation'
-    ? "SELECT 1 FROM conversations WHERE id = ? AND direction = 'in' AND status IN ('pending', 'running')"
-    : "SELECT 1 FROM control_queue WHERE id = ? AND status IN ('pending', 'running')";
-  return Boolean(getDb().prepare(sql).get(Number(match[2])));
-}
-
-/**
  * Get next pending control item by priority/FIFO order
  * @param {number} current - unix seconds
  * @returns {object|null}
@@ -1129,6 +1116,10 @@ export function requeueControl(id, lastError = null) {
 export function ackControl(id) {
   const database = getDb();
   const tx = database.transaction((controlId) => {
+    // Its delivery record (written before its paste) is settled by the ack.
+    if (hasLedger(database)) {
+      database.prepare(`DELETE FROM delivery_uncertain WHERE item_type = 'control' AND item_id = ? AND outcome IN ('in_flight', 'submitted')`).run(controlId);
+    }
     const row = database.prepare('SELECT status, ack_deadline_at FROM control_queue WHERE id = ?').get(controlId);
     if (!row) {
       return { found: false };
@@ -1252,7 +1243,86 @@ export function cleanupControlQueue(cutoff) {
 // The activity monitor reads getUncertainDeliveries() to notify the operator
 // and marks each record notified.
 
-export const UNCERTAIN_DIALOG_KINDS = Object.freeze(['fable_limit', 'credits_offer']);
+//
+// The same table is the dispatcher's delivery ledger (PASTE-STRAND-1): one
+// record per row (UNIQUE item_type, item_id), its `outcome`
+//   in_flight - written right before the row's text is pasted (beginDelivery);
+//               deleted when its success is recorded (markDelivered,
+//               ackControl). Found at a dispatcher start it becomes uncertain
+//               ('interrupted', settleInterruptedDeliveries);
+//   submitted - an ack-mode control whose submission was verified; its ack or
+//               deadline decides (markDeliverySubmitted);
+//   uncertain - never pasted or submitted again by code; a person decides;
+//   delivered / redeliver - a person's resolution (comm-bridge SKILL.md).
+// A row with an in_flight, submitted or uncertain record is never pasted.
+// Kinds of the dispatcher's own uncertain outcomes (activity-monitor
+// dialog-watch alerts them; the Fable guard alerts the two dialog kinds).
+export const PASTE_UNCERTAIN_KINDS = Object.freeze(['paste_unverified', 'enter_unverified', 'interrupted']);
+export const UNCERTAIN_DIALOG_KINDS = Object.freeze(['fable_limit', 'credits_offer', ...PASTE_UNCERTAIN_KINDS]);
+
+let ledgerSeen = false;
+function hasLedger(database = getDb()) {
+  if (!ledgerSeen) ledgerSeen = tableExists(database, 'delivery_uncertain');
+  return ledgerSeen;
+}
+
+function deliverySource(database, itemType, itemId) {
+  if (itemType === 'conversation') return database.prepare('SELECT target_instance, channel, endpoint_id FROM conversations WHERE id = ?').get(itemId) || null;
+  const row = database.prepare('SELECT target_instance FROM control_queue WHERE id = ?').get(itemId);
+  return row ? { target_instance: row.target_instance, channel: null, endpoint_id: null } : null;
+}
+
+/**
+ * Record, right before a row's text is pasted, that its delivery is in
+ * flight. Refused when the row already has a record that is in flight,
+ * submitted or uncertain: a row is pasted at most once.
+ * @returns {{ ok: boolean, recorded?: boolean, outcome?: string }}
+ */
+export function beginDelivery({ itemType, itemId, sessionRef = null, now = nowSeconds() }) {
+  const database = getDb();
+  if (!hasLedger(database)) return { ok: true, recorded: false };
+  return database.transaction(() => {
+    const prior = database.prepare('SELECT outcome FROM delivery_uncertain WHERE item_type = ? AND item_id = ?').get(itemType, itemId);
+    if (prior && ['in_flight', 'submitted', 'uncertain'].includes(prior.outcome)) return { ok: false, outcome: prior.outcome };
+    const source = deliverySource(database, itemType, itemId);
+    if (!source) return { ok: true, recorded: false };
+    database.prepare(`
+      INSERT INTO delivery_uncertain
+        (item_type, item_id, target_instance, channel, endpoint_id, session_ref, dialog_kind, outcome, detected_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'in_flight', 'in_flight', ?)
+      ON CONFLICT (item_type, item_id) DO UPDATE SET session_ref = excluded.session_ref, dialog_kind = 'in_flight',
+        outcome = 'in_flight', detected_at = excluded.detected_at, notified_at = NULL
+    `).run(itemType, itemId, source.target_instance ?? null, source.channel ?? null, source.endpoint_id ?? null, sessionRef, now);
+    return { ok: true, recorded: true };
+  })();
+}
+
+/** An ack-mode control's submission was verified: its record waits for the ack. */
+export function markDeliverySubmitted({ itemType, itemId }) {
+  const database = getDb();
+  if (!hasLedger(database)) return false;
+  return database.prepare(`UPDATE delivery_uncertain SET outcome = 'submitted'
+    WHERE item_type = ? AND item_id = ? AND outcome = 'in_flight'`).run(itemType, itemId).changes > 0;
+}
+
+/**
+ * At a dispatcher start: every delivery still in flight was cut off after its
+ * paste by the previous process. Each becomes uncertain ('interrupted'), with
+ * the row rules of recordUncertainDelivery, and is never pasted again.
+ * @returns {{ conversations: number, controls: number }}
+ */
+export function settleInterruptedDeliveries() {
+  const database = getDb();
+  if (!hasLedger(database)) return { conversations: 0, controls: 0 };
+  const rows = database.prepare(`SELECT item_type, item_id, session_ref FROM delivery_uncertain WHERE outcome = 'in_flight'`).all();
+  const counts = { conversations: 0, controls: 0 };
+  for (const row of rows) {
+    if (recordUncertainDelivery({ itemType: row.item_type, itemId: row.item_id, dialogKind: 'interrupted', sessionRef: row.session_ref }).recorded) {
+      counts[row.item_type === 'conversation' ? 'conversations' : 'controls']++;
+    }
+  }
+  return counts;
+}
 
 /**
  * @param {{ itemType: 'conversation'|'control', itemId: number, dialogKind: string,
@@ -1279,13 +1349,21 @@ export function recordUncertainDelivery({ itemType, itemId, dialogKind, sessionR
           WHERE id = ? AND status IN ('pending', 'running', 'done')`).run(`DELIVERY_UNCERTAIN:${dialogKind}`, nowSeconds(), itemId);
       }
     }
+    // A record written before the paste (in flight, or a submitted ack-mode
+    // control) becomes this outcome; any other existing record stays.
     const result = database.prepare(`
-      INSERT OR IGNORE INTO delivery_uncertain
+      INSERT INTO delivery_uncertain
         (item_type, item_id, target_instance, channel, endpoint_id, session_ref, dialog_kind, outcome, detected_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'uncertain', ?)
+      ON CONFLICT (item_type, item_id) DO UPDATE SET dialog_kind = excluded.dialog_kind, outcome = 'uncertain',
+        session_ref = COALESCE(excluded.session_ref, delivery_uncertain.session_ref), detected_at = excluded.detected_at,
+        notified_at = NULL
+      WHERE delivery_uncertain.outcome IN ('in_flight', 'submitted')
     `).run(itemType, itemId, source.target_instance ?? null, source.channel ?? null, source.endpoint_id ?? null,
       sessionRef, dialogKind, detectedAt);
-    return { recorded: result.changes > 0, id: result.changes > 0 ? Number(result.lastInsertRowid) : null };
+    const id = result.changes > 0
+      ? database.prepare('SELECT id FROM delivery_uncertain WHERE item_type = ? AND item_id = ?').get(itemType, itemId).id : null;
+    return { recorded: result.changes > 0, id };
   })();
 }
 
@@ -1295,10 +1373,12 @@ export function recordUncertainDelivery({ itemType, itemId, dialogKind, sessionR
  * @param {{ instanceId?: string|null, unnotifiedOnly?: boolean, limit?: number }} [options]
  *   instanceId undefined = all instances; null = unattributed rows only.
  */
-export function getUncertainDeliveries({ instanceId, unnotifiedOnly = true, limit = 50 } = {}) {
+export function getUncertainDeliveries({ instanceId, unnotifiedOnly = true, limit = 50, kinds = null } = {}) {
   const n = Math.min(Math.max(Number.parseInt(limit, 10) || 50, 1), 500);
-  const where = [];
+  // In-flight and submitted ledger records are not uncertain (yet).
+  const where = ["u.outcome = 'uncertain'"];
   const params = [];
+  if (Array.isArray(kinds) && kinds.length) { where.push(`u.dialog_kind IN (${kinds.map(() => '?').join(', ')})`); params.push(...kinds); }
   if (unnotifiedOnly) where.push('u.notified_at IS NULL');
   if (instanceId !== undefined) { where.push('u.target_instance IS ?'); params.push(instanceId); }
   return getDb().prepare(`
@@ -1310,6 +1390,38 @@ export function getUncertainDeliveries({ instanceId, unnotifiedOnly = true, limi
     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
     ORDER BY u.id ASC LIMIT ?
   `).all(...params, n);
+}
+
+/**
+ * A person's resolution of an uncertain row (the only way one is resolved):
+ *   delivered - it reached the session: a conversation becomes delivered, a
+ *               control failed with DELIVERY_UNCERTAIN becomes done;
+ *   redeliver - it did not: the row becomes pending (retries reset) and is
+ *               pasted afresh. Check first that its session's composer is empty.
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function resolveUncertainDelivery({ itemType, itemId, resolution, now = nowSeconds() }) {
+  if (itemType !== 'conversation' && itemType !== 'control') throw new Error(`invalid type: ${itemType}`);
+  if (resolution !== 'delivered' && resolution !== 'redeliver') throw new Error(`invalid resolution: ${resolution}`);
+  const database = getDb();
+  return database.transaction(() => {
+    const record = database.prepare(`SELECT id FROM delivery_uncertain WHERE item_type = ? AND item_id = ? AND outcome = 'uncertain'`).get(itemType, itemId);
+    if (!record) return { ok: false, reason: 'no uncertain record for this row' };
+    if (itemType === 'conversation') {
+      database.prepare(`UPDATE conversations SET status = ?, retry_count = CASE WHEN ? = 'pending' THEN 0 ELSE retry_count END
+        WHERE id = ? AND direction = 'in' AND status = 'uncertain'`).run(resolution === 'delivered' ? 'delivered' : 'pending',
+        resolution === 'delivered' ? 'delivered' : 'pending', itemId);
+    } else if (resolution === 'delivered') {
+      database.prepare(`UPDATE control_queue SET status = 'done', last_error = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('failed', 'running') AND (status = 'running' OR last_error LIKE 'DELIVERY_UNCERTAIN:%')`).run(now, itemId);
+    } else {
+      database.prepare(`UPDATE control_queue SET status = 'pending', retry_count = 0, last_error = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('failed', 'running') AND (status = 'running' OR last_error LIKE 'DELIVERY_UNCERTAIN:%')`).run(now, itemId);
+    }
+    database.prepare(`UPDATE delivery_uncertain SET outcome = ?, notified_at = COALESCE(notified_at, ?) WHERE id = ?`)
+      .run(resolution, now, record.id);
+    return { ok: true };
+  })();
 }
 
 /** Mark an uncertain record as notified to the operator. */
@@ -1571,6 +1683,25 @@ if (isMainModule) {
       console.log(JSON.stringify(cps, null, 2));
       break;
 
+    case 'uncertain': {
+      // uncertain [list] | uncertain delivered|redeliver <conversation|control> <id>
+      const [, action = 'list', type, id] = args;
+      if (action === 'list') {
+        for (const r of getUncertainDeliveries({ unnotifiedOnly: false, limit: 200 })) {
+          console.log(`${r.item_type} ${r.item_id} instance=${r.target_instance ?? '-'} kind=${r.dialog_kind} detected_at=${r.detected_at}`);
+        }
+        break;
+      }
+      if (!['delivered', 'redeliver'].includes(action) || !['conversation', 'control'].includes(type) || !/^\d+$/.test(id || '')) {
+        console.error('Usage: c4-db.js uncertain [list] | uncertain delivered|redeliver <conversation|control> <id>');
+        process.exit(1);
+      }
+      const result = resolveUncertainDelivery({ itemType: type, itemId: Number(id), resolution: action });
+      console.log(result.ok ? `${type} ${id}: ${action}` : `${type} ${id}: not changed (${result.reason})`);
+      if (!result.ok) process.exitCode = 1;
+      break;
+    }
+
     default:
       console.log(`C4 Database CLI
 
@@ -1583,6 +1714,9 @@ Commands:
   unsummarized                          Show unsummarized conversation range and count
   recent [limit]                        Get recent conversations
   checkpoints                           List all checkpoints
+  uncertain [list]                      Rows whose delivery could not be confirmed (never replayed)
+  uncertain delivered|redeliver <conversation|control> <id>
+                                        Resolve one: it reached the session / paste it again
 `);
   }
 
