@@ -160,7 +160,7 @@ import { rotateDailyLog } from './log-rotation.js';
 import { classifyLimitDialog, readTmuxInputState } from '../../comm-bridge/scripts/tmux-input-state.js';
 import { createFableMonitor, readProcessModelArgument } from './fable-monitor.js';
 // C4 owns its queue: the session fence and uncertain deliveries are comm-bridge's API.
-import { getUncertainDeliveries, markUncertainDeliveryNotified, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified,
+import { getUncertainDeliveries, markUncertainDeliveryNotified, PASTE_UNCERTAIN_KINDS, supersedeControlsForSession, getContentErrorFailures, markContentErrorNotified,
   getHeldWorkSummary, findDialogControl, withdrawDialogControl, insertDialogControl, hasLiveCapability,
   loadDialogWatchState, saveDialogWatchState } from '../../comm-bridge/scripts/c4-db.js';
 import { createContentErrorAlert } from './content-error-alert.js';
@@ -1214,7 +1214,7 @@ function fableHealthDeps(activeAdapter) {
     // stopSession defaults to killing exactly the judged session (its tmux session id).
     readProcessModel: () => readClaudeProcessModel(activeAdapter.sessionName),
     fenceReplacedSession, log, uncertainDeliveries: {
-      list: () => getUncertainDeliveries({ instanceId: INSTANCE_ID, unnotifiedOnly: true, limit: 20 }),
+      list: () => getUncertainDeliveries({ instanceId: INSTANCE_ID, unnotifiedOnly: true, limit: 20, kinds: ['fable_limit', 'credits_offer'] }),
       markNotified: id => markUncertainDeliveryNotified(id),
     },
     // The operator path of the degraded alert: a direct admin send whose exit code is the receipt.
@@ -1305,7 +1305,7 @@ function createDialogWatchFor() {
     ...bindDialogWatchQueue({ instanceId: INSTANCE_ID, isolated: Boolean(INSTANCE_ID && _getInstanceDef?.(INSTANCE_ID)?.os_user),
       routesUntargeted: routesUntargetedRows,
       db: { insertDialogControl, findDialogControl, withdrawDialogControl, getHeldWorkSummary, hasLiveCapability,
-        loadDialogWatchState, saveDialogWatchState } }),
+        loadDialogWatchState, saveDialogWatchState, getUncertainDeliveries, markUncertainDeliveryNotified, PASTE_UNCERTAIN_KINDS } }),
     notifyOperator: message => (ADMIN_CHAT_ID
       ? runC4Send('feishu', ADMIN_CHAT_ID, message, 'health-alert')
       : Promise.resolve({ ok: false, output: 'no admin chat_id configured' })),

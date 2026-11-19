@@ -275,46 +275,86 @@ describe('dialog watch: stuck delivery is visible', () => {
 });
 
 // 2026-11-19 (PASTE-STRAND-1): a composer scrolled past its prompt row held
-// every paste for user-pan, user-elaine and the scheduler for hours. Each row
-// failed within seconds, so nothing waited the 10 minutes of the stuck rule and
-// no one was told. The dispatcher now holds such rows; the watch reports them.
-describe('dialog watch: text left in the composer holds delivery', () => {
-  it('work waiting behind a composer that is not empty: stuck after a minute, without a 10-minute backlog, one alert', async () => {
+// every paste for user-pan, user-elaine and the scheduler for hours, and no
+// one was told. The dispatcher never pastes over text in a composer and sends
+// it no key; the watch reports such a composer, with or without waiting work,
+// and names every delivery the dispatcher recorded uncertain.
+describe('dialog watch: text left in an idle composer', () => {
+  it('stuck after a minute and one alert, with nothing waiting; the alert says what to do', async () => {
     const h = harness();
-    h.undelivered = { count: 2, oldestAt: T0, conversations: 2 };
-    await h.run(59 * SEC, { modal: null, composer: 'indeterminate' });
+    await h.run(59 * SEC, { modal: null, composer: 'has_content' });
     assert.equal(h.watch.deliveryStuck(), null, 'not within the first minute');
-    assert.deepEqual(h.alerts, []);
-    await h.run(90 * SEC, { modal: null, composer: 'indeterminate' });
-    assert.deepEqual(h.watch.deliveryStuck(), { cause: 'composer:indeterminate', pending: 2, oldest_age_seconds: Math.round((h.t - T0) / SEC) });
+    await h.run(90 * SEC, { modal: null, composer: 'has_content' });
+    assert.deepEqual(h.watch.deliveryStuck(), { cause: 'composer:has_content', pending: 0, oldest_age_seconds: 0 });
     assert.equal(h.alerts.length, 1);
-    assert.match(h.alerts[0], /^🔴 pan 的输入框 1 分钟没有清空（画面无法识别），2 条待送达（消息 2，控制 0）被挡住/);
-    assert.match(h.alerts[0], /不会在这段文字上再粘贴，也不会按键清空它/);
-    await h.run(5 * MIN, { modal: null, composer: 'has_content' });
+    assert.match(h.alerts[0], /^🔴 pan 的输入框 1 分钟没有清空（里面有文字），会话空闲，屏幕上没有对话框/);
+    assert.match(h.alerts[0], /目前没有排队的消息。c4-dispatcher 不会在这段文字上粘贴，也不会替它按任何键/);
+    assert.match(h.alerts[0], /清空输入框（不要按回车）。输入框清空后，排队的消息会照常送达/);
+    await h.run(5 * MIN, { modal: null, composer: 'indeterminate' });
     assert.equal(h.alerts.length, 1, 'one alert per episode');
-    assert.equal(h.watch.deliveryStuck().cause, 'composer:has_content');
-    await h.run(5 * MIN + 2 * SEC, { modal: null, composer: 'empty' });
-    assert.equal(h.watch.deliveryStuck(), null, 'the composer is free again and the backlog is younger than 10 min');
-    assert.ok(h.logs.includes('Dialog watch: waiting work cleared'));
+    assert.equal(h.watch.deliveryStuck().cause, 'composer:indeterminate');
   });
 
-  it('nothing for a composer that empties within the minute, a busy session, nothing waiting, or a dialog', async () => {
+  it('an operator draft with work waiting: stuck and alerted with the counts; cleared once the composer is empty', async () => {
+    const h = harness();
+    h.undelivered = { count: 2, oldestAt: T0, conversations: 2 };
+    await h.run(90 * SEC, { modal: null, composer: 'has_content' });
+    assert.equal(h.watch.deliveryStuck().pending, 2);
+    assert.match(h.alerts[0], /2 条待送达（消息 2，控制 0）在等它清空/);
+    await h.run(92 * SEC, { modal: null, composer: 'empty' });
+    assert.equal(h.watch.deliveryStuck(), null);
+  });
+
+  it('a second episode alerts again, even while an old backlog episode is open', async () => {
+    const h = harness();
+    h.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
+    await h.run(11 * MIN, { modal: null, composer: 'empty' });
+    assert.equal(h.alerts.length, 1, 'the 10-minute backlog alert');
+    await h.run(13 * MIN, { modal: null, composer: 'has_content' });
+    await h.run(13 * MIN + 2 * SEC, { modal: null, composer: 'empty' });
+    await h.run(16 * MIN, { modal: null, composer: 'has_content' });
+    const composerAlerts = h.alerts.filter((a) => /的输入框/.test(a));
+    assert.equal(composerAlerts.length, 2, 'one per composer episode, independent of the backlog episode');
+  });
+
+  it('nothing for a composer that empties within the minute, a busy session, or a dialog', async () => {
     const typing = harness();
-    typing.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
     for (let i = 0; i < 4; i++) {
       await typing.run((i * 50 + 45) * SEC, { modal: null, composer: 'has_content' });
       await typing.run((i * 50 + 50) * SEC, { modal: null, composer: 'empty' });
     }
     const busy = harness();
-    busy.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
     await busy.run(5 * MIN, { modal: null, composer: 'has_content', sessionState: 'busy' });
-    const idle = harness();
-    await idle.run(5 * MIN, { modal: null, composer: 'has_content' });
     const dialog = harness();
-    dialog.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
     await dialog.run(2 * MIN, { modal: UNKNOWN, composer: 'indeterminate' });
-    for (const h of [typing, busy, idle, dialog]) assert.equal(h.watch.deliveryStuck(), null);
-    assert.deepEqual([...typing.alerts, ...busy.alerts, ...idle.alerts, ...dialog.alerts], []);
+    for (const h of [typing, busy, dialog]) assert.equal(h.watch.deliveryStuck(), null);
+    assert.deepEqual([...typing.alerts, ...busy.alerts, ...dialog.alerts], []);
+  });
+});
+
+describe('dialog watch: deliveries the dispatcher recorded uncertain are named by id', () => {
+  it('one alert lists them with why; each is marked notified once sent, never twice', async () => {
+    const rows = [
+      { id: 7, item_type: 'conversation', item_id: 41, channel: 'telegram', dialog_kind: 'paste_unverified' },
+      { id: 8, item_type: 'control', item_id: 9, channel: null, dialog_kind: 'interrupted' },
+    ];
+    const marked = [];
+    const alerts = [];
+    const watch = createDialogWatch({ instanceId: 'user-pan', now: () => T0, enqueueKey: () => ({ ok: true }), findOwnControl: () => null,
+      withdrawOwnControl: () => false, enqueueNotice: () => ({ ok: true }), readHeld: () => ({ count: 0, oldestAt: null }),
+      notifyOperator: async (m) => { alerts.push(m); return { ok: true }; }, log: () => {},
+      listUncertain: () => rows.filter((r) => !marked.includes(r.id)), markUncertainNotified: (id) => marked.push(id) });
+    watch.tick({ sessionRef: PANE });
+    await watch.settled();
+    assert.equal(alerts.length, 1);
+    assert.match(alerts[0], /^⚠️ pan 有 2 条投递无法确认是否送达，不会自动重发，也没有标记失败/);
+    assert.match(alerts[0], /- 消息 #41（telegram）：贴入后没有在输入框里认出完整的这条消息，没有按回车/);
+    assert.match(alerts[0], /- 控制 #9：投递进行中 c4-dispatcher 重启，不知道是否已提交/);
+    assert.match(alerts[0], /c4-db\.js uncertain delivered <类型> <id>/);
+    assert.deepEqual(marked, [7, 8]);
+    watch.tick({ sessionRef: PANE });
+    await watch.settled();
+    assert.equal(alerts.length, 1);
   });
 });
 
