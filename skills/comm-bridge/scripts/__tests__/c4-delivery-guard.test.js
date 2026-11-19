@@ -76,17 +76,15 @@ describe('sendToTmux delivery guard', () => {
     assert.equal(h.enters(), 1);
   });
 
-  it('withholds a retried Enter when the modal opens after the first Enter; one Enter per row', async () => {
+  it('withholds a retried Enter when the modal opens after the first Enter', async () => {
     // the read after the first Enter (the one that would decide a retry) shows a dialog
     const h = harness([st('empty'), st('has_content'), otherModal()]);
     assert.equal(await sendToTmux('hello', h.options), 'modal_deferred');
     assert.equal(h.enters(), 1);
-    // PASTE-STRAND-1: the base sent a second Enter here; now the composer
-    // clearing is only observed.
     h.useStates([st('has_content'), st('has_content'), st('empty')]);
     assert.equal(await sendToTmux('hello', h.options), 'submitted');
     assert.equal(h.pastes(), 1);
-    assert.equal(h.enters(), 1);
+    assert.equal(h.enters(), 2);
   });
 
   it('a paste a modal swallowed (no Enter was ever sent) is recorded uncertain, never pasted again', async () => {
@@ -457,25 +455,11 @@ describe('no modal on screen: tmux calls identical to base d16221a4 (Astra #5, s
   const base = model.baseWithPaneTargets(recorded, 'claude-user-pan', '%2');
 
   for (const [name, scenario] of Object.entries(model.DELIVERY_SCENARIOS)) {
-    if (name === 'enter_retry') continue;
     it(`single-session sendToTmux: ${name}`, async () => {
       assert.ok(base.single[name], `base recording has scenario ${name}`);
       assert.deepEqual(await model.runSingleScenario(sendToTmux, scenario), base.single[name]);
     });
   }
-
-  // PASTE-STRAND-1: one Enter per row. Where the base retried Enter on text
-  // that stayed in the composer, the calls are the base's up to its first
-  // Enter, then reads only, and the row ends uncertain.
-  it('single-session sendToTmux: enter_retry sends the base calls up to the first Enter, then only reads', async () => {
-    const got = await model.runSingleScenario(sendToTmux, model.DELIVERY_SCENARIOS.enter_retry);
-    const want = base.single.enter_retry;
-    const firstEnter = (calls) => calls.findIndex((call) => call[1] === 'send-keys');
-    const at = firstEnter(want.calls);
-    assert.deepEqual(got.calls.slice(0, at + 1), want.calls.slice(0, at + 1));
-    assert.ok(got.calls.slice(at + 1).every((call) => call[1] === 'capture-pane'), JSON.stringify(got.calls.slice(at + 1)));
-    assert.deepEqual(got.results, ['uncertain']);
-  });
 
   it('multi-session dispatcher: conversation delivery', async () => {
     assert.deepEqual(await model.runMultiConversation(sendToTmux, processWithMultiSession), base.multi.conversation);

@@ -112,7 +112,9 @@ describe('the reader and the own-draft identification', () => {
 // whatever the composer holds and records it.
 const TRANSCRIPT = ['⏺ Acknowledged.', ''];
 function pane({ runtime = 'claude', identity = '$1:1000:%2:123' } = {}) {
-  const p = { composer: '', buffer: '', screen: null, pastes: [], enters: [], submissions: [], identity };
+  // dropEnters: the TUI ignores that many Enters (the text stays); afterEnter:
+  // what the screen shows once an Enter was sent (an operator edit, a modal).
+  const p = { composer: '', buffer: '', screen: null, pastes: [], enters: [], submissions: [], identity, dropEnters: 0, afterEnter: null };
   const own = () => {
     if (runtime === 'codex') {
       return p.composer ? { rows: ['', `› ${p.composer}`, '', '  ? for shortcuts'], cursor: [2 + p.composer.length, 1] }
@@ -139,10 +141,12 @@ function pane({ runtime = 'claude', identity = '$1:1000:%2:123' } = {}) {
       const target = { operator: 'a draft the operator typed', 'blank-panel': '<blank panel>', unreadable: '<unreadable>',
         modal: '<modal>', scrolled: '<scrolled draft>' }[p.screen] ?? p.composer;
       p.enters.push(target);
-      if (target && (p.screen === null || p.screen === 'operator')) {
+      if (p.dropEnters > 0) p.dropEnters--;
+      else if (target && (p.screen === null || p.screen === 'operator')) {
         p.submissions.push(target);
         if (p.screen === 'operator') p.screen = null; else p.composer = '';
       }
+      if (p.afterEnter) { p.screen = p.afterEnter; p.afterEnter = null; }
     }
     if (args[0] === 'capture-pane') return fx.snapshot(shown(), p.identity);
     return '';
@@ -248,6 +252,54 @@ describe('the reviewer\'s schedules (base 2189c729 behaviour in each name)', () 
   });
 });
 
+// The deployed head's bounded Enter retry stays (about one delivery in a few
+// hundred has its first Enter dropped by the TUI), under the condition of the
+// first Enter, decided by the read directly before it.
+describe('the Enter retry: only while the complete own draft is still on screen', () => {
+  const send = (p, extra = {}) => sendToTmux('a message for pan', options(p, { deliveryId: 'conversation:50', ...extra }));
+
+  it('a dropped first Enter with the draft still complete is delivered by the retry (base: the same)', async () => {
+    const p = pane();
+    p.dropEnters = 1;
+    assert.equal(await send(p), 'submitted');
+    assert.deepEqual(p.enters, ['a message for pan', 'a message for pan']);
+    assert.deepEqual(p.submissions, ['a message for pan']);
+  });
+
+  it('no retry when the draft changed between the two reads (an operator edit): uncertain (base: retried Enter on the edited draft)', async () => {
+    const p = pane();
+    p.dropEnters = 1;
+    p.afterEnter = 'operator';
+    assert.equal(await send(p), 'uncertain');
+    assert.deepEqual(p.enters, ['a message for pan']);
+    assert.deepEqual(p.submissions, []);
+  });
+
+  it('no retry when the composer scrolled: uncertain (base: no retry, read indeterminate, failed after 2 retries)', async () => {
+    const p = pane();
+    p.dropEnters = 1;
+    p.afterEnter = 'scrolled';
+    assert.equal(await send(p), 'uncertain');
+    assert.equal(p.enters.length, 1);
+  });
+
+  it('no retry while a modal is open: deferred (base: the same)', async () => {
+    const p = pane();
+    p.dropEnters = 1;
+    p.afterEnter = 'modal';
+    assert.equal(await send(p), 'modal_deferred');
+    assert.equal(p.enters.length, 1);
+  });
+
+  it('a retry is bounded: a draft that never clears gets at most ENTER_VERIFY_MAX_RETRIES more Enters, then is uncertain (base: the same count, then failed)', async () => {
+    const p = pane();
+    p.dropEnters = 99;
+    assert.equal(await send(p), 'uncertain');
+    assert.equal(p.enters.length, 1 + 3);
+    assert.deepEqual(p.submissions, []);
+  });
+});
+
 // The multi-session pass with the real sendToTmux, one pane per persona.
 function rowQueue(rows) {
   const byId = new Map(rows.map((row) => [row.id, { ...row, status: 'pending', retry_count: 0 }]));
@@ -329,11 +381,12 @@ describe('a composer that is not free: nothing is sent, rows wait, nothing fails
 });
 
 // The no-duplicate invariant over receipt and screen states: Enters are
-// counted with the composer each was sent to. Every Enter goes to a composer
-// holding exactly one row's own pasted text, and no row's text gets a second
-// Enter, whatever the retained state of the row, what the screen shows on
-// each attempt, and which row is delivered.
-describe('Enter only on the dispatcher\'s own complete draft, at most once per row', () => {
+// recorded with the composer each was sent to. Every Enter goes to a composer
+// holding exactly one row's own pasted text in full, and no row's text is
+// submitted twice, whatever the retained state of the row, what the screen
+// shows on each attempt (and right after an Enter), how many Enters the TUI
+// drops, and which row is delivered.
+describe('Enter only on the dispatcher\'s own complete draft; each row submitted at most once', () => {
   const screens = [null, 'operator', 'blank-panel', 'unreadable', 'modal', 'scrolled'];
   const retained = [
     null,
@@ -343,13 +396,16 @@ describe('Enter only on the dispatcher\'s own complete draft, at most once per r
     { observed: true, enterSent: true, modalDeferred: true },
   ];
 
-  it('over retained states x screen on each of two attempts x delivering row', async () => {
+  it('over retained states x screen on each of two attempts x screen after an Enter x dropped Enters x delivering row', async () => {
     let cases = 0;
     const X = 'retained payload x';
     const Y = 'payload y';
-    for (const r of retained) for (const first of screens) for (const second of screens) for (const own of [true, false]) {
+    for (const r of retained) for (const first of screens) for (const second of screens)
+    for (const afterEnter of [null, 'operator', 'scrolled', 'modal']) for (const drops of [0, 1, 9]) for (const own of [true, false]) {
       cases++;
       const p = pane();
+      p.dropEnters = drops;
+      p.afterEnter = afterEnter;
       const submissions = new Map();
       if (r) { submissions.set('claude-user-pan', { deliveryId: 'control:1', message: X, paneIdentity: p.identity, terminal: false, shutdown: false, ...r }); p.composer = X; }
       const opts = { ...options(p), pendingSubmissions: submissions };
@@ -366,14 +422,15 @@ describe('Enter only on the dispatcher\'s own complete draft, at most once per r
         if (!own) await attempt(Y, 'control:2');
         await attempt(X, 'control:1');
       }
-      const label = JSON.stringify({ r, first, second, own });
+      const label = JSON.stringify({ r, first, second, afterEnter, drops, own });
       for (const target of p.enters) assert.ok(target === X || target === Y, `Enter on a composer that was not a row's own draft: ${label} -> ${target}`);
-      assert.ok(p.enters.filter((t) => t === X).length <= 1, `two Enters for X: ${label}`);
-      assert.ok(p.enters.filter((t) => t === Y).length <= 1, `two Enters for Y: ${label}`);
+      assert.ok(p.submissions.filter((t) => t === X).length <= 1, `X submitted twice: ${label}`);
+      assert.ok(p.submissions.filter((t) => t === Y).length <= 1, `Y submitted twice: ${label}`);
+      assert.ok(p.enters.filter((t) => t === X).length <= 4 && p.enters.filter((t) => t === Y).length <= 4, `more Enters than the bounded retry: ${label}`);
       assert.ok(p.pastes.filter((t) => t === X).length <= (r ? 0 : 1), `X pasted again: ${label}`);
       assert.ok(p.pastes.filter((t) => t === Y).length <= 1, `Y pasted twice: ${label}`);
     }
-    assert.equal(cases, retained.length * screens.length * screens.length * 2);
+    assert.equal(cases, retained.length * screens.length * screens.length * 4 * 3 * 2);
   });
 });
 
@@ -408,19 +465,21 @@ describe('restart: durable state keeps every row out of replay', () => {
     rows: db.getDb().prepare("SELECT id, status FROM conversations ORDER BY id").all(),
     uncertain: db.getUncertainDeliveries({ unnotifiedOnly: false, kinds: db.PASTE_UNCERTAIN_KINDS }).map((r) => [r.item_id, r.dialog_kind]) })`).stdout);
 
-  for (const [name, script] of [
+  for (const [name, script, dropEnters = 0] of [
     ['the first Enter after a fresh paste', {}],
     ['an Enter resumed after a modal held the first one back', { 2: 'modal' }],
     ['an Enter resumed after a modal, whose first read then failed', { 2: 'modal', 3: 'unreadable' }],
+    ['a retried Enter (the first one dropped by the TUI)', {}, 1],
   ]) {
     it(`killed right after the UI accepted ${name}, before SQLite recorded success: uncertain after the restart, never pasted or submitted again`, () => {
-      const dir = setup({ kill: 'enter', script });
+      const dir = setup({ kill: 'enter', script, dropEnters });
       const [id] = insert(dir, ['the only message']);
       const first = run(dir, 'first', 4);
       assert.equal(first.signal, 'SIGKILL', first.stderr);
       const restart = run(dir, 'restart', 4);
       assert.equal(restart.status, 0, restart.stderr);
       const pane = paneState(dir);
+      assert.equal(pane.enters.length, 1 + dropEnters, 'the kill came right after the accepted Enter');
       assert.deepEqual(pane.pastes, ['the only message']);
       assert.deepEqual(pane.submissions, ['the only message']);
       assert.deepEqual(rows(dir), { rows: [{ id, status: 'uncertain' }], uncertain: [[id, 'interrupted']] });

@@ -6,7 +6,8 @@
 // send-keys Enter, and records every paste, every Enter (with the composer it
 // was sent to) and every submission. `kill: 'enter'` ends the dispatcher
 // process (SIGKILL to the parent) right after an Enter was accepted, before
-// it can record anything; `script[n]` overrides the n-th capture
+// it can record anything; `dropEnters: n` ignores the first n Enters (the
+// TUI did not consume them); `script[n]` overrides the n-th capture
 // ('modal', 'unreadable').
 import fs from 'node:fs';
 
@@ -45,6 +46,8 @@ switch (args[0]) {
   case 'send-keys':
     if (args[args.length - 1] === 'Enter') {
       state.enters.push(state.composer);
+      // `dropEnters`: the TUI ignores that many Enters (the text stays).
+      if (state.dropEnters > 0) { state.dropEnters--; save(); break; }
       if (state.composer) { state.submissions.push(state.composer); state.composer = ''; }
       save();
       if (state.kill === 'enter') { state.kill = null; save(); process.kill(process.ppid, 'SIGKILL'); }

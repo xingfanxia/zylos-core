@@ -604,7 +604,7 @@ function enterAllowed(pending, state) {
 }
 
 export async function submitAndVerify(session, {
-  pending, readState, lastState = null, execFileSyncImpl = execFileSync, sleepImpl = sleep,
+  pending, readState, lastState = null, execFileSyncImpl = execFileSync, sleepImpl = sleep, logImpl = log,
   // Whether a read shows the pasted text as the complete draft in the
   // composer (ownDraftOnScreen): the only evidence for an Enter.
   ownDraft = () => false,
@@ -658,12 +658,22 @@ export async function submitAndVerify(session, {
     // the model (it depends on the answer). That is an outcome, not a deferral.
     if (isLimitModal(state.modal)) return { verified: false, state: 'uncertain', modal: state.modal, paneIdentity: state.paneIdentity };
     if (state.modal) return deferred();
+    // Empty on the same pane after our Enter: the draft that was on screen in
+    // full was submitted, once, whichever Enter took it.
     if (state.inputState === 'empty') return { verified: true, state: 'empty' };
     // A working model must never receive repeated Enter, nor an Escape that
     // could interrupt it. Keep the delivery pending until its composer clears.
     if (state.inProgressCapture) return { verified: false, state: 'working' };
-    // One Enter per row: text still in the composer is not submitted again
-    // (PASTE-STRAND-1); the row ends uncertain if it does not clear.
+    if (state.inputState === 'has_content' && !state.usageOverlay) {
+      // Retried only under the condition of the first Enter, decided by this
+      // read: the complete draft still on screen means the last Enter was not
+      // consumed, so this one cannot submit it a second time. Anything else in
+      // the composer (an edit, a scrolled box) gets no further key.
+      if (!ownDraft(state)) return { verified: false, state: 'not_ours' };
+      if (!enterAllowed(pending, state)) return unbound();
+      logImpl(`Enter verify attempt ${attempt + 1}: owned input remains, retrying Enter`);
+      enter(state);
+    }
   }
   return { verified: false, state: 'indeterminate' };
 }
