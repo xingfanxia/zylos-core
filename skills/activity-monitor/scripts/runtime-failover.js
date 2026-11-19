@@ -44,7 +44,7 @@ function windowUsedPercent(window, nowMs) {
   return Number(window.used_percent);
 }
 
-function providerUsageState(providerUsage, provider, nowMs, maxAgeMs = null) {
+export function providerUsageState(providerUsage, provider, nowMs, maxAgeMs = null) {
   if (!provider) return { available: true, exhausted: false, usedPercent: 0 };
   const data = providerUsage?.providers?.[provider];
   if (!data?.available) return { available: false, exhausted: false, usedPercent: null };

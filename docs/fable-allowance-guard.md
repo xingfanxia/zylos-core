@@ -197,7 +197,8 @@ last good one.
   observation only, so backoff never extends it.
 
 Store: `<ZYLOS_DIR>/activity-monitor/fable-usage.json`, written only by the
-daemon, separate from the 30-second `provider-usage.json` rewrite:
+daemon, separate from `provider-usage.json` (which the usage updater rewrites
+after every probe, each entry dated by its own probe start):
 
 ```json
 { "version": 1, "accounts": { "claude-ax-backup": {

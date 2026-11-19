@@ -14,7 +14,9 @@ const {
   normalizeProviderPayload,
   normalizeNativeClaudeUsage,
   runProviderUsageOnce,
+  runDaemon,
 } = await import('../update-provider-usage.js');
+const { providerUsageState } = await import('../runtime-failover.js');
 
 describe('fetchCodexNativeUsage', () => {
   it('publishes a weekly-only Codex subscription window from the selected profile rollout', () => {
@@ -403,7 +405,7 @@ describe('runProviderUsageOnce: the claude provider is the account a launch with
     assert.equal(claude.provider, 'claude');
     assert.equal(claude.secondary.used_percent, 61);
     assert.equal(claude.quota_authoritative, true);
-    assert.equal(claude.observed_at, payload.updated_at);
+    assert.ok(Date.parse(claude.observed_at) <= Date.parse(payload.updated_at));
   });
 
   it('runs no token-file probe when the shared project file holds no token', async (t) => {
@@ -451,5 +453,250 @@ describe('runProviderUsageOnce: the claude provider is the account a launch with
     assert.equal(payload.providers.claude.source, 'zylos-native');
     assert.equal(payload.providers.claude.fetched_at, '2026-11-18T18:40:00.000Z');
     assert.match(payload.providers.claude.probe_error, /timed out/);
+  });
+});
+
+// A pass probes claude, codex, then each extra Claude account, one after
+// another. Durations follow the devbox measurement of 2026-11-19 (three Claude
+// probes of ~40 s). The clock is the mocked Date, so the updater's own default
+// clock is what dates every reading.
+describe('runProviderUsageOnce: each observation is dated by its own probe and published at once', () => {
+  const T0 = Date.parse('2026-11-19T06:58:35.000Z');
+  const RESETS = '2026-11-25T00:00:00.000Z';
+  const EXTRA = ['claude-ax-backup', 'claude-ax-third'];
+  const CLAUDE = ['claude', ...EXTRA];
+  const iso = ms => new Date(ms).toISOString();
+  const readDoc = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
+  const good = (provider, at) => ({ provider, available: true, quota_authoritative: true, source: 'cli',
+    fetched_at: at, observed_at: at, primary: null, secondary: { used_percent: 30, window_minutes: 10080, resets_at: RESETS },
+    tertiary: null });
+
+  function fixture(t, { durations = {}, fail = new Set(), disk } = {}) {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: T0 });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-publish-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    fs.mkdirSync(path.join(dir, '.claude'));
+    fs.writeFileSync(path.join(dir, '.claude', 'settings.local.json'),
+      JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-fixture-main' } }));
+    const profiles = { 'claude-ax-main': { runtime: 'claude', usage_provider: 'claude' } };
+    for (const provider of EXTRA) {
+      profiles[provider] = { runtime: 'claude', usage_provider: provider, claude_settings_file: path.join(dir, `${provider}.json`) };
+    }
+    fs.writeFileSync(path.join(dir, 'instances.json'), JSON.stringify({ instances: {}, runtime_profiles: profiles }));
+    const file = path.join(dir, 'activity-monitor', 'provider-usage.json');
+    if (disk !== undefined) {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, typeof disk === 'string' ? disk : JSON.stringify(disk));
+    }
+    const advance = ms => t.mock.timers.setTime(Date.now() + ms);
+    // What the file held when each step began: writes happen only between steps.
+    const boundaries = [];
+    const snap = label => boundaries.push({ label, at: Date.now(), doc: readDoc(file) });
+    const starts = {};
+    let passes = 0;
+    const opts = {
+      zylosDir: dir, filePath: file, log: () => {},
+      execFileSyncImpl: () => { throw new Error('no CodexBar in tests'); },
+      fetchClaudeNativeUsageImpl: () => { throw new Error('multi-instance host reads no native files'); },
+      fetchCodexNativeUsageImpl: () => { throw new Error('codex probe succeeds in these tests'); },
+      // Like fetchClaudeAccountUsage: the reading carries the `now` it was given.
+      fetchClaudeAccountUsageImpl: (provider, _settingsFile, options) => {
+        snap(provider);
+        starts[provider] = options.now;
+        advance(durations[provider] ?? 40_000);
+        if (!fail.has(provider)) return good(provider, options.now);
+        return { provider, available: false, fetched_at: options.now, source: 'cli', error: 'Claude usage probe timed out.',
+          primary: null, secondary: null, tertiary: null, account_email: null, version: null };
+      },
+      // Like fetchCodexAccountUsage: dated by its own clock when the answer arrives.
+      fetchCodexAccountUsageImpl: async () => {
+        snap('codex');
+        starts.codex = iso(Date.now());
+        advance(durations.codex ?? 10_000);
+        return { ...good('codex', iso(Date.now())), source: 'codex-account-api', account_key: 'a'.repeat(64) };
+      },
+      refreshQuotaRecoveryProofsImpl: async () => {
+        snap('quota');
+        advance(500);
+        passes += 1;
+        return { pass: passes };
+      },
+    };
+    const run = async (extra = {}) => {
+      const payload = await runProviderUsageOnce({ ...opts, ...extra });
+      snap('end');
+      return payload;
+    };
+    return { dir, file, boundaries, starts, run, advance, at: label => boundaries.find(b => b.label === label) };
+  }
+
+  const PREVIOUS = {
+    updated_at: iso(T0 - 1_000), source_bin: 'codexbar', quota_recovery: { pass: 0 },
+    providers: {
+      claude: good('claude', iso(T0 - 131_000)),
+      codex: { ...good('codex', iso(T0 - 81_000)), source: 'codex-account-api' },
+      'claude-ax-backup': good('claude-ax-backup', iso(T0 - 81_000)),
+      'claude-ax-third': good('claude-ax-third', iso(T0 - 41_000)),
+    },
+  };
+
+  it('dates each reading by the start of its own probe, not the start of the pass', async (t) => {
+    const f = fixture(t);
+    const payload = await f.run();
+    assert.deepEqual(f.starts, {
+      claude: iso(T0), codex: iso(T0 + 40_000), 'claude-ax-backup': iso(T0 + 50_000), 'claude-ax-third': iso(T0 + 90_000),
+    });
+    for (const provider of CLAUDE) {
+      assert.equal(payload.providers[provider].observed_at, f.starts[provider], provider);
+      assert.equal(payload.providers[provider].fetched_at, f.starts[provider], provider);
+    }
+    for (const [provider, entry] of Object.entries(payload.providers)) {
+      assert.ok(Date.parse(entry.observed_at) >= Date.parse(f.starts[provider]), `${provider} predates its probe`);
+    }
+    assert.equal(payload.updated_at, iso(T0 + 130_500), 'updated_at is the time of the last write');
+  });
+
+  it('rewrites the file after every observation and leaves every other entry as last published', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS });
+    const payload = await f.run();
+    const before = name => f.at(name).doc;
+    // Written once the claude probe returned; the rest is still the previous pass.
+    assert.equal(before('codex').updated_at, iso(T0 + 40_000));
+    assert.deepEqual(before('codex').providers.claude, good('claude', iso(T0)));
+    for (const provider of ['codex', ...EXTRA]) {
+      assert.deepEqual(before('codex').providers[provider], PREVIOUS.providers[provider], provider);
+    }
+    assert.equal(before('claude-ax-backup').updated_at, iso(T0 + 50_000));
+    assert.equal(before('claude-ax-backup').providers.codex.observed_at, iso(T0 + 50_000));
+    assert.deepEqual(before('claude-ax-backup').providers.claude, before('codex').providers.claude);
+    assert.deepEqual(before('claude-ax-backup').providers['claude-ax-third'], PREVIOUS.providers['claude-ax-third']);
+    assert.deepEqual(before('claude-ax-third').providers['claude-ax-backup'], good('claude-ax-backup', iso(T0 + 50_000)));
+    assert.deepEqual(before('claude-ax-third').providers['claude-ax-third'], PREVIOUS.providers['claude-ax-third']);
+    assert.deepEqual(before('quota').providers['claude-ax-third'], good('claude-ax-third', iso(T0 + 90_000)));
+    // quota_recovery is refreshed once per pass, at the end.
+    for (const name of ['codex', 'claude-ax-backup', 'claude-ax-third', 'quota']) {
+      assert.deepEqual(before(name).quota_recovery, PREVIOUS.quota_recovery, name);
+    }
+    assert.deepEqual(f.at('end').doc, payload);
+    assert.deepEqual(payload.quota_recovery, { pass: 1 });
+  });
+
+  it('a failed probe replaces only its own entry and refreshes no other entry time', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS, fail: new Set(['claude-ax-backup']) });
+    await f.run();
+    const published = f.at('claude-ax-third').doc;
+    const backup = published.providers['claude-ax-backup'];
+    assert.equal(backup.available, false);
+    assert.match(backup.error, /timed out/);
+    assert.equal(backup.secondary, null, 'the previous good reading must not survive the failure');
+    assert.equal(backup.observed_at, undefined);
+    assert.equal(backup.fetched_at, iso(T0 + 50_000));
+    assert.deepEqual(published.providers.claude, f.at('claude-ax-backup').doc.providers.claude);
+    assert.deepEqual(published.providers.codex, f.at('claude-ax-backup').doc.providers.codex);
+    assert.deepEqual(published.providers['claude-ax-third'], PREVIOUS.providers['claude-ax-third'],
+      'an entry not probed yet keeps its own time');
+    assert.equal(providerUsageState(published, 'claude-ax-backup', Date.now(), 180_000).available, false);
+  });
+
+  it('starts from an empty document when the file on disk does not parse, and drops unconfigured accounts at the end', async (t) => {
+    const unreadable = fixture(t, { disk: '{not json' });
+    await unreadable.run();
+    assert.deepEqual(Object.keys(unreadable.at('codex').doc.providers), ['claude']);
+    assert.deepEqual(unreadable.at('codex').doc.quota_recovery, {});
+    t.mock.timers.reset();
+
+    const stale = fixture(t, { disk: { ...PREVIOUS, providers: { ...PREVIOUS.providers, 'claude-ax-gone': good('claude-ax-gone', iso(T0 - 600_000)) } } });
+    const payload = await stale.run();
+    assert.ok(stale.at('quota').doc.providers['claude-ax-gone'], 'kept as last published during the pass');
+    assert.deepEqual(Object.keys(payload.providers).sort(), ['claude', 'claude-ax-backup', 'claude-ax-third', 'codex']);
+    assert.deepEqual(Object.keys(readDoc(stale.file).providers).sort(), Object.keys(payload.providers).sort());
+  });
+
+  it('builds on the document it last published instead of rereading the file', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS });
+    const inMemory = { ...PREVIOUS, quota_recovery: { pass: 'memory' } };
+    await f.run({ previous: inMemory });
+    assert.deepEqual(f.at('codex').doc.quota_recovery, { pass: 'memory' });
+  });
+
+  // The failover's own freshness rule over a modelled daemon run: every
+  // Claude reading must be current at every instant once all are published.
+  it('with three 40 s Claude probes no Claude reading is ever older than usage_max_age_sec', async (t) => {
+    const f = fixture(t);
+    const MAX_AGE_MS = 180_000;
+    const unknownInstants = boundaries => {
+      const firstAll = boundaries.find(b => CLAUDE.every(p => b.doc?.providers?.[p]?.available));
+      assert.ok(firstAll, 'every Claude account was published at least once');
+      const horizon = firstAll.at + 3 * MAX_AGE_MS;
+      const unknown = [];
+      boundaries.forEach((b, i) => {
+        if (b.at < firstAll.at || b.at >= horizon) return;
+        // The file is constant until the next boundary; its oldest instant is just before that.
+        const until = Math.min(boundaries[i + 1]?.at ?? horizon, horizon);
+        for (const nowMs of [b.at, until - 1]) {
+          for (const provider of CLAUDE) {
+            if (!providerUsageState(b.doc, provider, nowMs, MAX_AGE_MS).available) {
+              unknown.push(`${provider}@+${Math.round((nowMs - T0) / 1000)}s`);
+            }
+          }
+        }
+      });
+      return [...new Set(unknown)];
+    };
+
+    // Production pacing (60 s interval); the seventh pass parks the daemon.
+    let count = 0;
+    runDaemon({
+      intervalMs: 60_000, retryMs: 60_000, log: () => {}, error: () => {},
+      sleepImpl: async ms => f.advance(ms),
+      once: async args => (count++ === 6 ? new Promise(() => {}) : f.run(args)),
+    });
+    for (let turn = 0; turn < 500 && count <= 6; turn += 1) await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(unknownInstants(f.boundaries), []);
+    assert.ok(count > 6, `the daemon completed six passes (completed ${count})`);
+    // Cycle: 3 x 40 s + 10 s + 0.5 s = 130.5 s, then the 1 s minimum gap.
+    const passStarts = f.boundaries.filter(b => b.label === 'claude').map(b => b.at - T0);
+    assert.deepEqual(passStarts.slice(0, 3), [0, 131_500, 263_000]);
+
+    // Contrast: the same probes published the old way (one write at the end of
+    // the pass, every reading dated by the pass start, 60 s sleep after it).
+    const old = [];
+    let start = T0;
+    for (let pass = 0; pass < 6; pass += 1) {
+      const end = start + 130_500;
+      const doc = { providers: Object.fromEntries(CLAUDE.map(p => [p, good(p, iso(start))])) };
+      old.push({ at: end, doc });
+      start = end + 60_000;
+    }
+    assert.notDeepEqual(unknownInstants(old), [], 'the model detects the old publication gap');
+  });
+});
+
+describe('runDaemon: passes are paced start to start', () => {
+  it('starts each pass intervalMs after the previous start, 1 s after a long pass, retryMs after a throw', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+    const durations = [20_000, 130_000, 5_000, 60_000];
+    const starts = [];
+    const delays = [];
+    const seen = [];
+    let done = false;
+    runDaemon({
+      intervalMs: 60_000, retryMs: 30_000, log: () => {}, error: () => {},
+      sleepImpl: async ms => { delays.push(ms); t.mock.timers.setTime(Date.now() + ms); },
+      once: async ({ previous }) => {
+        const pass = starts.length;
+        if (pass === durations.length) { done = true; seen.push(previous); return new Promise(() => {}); }
+        starts.push(Date.now());
+        seen.push(previous);
+        t.mock.timers.setTime(Date.now() + durations[pass]);
+        if (pass === 2) throw new Error('pass failed');
+        return { pass };
+      },
+    });
+    for (let turn = 0; turn < 200 && !done; turn += 1) await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(delays, [40_000, 1_000, 30_000, 1_000]);
+    assert.deepEqual(starts, [0, 60_000, 191_000, 226_000]);
+    // Each pass builds on what the previous one returned; after a throw it rereads the file.
+    assert.deepEqual(seen, [null, { pass: 0 }, { pass: 1 }, null, { pass: 3 }]);
   });
 });

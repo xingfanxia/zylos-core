@@ -314,6 +314,26 @@ export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
   fs.renameSync(tmpPath, filePath);
 }
 
+function readPublishedUsage(filePath) {
+  try {
+    const document = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (document && typeof document === 'object' && !Array.isArray(document)) return document;
+  } catch { /* first run or unreadable: start empty */ }
+  return {};
+}
+
+/**
+ * One pass over every account. Each observation is dated by the moment its
+ * own probe started and is published as soon as it returns: the probes run
+ * one after another (three Claude probes take ~2 minutes), and the failover
+ * treats a reading older than usage_max_age_sec (180 s) as unknown, so a
+ * reading held back until the end of the pass was mostly stale on arrival.
+ *
+ * `previous` is the document this process last published; without one the
+ * pass starts from the file on disk. Entries not yet probed this pass stay as
+ * last published with their own times. `updated_at` is the time of the write,
+ * never the age of any entry. quota_recovery is refreshed once, at the end.
+ */
 export async function runProviderUsageOnce({
   execFileSyncImpl = execFileSync,
   filePath = PROVIDER_USAGE_FILE,
@@ -322,25 +342,45 @@ export async function runProviderUsageOnce({
   fetchCodexAccountUsageImpl = fetchCodexAccountUsage,
   refreshQuotaRecoveryProofsImpl = refreshQuotaRecoveryProofs,
   fetchClaudeAccountUsageImpl = fetchClaudeAccountUsage,
+  nowImpl = () => new Date().toISOString(),
+  previous = null,
   zylosDir = ZYLOS_DIR,
   log = console.log,
 } = {}) {
-  const fetchedAt = new Date().toISOString();
   const codexbarBin = resolveCodexBarBin();
+  const base = previous || readPublishedUsage(filePath);
+  let payload = {
+    ...base,
+    source_bin: codexbarBin,
+    quota_recovery: base.quota_recovery ?? {},
+    providers: { ...(base.providers || {}) },
+  };
+  const probed = new Set();
+  const publish = (providers, extra = {}) => {
+    payload = { ...payload, ...extra, updated_at: nowImpl(), source_bin: codexbarBin,
+      providers: { ...payload.providers, ...providers } };
+    writeProviderUsage(payload, filePath);
+  };
+  const observe = (provider, entry) => {
+    probed.add(provider);
+    publish({ [provider]: entry });
+  };
+
   // `claude` is the account a Claude launch without its own account file runs
   // on: the shared project token when that file holds one (the launch passes
   // the same file with --settings), else the operator's own login.
   const sharedTokenFile = sharedProjectTokenFile(zylosDir);
+  const claudeStartedAt = nowImpl();
   let claude = sharedTokenFile
-    ? fetchClaudeAccountUsageImpl('claude', sharedTokenFile, { execFileSyncImpl, codexbarBin, now: fetchedAt })
-    : fetchProviderUsage('claude', { execFileSyncImpl, codexbarBin, now: fetchedAt });
+    ? fetchClaudeAccountUsageImpl('claude', sharedTokenFile, { execFileSyncImpl, codexbarBin, now: claudeStartedAt })
+    : fetchProviderUsage('claude', { execFileSyncImpl, codexbarBin, now: claudeStartedAt });
   if (!claude.available) {
     // The top-level monitor files are the live session's only on a
     // single-session host. With instances.json every instance writes its own,
     // and the top-level ones belong to no account.
     const nativeClaude = fs.existsSync(path.join(zylosDir, 'instances.json'))
       ? { available: false, error: 'Multi-instance host: top-level monitor files belong to no account' }
-      : fetchClaudeNativeUsageImpl({ zylosDir, now: fetchedAt });
+      : fetchClaudeNativeUsageImpl({ zylosDir, now: nowImpl() });
     if (nativeClaude.available) {
       claude = { ...nativeClaude, probe_error: claude.error || null };
     } else {
@@ -350,33 +390,32 @@ export async function runProviderUsageOnce({
       };
     }
   }
+  observe('claude', claude);
+
   let codex = await fetchCodexAccountUsageImpl({ codexHome: DEFAULT_CODEX_SUBSCRIPTION_HOME,
-    codexBin: rawCodexQuotaProbeBin() });
+    codexBin: rawCodexQuotaProbeBin(), now: nowImpl });
   if (!codex.available) {
-    const nativeCodex = fetchCodexNativeUsageImpl({ now: fetchedAt });
+    const nativeCodex = fetchCodexNativeUsageImpl({ now: nowImpl() });
     codex = { ...nativeCodex, available: false, quota_authoritative: false, fetched_at: null,
       account_key: codex.account_key || null, api_error: codex.error || 'quota_probe_failed' };
   }
+  observe('codex', codex);
+
   let document;
   for (const file of [path.join(zylosDir, 'instances.json'), path.join(zylosDir, '.zylos', 'runtime-profiles.json')]) {
     try { document = JSON.parse(fs.readFileSync(file, 'utf8')); break; } catch { /* next supported layout */ }
   }
-  const accounts = {};
   for (const [provider, settingsFile] of extraClaudeAccounts(document)) {
-    accounts[provider] = fetchClaudeAccountUsageImpl(provider, settingsFile, { execFileSyncImpl, codexbarBin, now: fetchedAt });
+    observe(provider, fetchClaudeAccountUsageImpl(provider, settingsFile,
+      { execFileSyncImpl, codexbarBin, now: nowImpl() }));
   }
+
   const quotaRecovery = await refreshQuotaRecoveryProofsImpl({ zylosDir, document });
-  const payload = {
-    updated_at: fetchedAt,
-    source_bin: codexbarBin,
-    quota_recovery: quotaRecovery,
-    providers: {
-      claude,
-      codex,
-      ...accounts,
-    },
-  };
-  writeProviderUsage(payload, filePath);
+  // The final write drops accounts no longer configured, so a removed
+  // profile's last reading cannot outlive it.
+  payload = { ...payload, providers: Object.fromEntries(
+    Object.entries(payload.providers).filter(([provider]) => probed.has(provider))) };
+  publish({}, { quota_recovery: quotaRecovery });
   log(`[update-provider-usage] Written ${filePath}`);
   return payload;
 }
@@ -385,23 +424,34 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Passes are paced start to start: the next one begins intervalMs after the
+ * previous one began, or after 1 s when a pass ran longer than that. A thrown
+ * pass waits retryMs and restarts from the file on disk.
+ */
 export async function runDaemon({
   intervalMs = DEFAULT_INTERVAL_MS,
   retryMs = DEFAULT_RETRY_MS,
   once = runProviderUsageOnce,
+  sleepImpl = sleep,
+  nowMsImpl = Date.now,
   log = console.log,
   error = console.error,
 } = {}) {
   log(`[update-provider-usage] Daemon mode started (interval=${intervalMs}ms retry=${retryMs}ms)`);
+  let previous = null;
   while (true) {
-    let delay = intervalMs;
+    const startedMs = nowMsImpl();
+    let delay;
     try {
-      await once({ log });
+      previous = await once({ log, previous });
+      delay = Math.max(1000, intervalMs - (nowMsImpl() - startedMs));
     } catch (err) {
+      previous = null;
       delay = retryMs;
       error(`[update-provider-usage] ${err.message}`);
     }
-    await sleep(delay);
+    await sleepImpl(delay);
   }
 }
 
