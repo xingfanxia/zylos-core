@@ -471,7 +471,7 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     fetched_at: at, observed_at: at, primary: null, secondary: { used_percent: 30, window_minutes: 10080, resets_at: RESETS },
     tertiary: null });
 
-  function fixture(t, { durations = {}, fail = new Set(), disk } = {}) {
+  function fixture(t, { durations = {}, fail = new Set(), disk, during = {} } = {}) {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: T0 });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-publish-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -504,6 +504,7 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
         snap(provider);
         starts[provider] = options.now;
         advance(durations[provider] ?? 40_000);
+        during[provider]?.(file); // another writer, while this probe runs
         if (!fail.has(provider)) return good(provider, options.now);
         return { provider, available: false, fetched_at: options.now, source: 'cli', error: 'Claude usage probe timed out.',
           primary: null, secondary: null, tertiary: null, account_email: null, version: null };
@@ -602,7 +603,7 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     const unreadable = fixture(t, { disk: '{not json' });
     await unreadable.run();
     assert.deepEqual(Object.keys(unreadable.at('codex').doc.providers), ['claude']);
-    assert.deepEqual(unreadable.at('codex').doc.quota_recovery, {});
+    assert.equal(unreadable.at('codex').doc.quota_recovery, undefined, 'no proof is invented mid-pass');
     t.mock.timers.reset();
 
     const stale = fixture(t, { disk: { ...PREVIOUS, providers: { ...PREVIOUS.providers, 'claude-ax-gone': good('claude-ax-gone', iso(T0 - 600_000)) } } });
@@ -612,11 +613,22 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     assert.deepEqual(Object.keys(readDoc(stale.file).providers).sort(), Object.keys(payload.providers).sort());
   });
 
-  it('builds on the document it last published instead of rereading the file', async (t) => {
-    const f = fixture(t, { disk: PREVIOUS });
-    const inMemory = { ...PREVIOUS, quota_recovery: { pass: 'memory' } };
-    await f.run({ previous: inMemory });
-    assert.deepEqual(f.at('codex').doc.quota_recovery, { pass: 'memory' });
+  // The codex rotation handoff runs a one-shot pass after a credential change.
+  // Its codex entry (new account) lands on disk while this pass probes backup;
+  // this pass's next publish must not put its own earlier codex entry back.
+  it('keeps an entry another writer published mid-pass byte-for-byte', async (t) => {
+    const rotated = { ...good('codex', iso(T0 + 70_000)), source: 'codex-account-api', account_key: 'b'.repeat(64),
+      secondary: { used_percent: 3, window_minutes: 10080, resets_at: RESETS } };
+    const f = fixture(t, { disk: PREVIOUS, during: { 'claude-ax-backup': file => {
+      const doc = readDoc(file);
+      doc.providers.codex = rotated;
+      fs.writeFileSync(file, JSON.stringify(doc, null, 2) + '\n');
+    } } });
+    const payload = await f.run();
+    assert.equal(f.at('claude-ax-third').doc.providers['claude-ax-backup'].observed_at, iso(T0 + 50_000));
+    assert.equal(JSON.stringify(f.at('claude-ax-third').doc.providers.codex), JSON.stringify(rotated));
+    assert.equal(JSON.stringify(payload.providers.codex), JSON.stringify(rotated));
+    assert.equal(JSON.stringify(readDoc(f.file).providers.codex), JSON.stringify(rotated));
   });
 
   // The failover's own freshness rule over a modelled daemon run: every
@@ -678,16 +690,14 @@ describe('runDaemon: passes are paced start to start', () => {
     const durations = [20_000, 130_000, 5_000, 60_000];
     const starts = [];
     const delays = [];
-    const seen = [];
     let done = false;
     runDaemon({
       intervalMs: 60_000, retryMs: 30_000, log: () => {}, error: () => {},
       sleepImpl: async ms => { delays.push(ms); t.mock.timers.setTime(Date.now() + ms); },
-      once: async ({ previous }) => {
+      once: async () => {
         const pass = starts.length;
-        if (pass === durations.length) { done = true; seen.push(previous); return new Promise(() => {}); }
+        if (pass === durations.length) { done = true; return new Promise(() => {}); }
         starts.push(Date.now());
-        seen.push(previous);
         t.mock.timers.setTime(Date.now() + durations[pass]);
         if (pass === 2) throw new Error('pass failed');
         return { pass };
@@ -696,7 +706,5 @@ describe('runDaemon: passes are paced start to start', () => {
     for (let turn = 0; turn < 200 && !done; turn += 1) await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(delays, [40_000, 1_000, 30_000, 1_000]);
     assert.deepEqual(starts, [0, 60_000, 191_000, 226_000]);
-    // Each pass builds on what the previous one returned; after a throw it rereads the file.
-    assert.deepEqual(seen, [null, { pass: 0 }, { pass: 1 }, null, { pass: 3 }]);
   });
 });

@@ -329,10 +329,13 @@ function readPublishedUsage(filePath) {
  * treats a reading older than usage_max_age_sec (180 s) as unknown, so a
  * reading held back until the end of the pass was mostly stale on arrival.
  *
- * `previous` is the document this process last published; without one the
- * pass starts from the file on disk. Entries not yet probed this pass stay as
- * last published with their own times. `updated_at` is the time of the write,
- * never the age of any entry. quota_recovery is refreshed once, at the end.
+ * Every publish reads the file as it is at that moment and replaces only the
+ * entry just probed: the codex rotation handoff runs a one-shot pass after a
+ * credential change, and an entry this process did not just probe must never
+ * be written back from memory over another writer's newer one. `updated_at`
+ * is the time of the write, never the age of any entry. quota_recovery is
+ * refreshed once, at the end, and the final write drops providers this pass
+ * did not probe (only this updater writes provider entries).
  */
 export async function runProviderUsageOnce({
   execFileSyncImpl = execFileSync,
@@ -343,23 +346,19 @@ export async function runProviderUsageOnce({
   refreshQuotaRecoveryProofsImpl = refreshQuotaRecoveryProofs,
   fetchClaudeAccountUsageImpl = fetchClaudeAccountUsage,
   nowImpl = () => new Date().toISOString(),
-  previous = null,
   zylosDir = ZYLOS_DIR,
   log = console.log,
 } = {}) {
   const codexbarBin = resolveCodexBarBin();
-  const base = previous || readPublishedUsage(filePath);
-  let payload = {
-    ...base,
-    source_bin: codexbarBin,
-    quota_recovery: base.quota_recovery ?? {},
-    providers: { ...(base.providers || {}) },
-  };
   const probed = new Set();
-  const publish = (providers, extra = {}) => {
-    payload = { ...payload, ...extra, updated_at: nowImpl(), source_bin: codexbarBin,
-      providers: { ...payload.providers, ...providers } };
+  const publish = (entries, final = null) => {
+    const onDisk = readPublishedUsage(filePath);
+    let providers = { ...(onDisk.providers && typeof onDisk.providers === 'object' ? onDisk.providers : {}), ...entries };
+    if (final) providers = Object.fromEntries(Object.entries(providers).filter(([provider]) => probed.has(provider)));
+    const payload = { ...onDisk, updated_at: nowImpl(), source_bin: codexbarBin,
+      ...(final ? { quota_recovery: final.quotaRecovery } : {}), providers };
     writeProviderUsage(payload, filePath);
+    return payload;
   };
   const observe = (provider, entry) => {
     probed.add(provider);
@@ -413,9 +412,7 @@ export async function runProviderUsageOnce({
   const quotaRecovery = await refreshQuotaRecoveryProofsImpl({ zylosDir, document });
   // The final write drops accounts no longer configured, so a removed
   // profile's last reading cannot outlive it.
-  payload = { ...payload, providers: Object.fromEntries(
-    Object.entries(payload.providers).filter(([provider]) => probed.has(provider))) };
-  publish({}, { quota_recovery: quotaRecovery });
+  const payload = publish({}, { quotaRecovery });
   log(`[update-provider-usage] Written ${filePath}`);
   return payload;
 }
@@ -427,7 +424,7 @@ function sleep(ms) {
 /**
  * Passes are paced start to start: the next one begins intervalMs after the
  * previous one began, or after 1 s when a pass ran longer than that. A thrown
- * pass waits retryMs and restarts from the file on disk.
+ * pass waits retryMs.
  */
 export async function runDaemon({
   intervalMs = DEFAULT_INTERVAL_MS,
@@ -439,15 +436,13 @@ export async function runDaemon({
   error = console.error,
 } = {}) {
   log(`[update-provider-usage] Daemon mode started (interval=${intervalMs}ms retry=${retryMs}ms)`);
-  let previous = null;
   while (true) {
     const startedMs = nowMsImpl();
     let delay;
     try {
-      previous = await once({ log, previous });
+      await once({ log });
       delay = Math.max(1000, intervalMs - (nowMsImpl() - startedMs));
     } catch (err) {
-      previous = null;
       delay = retryMs;
       error(`[update-provider-usage] ${err.message}`);
     }
