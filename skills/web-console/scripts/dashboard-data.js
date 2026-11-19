@@ -435,7 +435,8 @@ export function buildRuntimeUsage({
         percent: claudeProvider.tertiary.left_percent,
         resets: claudeProvider.tertiary.reset_description,
       } : null,
-      lastCheck: claudeProvider.fetched_at || providerUsage?.updated_at || null,
+      // The entry's own observation time; updated_at is the last write.
+      lastCheck: claudeProvider.observed_at || claudeProvider.fetched_at || null,
       account_email: claudeProvider.account_email || null,
     };
   }
@@ -466,7 +467,7 @@ export function buildRuntimeUsage({
           resets: codexProvider.secondary.reset_description,
         } : null,
         weeklySonnet: null,
-        lastCheck: codexProvider.fetched_at || providerUsage?.updated_at || null,
+        lastCheck: codexProvider.observed_at || codexProvider.fetched_at || null,
         account_email: codexProvider.account_email || null,
       };
     }

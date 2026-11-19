@@ -271,3 +271,19 @@ describe('buildRuntimeUsage', () => {
     assert.equal(result.codex.source, 'local_rollout');
   });
 });
+
+describe('buildRuntimeUsage last check', () => {
+  const usage = (claude, codex) => buildRuntimeUsage({ instancesConfig: { instances: {} }, usageWindows: {},
+    providerUsage: { updated_at: '2026-11-19T07:00:44.000Z', providers: { claude: { available: true, ...claude },
+      codex: { available: true, ...codex } } } });
+
+  it('shows each entry\'s own observation time, never the time of the last file write', () => {
+    const result = usage({ observed_at: '2026-11-19T06:58:35.000Z', fetched_at: '2026-11-19T06:58:35.000Z' },
+      { observed_at: '2026-11-19T06:59:18.000Z', fetched_at: '2026-11-19T06:59:18.000Z' });
+    assert.equal(result.claude.lastCheck, '2026-11-19T06:58:35.000Z');
+    assert.equal(result.codex.lastCheck, '2026-11-19T06:59:18.000Z');
+    const undated = usage({}, {});
+    assert.equal(undated.claude.lastCheck, null);
+    assert.equal(undated.codex.lastCheck, null);
+  });
+});

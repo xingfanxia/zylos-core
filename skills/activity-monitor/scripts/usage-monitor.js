@@ -301,7 +301,9 @@ export class UsageMonitor {
       return { ok: false, reason: p?.error ? `unavailable(${String(p.error).slice(0, 80)})` : 'unavailable' };
     }
     if (this.usageProvider === 'codex') return readAuthoritativeCodex(p, currentTime);
-    const fetchedAtSec = Math.floor(new Date(p.fetched_at || doc.updated_at || 0).getTime() / 1000);
+    // The entry's own time only: updated_at is the time of the last write,
+    // which the updater advances after every probe, so it never dates an entry.
+    const fetchedAtSec = Math.floor(new Date(p.observed_at || p.fetched_at || 0).getTime() / 1000);
     if (!Number.isFinite(fetchedAtSec) || fetchedAtSec <= 0) return { ok: false, reason: 'no_timestamp' };
     const ageSec = currentTime - fetchedAtSec;
     // updater cadence is 5min (60s retry) — 15min = 3 missed cycles = poll is down.

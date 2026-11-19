@@ -782,3 +782,30 @@ describe('Codex ten-percent fleet milestones', () => {
     assert.equal(monitor.loadFleetAlertState().milestones, undefined);
   });
 });
+
+// The updater rewrites provider-usage.json after every probe, so updated_at is
+// the time of the last write, not the age of any entry.
+describe('readProviderUsage dates a Claude entry by its own time only', () => {
+  const now = Date.parse('2026-11-19T07:00:00Z') / 1000;
+  const iso = sec => new Date(sec * 1000).toISOString();
+  const write = (dir, claude) => {
+    const file = path.join(dir, 'activity-monitor', 'provider-usage.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ updated_at: iso(now), providers: { claude: { provider: 'claude', available: true,
+      secondary: { used_percent: 40, window_minutes: 10080, resets_at: '2026-11-25T00:00:00Z' }, ...claude } } }));
+  };
+
+  it('a fresh document write never makes an entry without its own time look fresh', () => {
+    const { dir, monitor } = makeMonitor();
+    write(dir, {});
+    assert.deepEqual(monitor.readProviderUsage(now), { ok: false, reason: 'no_timestamp' });
+  });
+
+  it('ages an entry by its own observation time under a newer updated_at', () => {
+    const { dir, monitor } = makeMonitor();
+    write(dir, { observed_at: iso(now - 1200), fetched_at: iso(now - 1200) });
+    assert.deepEqual(monitor.readProviderUsage(now), { ok: false, reason: 'stale(20m)' });
+    write(dir, { observed_at: iso(now - 40), fetched_at: iso(now - 40) });
+    assert.equal(monitor.readProviderUsage(now).reading.ageSec, 40);
+  });
+});
