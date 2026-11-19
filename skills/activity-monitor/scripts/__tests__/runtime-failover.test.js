@@ -11,6 +11,7 @@ import {
   planRuntimeFailover,
   planSingleSessionRuntimeFailover,
 } from '../runtime-failover.js';
+import * as failover from '../runtime-failover.js';
 import { readSubscriptionRotationMarkers } from '../codex-quota-recovery.js';
 import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 import { withFileLock } from '../../../multi-session/file-lock.js';
@@ -21,13 +22,19 @@ const profiles = {
   'codex-azure': { runtime: 'codex', usage_provider: null },
 };
 
+// The Codex account installed in every persona home in these fixtures; a
+// Codex reading counts only for it (usageForInstalledAccounts).
+const CODEX_KEY = 'c'.repeat(64);
+const installed = (...instanceIds) => Object.fromEntries(instanceIds.map(id => [id, { 'codex-subscription': CODEX_KEY }]));
+
 function usage({ claude = null, codex = null } = {}) {
   const provider = (used) => used == null ? { available: false } : {
     available: true,
     primary: { used_percent: used, resets_at: '2099-01-01T00:00:00Z' },
     secondary: { used_percent: used },
   };
-  return { providers: { claude: provider(claude), codex: provider(codex) } };
+  return { providers: { claude: provider(claude),
+    codex: codex == null ? provider(codex) : { ...provider(codex), account_key: CODEX_KEY } } };
 }
 
 describe('model and authoritative quota policy', () => {
@@ -125,14 +132,18 @@ describe('model and authoritative quota policy', () => {
       instances: { group: { runtime: 'codex', runtime_profile: 'codex-azure', runtime_failover_enabled: true,
         tmux_session: 'claude-group', marker: 'preserve-me' } },
     };
-    const multi = planRuntimeFailover({ document, providerUsage: authoritative(39), nowMs });
+    const multi = planRuntimeFailover({ document, providerUsage: authoritative(39), currentSubscriptionAccountKeys: installed('group'), nowMs });
     assert.equal(multi.document.instances.group.runtime_profile, 'codex-subscription');
     assert.equal(multi.document.instances.group.marker, 'preserve-me');
-    assert.equal(planRuntimeFailover({ document, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+    assert.equal(planRuntimeFailover({ document, providerUsage: authoritative(1, { quota_authoritative: false }),
+      currentSubscriptionAccountKeys: installed('group'), nowMs }).changes.length, 0);
     const single = { runtime_profiles: pinnedProfiles, runtime_failover: policy, active_profile: 'codex-azure',
       persona_id: 'single', tmux_session: 'claude-main' };
-    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(39), nowMs }).document.active_profile, 'codex-subscription');
-    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(1, { quota_authoritative: false }), nowMs }).changes.length, 0);
+    const singleKeys = installed('single').single;
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(39),
+      currentSubscriptionAccountKeys: singleKeys, nowMs }).document.active_profile, 'codex-subscription');
+    assert.equal(planSingleSessionRuntimeFailover({ document: single, providerUsage: authoritative(1, { quota_authoritative: false }),
+      currentSubscriptionAccountKeys: singleKeys, nowMs }).changes.length, 0);
   });
 });
 
@@ -228,7 +239,9 @@ describe('policy hold_profiles for a Claude -> Codex subscription -> Azure chain
         usage_max_age_sec: 180, ...(hold ? { hold_profiles: hold } : {}) },
       instances: { pan: { runtime_profile: profile, runtime_failover_enabled: true, tmux_session: 'claude-user-pan' } },
     },
-    providerUsage: { providers: { claude: seen(claude), codex: codex == null ? { available: false } : seen(codex) } },
+    providerUsage: { providers: { claude: seen(claude),
+      codex: codex == null ? { available: false } : { ...seen(codex), account_key: CODEX_KEY } } },
+    currentSubscriptionAccountKeys: installed('pan'),
     nowMs,
   }).document.instances.pan.runtime_profile;
 
@@ -279,8 +292,9 @@ describe('devbox chain with the ax-main reading', () => {
         .map(([id, profile]) => [id, { runtime_profile: profile, runtime_failover_enabled: true, tmux_session: `x-${id}`,
           runtime_profile_changed_at: new Date(nowMs - 600_000).toISOString() }])),
     },
-    providerUsage: { providers: { 'claude-ax-backup': seen(95), 'claude-ax-cl': seen(96), codex: seen(20),
-      ...(main === undefined ? {} : { claude: main }) } },
+    providerUsage: { providers: { 'claude-ax-backup': seen(95), 'claude-ax-cl': seen(96),
+      codex: { ...seen(20), account_key: CODEX_KEY }, ...(main === undefined ? {} : { claude: main }) } },
+    currentSubscriptionAccountKeys: installed('admin', 'group', 'sean'),
     healthByInstance: health,
     nowMs,
   }).changes.map(c => [c.instanceId, c.toProfile, c.reason]);
@@ -325,7 +339,9 @@ describe('policy ineligible_profiles for lapsed Claude subscriptions', () => {
       instances: { pan: { runtime: chain[profile].runtime, runtime_profile: profile, runtime_failover_enabled: true,
         tmux_session: 'claude-user-pan', runtime_profile_changed_at: new Date(nowMs - changedAgoMs).toISOString() } },
     },
-    providerUsage: { providers: { 'claude-ax-backup': seen(10), 'claude-ax-cl': seen(20), codex: seen(30) } },
+    providerUsage: { providers: { 'claude-ax-backup': seen(10), 'claude-ax-cl': seen(20),
+      codex: { ...seen(30), account_key: CODEX_KEY } } },
+    currentSubscriptionAccountKeys: installed('pan'),
     nowMs,
   });
 
@@ -945,7 +961,7 @@ describe('managed account rotation gets first chance before usage fallback', () 
   const markers = (at, extra = {}) => ({ admin: { 'codex-subscription': {
     generation: 'a'.repeat(64), available: true, checked_at: at / 1000, ...extra } } });
   const plan = (document, at, extra = {}) => planRuntimeFailover({ document, nowMs: at,
-    providerUsage: usage({ codex: 95 }), rotationMarkers: markers(at), ...extra });
+    providerUsage: usage({ codex: 95 }), rotationMarkers: markers(at), currentSubscriptionAccountKeys: installed('admin'), ...extra });
   it('waits across daemon restarts and refreshed generations but falls back at the original deadline', () => {
     const first = plan(doc(), now);
     assert.deepEqual(first.changes, []); assert.equal(first.stateChanged, true);
@@ -990,10 +1006,10 @@ describe('managed account rotation gets first chance before usage fallback', () 
     const multi = doc();
     const document = { runtime_profiles: multi.runtime_profiles, runtime_failover: multi.runtime_failover, active_profile: 'codex-subscription' };
     const first = planSingleSessionRuntimeFailover({ document, providerUsage: usage({ codex: 95 }),
-      rotationMarkers: markers(now).admin, nowMs: now });
+      rotationMarkers: markers(now).admin, currentSubscriptionAccountKeys: installed('admin').admin, nowMs: now });
     assert.equal(first.stateChanged, true); assert.deepEqual(first.changes, []);
     const next = planSingleSessionRuntimeFailover({ document: first.document, providerUsage: usage({ codex: 95 }),
-      rotationMarkers: markers(now + 120_000).admin, nowMs: now + 120_000 });
+      rotationMarkers: markers(now + 120_000).admin, currentSubscriptionAccountKeys: installed('admin').admin, nowMs: now + 120_000 });
     assert.equal(next.changes[0].toProfile, 'codex-azure');
   });
 });
@@ -1010,4 +1026,96 @@ it('reads rotation evidence from each configured subscription home, failing clos
     assert.deepEqual(readSubscriptionRotationMarkers(document, { homeForUser: user => user ? path.join(root, 'missing') : root }),
       { admin: { sub: marker }, tenant: { sub: null } });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// A rotation replaces auth.json in every persona home; the updater probes its
+// own home on its own schedule, so for a while it can publish a fresh reading
+// of the previous account. That reading must not count for the new one.
+describe('a Codex reading counts only for the Codex account installed now', () => {
+  const T = Date.parse('2026-11-19T08:00:00Z'); // the rotation
+  const OLD = 'a'.repeat(64);
+  const NEW = 'b'.repeat(64);
+  const chainProfiles = {
+    'claude-subscription': { runtime: 'claude', usage_provider: 'claude', model: 'claude-opus-5-5[1m]', reasoning_effort: 'high' },
+    'codex-subscription': { runtime: 'codex', usage_provider: 'codex', model: 'gpt-6-astra', reasoning_effort: 'medium',
+      codex_home: '~/.codex-subscription' },
+    'codex-azure': { runtime: 'codex', usage_provider: null, model: 'gpt-6-astra', reasoning_effort: 'medium' },
+  };
+  const reading = (used, observedMs, key) => ({ available: true, quota_authoritative: true, source: 'codex-account-api',
+    observed_at: new Date(observedMs).toISOString(), fetched_at: new Date(observedMs).toISOString(),
+    ...(key === undefined ? {} : { account_key: key }),
+    secondary: { used_percent: used, window_minutes: 10080, resets_at: '2026-11-25T00:00:00Z' } });
+  const claudeAt = (used, observedMs) => ({ available: true, quota_authoritative: true, source: 'cli',
+    observed_at: new Date(observedMs).toISOString(), secondary: { used_percent: used, resets_at: '2026-11-25T00:00:00Z' } });
+  // Claude is exhausted (97%, fresh) unless a case says otherwise.
+  const plan = ({ nowMs, profile, codex, claude = claudeAt(97, nowMs), keys = { 'codex-subscription': NEW }, extra = {}, recovery }) =>
+    planRuntimeFailover({
+      document: {
+        runtime_profiles: chainProfiles,
+        runtime_failover: { enabled: true, chain: Object.keys(chainProfiles), switch_threshold: 95, recover_threshold: 80,
+          min_dwell_sec: 0, auto_recover: true, usage_max_age_sec: 180 },
+        instances: { pan: { runtime_profile: profile, runtime_failover_enabled: true, tmux_session: 'codex-pan',
+          runtime_profile_changed_at: new Date(T - 3_600_000).toISOString(), ...extra } },
+      },
+      providerUsage: { providers: { claude, codex }, ...(recovery ? { quota_recovery: recovery } : {}) },
+      currentSubscriptionAccountKeys: keys === null ? {} : { pan: keys },
+      nowMs,
+    }).changes.map(c => [c.toProfile, c.reason]);
+
+  it('(a) an old-account reading stamped T+11 is unknown at T+20 and at T+190', () => {
+    for (const nowMs of [T + 20_000, T + 190_000]) {
+      // Old account exhausted: the new account is not sent to Azure on its behalf.
+      assert.deepEqual(plan({ profile: 'codex-subscription', codex: reading(97, T + 11_000, OLD), nowMs }), [], `exhausted @${nowMs - T}`);
+      // Old account low: nothing recovers into Codex on its behalf.
+      assert.deepEqual(plan({ profile: 'codex-azure', claude: claudeAt(97, nowMs), codex: reading(10, T + 11_000, OLD), nowMs }), [],
+        `low @${nowMs - T}`);
+    }
+    const view = failover.usageForInstalledAccounts({ providers: { codex: reading(97, T + 11_000, OLD) } }, chainProfiles,
+      ['codex-subscription'], { 'codex-subscription': NEW });
+    assert.equal(failover.providerUsageState(view, 'codex', T + 190_000, 180_000).available, false);
+  });
+
+  it('(b) a reading of the installed account is used as before', () => {
+    const nowMs = T + 20_000;
+    assert.deepEqual(plan({ profile: 'codex-subscription', codex: reading(97, T + 11_000, NEW), nowMs }),
+      [['codex-azure', 'usage_exhausted:codex']]);
+    assert.deepEqual(plan({ profile: 'codex-azure', claude: claudeAt(97, nowMs), codex: reading(10, T + 11_000, NEW), nowMs }),
+      [['codex-subscription', 'preferred_provider_recovered:codex']]);
+  });
+
+  it('(c) a reading without account_key, or no readable installed key, is unknown', () => {
+    const nowMs = T + 20_000;
+    for (const [codex, keys] of [
+      [reading(97, T + 11_000), { 'codex-subscription': NEW }],
+      [reading(97, T + 11_000, NEW), { 'codex-subscription': null }],
+      [reading(97, T + 11_000, NEW), {}],
+      [reading(97, T + 11_000, NEW), null],
+    ]) {
+      assert.deepEqual(plan({ profile: 'codex-subscription', codex, keys, nowMs }), [], JSON.stringify(keys));
+    }
+  });
+
+  it('(d) Claude and Codex at 97% with an old-account Codex reading: the one optimistic hop to Codex, not Azure', () => {
+    const nowMs = T + 20_000;
+    // Unknown Codex usage keeps its policy meaning: the forward hop may try it
+    // once; a rate_limited Codex session then moves on to Azure.
+    assert.deepEqual(plan({ profile: 'claude-subscription', claude: claudeAt(97, nowMs), codex: reading(97, T + 11_000, OLD), nowMs }),
+      [['codex-subscription', 'usage_exhausted:claude']]);
+    assert.deepEqual(plan({ profile: 'claude-subscription', claude: claudeAt(97, nowMs), codex: reading(97, T + 11_000, NEW), nowMs }),
+      [['codex-azure', 'usage_exhausted:claude']], 'the installed account at 97% is skipped as before');
+  });
+
+  it('(e) recovery proofs behave as before', () => {
+    const nowMs = T + 300_000;
+    const hold = { 'codex-subscription': { health: 'rate_limited', blocked_at: new Date(T - 600_000).toISOString() } };
+    const proof = key => ({ 'codex-subscription': { profile_id: 'codex-subscription', account_key: key, model: 'gpt-6-astra',
+      reasoning_effort: 'medium', blocked_at: hold['codex-subscription'].blocked_at, started_at: new Date(T + 100_000).toISOString(),
+      checked_at: new Date(T + 120_000).toISOString(), observed_at: new Date(T + 120_000).toISOString(), ok: true } });
+    const run = (key, codexKey, keys) => plan({ profile: 'codex-azure', claude: claudeAt(97, nowMs),
+      codex: { available: false, account_key: codexKey }, keys, nowMs, recovery: proof(key),
+      extra: { runtime_failover_blocked_profiles: hold } });
+    assert.deepEqual(run(NEW, NEW, { 'codex-subscription': NEW }),
+      [['codex-subscription', 'preferred_provider_recovered:codex']], 'a valid same-account proof keeps working');
+    assert.deepEqual(run(OLD, OLD, { 'codex-subscription': NEW }), [], 'a proof for another account is rejected');
+  });
 });

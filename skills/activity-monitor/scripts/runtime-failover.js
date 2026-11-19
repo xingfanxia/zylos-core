@@ -266,6 +266,29 @@ export function observedModelDownshift(snapshot, { profileId, profile, changedAt
   return model;
 }
 
+/**
+ * A Codex quota reading counts only for the Codex account installed now. The
+ * updater probes one home on its own schedule, so after a rotation its reading
+ * can still describe the previous account while younger than
+ * usage_max_age_sec. The current keys are the ones verifiedQuotaRecoveries
+ * already compares (readCurrentSubscriptionAccountKeys). A missing key on
+ * either side, or a mismatch, is unknown usage, like a stale reading. The
+ * planners judge usage through this view; recovery proofs keep the original
+ * document and their own account checks.
+ */
+export function usageForInstalledAccounts(providerUsage, profiles, profileIds, currentAccountKeys = {}) {
+  const entry = providerUsage?.providers?.codex;
+  if (!entry?.available) return providerUsage;
+  const codexProfiles = [...new Set(profileIds)].filter(id => profiles[id]?.usage_provider === 'codex');
+  if (!codexProfiles.length) return providerUsage;
+  const key = entry.account_key;
+  if (typeof key === 'string' && key && codexProfiles.every(id => (currentAccountKeys || {})[id] === key)) {
+    return providerUsage;
+  }
+  return { ...providerUsage, providers: { ...providerUsage.providers,
+    codex: { ...entry, available: false, quota_authoritative: false, unusable: 'codex_account_not_installed' } } };
+}
+
 function firstUsableTier({ chain, profiles, blocked, providerUsage, policy, nowMs }) {
   const threshold = Number(policy.switch_threshold) || 98;
   const maxAgeMs = Number(policy.usage_max_age_sec) > 0 ? Number(policy.usage_max_age_sec) * 1000 : null;
@@ -311,11 +334,12 @@ export function planRuntimeFailover({
     const currentAccountKeys = currentSubscriptionAccountKeys[instanceId] || {};
     const recovered = verifiedQuotaRecoveries({ blockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys })
       .filter(id => !held.has(id));
+    const usage = usageForInstalledAccounts(providerUsage, profiles, [...chain, currentProfile], currentAccountKeys);
     const eligibleBlocks = Object.fromEntries(Object.entries(blockedProfiles).filter(([id]) => !recovered.includes(id)));
     if (instance.runtime_failover_suspended) {
       // Stopped rather than run on a reserve model; resume on the first usable tier.
       const resume = firstUsableTier({ chain, profiles, blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))),
-        providerUsage, policy, nowMs });
+        providerUsage: usage, policy, nowMs });
       if (!resume) continue;
       if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
       delete instance.runtime_failover_suspended;
@@ -328,7 +352,7 @@ export function planRuntimeFailover({
       continue;
     }
     const leave = ineligible.has(currentProfile) && firstUsableTier({ chain, profiles,
-      blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))), providerUsage, policy, nowMs });
+      blocked: new Set(Object.keys(withHeld(eligibleBlocks, held))), providerUsage: usage, policy, nowMs });
     if (leave) {
       const reason = `plan_ineligible:${currentProfile}`;
       if (recovered.length) instance.runtime_failover_blocked_profiles = eligibleBlocks;
@@ -346,15 +370,15 @@ export function planRuntimeFailover({
     // A reserve-model switch means the account hit its hard limit: same handling
     // as an explicit Codex quota failure, without waiting out the dwell.
     const currentHealth = downshift ? 'rate_limited' : healthByInstance[instanceId] || 'ok';
-    const usageFailoverNotBeforeMs = downshift ? 0 : rotationDeadline(instance, { policy, profiles, currentProfile, providerUsage,
-      marker: rotationMarkers[instanceId]?.[currentProfile], nowMs });
+    const usageFailoverNotBeforeMs = downshift ? 0 : rotationDeadline(instance, { policy, profiles, currentProfile,
+      providerUsage: usage, marker: rotationMarkers[instanceId]?.[currentProfile], nowMs });
     const decision = chooseRuntimeProfile({
       skipDwell: Boolean(downshift),
       usageFailoverNotBeforeMs,
       currentProfile,
       chain,
       profiles,
-      providerUsage,
+      providerUsage: usage,
       currentHealth,
       switchThreshold: Number(policy.switch_threshold) || 98,
       recoverThreshold: Number(policy.recover_threshold) || 80,
@@ -441,14 +465,15 @@ export function planSingleSessionRuntimeFailover({
   const recovered = verifiedQuotaRecoveries({ blockedProfiles: currentBlockedProfiles, profiles, providerUsage, nowMs, currentAccountKeys: currentSubscriptionAccountKeys })
     .filter(id => !held.has(id));
   const eligibleBlocks = Object.fromEntries(Object.entries(currentBlockedProfiles).filter(([id]) => !recovered.includes(id)));
-  const usageFailoverNotBeforeMs = rotationDeadline(next, { policy, profiles, currentProfile, providerUsage,
+  const usage = usageForInstalledAccounts(providerUsage, profiles, [...chain, currentProfile], currentSubscriptionAccountKeys);
+  const usageFailoverNotBeforeMs = rotationDeadline(next, { policy, profiles, currentProfile, providerUsage: usage,
     marker: rotationMarkers[currentProfile], nowMs });
   const decision = chooseRuntimeProfile({
     usageFailoverNotBeforeMs,
     currentProfile,
     chain,
     profiles,
-    providerUsage,
+    providerUsage: usage,
     currentHealth,
     switchThreshold: Number(policy.switch_threshold) || 98,
     recoverThreshold: Number(policy.recover_threshold) || 80,
