@@ -338,10 +338,12 @@ export function tmuxSendKeys(session, ...keys) {
 // default-size (80x24). At 80x24 a message of a few hundred characters
 // scrolled Claude Code's composer past its prompt row, the dispatcher could
 // not see its own paste, and user-pan, user-elaine and the scheduler received
-// nothing for hours (2026-11-19). At 200x60 every message the dispatcher
-// pastes fits the composer unscrolled: Claude Code collapses a paste over 800
-// characters into one "[Pasted text]" row, and longer messages are spilled to
-// a file first (comm-bridge c4-utils truncateForDelivery).
+// nothing for hours (2026-11-19). Measured on CLI 2.1.327 at 200x60: the
+// composer shows 25 rows before it scrolls. A pasted message is at most 800
+// characters and 2048 bytes (longer ones are spilled to a file: comm-bridge
+// c4-utils truncateForDelivery); 800 double-width characters with two line
+// breaks (a third makes Claude Code collapse the paste into one placeholder
+// row), more than that limit allows, take 11 rows.
 export const AGENT_WINDOW = Object.freeze({ width: 200, height: 60 });
 
 /**
@@ -355,34 +357,40 @@ export function tmuxNewSession(args) {
 }
 
 /**
- * Keep a session's window at AGENT_WINDOW (at least that size: a larger one
- * keeps its size) before anything is typed into it. `resize-window` also sets
- * the window's `window-size` to manual, so a client attached later does not
- * resize it: with the default `latest`, an 80x24 client shrank a 200x60 window
- * to 80x23 and it stayed so after the client detached. An attached client
- * smaller than the window sees part of it. A failure is logged; the dispatcher
- * still reads a scrolled composer.
+ * Keep a session's window at AGENT_WINDOW or larger before anything is typed
+ * into it: the session's active window (the one a session target resolves
+ * to) is read and resized by its window id, to at least AGENT_WINDOW in each
+ * dimension; a larger window is never shrunk. `resize-window` also sets that
+ * window's `window-size` to manual, so a client attached later does not
+ * resize it: with the default `latest`, an 80x24 client shrank a 200x60
+ * window to 80x23 and it stayed so after the client detached. An attached
+ * client smaller than the window sees part of it. When the size cannot be
+ * read nothing is resized (logged).
  * @param {string} session
  * @returns {boolean} whether the window size changed (the pane redraws)
  */
 export function tmuxPinAgentWindow(session, { execFileSyncImpl = execFileSync } = {}) {
-  let width = 0;
-  let height = 0;
+  let active = null;
   try {
-    const out = String(execFileSyncImpl('tmux', ['list-windows', '-t', session, '-F', '#{window_width} #{window_height}'],
-      { encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'] })).trim().split('\n')[0];
-    const m = /^(\d+) (\d+)$/.exec(out || '');
-    if (m) [width, height] = [Number(m[1]), Number(m[2])];
-  } catch { /* unknown size: resize */ }
-  const target = { width: Math.max(width, AGENT_WINDOW.width), height: Math.max(height, AGENT_WINDOW.height) };
+    const out = String(execFileSyncImpl('tmux', ['list-windows', '-t', session, '-F', '#{window_active} #{window_id} #{window_width} #{window_height}'],
+      { encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'] }));
+    const m = out.split('\n').map((line) => /^1 (@\d+) (\d+) (\d+)$/.exec(line.trim())).find(Boolean);
+    if (m) active = { id: m[1], width: Number(m[2]), height: Number(m[3]) };
+  } catch { /* unreadable: nothing resized */ }
+  if (!active) {
+    process.stderr.write(`[tmux-helpers] could not read the active window of ${session}; its size is left as it is\n`);
+    return false;
+  }
+  const width = Math.max(active.width, AGENT_WINDOW.width);
+  const height = Math.max(active.height, AGENT_WINDOW.height);
   try {
-    execFileSyncImpl('tmux', ['resize-window', '-t', session, '-x', String(target.width), '-y', String(target.height)],
+    execFileSyncImpl('tmux', ['resize-window', '-t', active.id, '-x', String(width), '-y', String(height)],
       { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   } catch (err) {
     process.stderr.write(`[tmux-helpers] could not keep ${session} at ${AGENT_WINDOW.width}x${AGENT_WINDOW.height}: ${err.message}\n`);
     return false;
   }
-  return width !== target.width || height !== target.height;
+  return width !== active.width || height !== active.height;
 }
 
 /**

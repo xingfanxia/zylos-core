@@ -333,3 +333,34 @@ describe('cellWidth (terminal cells, or null when not known with confidence)', a
     }
   });
 });
+
+// PASTE-STRAND-1 review (ii): in a real private tmux server, a session whose
+// first window is 80x24 and whose active window is larger: the active window
+// is measured and resized by its own id, and never shrunk.
+describe('tmuxPinAgentWindow (private tmux server)', () => {
+  const socket = `pin-${process.pid}`;
+  const tmux = (...args) => execFileSync('tmux', ['-L', socket, '-f', '/dev/null', ...args], { encoding: 'utf8' });
+  const viaSocket = (file, args, opts) => execFileSync(file, ['-L', socket, ...args], opts);
+  const size = (target) => tmux('display-message', '-p', '-t', target, '#{window_width}x#{window_height}').trim();
+  let available = true;
+  try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); } catch { available = false; }
+
+  it('keeps a larger active window at its size and leaves the first window alone; brings a small active window to 200x60', { skip: !available }, async () => {
+    const { tmuxPinAgentWindow } = await import('../tmux-helpers.js');
+    try {
+      tmux('new-session', '-d', '-s', 'pin', '-x', '80', '-y', '24', 'sleep 30');
+      const big = tmux('new-window', '-P', '-F', '#{window_id}', '-t', 'pin', 'sleep 30').trim();
+      tmux('resize-window', '-t', big, '-x', '250', '-y', '70');
+      assert.equal(size('pin:0'), '80x24');
+      assert.equal(tmuxPinAgentWindow('pin', { execFileSyncImpl: viaSocket }), false);
+      assert.equal(size(big), '250x70', 'the larger active window is not shrunk');
+      assert.equal(size('pin:0'), '80x24', 'the first window is not touched');
+      tmux('select-window', '-t', 'pin:0');
+      assert.equal(tmuxPinAgentWindow('pin', { execFileSyncImpl: viaSocket }), true);
+      assert.equal(size('pin:0'), '200x60');
+      assert.equal(size(big), '250x70');
+    } finally {
+      try { tmux('kill-server'); } catch { /* already gone */ }
+    }
+  });
+});
