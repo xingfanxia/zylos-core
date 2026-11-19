@@ -1042,6 +1042,46 @@ for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => Cod
   });
 }
 
+// 2026-11-19 (PASTE-STRAND-1): the persona windows were tmux's default 80x24,
+// which scrolled Claude Code's composer past its prompt row for a message of a
+// few hundred characters; the dispatcher then could not see its own paste.
+for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => CodexAdapter]]) {
+  describe(`${label} launch — the agent window size`, () => {
+    const tmuxCall = (name) => calls.execFileSync.findIndex((c) => c.file === 'tmux' && c.args[0] === name);
+
+    it(`${label}: a new session is created at 200x60 and its window pinned there`, async () => {
+      tmuxSessionExists = false;
+      await makeAdapter(Cls()).launch({ bypassPermissions: false });
+      const tmux = findTmuxNewSession();
+      const at = tmux.args.indexOf('-x');
+      assert.deepEqual(tmux.args.slice(at, at + 4), ['-x', '200', '-y', '60']);
+      const pinned = tmuxCall('resize-window');
+      assert.ok(pinned > calls.execFileSync.indexOf(tmux), 'pinned (window-size manual) once it exists');
+      assert.deepEqual(calls.execFileSync[pinned].args.slice(-4), ['-x', '200', '-y', '60']);
+    });
+
+    it(`${label}: a retained 80x24 window is brought to 200x60 before anything is typed; a larger one keeps its size`, async () => {
+      for (const [size, expected] of [['80 24', ['-x', '200', '-y', '60']], ['250 70', ['-x', '250', '-y', '70']]]) {
+        try {
+          tmuxSessionExists = true;
+          tmuxHook = (args) => (args[0] === 'list-windows' ? `${size}\n` : undefined);
+          calls.execFileSync.length = 0;
+          let typedAt = -1;
+          const adapter = makeAdapter(Cls());
+          adapter.sendMessage = async () => { typedAt = calls.execFileSync.length; };
+          await adapter.launch({ bypassPermissions: false });
+          const resized = tmuxCall('resize-window');
+          assert.ok(resized >= 0 && typedAt > resized, `${size}: resized before typing`);
+          assert.deepEqual(calls.execFileSync[resized].args.slice(-4), expected, size);
+          assert.ok(resized < tmuxCall('display-message'), `${size}: before the shell prompt check reads the pane`);
+        } finally {
+          tmuxHook = null;
+        }
+      }
+    });
+  });
+}
+
 describe('Claude launch — compat mode PATH dedupe', () => {
   it('spec.env.PATH is deduplicated in compat mode', async () => {
     tmuxSessionExists = false;

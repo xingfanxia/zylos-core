@@ -334,12 +334,55 @@ export function tmuxSendKeys(session, ...keys) {
   });
 }
 
+// The size of every agent session's window: the launcher's, never tmux's
+// default-size (80x24). At 80x24 a message of a few hundred characters
+// scrolled Claude Code's composer past its prompt row, the dispatcher could
+// not see its own paste, and user-pan, user-elaine and the scheduler received
+// nothing for hours (2026-11-19). At 200x60 every message the dispatcher
+// pastes fits the composer unscrolled: Claude Code collapses a paste over 800
+// characters into one "[Pasted text]" row, and longer messages are spilled to
+// a file first (comm-bridge c4-utils truncateForDelivery).
+export const AGENT_WINDOW = Object.freeze({ width: 200, height: 60 });
+
 /**
- * Create a new tmux session.
+ * Create a new agent tmux session, its window at AGENT_WINDOW.
  * @param {string[]} args - Full argument list for `tmux new-session`
  */
 export function tmuxNewSession(args) {
-  execFileSync('tmux', args, { timeout: LAUNCH_TIMEOUT });
+  const [command, ...rest] = args;
+  execFileSync('tmux', [command, '-x', String(AGENT_WINDOW.width), '-y', String(AGENT_WINDOW.height), ...rest],
+    { timeout: LAUNCH_TIMEOUT });
+}
+
+/**
+ * Keep a session's window at AGENT_WINDOW (at least that size: a larger one
+ * keeps its size) before anything is typed into it. `resize-window` also sets
+ * the window's `window-size` to manual, so a client attached later does not
+ * resize it: with the default `latest`, an 80x24 client shrank a 200x60 window
+ * to 80x23 and it stayed so after the client detached. An attached client
+ * smaller than the window sees part of it. A failure is logged; the dispatcher
+ * still reads a scrolled composer.
+ * @param {string} session
+ * @returns {boolean} whether the window size changed (the pane redraws)
+ */
+export function tmuxPinAgentWindow(session, { execFileSyncImpl = execFileSync } = {}) {
+  let width = 0;
+  let height = 0;
+  try {
+    const out = String(execFileSyncImpl('tmux', ['list-windows', '-t', session, '-F', '#{window_width} #{window_height}'],
+      { encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'] })).trim().split('\n')[0];
+    const m = /^(\d+) (\d+)$/.exec(out || '');
+    if (m) [width, height] = [Number(m[1]), Number(m[2])];
+  } catch { /* unknown size: resize */ }
+  const target = { width: Math.max(width, AGENT_WINDOW.width), height: Math.max(height, AGENT_WINDOW.height) };
+  try {
+    execFileSyncImpl('tmux', ['resize-window', '-t', session, '-x', String(target.width), '-y', String(target.height)],
+      { timeout: CMD_TIMEOUT, stdio: 'ignore' });
+  } catch (err) {
+    process.stderr.write(`[tmux-helpers] could not keep ${session} at ${AGENT_WINDOW.width}x${AGENT_WINDOW.height}: ${err.message}\n`);
+    return false;
+  }
+  return width !== target.width || height !== target.height;
 }
 
 /**
