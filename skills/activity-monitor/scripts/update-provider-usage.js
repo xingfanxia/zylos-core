@@ -373,8 +373,10 @@ function readInventory(zylosDir) {
  * standing writer; a one-shot pass may run only while the daemon is stopped
  * (the codex rotation handoff pm2-stops it first and starts it again after:
  * azure-agents-infra scripts/ops/codex_rotation_handoff.py:188-199, :231).
- * Nothing enforces this. Two overlapping passes can lose one entry, or put
- * back that entry's previous own-dated value, for up to one cycle.
+ * Nothing here enforces this. Two overlapping passes can put back a reading
+ * that is still young enough to count and so reverse a failover decision,
+ * replace another provider's entry or the recovery proofs, or fail the shared
+ * temp-file rename; it lasts until the next successful publish of that entry.
  */
 export async function runProviderUsageOnce({
   execFileSyncImpl = execFileSync,
