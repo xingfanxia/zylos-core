@@ -32,6 +32,8 @@ import {
   tmuxPasteBuffer,
   tmuxDeleteBuffer,
   tmuxNewSession,
+  tmuxPinAgentWindow,
+  PROMPT_SETTLE_MS,
   getProcessName,
   hasChildProcess,
   requirePaneAtShellPrompt,
@@ -480,6 +482,9 @@ export class ClaudeAdapter extends RuntimeAdapter {
       // Typed only into the one pane positively found at an idle shell prompt,
       // by its pane id; otherwise nothing is typed and the launch fails
       // (requirePaneAtShellPrompt, tmuxPasteToVerifiedPane).
+      // The window gets the agent size before anything is typed; a resize
+      // redraws the pane, so the prompt check waits for it to settle.
+      if (tmuxPinAgentWindow(SESSION)) await new Promise((resolve) => setTimeout(resolve, PROMPT_SETTLE_MS));
       const pane = await requirePaneAtShellPrompt(SESSION);
       // Multi-session: re-export instance env so subsequent in-session restarts inherit identity.
       const recoveryPrompt = upgradeStartupPrompt(ZYLOS_DIR);
@@ -567,6 +572,7 @@ export class ClaudeAdapter extends RuntimeAdapter {
         try { fs.unlinkSync(specPath); } catch { }
         throw new Error(`Failed to create tmux session: ${e.message}`);
       }
+      tmuxPinAgentWindow(SESSION);
       this.lastLaunchRecord = launchRecord;
     }
   }
