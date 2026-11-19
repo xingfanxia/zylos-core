@@ -3,6 +3,7 @@ import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 
@@ -16,7 +17,7 @@ const {
   runProviderUsageOnce,
   runDaemon,
 } = await import('../update-provider-usage.js');
-const { providerUsageState } = await import('../runtime-failover.js');
+const { providerUsageState, chooseRuntimeProfile } = await import('../runtime-failover.js');
 
 describe('fetchCodexNativeUsage', () => {
   it('publishes a weekly-only Codex subscription window from the selected profile rollout', () => {
@@ -467,11 +468,11 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
   const CLAUDE = ['claude', ...EXTRA];
   const iso = ms => new Date(ms).toISOString();
   const readDoc = file => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
-  const good = (provider, at) => ({ provider, available: true, quota_authoritative: true, source: 'cli',
-    fetched_at: at, observed_at: at, primary: null, secondary: { used_percent: 30, window_minutes: 10080, resets_at: RESETS },
+  const good = (provider, at, used = 30) => ({ provider, available: true, quota_authoritative: true, source: 'cli',
+    fetched_at: at, observed_at: at, primary: null, secondary: { used_percent: used, window_minutes: 10080, resets_at: RESETS },
     tertiary: null });
 
-  function fixture(t, { durations = {}, fail = new Set(), disk, during = {} } = {}) {
+  function fixture(t, { durations = {}, fail = new Set(), disk, during = {}, used = {}, instances, runtimeProfiles } = {}) {
     t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: T0 });
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-publish-'));
     t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -482,7 +483,15 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     for (const provider of EXTRA) {
       profiles[provider] = { runtime: 'claude', usage_provider: provider, claude_settings_file: path.join(dir, `${provider}.json`) };
     }
-    fs.writeFileSync(path.join(dir, 'instances.json'), JSON.stringify({ instances: {}, runtime_profiles: profiles }));
+    // instances: undefined → the default inventory, null → no file, string → written as is.
+    if (instances !== null) {
+      fs.writeFileSync(path.join(dir, 'instances.json'),
+        instances ?? JSON.stringify({ instances: {}, runtime_profiles: profiles }));
+    }
+    if (runtimeProfiles !== undefined) {
+      fs.mkdirSync(path.join(dir, '.zylos'));
+      fs.writeFileSync(path.join(dir, '.zylos', 'runtime-profiles.json'), runtimeProfiles);
+    }
     const file = path.join(dir, 'activity-monitor', 'provider-usage.json');
     if (disk !== undefined) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -493,9 +502,11 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     const boundaries = [];
     const snap = label => boundaries.push({ label, at: Date.now(), doc: readDoc(file) });
     const starts = {};
+    const quotaDocuments = [];
+    const logs = [];
     let passes = 0;
     const opts = {
-      zylosDir: dir, filePath: file, log: () => {},
+      zylosDir: dir, filePath: file, log: line => logs.push(line),
       execFileSyncImpl: () => { throw new Error('no CodexBar in tests'); },
       fetchClaudeNativeUsageImpl: () => { throw new Error('multi-instance host reads no native files'); },
       fetchCodexNativeUsageImpl: () => { throw new Error('codex probe succeeds in these tests'); },
@@ -505,7 +516,7 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
         starts[provider] = options.now;
         advance(durations[provider] ?? 40_000);
         during[provider]?.(file); // another writer, while this probe runs
-        if (!fail.has(provider)) return good(provider, options.now);
+        if (!fail.has(provider)) return good(provider, options.now, used[provider]);
         return { provider, available: false, fetched_at: options.now, source: 'cli', error: 'Claude usage probe timed out.',
           primary: null, secondary: null, tertiary: null, account_email: null, version: null };
       },
@@ -514,10 +525,11 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
         snap('codex');
         starts.codex = iso(Date.now());
         advance(durations.codex ?? 10_000);
-        return { ...good('codex', iso(Date.now())), source: 'codex-account-api', account_key: 'a'.repeat(64) };
+        return { ...good('codex', iso(Date.now()), used.codex), source: 'codex-account-api', account_key: 'a'.repeat(64) };
       },
-      refreshQuotaRecoveryProofsImpl: async () => {
+      refreshQuotaRecoveryProofsImpl: async ({ document }) => {
         snap('quota');
+        quotaDocuments.push(document);
         advance(500);
         passes += 1;
         return { pass: passes };
@@ -528,7 +540,8 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
       snap('end');
       return payload;
     };
-    return { dir, file, boundaries, starts, run, advance, at: label => boundaries.find(b => b.label === label) };
+    return { dir, file, boundaries, starts, run, advance, logs, quotaDocuments,
+      labels: () => boundaries.map(b => b.label), at: label => boundaries.find(b => b.label === label) };
   }
 
   const PREVIOUS = {
@@ -599,13 +612,14 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     assert.equal(providerUsageState(published, 'claude-ax-backup', Date.now(), 180_000).available, false);
   });
 
-  it('starts from an empty document when the file on disk does not parse, and drops unconfigured accounts at the end', async (t) => {
-    const unreadable = fixture(t, { disk: '{not json' });
-    await unreadable.run();
-    assert.deepEqual(Object.keys(unreadable.at('codex').doc.providers), ['claude']);
-    assert.equal(unreadable.at('codex').doc.quota_recovery, undefined, 'no proof is invented mid-pass');
-    t.mock.timers.reset();
+  it('starts from an empty document when no file exists yet', async (t) => {
+    const fresh = fixture(t);
+    await fresh.run();
+    assert.deepEqual(Object.keys(fresh.at('codex').doc.providers), ['claude']);
+    assert.equal(fresh.at('codex').doc.quota_recovery, undefined, 'no proof is invented mid-pass');
+  });
 
+  it('drops unconfigured accounts at the end of the pass', async (t) => {
     const stale = fixture(t, { disk: { ...PREVIOUS, providers: { ...PREVIOUS.providers, 'claude-ax-gone': good('claude-ax-gone', iso(T0 - 600_000)) } } });
     const payload = await stale.run();
     assert.ok(stale.at('quota').doc.providers['claude-ax-gone'], 'kept as last published during the pass');
@@ -629,6 +643,143 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     assert.equal(JSON.stringify(f.at('claude-ax-third').doc.providers.codex), JSON.stringify(rotated));
     assert.equal(JSON.stringify(payload.providers.codex), JSON.stringify(rotated));
     assert.equal(JSON.stringify(readDoc(f.file).providers.codex), JSON.stringify(rotated));
+  });
+
+  // (h) A file that exists but cannot be read is never overwritten.
+  const failReads = (t, file, code, { when = () => true } = {}) => {
+    const original = fs.readFileSync;
+    t.mock.method(fs, 'readFileSync', function readFileSync(target, ...rest) {
+      if (target === file && when()) throw Object.assign(new Error(`simulated ${code}`), { code });
+      return original.call(fs, target, ...rest);
+    });
+    return original;
+  };
+  for (const code of ['EIO', 'EACCES']) {
+    it(`a ${code} reading the published file fails the pass and leaves the file untouched`, async (t) => {
+      const f = fixture(t, { disk: PREVIOUS });
+      const bytes = fs.readFileSync(f.file);
+      const original = failReads(t, f.file, code);
+      const outcome = await f.run().catch(err => err);
+      assert.ok(original.call(fs, f.file).equals(bytes), 'file bytes unchanged');
+      assert.deepEqual(f.labels(), [], 'no probe runs');
+      assert.match(String(outcome?.message), new RegExp(`cannot read .*provider-usage\\.json: ${code}`));
+    });
+  }
+
+  it('an unparseable published file fails the pass and is not overwritten', async (t) => {
+    const f = fixture(t, { disk: '{"providers": {"codex": trunc' });
+    const bytes = fs.readFileSync(f.file);
+    const outcome = await f.run().catch(err => err);
+    assert.ok(fs.readFileSync(f.file).equals(bytes), 'file bytes unchanged');
+    assert.deepEqual(f.labels(), []);
+    assert.match(String(outcome?.message), /cannot parse .*provider-usage\.json: EPARSE/);
+    assert.ok(!outcome.message.includes('trunc'), 'no file content in the error');
+  });
+
+  // (i) The profile list names the extra accounts; unreadable means unknown, not none.
+  for (const [name, setup] of [
+    ['unparseable', { instances: '{"runtime_profiles": ' }],
+    ['unreadable (EACCES)', { eacces: true }],
+  ]) {
+    it(`an ${name} profile list prunes nothing and keeps every extra account's entry byte-for-byte`, async (t) => {
+      const f = fixture(t, { disk: PREVIOUS, instances: setup.instances });
+      if (setup.eacces) failReads(t, path.join(f.dir, 'instances.json'), 'EACCES');
+      const payload = await f.run();
+      for (const provider of EXTRA) {
+        assert.equal(JSON.stringify(payload.providers[provider]), JSON.stringify(PREVIOUS.providers[provider]), provider);
+      }
+      assert.deepEqual(f.labels(), ['claude', 'codex', 'end'], 'no extra account is probed');
+      assert.deepEqual(payload.quota_recovery, PREVIOUS.quota_recovery, 'recovery proofs are kept, not refreshed');
+      assert.match(f.logs.at(-1), /without pruning; profile list unreadable .*instances\.json: (EPARSE|EACCES)/);
+    });
+  }
+
+  it('no profile list at all is a host without extra accounts, as before', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS, instances: null });
+    const payload = await f.run();
+    assert.deepEqual(Object.keys(payload.providers).sort(), ['claude', 'codex']);
+    assert.deepEqual(f.quotaDocuments, [undefined]);
+    assert.deepEqual(payload.quota_recovery, { pass: 1 });
+  });
+
+  it('a single-session host reads its accounts from .zylos/runtime-profiles.json', async (t) => {
+    const profiles = { 'claude-ax-backup': { runtime: 'claude', usage_provider: 'claude-ax-backup', claude_settings_file: '/fixture/backup.json' } };
+    const f = fixture(t, { disk: PREVIOUS, instances: null, runtimeProfiles: JSON.stringify({ runtime_profiles: profiles }) });
+    const payload = await f.run();
+    assert.deepEqual(f.labels(), ['claude', 'codex', 'claude-ax-backup', 'quota', 'end']);
+    assert.deepEqual(Object.keys(payload.providers).sort(), ['claude', 'claude-ax-backup', 'codex']);
+  });
+
+  // (j) One pass at a time per usage file.
+  it('a second pass waits for the first to release the lock, probing and writing nothing until then', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS });
+    let sleeps = 0;
+    const first = f.run();
+    const second = f.run({ sleepImpl: async () => { sleeps += 1; await new Promise(resolve => setImmediate(resolve)); } });
+    await Promise.all([first, second]);
+    const pass = ['claude', 'codex', 'claude-ax-backup', 'claude-ax-third', 'quota', 'end'];
+    assert.deepEqual(f.labels(), [...pass, ...pass], 'the passes do not interleave');
+    assert.ok(sleeps > 0, 'the second pass waited');
+    assert.deepEqual(f.boundaries[6].doc, f.boundaries[5].doc, 'nothing written while waiting');
+    assert.equal(fs.existsSync(`${f.file}.lock`), false, 'released');
+  });
+
+  it('takes over at once a lock left by a dead pid (a daemon pm2-stopped mid-pass)', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS });
+    const dead = spawnSync(process.execPath, ['-e', '']).pid;
+    fs.writeFileSync(`${f.file}.lock`, `${dead}\n`);
+    let sleeps = 0;
+    await f.run({ sleepImpl: async () => { sleeps += 1; } });
+    assert.equal(sleeps, 0);
+    assert.equal(f.labels().length, 6, 'the pass ran');
+    assert.equal(fs.existsSync(`${f.file}.lock`), false, 'the taken-over lock is released');
+  });
+
+  it('waits on an empty lock while it is fresh and takes it over after 5 s', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS });
+    fs.writeFileSync(`${f.file}.lock`, '');
+    fs.utimesSync(`${f.file}.lock`, (T0 - 1000) / 1000, (T0 - 1000) / 1000);
+    let sleeps = 0;
+    await f.run({ sleepImpl: async ms => { sleeps += 1; f.advance(ms); } });
+    assert.equal(sleeps, 5, 'ages 1-5 s are waited for; at 6 s the lock is taken');
+    assert.equal(f.labels().length, 6);
+    assert.equal(fs.existsSync(`${f.file}.lock`), false);
+  });
+
+  it('gives up after 300 s while a live holder keeps the lock, writing nothing', async (t) => {
+    const f = fixture(t, { disk: PREVIOUS });
+    fs.writeFileSync(`${f.file}.lock`, '4242\n');
+    const bytes = fs.readFileSync(f.file);
+    let sleeps = 0;
+    const outcome = await f.run({ isPidAliveImpl: pid => pid === 4242,
+      sleepImpl: async ms => { sleeps += 1; f.advance(ms); } }).catch(err => err);
+    assert.deepEqual(f.labels(), [], 'no probe while the holder lives');
+    assert.ok(fs.readFileSync(f.file).equals(bytes));
+    assert.equal(sleeps, 300);
+    assert.match(String(outcome?.message), /held by pid 4242 for over 300 s/);
+    assert.equal(fs.readFileSync(`${f.file}.lock`, 'utf8'), '4242\n', 'a live holder\'s lock is never removed');
+  });
+
+  // (k) The reviewer's decision case, judged by the real planner.
+  it('a read error mid-pass leaves Claude and Codex at 97% on disk, so the planner still picks Azure', async (t) => {
+    const disk = { ...PREVIOUS, providers: { ...PREVIOUS.providers,
+      claude: good('claude', iso(T0 - 30_000), 97),
+      codex: { ...good('codex', iso(T0 - 20_000), 97), source: 'codex-account-api', account_key: 'a'.repeat(64) } } };
+    let failNext = false;
+    const f = fixture(t, { disk, used: { claude: 97 }, during: { claude: () => { failNext = true; } } });
+    failReads(t, f.file, 'EIO', { when: () => { const fail = failNext; failNext = false; return fail; } });
+    const profiles = {
+      'claude-ax-main': { runtime: 'claude', usage_provider: 'claude' },
+      'codex-sub': { runtime: 'codex', usage_provider: 'codex' },
+      'azure-api': { runtime: 'codex' },
+    };
+    const decide = () => chooseRuntimeProfile({ currentProfile: 'claude-ax-main', chain: ['claude-ax-main', 'codex-sub', 'azure-api'],
+      profiles, providerUsage: JSON.parse(fs.readFileSync(f.file, 'utf8')), switchThreshold: 95, recoverThreshold: 80,
+      nowMs: Date.now(), usageMaxAgeMs: 180_000 }).profile;
+    assert.equal(decide(), 'azure-api', 'before the pass');
+    const outcome = await f.run().catch(err => err);
+    assert.equal(decide(), 'azure-api', 'after the failed pass');
+    assert.match(String(outcome?.message), /cannot read .*: EIO/);
   });
 
   // The failover's own freshness rule over a modelled daemon run: every

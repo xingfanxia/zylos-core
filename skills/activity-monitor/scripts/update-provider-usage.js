@@ -314,12 +314,104 @@ export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
   fs.renameSync(tmpPath, filePath);
 }
 
+// Absent is a first run. A file that exists but cannot be read or parsed is
+// never overwritten: the pass fails and the daemon retries. Our own writes are
+// temp file + rename, so they never leave a partial document behind.
 function readPublishedUsage(filePath) {
+  let raw;
   try {
-    const document = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    if (document && typeof document === 'object' && !Array.isArray(document)) return document;
-  } catch { /* first run or unreadable: start empty */ }
-  return {};
+    raw = fs.readFileSync(filePath, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT') return {};
+    throw new Error(`cannot read ${filePath}: ${err?.code || 'read error'}`);
+  }
+  let document = null;
+  try { document = JSON.parse(raw); } catch { /* reported below */ }
+  if (!document || typeof document !== 'object' || Array.isArray(document)) {
+    throw new Error(`cannot parse ${filePath}: EPARSE`);
+  }
+  return document;
+}
+
+// The profile list names the extra Claude accounts. Neither file existing is a
+// host with none; a file that exists but cannot be read leaves them unknown.
+function readInventory(zylosDir) {
+  for (const file of [path.join(zylosDir, 'instances.json'), path.join(zylosDir, '.zylos', 'runtime-profiles.json')]) {
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+      return { ok: false, error: `${file}: ${err?.code || 'read error'}` };
+    }
+    try {
+      const document = JSON.parse(raw);
+      if (document && typeof document === 'object' && !Array.isArray(document)) return { ok: true, document };
+    } catch { /* reported below */ }
+    return { ok: false, error: `${file}: EPARSE` };
+  }
+  return { ok: true, document: undefined };
+}
+
+const LOCK_WAIT_MS = 300_000;
+const LOCK_EMPTY_STALE_MS = 5_000;
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+/**
+ * One pass at a time per usage file, daemon and one-shot alike. The lock file
+ * holds the holder's pid; a dead holder (e.g. a daemon pm2-stopped mid-pass)
+ * or an empty/unreadable lock older than a few seconds is taken over.
+ */
+async function acquireUsageLock(filePath, { sleepImpl, nowMsImpl, isPidAliveImpl }) {
+  const lockPath = `${filePath}.lock`;
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+  const deadline = nowMsImpl() + LOCK_WAIT_MS;
+  while (true) {
+    try {
+      fs.writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
+      return lockPath;
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw err;
+    }
+    let seen = null;
+    let holder = null;
+    try {
+      seen = fs.statSync(lockPath);
+      holder = Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
+    } catch (err) {
+      if (err?.code === 'ENOENT') continue;
+    }
+    const known = Number.isInteger(holder) && holder > 0;
+    const abandoned = known ? !isPidAliveImpl(holder)
+      : seen !== null && nowMsImpl() - seen.mtimeMs > LOCK_EMPTY_STALE_MS;
+    if (abandoned) {
+      // Unlink only the lock judged abandoned, never one created since.
+      try {
+        if (fs.statSync(lockPath).ino === seen.ino) fs.unlinkSync(lockPath);
+      } catch (err) {
+        if (err?.code !== 'ENOENT') throw err;
+      }
+      continue;
+    }
+    if (nowMsImpl() >= deadline) {
+      throw new Error(`${lockPath} held by pid ${known ? holder : 'unknown'} for over ${LOCK_WAIT_MS / 1000} s`);
+    }
+    await sleepImpl(1000);
+  }
+}
+
+function releaseUsageLock(lockPath) {
+  try {
+    if (Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10) === process.pid) fs.unlinkSync(lockPath);
+  } catch { /* already gone */ }
 }
 
 /**
@@ -335,9 +427,29 @@ function readPublishedUsage(filePath) {
  * be written back from memory over another writer's newer one. `updated_at`
  * is the time of the write, never the age of any entry. quota_recovery is
  * refreshed once, at the end, and the final write drops providers this pass
- * did not probe (only this updater writes provider entries).
+ * did not probe (only this updater writes provider entries) when the profile
+ * list was read; if it could not be, nothing is pruned.
+ *
+ * The whole pass holds provider-usage.json.lock, so passes never overlap: a
+ * slower pass cannot write an older entry over a newer one or prune an account
+ * a newer pass just added, and the shared .tmp name has one writer.
  */
 export async function runProviderUsageOnce({
+  filePath = PROVIDER_USAGE_FILE,
+  sleepImpl = sleep,
+  nowMsImpl = Date.now,
+  isPidAliveImpl = pidAlive,
+  ...options
+} = {}) {
+  const lockPath = await acquireUsageLock(filePath, { sleepImpl, nowMsImpl, isPidAliveImpl });
+  try {
+    return await providerUsagePass({ ...options, filePath });
+  } finally {
+    releaseUsageLock(lockPath);
+  }
+}
+
+async function providerUsagePass({
   execFileSyncImpl = execFileSync,
   filePath = PROVIDER_USAGE_FILE,
   fetchClaudeNativeUsageImpl = fetchClaudeNativeUsage,
@@ -350,13 +462,14 @@ export async function runProviderUsageOnce({
   log = console.log,
 } = {}) {
   const codexbarBin = resolveCodexBarBin();
+  readPublishedUsage(filePath); // an unreadable file fails the pass before any probe
   const probed = new Set();
   const publish = (entries, final = null) => {
     const onDisk = readPublishedUsage(filePath);
     let providers = { ...(onDisk.providers && typeof onDisk.providers === 'object' ? onDisk.providers : {}), ...entries };
-    if (final) providers = Object.fromEntries(Object.entries(providers).filter(([provider]) => probed.has(provider)));
+    if (final?.prune) providers = Object.fromEntries(Object.entries(providers).filter(([provider]) => probed.has(provider)));
     const payload = { ...onDisk, updated_at: nowImpl(), source_bin: codexbarBin,
-      ...(final ? { quota_recovery: final.quotaRecovery } : {}), providers };
+      ...(final && 'quotaRecovery' in final ? { quota_recovery: final.quotaRecovery } : {}), providers };
     writeProviderUsage(payload, filePath);
     return payload;
   };
@@ -400,10 +513,15 @@ export async function runProviderUsageOnce({
   }
   observe('codex', codex);
 
-  let document;
-  for (const file of [path.join(zylosDir, 'instances.json'), path.join(zylosDir, '.zylos', 'runtime-profiles.json')]) {
-    try { document = JSON.parse(fs.readFileSync(file, 'utf8')); break; } catch { /* next supported layout */ }
+  const inventory = readInventory(zylosDir);
+  if (!inventory.ok) {
+    // Which accounts exist is unknown: probe none, prune none, and keep the
+    // published recovery proofs (they cannot be refreshed without the holds).
+    const payload = publish({}, {});
+    log(`[update-provider-usage] Written ${filePath} without pruning; profile list unreadable (${inventory.error})`);
+    return payload;
   }
+  const { document } = inventory;
   for (const [provider, settingsFile] of extraClaudeAccounts(document)) {
     observe(provider, fetchClaudeAccountUsageImpl(provider, settingsFile,
       { execFileSyncImpl, codexbarBin, now: nowImpl() }));
@@ -412,7 +530,7 @@ export async function runProviderUsageOnce({
   const quotaRecovery = await refreshQuotaRecoveryProofsImpl({ zylosDir, document });
   // The final write drops accounts no longer configured, so a removed
   // profile's last reading cannot outlive it.
-  const payload = publish({}, { quotaRecovery });
+  const payload = publish({}, { quotaRecovery, prune: true });
   log(`[update-provider-usage] Written ${filePath}`);
   return payload;
 }
