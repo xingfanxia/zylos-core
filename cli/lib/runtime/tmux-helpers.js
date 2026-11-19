@@ -160,9 +160,17 @@ function lastRow(paneId, execFileSyncImpl) {
  * @returns {Promise<{ ok: boolean, reason: string, pane?: { id: string, pid: number, command: string } }>}
  */
 export async function tmuxPaneAtShellPrompt(session, { execFileSyncImpl = execFileSync, buildTree = buildProcessTree,
-  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), settleMs = PROMPT_SETTLE_MS } = {}) {
-  const first = readPane(session, execFileSyncImpl);
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), settleMs = PROMPT_SETTLE_MS, pinWindow = null } = {}) {
+  let first = readPane(session, execFileSyncImpl);
   if (!first) return { ok: false, reason: 'pane unreadable' };
+  // The window of the pane resolved here, and of no other, gets the agent
+  // size (tmuxPinAgentWindow by this pane's id). When it was resized the pane
+  // is read again by its id; the checks below then decide as before, and the
+  // two reads PROMPT_SETTLE_MS apart refuse a pane still redrawing.
+  if (pinWindow && pinWindow(first.id)) {
+    first = readPane(first.id, execFileSyncImpl);
+    if (!first) return { ok: false, reason: 'pane unreadable' };
+  }
   if (first.dead) return { ok: false, reason: 'pane is dead' };
   if (!SHELL_NAMES.has(first.command)) return { ok: false, reason: `foreground is ${first.command.slice(0, 32)}, not a shell` };
   const tree = buildTree();
@@ -357,40 +365,41 @@ export function tmuxNewSession(args) {
 }
 
 /**
- * Keep a session's window at AGENT_WINDOW or larger before anything is typed
- * into it: the session's active window (the one a session target resolves
- * to) is read and resized by its window id, to at least AGENT_WINDOW in each
- * dimension; a larger window is never shrunk. `resize-window` also sets that
- * window's `window-size` to manual, so a client attached later does not
- * resize it: with the default `latest`, an 80x24 client shrank a 200x60
- * window to 80x23 and it stayed so after the client detached. An attached
- * client smaller than the window sees part of it. When the size cannot be
- * read nothing is resized (logged).
- * @param {string} session
- * @returns {boolean} whether the window size changed (the pane redraws)
+ * Keep the window of `target` (a pane id, or a session: its current window)
+ * at AGENT_WINDOW or larger: that window is measured and resized by its own
+ * window id, to at least AGENT_WINDOW in each dimension; a larger window is
+ * never shrunk. `resize-window` also sets that window's `window-size` to
+ * manual, so a client attached later does not resize it: with the default
+ * `latest`, an 80x24 client shrank a 200x60 window to 80x23 and it stayed so
+ * after the client detached. An attached client smaller than the window sees
+ * part of it. When the size cannot be read, or the resize fails, nothing
+ * changes (logged) and the caller goes on as without it.
+ * @param {string} target
+ * @returns {boolean} whether the window size changed (its panes redraw)
  */
-export function tmuxPinAgentWindow(session, { execFileSyncImpl = execFileSync } = {}) {
-  let active = null;
+export function tmuxPinAgentWindow(target, { execFileSyncImpl = execFileSync } = {}) {
+  let win = null;
   try {
-    const out = String(execFileSyncImpl('tmux', ['list-windows', '-t', session, '-F', '#{window_active} #{window_id} #{window_width} #{window_height}'],
+    const out = String(execFileSyncImpl('tmux', ['list-panes', '-t', target, '-F', '#{window_id} #{window_width} #{window_height}'],
       { encoding: 'utf8', timeout: CMD_TIMEOUT, stdio: ['ignore', 'pipe', 'ignore'] }));
-    const m = out.split('\n').map((line) => /^1 (@\d+) (\d+) (\d+)$/.exec(line.trim())).find(Boolean);
-    if (m) active = { id: m[1], width: Number(m[2]), height: Number(m[3]) };
+    const m = /^(@\d+) (\d+) (\d+)$/.exec(out.split('\n')[0].trim());
+    if (m) win = { id: m[1], width: Number(m[2]), height: Number(m[3]) };
   } catch { /* unreadable: nothing resized */ }
-  if (!active) {
-    process.stderr.write(`[tmux-helpers] could not read the active window of ${session}; its size is left as it is\n`);
+  if (!win) {
+    process.stderr.write(`[tmux-helpers] could not read the window of ${target}; its size is left as it is\n`);
     return false;
   }
-  const width = Math.max(active.width, AGENT_WINDOW.width);
-  const height = Math.max(active.height, AGENT_WINDOW.height);
+  const width = Math.max(win.width, AGENT_WINDOW.width);
+  const height = Math.max(win.height, AGENT_WINDOW.height);
   try {
-    execFileSyncImpl('tmux', ['resize-window', '-t', active.id, '-x', String(width), '-y', String(height)],
+    // Also when the size is already right: it sets window-size manual.
+    execFileSyncImpl('tmux', ['resize-window', '-t', win.id, '-x', String(width), '-y', String(height)],
       { timeout: CMD_TIMEOUT, stdio: 'ignore' });
   } catch (err) {
-    process.stderr.write(`[tmux-helpers] could not keep ${session} at ${AGENT_WINDOW.width}x${AGENT_WINDOW.height}: ${err.message}\n`);
+    process.stderr.write(`[tmux-helpers] could not keep ${target} at ${AGENT_WINDOW.width}x${AGENT_WINDOW.height}: ${err.message}\n`);
     return false;
   }
-  return width !== active.width || height !== active.height;
+  return width !== win.width || height !== win.height;
 }
 
 /**

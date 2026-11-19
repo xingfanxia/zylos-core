@@ -1048,12 +1048,13 @@ for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => Cod
 for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => CodexAdapter]]) {
   describe(`${label} launch — the agent window size`, () => {
     const tmuxCalls = (name) => calls.execFileSync.filter((c) => c.file === 'tmux' && c.args[0] === name);
-    const windows = (listing) => { tmuxHook = (args) => (args[0] === 'list-windows' ? listing : undefined); };
+    const order = () => calls.execFileSync.filter((c) => c.file === 'tmux').map((c) => c.args[0]);
+    const windowOf = (sizes) => { tmuxHook = (args) => (args[0] === 'list-panes' && args[2] in sizes ? `${sizes[args[2]]}\n` : undefined); };
 
     it(`${label}: a new session is created at 200x60 and its window pinned there by its id`, async () => {
       try {
         tmuxSessionExists = false;
-        windows('1 @4 200 60\n');
+        tmuxHook = (args) => (args[0] === 'list-panes' ? '@4 200 60\n' : undefined);
         await makeAdapter(Cls()).launch({ bypassPermissions: false });
         const tmux = findTmuxNewSession();
         const at = tmux.args.indexOf('-x');
@@ -1066,40 +1067,42 @@ for (const [label, Cls] of [['Claude', () => ClaudeAdapter], ['Codex', () => Cod
       }
     });
 
-    it(`${label}: a retained session's active window is measured and resized by its id before anything is typed; a larger one keeps its size`, async () => {
-      // The first window 80x24, the active one larger (the reviewer's case),
-      // and the reverse.
-      for (const [listing, expected] of [
-        ['0 @1 80 24\n1 @3 250 70\n', ['resize-window', '-t', '@3', '-x', '250', '-y', '70']],
-        ['0 @1 250 70\n1 @3 80 24\n', ['resize-window', '-t', '@3', '-x', '200', '-y', '60']],
+    it(`${label}: a retained session: the pane resolved for the prompt check is the one whose window is resized, then checked and typed into; a larger one keeps its size`, async () => {
+      // IDLE_PROBE resolves the session to pane %7.
+      for (const [size, expected, reread] of [
+        ['@3 80 24', ['resize-window', '-t', '@3', '-x', '200', '-y', '60'], true],
+        ['@3 250 70', ['resize-window', '-t', '@3', '-x', '250', '-y', '70'], false],
       ]) {
         try {
           tmuxSessionExists = true;
-          windows(listing);
+          windowOf({ '%7': size });
           calls.execFileSync.length = 0;
-          let typedAt = -1;
+          let typedInto = null;
           const adapter = makeAdapter(Cls());
-          adapter.sendMessage = async () => { typedAt = calls.execFileSync.length; };
+          adapter.sendMessage = async (text, opts) => { typedInto = opts?.pane?.id; };
           await adapter.launch({ bypassPermissions: false });
-          const [resize] = tmuxCalls('resize-window');
-          assert.deepEqual(resize?.args, expected, listing);
-          const at = calls.execFileSync.indexOf(resize);
-          assert.ok(typedAt > at, 'resized before typing');
-          assert.ok(at < calls.execFileSync.findIndex((c) => c.file === 'tmux' && c.args[0] === 'display-message'),
-            'before the shell prompt check reads the pane');
+          assert.deepEqual(tmuxCalls('list-panes').map((c) => c.args.slice(0, 3)), [['list-panes', '-t', '%7']], 'measured by the resolved pane id');
+          assert.deepEqual(tmuxCalls('resize-window').map((c) => c.args), [expected], size);
+          const seq = order().filter((name) => ['display-message', 'list-panes', 'resize-window', 'capture-pane'].includes(name));
+          const firstRead = seq.indexOf('display-message');
+          assert.deepEqual(seq.slice(firstRead, firstRead + 3), ['display-message', 'list-panes', 'resize-window'], 'resolved, then that window resized');
+          assert.equal(seq[firstRead + 3], reread ? 'display-message' : 'capture-pane', reread ? 'read again by id after a resize' : 'no resize, no extra read');
+          assert.equal(typedInto, '%7');
         } finally {
           tmuxHook = null;
         }
       }
     });
 
-    it(`${label}: an unreadable window size resizes nothing`, async () => {
+    it(`${label}: an unreadable window size resizes nothing and the launch goes on as before`, async () => {
       tmuxSessionExists = true;
       calls.execFileSync.length = 0;
+      let typed = false;
       const adapter = makeAdapter(Cls());
-      adapter.sendMessage = async () => {};
+      adapter.sendMessage = async () => { typed = true; };
       await adapter.launch({ bypassPermissions: false });
       assert.deepEqual(tmuxCalls('resize-window'), []);
+      assert.equal(typed, true);
     });
   });
 }

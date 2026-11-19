@@ -42,7 +42,6 @@ import {
   tmuxSendKeys,
   tmuxNewSession,
   tmuxPinAgentWindow,
-  PROMPT_SETTLE_MS,
   getProcessName,
   hasChildProcess,
   requirePaneAtShellPrompt,
@@ -457,10 +456,9 @@ export class CodexAdapter extends RuntimeAdapter {
       // by its pane id; otherwise nothing is typed and the launch fails
       // (requirePaneAtShellPrompt, tmuxPasteToVerifiedPane). The failover
       // chain can relaunch any persona on Codex in its tmux session.
-      // The window gets the agent size before anything is typed; a resize
-      // redraws the pane, so the prompt check waits for it to settle.
-      if (tmuxPinAgentWindow(SESSION)) await new Promise((resolve) => setTimeout(resolve, PROMPT_SETTLE_MS));
-      const pane = await requirePaneAtShellPrompt(SESSION);
+      // The window of the very pane resolved for this check gets the agent
+      // size before it is checked and typed into (tmuxPinAgentWindow).
+      const pane = await requirePaneAtShellPrompt(SESSION, { pinWindow: (paneId) => tmuxPinAgentWindow(paneId) });
       await this.sendMessage(cmd, { pane });
     } else {
       // New session — launcher pipeline

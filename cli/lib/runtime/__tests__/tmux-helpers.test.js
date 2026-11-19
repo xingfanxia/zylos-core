@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it, mock } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 
 // We test the module's behavior by importing it and verifying that
 // the functions handle various child_process outcomes correctly.
@@ -359,6 +360,53 @@ describe('tmuxPinAgentWindow (private tmux server)', () => {
       assert.equal(tmuxPinAgentWindow('pin', { execFileSyncImpl: viaSocket }), true);
       assert.equal(size('pin:0'), '200x60');
       assert.equal(size(big), '250x70');
+    } finally {
+      try { tmux('kill-server'); } catch { /* already gone */ }
+    }
+  });
+});
+
+// PASTE-STRAND-1 review (ii) 3: during a retained relaunch the focus moves
+// from window A to window B 150 ms into the launch. The deployed check and
+// the pinned one verify, and would type into, the same pane: the one the
+// launch resolved first (A); the resize goes to that pane's window only.
+describe('requirePaneAtShellPrompt with the pin (private tmux server, focus change during launch)', () => {
+  const socket = `focus-${process.pid}`;
+  const tmux = (...args) => execFileSync('tmux', ['-L', socket, '-f', '/dev/null', ...args], { encoding: 'utf8' });
+  const viaSocket = (file, args, opts) => execFileSync(file, file === 'tmux' ? ['-L', socket, ...args] : args, opts);
+  const size = (target) => tmux('display-message', '-p', '-t', target, '#{window_width}x#{window_height}').trim();
+  let available = true;
+  try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); } catch { available = false; }
+  const shell = `env -i PATH=${process.env.PATH} HOME=${os.tmpdir()} TERM=xterm PS1='$ ' bash --norc --noprofile -i`;
+
+  it('the deployed check and the pinned check both settle on window A\'s pane, never B', { skip: !available }, async () => {
+    const { requirePaneAtShellPrompt, tmuxPinAgentWindow } = await import('../tmux-helpers.js');
+    const run = async (pin) => {
+      try { tmux('kill-server'); } catch { /* none */ }
+      tmux('new-session', '-d', '-s', 'launch', '-x', '80', '-y', '24', shell);
+      const paneA = tmux('display-message', '-p', '-t', 'launch', '#{pane_id}').trim();
+      const paneB = tmux('new-window', '-d', '-P', '-F', '#{pane_id}', '-t', 'launch', shell).trim();
+      await new Promise((resolve) => setTimeout(resolve, 600)); // both prompts drawn
+      const focus = setTimeout(() => tmux('select-window', '-t', paneB), 150);
+      let result;
+      try {
+        const pane = await requirePaneAtShellPrompt('launch', { execFileSyncImpl: viaSocket,
+          ...(pin ? { pinWindow: (id) => tmuxPinAgentWindow(id, { execFileSyncImpl: viaSocket }) } : {}) });
+        result = { ok: true, id: pane.id };
+      } catch (err) {
+        result = { ok: false, reason: err.message };
+      }
+      clearTimeout(focus);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { result, paneA, paneB, sizeA: size(paneA), sizeB: size(paneB) };
+    };
+    try {
+      const deployed = await run(false);
+      assert.deepEqual(deployed.result, { ok: true, id: deployed.paneA }, JSON.stringify(deployed));
+      const pinned = await run(true);
+      assert.deepEqual(pinned.result, { ok: true, id: pinned.paneA }, JSON.stringify(pinned));
+      assert.equal(pinned.sizeA, '200x60', 'the resolved pane\'s window was resized');
+      assert.equal(pinned.sizeB, '80x24', 'the other window was not');
     } finally {
       try { tmux('kill-server'); } catch { /* already gone */ }
     }

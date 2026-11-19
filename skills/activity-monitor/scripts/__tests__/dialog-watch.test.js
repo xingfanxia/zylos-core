@@ -292,36 +292,35 @@ const SCROLLED = [
 const incidentFrame = readTmuxInputState({ sessionName: 's', execFileSyncImpl: () =>
   `${SCROLLED.join('\n')}\n__ZYLOS_CURSOR__ 72 21 $5 1763400000 %7 4242\n` });
 
-describe('dialog watch: an idle composer that is not empty', () => {
+describe('dialog watch: an idle composer that is not empty (advisory)', () => {
   it('the incident frame, read by the deployed reader, is not empty', () => {
     assert.equal(incidentFrame.modal, null);
     assert.equal(incidentFrame.inputState, 'indeterminate');
   });
 
-  it('the incident frame with nothing pending: delivery_stuck after a minute and one alert with what a person does', async () => {
+  it('the incident frame with nothing pending: one alert after a minute with what a person does; no stuck status', async () => {
     const h = harness();
     h.failed = 0;
     await h.run(59 * SEC, { modal: null, composer: incidentFrame.inputState });
-    assert.equal(h.watch.deliveryStuck(), null, 'not within the first minute');
-    assert.deepEqual(h.alerts, []);
+    assert.deepEqual(h.alerts, [], 'not within the first minute');
     await h.run(90 * SEC, { modal: null, composer: incidentFrame.inputState });
-    assert.deepEqual(h.watch.deliveryStuck(), { cause: 'composer:indeterminate', pending: 0, oldest_age_seconds: 0 });
     assert.equal(h.alerts.length, 1);
+    assert.equal(h.watch.deliveryStuck(), null, 'advisory: never delivery_stuck');
     assert.match(h.alerts[0], /^🔴 pan 的输入框 1 分钟没有清空（画面无法识别（例如窗口太小，输入框被卷动）），会话空闲，屏幕上没有对话框/);
-    assert.match(h.alerts[0], /不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。这段时间到达、目前标记为失败的消息有 0 条/);
+    assert.match(h.alerts[0], /不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。2026-11-18 04:15:35 UTC 之后到达、目前标记为失败的发给 pan 的消息：0 条/);
     assert.match(h.alerts[0], /至少 200x60/);
     assert.match(h.alerts[0], /清空输入框（按两次 Esc），不要按回车/);
     assert.match(h.alerts[0], /重新投递 2026-11-18 04:15:35 UTC 之后到达、目前标记为失败的消息/);
     await h.run(10 * MIN, { modal: null, composer: 'has_content' });
     assert.equal(h.alerts.length, 1, 'one alert per episode');
-    assert.equal(h.watch.deliveryStuck().cause, 'composer:has_content');
   });
 
-  it('the alert counts the inbound rows of that persona that failed since the episode began (from a minute earlier)', async () => {
+  it('the count is printed beside its cutoff, a minute before the episode began, and the step uses the same time', async () => {
     const asked = [];
     const h = harness({ countFailedSince: (sec) => { asked.push(sec); return 3; } });
     await h.run(61 * SEC, { modal: null, composer: 'has_content' });
-    assert.match(h.alerts[0], /这段时间到达、目前标记为失败的消息有 3 条（发给 pan/);
+    assert.match(h.alerts[0], /2026-11-18 04:15:35 UTC 之后到达、目前标记为失败的发给 pan 的消息：3 条/);
+    assert.match(h.alerts[0], /重新投递 2026-11-18 04:15:35 UTC 之后到达/);
     assert.deepEqual(asked, [Math.floor((T0 - MIN) / SEC)]);
   });
 
@@ -335,7 +334,34 @@ describe('dialog watch: an idle composer that is not empty', () => {
     await h.run(16 * MIN, { modal: null, composer: 'has_content' });
     const composerAlerts = h.alerts.filter((a) => /的输入框/.test(a));
     assert.equal(composerAlerts.length, 2, 'one per composer episode, independent of the backlog episode');
-    assert.doesNotMatch(composerAlerts[0], /目前标记为失败的消息有/);
+    assert.doesNotMatch(composerAlerts[0], /目前标记为失败的发给/);
+  });
+
+  it('the reviewer\'s schedule: 70 busy seconds then one idle tick does not alert; 60 idle ticks after it do', async () => {
+    const h = harness();
+    await h.run(70 * SEC, { modal: null, composer: 'has_content', sessionState: 'busy' });
+    await h.run(71 * SEC, { modal: null, composer: 'has_content' });
+    assert.deepEqual(h.alerts, [], 'the busy minute is not counted');
+    await h.run(130 * SEC, { modal: null, composer: 'has_content' });
+    assert.deepEqual(h.alerts, []);
+    await h.run(132 * SEC, { modal: null, composer: 'has_content' });
+    assert.equal(h.alerts.length, 1);
+  });
+
+  it('the reviewer\'s schedule: one occupied frame then 60 s of failed captures does not alert; any reset tick starts the minute over', async () => {
+    const h = harness();
+    await h.run(0, { modal: null, composer: 'has_content' });
+    await h.run(70 * SEC, { modal: null, composer: null, captureOk: false });
+    assert.deepEqual(h.alerts, [], 'no alert from a stale observation');
+    await h.run(71 * SEC, { modal: null, composer: 'has_content' });
+    assert.deepEqual(h.alerts, [], 'a new episode starts at the first valid frame');
+    for (const reset of [{ captureOk: false, composer: null }, { modal: UNKNOWN, composer: 'indeterminate' }, { composer: 'empty' }, { sessionState: 'busy' }]) {
+      const r = harness();
+      await r.run(40 * SEC, { modal: null, composer: 'has_content' });
+      await r.run(41 * SEC, { modal: null, composer: 'has_content', ...reset });
+      await r.run(95 * SEC, { modal: null, composer: 'has_content' });
+      assert.deepEqual(r.alerts.filter((a) => /的输入框/.test(a)), [], JSON.stringify(reset));
+    }
   });
 
   it('no alert for a dialog, a busy session, or a composer that empties within the minute', async () => {
@@ -348,7 +374,6 @@ describe('dialog watch: an idle composer that is not empty', () => {
       await typing.run((i * 50 + 45) * SEC, { modal: null, composer: 'has_content' });
       await typing.run((i * 50 + 50) * SEC, { modal: null, composer: 'empty' });
     }
-    for (const h of [dialog, busy, typing]) assert.equal(h.watch.deliveryStuck(), null);
     assert.deepEqual([...dialog.alerts.filter((a) => /的输入框/.test(a)), ...busy.alerts, ...typing.alerts], []);
   });
 });
