@@ -36,6 +36,7 @@ import {
   bindControlSession,
   supersedeControl,
   recordUncertainDelivery,
+  isOpenDelivery,
   stripTrailingAckSuffix,
   startDialogSchemaCheck,
   publishCapabilities,
@@ -393,7 +394,9 @@ export function runtimeForSession(session = TMUX_SESSION) {
 
 function deliveryInputState(session, runtime, execFileSyncImpl = execFileSync) {
   const state = readTmuxInputState({ sessionName: session, execFileSyncImpl, detectModals: runtime === 'claude' });
-  if (runtime === 'claude' && state.inputState === 'has_content') {
+  // A scrolled composer (prompt row off screen) has no first row to inspect:
+  // the fallback would read whatever row follows an earlier rule as the box.
+  if (runtime === 'claude' && state.inputState === 'has_content' && !state.composerScrolled) {
     const fallback = checkClaudeFallbackInputBox(state.capture);
     if (fallback !== 'indeterminate') return { ...state, inputState: fallback };
   }
@@ -521,6 +524,10 @@ export function getCursorY(session = TMUX_SESSION) {
 
 // A failed observation leaves ownership with the same delivery. Its retry
 // resumes verification/Enter, never pastes a second copy into the composer.
+// While a paste is retained, every delivery to that session settles it first
+// (sendToTmux): its text on screen is submitted (Enter, verify), whichever row
+// is being delivered; text that left the composer without this dispatcher's
+// Enter is pasted again only on proof that nothing of it was submitted.
 const pendingSubmissions = new Map();
 // Receipts exist only for reconciled/retired ambiguous deliveries, keyed by C4
 // row identity. A later retry cannot replay their old payload into a new pane.
@@ -534,6 +541,45 @@ const LIMIT_AFTER_SUBMIT_WINDOW_MS = 30_000;
 
 function isLimitModal(modal) {
   return !!modal && (modal.kind === 'fable_limit' || modal.kind === 'credits_offer');
+}
+
+// A retained paste that is not in the composer, whose Enter never went out,
+// is pasted again only once it is at least this old: bracketed paste is
+// asynchronous, and a younger one may still be on its way into the composer.
+export const RETAINED_PASTE_STALE_MS = 60_000;
+
+// Log lines name a delivery by its row id, never by its text.
+const idLabel = (id) => (/^(conversation|control):\d+$/.test(String(id)) ? id : 'an unnamed delivery');
+
+// A retained paste is submitted for its row only while that row is still to
+// be delivered (c4-db isOpenDelivery). An id that names no row, or a failed
+// read, counts as open: the stricter rule for text that left the composer
+// (promptTakenSince) then applies.
+function openDelivery(deliveryId) {
+  if (!/^(conversation|control):\d+$/.test(String(deliveryId))) return true;
+  try { return isOpenDelivery(deliveryId); } catch { return true; }
+}
+
+/**
+ * Whether the session took a prompt since `sinceMs`, from the activity
+ * monitor's status of that session (agent-status.json, written every second):
+ *   'no'      - fresh, `idle`, and idle since no later than one second after
+ *               `sinceMs` (last_check - idle_seconds, whole seconds);
+ *   'yes'     - fresh, `idle`, but idle only since later: a prompt submitted
+ *               by anyone (a person's Enter, a hand-queued key) makes the
+ *               session busy for at least the monitor's idle threshold (3 s);
+ *   'unknown' - stale or unreadable, or busy now.
+ * @returns {'no'|'yes'|'unknown'}
+ */
+export function promptTakenSince(sinceMs, statusFile = AGENT_STATUS_FILE, nowMs = Date.now()) {
+  try {
+    if (nowMs - statSync(statusFile).mtimeMs > STALE_STATUS_THRESHOLD) return 'unknown';
+    const status = readJsonFileWithRetry(statusFile);
+    if (status.state !== 'idle' || !Number.isFinite(status.last_check) || !Number.isFinite(status.idle_seconds)) return 'unknown';
+    return (status.last_check - status.idle_seconds) * 1000 <= sinceMs + 1000 ? 'no' : 'yes';
+  } catch {
+    return 'unknown';
+  }
 }
 
 /**
@@ -568,6 +614,17 @@ function wasReplaced(pending, state) {
 
 function replacementResult(pending) {
   return { verified: !!(pending.shutdown && pending.observed && pending.enterSent), state: 'replaced' };
+}
+
+// Whether text retained for a pane that has since been replaced is pasted
+// afresh into the replacement: only when no Enter from here went out for it,
+// and it was either held back by a modal or seen in the composer (so the
+// runtime had not taken it on arrival), and it does not end a session (a
+// replacement after /exit is that control's own effect). A paste that was
+// never seen may have been taken by the runtime itself (Codex's paste-burst
+// handling): such a row keeps its 'verify_failed' receipt and is not replayed.
+function freshInReplacement(pending) {
+  return !pending.enterSent && (pending.modalDeferred || (pending.observed && !pending.shutdown));
 }
 
 // The read that decides an Enter is the last tmux call before it: no await and
@@ -616,8 +673,10 @@ export async function submitAndVerify(session, {
     if (wasReplaced(pending, state)) return replacementResult(pending);
     if (state.modal) return deferred();
     if (!enterAllowed(pending, state)) return unbound();
-    enter(state);
+    // Recorded before the send: a send that throws (a timeout) may still have
+    // delivered the key, so `enterSent` false proves that no Enter went out.
     pending.enterSent = true;
+    enter(state);
   }
   for (let attempt = 0; attempt < ENTER_VERIFY_MAX_RETRIES; attempt++) {
     await sleepImpl(ENTER_VERIFY_WAIT_MS);
@@ -640,6 +699,16 @@ export async function submitAndVerify(session, {
   return { verified: false, state: 'indeterminate' };
 }
 
+/**
+ * Paste one message into a session's composer and submit it (observe, Enter,
+ * verify). Results: 'submitted'; 'uncertain' (a limit dialog right after its
+ * Enter: recorded, never replayed); 'modal_deferred' (a modal owns the
+ * keyboard); 'session_replaced' (a bound row's pane is gone); 'held' (not
+ * now: the composer is not free, or a paste cannot be verified yet; waiting
+ * can change it, so no retry is consumed and the row stays pending);
+ * 'verify_failed' (only from a receipt: a submission whose outcome cannot be
+ * known, so it is never pasted again).
+ */
 async function sendToTmux(message, options = {}) {
   const session = options.session || TMUX_SESSION;
   const runtime = options.runtime || runtimeForSession(session);
@@ -651,9 +720,12 @@ async function sendToTmux(message, options = {}) {
   const statusFile = options.statusFile || AGENT_STATUS_FILE;
   const onUncertain = options.onUncertain || recordUncertainSubmission;
   const recent = options.recentSubmissions || recentSubmissions;
+  const isOpen = options.isOpenDelivery || openDelivery;
   const sanitized = sanitizeMessage(message);
   const deliveryId = options.deliveryId || sanitized;
-  const receiptKey = `${session}\0${deliveryId}`;
+  const keyOf = (id) => `${session}\0${id}`;
+  const receiptKey = keyOf(deliveryId);
+  const held = (why) => { log(`Held ${idLabel(deliveryId)}: ${why}`); return 'held'; };
   if (receipts.has(receiptKey)) return receipts.get(receiptKey);
   let pending = submissions.get(session);
   let initial = readState();
@@ -664,16 +736,14 @@ async function sendToTmux(message, options = {}) {
       && initial.paneIdentity !== options.boundSessionRef) {
     return 'session_replaced';
   }
-  if (options.boundSessionRef && !initial.paneIdentity) return 'verify_failed';
-  if (pending && wasReplaced(pending, initial) && pending.modalDeferred && !pending.enterSent) {
-    // The old pane never got Enter for this text (a modal held it back), so it
-    // cannot have run there; the replacement pane receives a fresh paste.
+  if (options.boundSessionRef && !initial.paneIdentity) return held('its bound pane could not be read');
+  if (pending && wasReplaced(pending, initial) && freshInReplacement(pending)) {
     submissions.delete(session);
     pending = null;
   }
   if (pending && wasReplaced(pending, initial)) {
     const consumed = replacementResult(pending).verified;
-    receipts.set(`${session}\0${pending.deliveryId}`, consumed ? 'submitted' : 'verify_failed');
+    receipts.set(keyOf(pending.deliveryId), consumed ? 'submitted' : 'verify_failed');
     submissions.delete(session);
     pending = null;
     if (receipts.has(receiptKey)) return receipts.get(receiptKey);
@@ -682,7 +752,7 @@ async function sendToTmux(message, options = {}) {
   // uncertain (record it, never replay it). Covers a still-unverified
   // submission and one verified moments before the dialog was drawn.
   const settleUncertain = (info) => {
-    receipts.set(`${session}\0${info.deliveryId}`, 'uncertain');
+    receipts.set(keyOf(info.deliveryId), 'uncertain');
     onUncertain({ ...info, session });
   };
   if (isLimitModal(initial.modal)) {
@@ -718,21 +788,119 @@ async function sendToTmux(message, options = {}) {
     }
     initial = confirmed;
   }
+  // How a submission ended, for the row it belongs to (`p`), with its
+  // bookkeeping. 'held' keeps the paste retained for the next attempt.
+  const conclude = (p, result) => {
+    if (result.verified) {
+      submissions.delete(session);
+      if (result.state === 'replaced') receipts.set(keyOf(p.deliveryId), 'submitted');
+      else recent.set(session, { deliveryId: p.deliveryId, paneIdentity: p.paneIdentity, at: Date.now() });
+      return 'submitted';
+    }
+    if (result.state === 'uncertain') {
+      submissions.delete(session);
+      recent.delete(session);
+      settleUncertain({ deliveryId: p.deliveryId, kind: result.modal.kind, sessionRef: result.paneIdentity, delivered: false });
+      return 'uncertain';
+    }
+    if (result.state === 'modal') return 'modal_deferred';
+    if (result.state === 'replaced' && freshInReplacement(p)) {
+      submissions.delete(session);
+      return p.modalDeferred ? 'modal_deferred' : 'held';
+    }
+    if (result.state === 'replaced') {
+      submissions.delete(session);
+      receipts.set(keyOf(p.deliveryId), 'verify_failed');
+      return 'verify_failed';
+    }
+    // /exit intentionally removes the UI after its observed submit. Every other
+    // control needs the same submission proof as a conversation; process liveness
+    // alone cannot establish that a pasted message reached the model.
+    if (p.observed && p.enterSent && p.shutdown) {
+      const proc = readProcState(statusFile);
+      const state = getAgentState(statusFile);
+      if (proc?.alive === false || state.state === 'offline' || state.state === 'stopped') {
+        submissions.delete(session);
+        receipts.set(keyOf(p.deliveryId), 'submitted');
+        return 'submitted';
+      }
+    }
+    log(`Submission of ${idLabel(p.deliveryId)} remains unverified (state=${result.state}); retaining pasted input; held`);
+    return 'held';
+  };
+  const submit = async (p, lastState) => {
+    let result = { verified: false, state: 'indeterminate' };
+    try { result = await submitAndVerify(session, { pending: p, readState, lastState, execFileSyncImpl: exec, sleepImpl: wait }); }
+    catch (err) { log(`Warning: Enter verification error: ${err.message}`); }
+    return conclude(p, result);
+  };
+  // A retained paste whose Enter never went out is settled first, whichever
+  // row is being delivered now (2026-11-19: user-pan, user-elaine and the
+  // scheduler failed every message behind a paste their reader could not
+  // see). Nothing is pasted over it and no key clears it.
+  if (pending && !pending.enterSent && !pending.terminal) {
+    const retained = pending;
+    if (initial.inputState === 'has_content' && !initial.usageOverlay) {
+      retained.observed = true;
+      if (retained.deliveryId !== deliveryId) {
+        // Its text is on screen: submit it (Enter, verify) for its own row,
+        // which then takes the receipt; this row waits for its next attempt.
+        // Never for a row that is no longer to be delivered.
+        if (!isOpen(retained.deliveryId)) return held(`the composer holds the text of ${idLabel(retained.deliveryId)}, which is closed; not submitted`);
+        const outcome = await submit(retained, initial);
+        if (outcome === 'submitted') receipts.set(keyOf(retained.deliveryId), 'submitted');
+        if (outcome === 'modal_deferred') return 'modal_deferred';
+        return held(`resumed the retained paste of ${idLabel(retained.deliveryId)} first (${outcome})`);
+      }
+    } else if (initial.inputState === 'empty' && !initial.usageOverlay) {
+      // Its text left the composer without this dispatcher's Enter. Nothing
+      // of it was submitted when the session took no prompt since the paste.
+      await wait(100);
+      const confirmed = readState();
+      if (confirmed.modal) return 'modal_deferred';
+      if (confirmed.inputState !== 'empty' || confirmed.usageOverlay || confirmed.paneIdentity !== initial.paneIdentity) {
+        return held(`the composer changed while the retained paste of ${idLabel(retained.deliveryId)} was checked`);
+      }
+      if (isOpen(retained.deliveryId)) {
+        const taken = promptTakenSince(retained.pastedAt, statusFile);
+        if (taken === 'yes') {
+          receipts.set(keyOf(retained.deliveryId), 'verify_failed');
+          log(`UNCONFIRMED: ${idLabel(retained.deliveryId)} - its paste left the composer without this dispatcher's Enter and the session took a prompt since; never pasted again`);
+        } else if (taken === 'no' && Date.now() - retained.pastedAt >= RETAINED_PASTE_STALE_MS) {
+          log(`Retained paste of ${idLabel(retained.deliveryId)} left the composer unsubmitted (no Enter from here, no prompt taken since); pasted again`);
+        } else {
+          return held(`the retained paste of ${idLabel(retained.deliveryId)} is not in the composer and ${taken === 'no' ? 'is too recent to release' : 'the session status cannot show that nothing was submitted'}`);
+        }
+      }
+      submissions.delete(session);
+      pending = null;
+      initial = confirmed;
+      if (receipts.has(receiptKey)) return receipts.get(receiptKey);
+    } else {
+      return held(`the composer cannot be read (${initial.inputState}${initial.usageOverlay ? ', usage overlay' : ''}) while ${idLabel(retained.deliveryId)} is retained`);
+    }
+  }
   if (pending && pending.deliveryId !== deliveryId) {
-    // The old row may have exhausted retries or been manually submitted. Only
-    // confirmed empty input releases it; occupied text is never cleared.
-    if (initial.inputState !== 'empty' || (!pending.terminal && !(pending.observed && pending.enterSent))) return 'verify_failed';
+    // The retained row's Enter went out (or it is retired). Only confirmed
+    // empty input releases it; occupied text is never cleared.
+    if (initial.inputState !== 'empty' || (!pending.terminal && !(pending.observed && pending.enterSent))) {
+      return held(`the composer still holds the submitted text of ${idLabel(pending.deliveryId)}`);
+    }
     await wait(100);
     const confirmed = readState();
-    if (confirmed.inputState !== 'empty' || confirmed.paneIdentity !== initial.paneIdentity) return 'verify_failed';
-    receipts.set(`${session}\0${pending.deliveryId}`, pending.terminal ? 'verify_failed' : 'submitted');
+    if (confirmed.inputState !== 'empty' || confirmed.paneIdentity !== initial.paneIdentity) {
+      return held(`the composer changed while the submission of ${idLabel(pending.deliveryId)} was checked`);
+    }
+    receipts.set(keyOf(pending.deliveryId), pending.terminal ? 'verify_failed' : 'submitted');
     submissions.delete(session);
     pending = null;
     initial = confirmed;
   }
   if (pending && initial.inputState === 'has_content' && !initial.usageOverlay) pending.observed = true;
   if (!pending) {
-    if (initial.inputState !== 'empty' || initial.usageOverlay) return 'verify_failed';
+    if (initial.inputState !== 'empty' || initial.usageOverlay) {
+      return held(`the composer is not free (${initial.usageOverlay ? 'usage overlay' : initial.inputState}); nothing pasted`);
+    }
     const bufferName = `c4-msg-${process.pid}-${Date.now()}`;
     try {
       exec('tmux', ['set-buffer', '-b', bufferName, '--', sanitized], { stdio: 'pipe', timeout: 5000 });
@@ -742,62 +910,24 @@ async function sendToTmux(message, options = {}) {
       // The paste belongs to the pane `initial` was read from (see sendTarget).
       exec('tmux', ['paste-buffer', '-p', '-r', '-b', bufferName, '-t', sendTarget(initial.paneIdentity, session)],
         { stdio: 'pipe', timeout: 5000 });
-      pending = { deliveryId, message: sanitized, paneIdentity: initial.paneIdentity,
+      pending = { deliveryId, message: sanitized, paneIdentity: initial.paneIdentity, pastedAt: Date.now(),
         observed: false, enterSent: false, terminal: false,
         shutdown: options.acceptShutdownAfterSubmit || isSessionEndingControl(sanitized) };
       submissions.set(session, pending);
     } catch (err) {
+      // Nothing was retained: the next attempt reads the pane again.
       log(`Error pasting to tmux: ${err.message}`);
       logDeliveryFailure('tmux_paste', 0, 'PASTE_ERROR', { error: err.message });
-      return 'paste_error';
+      return held('the paste failed');
     } finally {
       try { exec('tmux', ['delete-buffer', '-b', bufferName], { stdio: 'pipe', timeout: 5000 }); }
       catch { /* private buffer may already be gone */ }
     }
     await wait(getDeliveryDelay(Buffer.byteLength(sanitized, 'utf8')));
   }
-  let result = { verified: false, state: 'indeterminate' };
   // `initial` is the last read when the paste already exists (no tmux call
   // since); a fresh paste is observed, and so decided, inside submitAndVerify.
-  try { result = await submitAndVerify(session, { pending, readState, lastState: initial, execFileSyncImpl: exec, sleepImpl: wait }); }
-  catch (err) { log(`Warning: Enter verification error: ${err.message}`); }
-  if (result.verified) {
-    submissions.delete(session);
-    if (result.state === 'replaced') receipts.set(receiptKey, 'submitted');
-    else recent.set(session, { deliveryId, paneIdentity: pending.paneIdentity, at: Date.now() });
-    return 'submitted';
-  }
-  if (result.state === 'uncertain') {
-    submissions.delete(session);
-    recent.delete(session);
-    settleUncertain({ deliveryId, kind: result.modal.kind, sessionRef: result.paneIdentity, delivered: false });
-    return 'uncertain';
-  }
-  if (result.state === 'modal') return 'modal_deferred';
-  if (result.state === 'replaced' && pending.modalDeferred && !pending.enterSent) {
-    // Same rule as above: text a modal held back never ran in the old pane.
-    submissions.delete(session);
-    return 'modal_deferred';
-  }
-  if (result.state === 'replaced') {
-    submissions.delete(session);
-    receipts.set(receiptKey, 'verify_failed');
-    return 'verify_failed';
-  }
-  // /exit intentionally removes the UI after its observed submit. Every other
-  // control needs the same submission proof as a conversation; process liveness
-  // alone cannot establish that a pasted message reached the model.
-  if (pending.observed && pending.enterSent && pending.shutdown) {
-    const proc = readProcState(statusFile);
-    const state = getAgentState(statusFile);
-    if (proc?.alive === false || state.state === 'offline' || state.state === 'stopped') {
-      submissions.delete(session);
-      receipts.set(receiptKey, 'submitted');
-      return 'submitted';
-    }
-  }
-  log(`Submission remains unverified (state=${result.state}); retaining pasted input for retry`);
-  return 'verify_failed';
+  return submit(pending, initial);
 }
 
 export function isBypassState(item) {
@@ -1208,6 +1338,14 @@ async function processNextMessage() {
     return { delivered: false, state: agentState.state };
   }
 
+  if (result === 'held') {
+    // Not delivered and not a failure (sendToTmux logged why): the composer is
+    // not free or a retained paste is not verified yet. No retry is consumed;
+    // the row stays pending and its next attempt settles the retained paste.
+    releaseItem(item, 'PASTE_HELD');
+    return { delivered: false, state: agentState.state };
+  }
+
   if (result === 'uncertain') {
     // Enter went out and a limit dialog followed: recordUncertainSubmission
     // finalized the row (status 'uncertain') and named it for the operator.
@@ -1237,7 +1375,9 @@ async function processNextMessage() {
     return { delivered: true, state: agentState.state };
   }
 
-  const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
+  // Only a submission whose outcome cannot be known ('verify_failed', from its
+  // receipt) reaches here; it is never replayed.
+  const reason = 'VERIFY_FAILED';
   log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
   logDeliveryFailure(item.type, item.id, reason);
   if (item.type === 'control') {

@@ -105,8 +105,9 @@ export function getNextPendingForInstance(instanceId) {
 // The dispatcher's per-call holds (c4-dispatcher-multi.js fair selection):
 // once an instance has a held row of one class in a pass, the rest of that
 // class for that instance is left out of the claim queries for the pass.
-//   paste - a modal on the pane holds every pasted row: conversations and
-//           non-key controls;
+//   paste - a modal on the pane, or a composer that is not free or holds a
+//           paste not verified yet, holds every pasted row: conversations
+//           and non-key controls;
 //   keys  - a modal that takes no key holds every [KEYSTROKE] control;
 //   idle  - a busy session holds every require_idle row;
 //   state - offline / unhealthy / suspended holds every non-bypass row.

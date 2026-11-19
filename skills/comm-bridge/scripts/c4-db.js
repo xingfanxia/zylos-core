@@ -957,6 +957,23 @@ export function getControlById(id) {
 }
 
 /**
+ * Whether a delivery id (`conversation:<id>` / `control:<id>`) names a row
+ * that is still to be delivered: an inbound conversation or a control, pending
+ * or claimed. The dispatcher submits text it left in a composer only for such
+ * a row (c4-dispatcher.js sendToTmux).
+ * @param {string} deliveryId
+ * @returns {boolean}
+ */
+export function isOpenDelivery(deliveryId) {
+  const match = /^(conversation|control):(\d+)$/.exec(String(deliveryId));
+  if (!match) return false;
+  const sql = match[1] === 'conversation'
+    ? "SELECT 1 FROM conversations WHERE id = ? AND direction = 'in' AND status IN ('pending', 'running')"
+    : "SELECT 1 FROM control_queue WHERE id = ? AND status IN ('pending', 'running')";
+  return Boolean(getDb().prepare(sql).get(Number(match[2])));
+}
+
+/**
  * Get next pending control item by priority/FIFO order
  * @param {number} current - unix seconds
  * @returns {object|null}

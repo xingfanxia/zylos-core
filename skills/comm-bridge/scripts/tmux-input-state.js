@@ -38,6 +38,43 @@ export function findPromptY(capture) {
   return -1;
 }
 
+// ── Scrolled composer ───────────────────────────────────────────────────
+//
+// Claude Code draws its composer between two column-0 rules, the prompt `❯`
+// on its first row and the continuation rows indented. Text taller than the
+// box scrolls it: the prompt row leaves the screen and the top rule carries a
+// count of the hidden rows. CLI 2.1.327 and 2.1.328 at 80x24, a 781-character
+// paste (7 visible rows):
+//   ─── ↑ 4 more ──────…──   top rule, label inside it
+//     harmless fixture …     7 indented rows, the cursor at the end of the last
+//   ──────────────────…──   bottom rule
+//     ⏵⏵ bypass permissions on (shift+tab to cycle)    footer
+// On 2026-11-19 such a composer read `indeterminate` (no prompt row) for
+// user-pan, user-elaine and the scheduler: the dispatcher never saw its own
+// paste and failed every later message. Read by structure, not by the label:
+// the cursor sits on a row strictly between a top rule (a `─` rule, plain or
+// broken by a label) and a plain bottom rule, every row between them is blank
+// or indented, and so is every row below the bottom rule.
+const LABELLED_RULE_RE = /^─{3,} \S(?:.*\S)? ─{3,}$/;
+const isComposerRule = (line) => RULE_RE.test(line) || LABELLED_RULE_RE.test(line);
+const isIndentedOrBlank = (line) => !line || /^\s/.test(line);
+
+function cursorInScrolledComposer(lines, cursorY) {
+  if (cursorY < 1 || cursorY >= lines.length - 1 || !isIndentedOrBlank(lines[cursorY])) return false;
+  let top = cursorY - 1;
+  while (top >= 0 && !isComposerRule(lines[top])) {
+    if (!isIndentedOrBlank(lines[top])) return false;
+    top--;
+  }
+  let bottom = cursorY + 1;
+  while (bottom < lines.length && !RULE_RE.test(lines[bottom])) {
+    if (!isIndentedOrBlank(lines[bottom])) return false;
+    bottom++;
+  }
+  if (top < 0 || bottom >= lines.length) return false;
+  return lines.slice(bottom + 1).every(isIndentedOrBlank);
+}
+
 // ── Modal / limit-dialog detection ──────────────────────────────────────
 //
 // Claude Code CLI 2.1.322 renders a dialog as a Pane: a blank row, a full-width
@@ -374,9 +411,16 @@ export function readTmuxInputState({
   // row (a transcript message or a hidden-behind composer) is on screen.
   const promptY = captureOk && !modal ? findPromptY(capture) : -1;
   const promptVisible = promptY >= 0;
+  // The cursor inside a composer whose prompt row scrolled away: text is in
+  // it, so it is never `empty` and never lets a paste proceed. A `❯` row
+  // still on screen above it is a transcript row (a submitted message).
+  const composerScrolled = captureOk && !modal && cursorX >= 0 && cursorY >= 0
+    && cursorInScrolledComposer(String(capture).split('\n').map(trimRight), cursorY);
 
   let inputState = 'indeterminate';
-  if (cursorX >= 0 && cursorY >= 0 && promptVisible) {
+  if (composerScrolled) {
+    inputState = 'has_content';
+  } else if (cursorX >= 0 && cursorY >= 0 && promptVisible) {
     if (cursorX > CURSOR_EMPTY_THRESHOLD) {
       inputState = 'has_content';
     } else {
@@ -386,6 +430,7 @@ export function readTmuxInputState({
 
   return {
     promptVisible,
+    composerScrolled,
     inputState,
     usageOverlay,
     modal,

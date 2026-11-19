@@ -493,7 +493,7 @@ describe('limit dialog right after a submission (Astra (h))', () => {
 
   it('the dialog first seen on the next cycle still names the submitted row', async () => {
     const h = uncertainHarness([st('empty'), st('has_content'), st('has_content', { inProgressCapture: true })]);
-    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:52' }), 'verify_failed');
+    assert.equal(await sendToTmux('hello', { ...h.options, deliveryId: 'conversation:52' }), 'held');
     h.useStates([modal()]);
     assert.equal(await sendToTmux('next', { ...h.options, deliveryId: 'conversation:53' }), 'modal_deferred');
     assert.deepEqual(h.records.map((r) => r.deliveryId), ['conversation:52']);
@@ -554,7 +554,7 @@ describe('session replaced between the deciding read and the send', async () => 
     // The read that observes the pasted text decides the Enter; the session is
     // replaced right after it.
     const server = make((pane) => pane.composer !== '');
-    assert.equal(await send(server), 'verify_failed');
+    assert.equal(await send(server), 'held');
     assert.deepEqual(server.replacement.received, [], 'no key reaches the replacement session');
     const enters = server.calls.filter((call) => call[1] === 'send-keys');
     assert.deepEqual(enters, [['tmux', 'send-keys', '-t', '%2', 'Enter']], 'Enter targets the old pane id');
@@ -566,7 +566,7 @@ describe('session replaced between the deciding read and the send', async () => 
   it('paste: the replacement never receives text pasted for the old pane', async () => {
     // The initial read (empty composer) owns the paste; the session is replaced right after it.
     const server = make(() => true);
-    assert.equal(await send(server, 'conversation:72'), 'paste_error');
+    assert.equal(await send(server, 'conversation:72'), 'held', 'the paste failed: nothing retained, retried later');
     assert.deepEqual(server.replacement.received, [], 'no text reaches the replacement session');
     assert.deepEqual(server.calls.filter((call) => call[1] === 'paste-buffer').map((call) => call[call.length - 1]), ['%2']);
   });

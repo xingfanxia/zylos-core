@@ -484,7 +484,8 @@ export async function processWithMultiSession(helpers) {
   // stay held), so they can neither use up MAX_SKIP_ATTEMPTS nor hide another
   // instance's rows. Ten rows held behind user-pan's dialog had kept
   // user-elaine's rows from ever being claimed (state=skip_exhausted, 70 min).
-  //   paste - a modal on the pane: conversations and non-key controls;
+  //   paste - a modal on the pane, or a composer that is not free or holds a
+  //           paste not verified yet: conversations and non-key controls;
   //   keys  - a modal that takes no key: [KEYSTROKE] controls;
   //   idle  - the session is not idle: require_idle rows;
   //   state - offline / unhealthy / suspended: non-bypass rows.
@@ -684,6 +685,18 @@ export async function processWithMultiSession(helpers) {
         continue;
       }
 
+      // The composer is not free or a retained paste is not verified yet
+      // (sendToTmux logged why): held like a modal, no retry consumed, and the
+      // rest of this instance's pasted rows wait for the next pass.
+      if (result === 'held') {
+        heldItems.push(item);
+        noteHeld('paste');
+        holdClass(item, 'paste');
+        inFlight = null;
+        log(`Held ${item.type} id=${item.id} for ${item.target_instance || 'default'}: its composer is not free or its paste is not verified yet`);
+        continue;
+      }
+
       if (result === 'session_replaced') {
         supersedeControl(item.id, 'SESSION_REPLACED');
         inFlight = null;
@@ -747,8 +760,9 @@ export async function processWithMultiSession(helpers) {
         return summarize({ delivered: true, state: claudeState.state });
       }
 
-      // Delivery failed.
-      const reason = result === 'verify_failed' ? 'VERIFY_FAILED' : 'TMUX_PASTE_FAILED';
+      // Delivery failed: only a submission whose outcome cannot be known
+      // ('verify_failed', from its receipt) reaches here; it is never replayed.
+      const reason = 'VERIFY_FAILED';
       log(`Failed to deliver ${item.type} id=${item.id} to tmux (${reason})`);
 
       if (item.type === 'control') {

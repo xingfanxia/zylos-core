@@ -92,7 +92,8 @@ selected pane. It never changes a message's recorded delivery status.
 > fork accepts the first `empty` read after Enter, including a parser override
 > of a cursor `has_content`, so the #795 false `empty` can mark a message
 > submitted while it stays in the composer. A later delivery then finds an
-> occupied composer it does not own and is retried, not pasted.
+> occupied composer it does not own and is held (no retry consumed), not
+> pasted (comm-bridge SKILL.md, Unverified paste).
 
 For Claude, the cursor detector runs first and the text parser can override a
 cursor `has_content`. The parser only reads the first 10 characters of the
