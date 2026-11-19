@@ -193,6 +193,13 @@ export async function fetchCodexAccountUsage({
   try {
     const response = await readImpl({ codexHome, codexBin });
     if (response?.accountId && response.accountId !== identity.accountId) throw fail('quota_account_mismatch');
+    // The app-server reads the live home, and accountId may be null. If the
+    // home's account changed (or became unreadable) while the RPC was in
+    // flight, the answer may belong to either account: publish and cache
+    // nothing, and carry no account key.
+    let after = null;
+    try { after = profileIdentity(codexHome, uid); } catch { /* unreadable counts as changed */ }
+    if (after?.accountKey !== identity.accountKey) return unavailable('account_changed_during_probe', now());
     snapshot = normalizeCodexAccountUsage(response, { observedAt: now(), accountKey: identity.accountKey });
   } catch (error) {
     return unavailable(error.code?.startsWith('quota_') || error.code === 'codex_limit_missing' ? error.code : 'quota_probe_failed', now(), { account_key: identity.accountKey });

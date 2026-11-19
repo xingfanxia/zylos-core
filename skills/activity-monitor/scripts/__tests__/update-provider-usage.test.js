@@ -17,7 +17,8 @@ const {
   runDaemon,
   writeProviderUsage,
 } = await import('../update-provider-usage.js');
-const { providerUsageState, chooseRuntimeProfile } = await import('../runtime-failover.js');
+const { providerUsageState, chooseRuntimeProfile, planRuntimeFailover } = await import('../runtime-failover.js');
+const { fetchCodexAccountUsage, readSubscriptionAccountKey } = await import('../codex-account-usage.js');
 
 describe('fetchCodexNativeUsage', () => {
   it('publishes a weekly-only Codex subscription window from the selected profile rollout', () => {
@@ -730,6 +731,59 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     const outcome = await f.run().catch(err => err);
     assert.equal(decide(), 'azure-api', 'after the failed pass');
     assert.match(String(outcome?.message), /cannot read .*: EIO/);
+  });
+
+  // (d) of round 8: the probe home crosses A -> B while the RPC is in flight and
+  // the answer (B at 97%) carries no accountId. A persona still on A must not
+  // see B's 97% as its own.
+  it('a Codex answer from an account that crossed mid-probe is not counted for the persona still on the old account', async (t) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-crossing-'));
+    fs.chmodSync(home, 0o700);
+    t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+    const install = (id, sub) => {
+      const body = Buffer.from(JSON.stringify({ sub, 'https://api.openai.com/auth': { chatgpt_account_id: id } })).toString('base64url');
+      fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt',
+        tokens: { account_id: id, id_token: `header.${body}.signature` } }), { mode: 0o600 });
+    };
+    const answer97 = () => ({ accountId: null, rateLimits: { limitId: 'codex', primary: { usedPercent: 97,
+      windowDurationMins: 10080, resetsAt: Date.now() / 1000 + 86_400 } } });
+    const decide = (f, keyA) => planRuntimeFailover({
+      document: {
+        runtime_profiles: {
+          'codex-subscription': { runtime: 'codex', usage_provider: 'codex', codex_home: '~/.codex-subscription' },
+          'codex-azure': { runtime: 'codex', usage_provider: null },
+        },
+        runtime_failover: { enabled: true, chain: ['codex-subscription', 'codex-azure'], switch_threshold: 95,
+          recover_threshold: 80, min_dwell_sec: 0, auto_recover: true, usage_max_age_sec: 180 },
+        instances: { pan: { runtime_profile: 'codex-subscription', runtime_failover_enabled: true, tmux_session: 'codex-pan' } },
+      },
+      providerUsage: readDoc(f.file),
+      currentSubscriptionAccountKeys: { pan: { 'codex-subscription': keyA } },
+      nowMs: Date.now(),
+    }).changes.map(c => [c.toProfile, c.reason]);
+    const probe = crossing => ({ fetchCodexAccountUsageImpl: options => fetchCodexAccountUsage({ ...options, codexHome: home,
+      cacheFile: null, readImpl: async () => { if (crossing) install('account-b', 'subject-b'); return answer97(); } }),
+      fetchCodexNativeUsageImpl: () => ({ available: false, quota_authoritative: false, fetched_at: null, observed_at: null,
+        source: 'zylos-native-rollout', error: 'No Codex subscription rate-limit event found' }) });
+
+    install('account-a', 'subject-a');
+    const keyA = readSubscriptionAccountKey(home);
+    const crossed = fixture(t);
+    await crossed.run(probe(true));
+    const entry = readDoc(crossed.file).providers.codex;
+    assert.deepEqual(decide(crossed, keyA), [], 'B\'s 97% does not move the persona on A');
+    assert.equal(entry.available, false);
+    assert.equal(entry.quota_authoritative, false);
+    assert.equal(entry.api_error, 'account_changed_during_probe');
+    assert.equal(entry.account_key, null);
+    t.mock.timers.reset();
+
+    // Control: the same 97% with an unchanged identity is A's own and is used.
+    install('account-a', 'subject-a');
+    const steady = fixture(t);
+    await steady.run(probe(false));
+    assert.equal(readDoc(steady.file).providers.codex.account_key, keyA);
+    assert.deepEqual(decide(steady, keyA), [['codex-azure', 'usage_exhausted:codex']]);
   });
 
   // The failover's own freshness rule over a modelled daemon run: every

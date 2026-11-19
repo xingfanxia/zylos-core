@@ -183,3 +183,50 @@ if(m.method==='account/rateLimits/read'){const ready=setInterval(()=>{if(fs.exis
   while (running() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(Boolean(running()), false, 'TERM-ignoring descendant must not survive leader exit');
 });
+
+// The app-server reads the live home and may answer with accountId null. A
+// home that crosses accounts while the RPC is in flight must not have the
+// other account's answer published or cached under the identity read before.
+test('(a) an account change during the RPC discards the answer: unavailable, uncached, no account key', async (t) => {
+  const f = fixture(t);
+  const cacheFile = path.join(f.home, 'zylos-rate-limits-cache.json');
+  const result = await fetchCodexAccountUsage({ ...f.options, readImpl: async () => {
+    f.account('account-b', 'subject-b');
+    return { ...f.response(97), accountId: null };
+  } });
+  assert.equal(result.available, false);
+  assert.equal(result.quota_authoritative, false);
+  assert.equal(result.error, 'account_changed_during_probe');
+  assert.equal(result.account_key, undefined);
+  assert.equal(result.secondary, null);
+  assert.equal(fs.existsSync(cacheFile), false, 'nothing cached');
+  // Back on account A within the cache lifetime: a fresh RPC, never B's 97%.
+  f.account('account-a', 'subject-a');
+  let called = false;
+  const next = await fetchCodexAccountUsage({ ...f.options, readImpl: async () => { called = true; return f.response(39); } });
+  assert.equal(called, true);
+  assert.equal(next.secondary.used_percent, 39);
+});
+
+test('(b) a home that cannot be read after the RPC discards the answer the same way', async (t) => {
+  const f = fixture(t);
+  const result = await fetchCodexAccountUsage({ ...f.options, readImpl: async () => {
+    fs.rmSync(path.join(f.home, 'auth.json'));
+    return { ...f.response(97), accountId: null };
+  } });
+  assert.equal(result.available, false);
+  assert.equal(result.error, 'account_changed_during_probe');
+  assert.equal(result.account_key, undefined);
+  assert.equal(fs.existsSync(path.join(f.home, 'zylos-rate-limits-cache.json')), false);
+});
+
+test('(c) an unchanged identity is published and cached as before, also without accountId', async (t) => {
+  const f = fixture(t);
+  const before = await fetchCodexAccountUsage({ ...f.options, readImpl: async () => ({ ...f.response(97), accountId: null }) });
+  assert.equal(before.available, true);
+  assert.equal(before.quota_authoritative, true);
+  assert.equal(before.secondary.used_percent, 97);
+  assert.match(before.account_key, /^[a-f0-9]{64}$/);
+  const cached = JSON.parse(fs.readFileSync(path.join(f.home, 'zylos-rate-limits-cache.json'), 'utf8'));
+  assert.equal(cached.account_key, before.account_key);
+});
