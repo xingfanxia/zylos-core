@@ -307,11 +307,19 @@ export function fetchCodexNativeUsage({
   };
 }
 
+// The temp file is this process's own: two writers sharing one temp name can
+// rename a mix of both documents into place, and an unparseable published file
+// then fails every later pass. A write within one process is synchronous.
 export function writeProviderUsage(data, filePath = PROVIDER_USAGE_FILE) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tmpPath = `${filePath}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + '\n');
-  fs.renameSync(tmpPath, filePath);
+  const tmpPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2) + '\n');
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch { /* never created */ }
+    throw err;
+  }
 }
 
 // Absent is a first run. A file that exists but cannot be read or parsed is
@@ -369,14 +377,15 @@ function readInventory(zylosDir) {
  * did not probe (only this updater writes provider entries) when the profile
  * list was read; if it could not be, nothing is pruned.
  *
- * Caller contract: one pass at a time per usage file. The daemon is the only
- * standing writer; a one-shot pass may run only while the daemon is stopped
- * (the codex rotation handoff pm2-stops it first and starts it again after:
- * azure-agents-infra scripts/ops/codex_rotation_handoff.py:188-199, :231).
- * Nothing here enforces this. Two overlapping passes can put back a reading
- * that is still young enough to count and so reverse a failover decision,
- * replace another provider's entry or the recovery proofs, or fail the shared
- * temp-file rename; it lasts until the next successful publish of that entry.
+ * Caller contract: the daemon is the only standing writer. The Codex rotation
+ * handoff runs no pass of its own; it waits for the daemon's reading of the new
+ * account (runtime-failover counts a Codex reading only for the account
+ * installed now). The only other caller is the herdr setup script's one-shot,
+ * which can overlap a daemon pass on the same accounts: nothing here prevents
+ * that, and one overlapping publish can lose the other's update of an entry,
+ * leaving an older same-account reading that may still count, until that
+ * entry's next probe. Each writer has its own temp file, so the
+ * published file is always one complete document.
  */
 export async function runProviderUsageOnce({
   execFileSyncImpl = execFileSync,

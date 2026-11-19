@@ -15,6 +15,7 @@ const {
   normalizeNativeClaudeUsage,
   runProviderUsageOnce,
   runDaemon,
+  writeProviderUsage,
 } = await import('../update-provider-usage.js');
 const { providerUsageState, chooseRuntimeProfile } = await import('../runtime-failover.js');
 
@@ -806,5 +807,64 @@ describe('runDaemon: passes are paced start to start', () => {
     for (let turn = 0; turn < 200 && !done; turn += 1) await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(delays, [40_000, 1_000, 30_000, 1_000]);
     assert.deepEqual(starts, [0, 60_000, 191_000, 226_000]);
+  });
+});
+
+describe('writeProviderUsage: each writer has its own temp file', () => {
+  const MODULE = new URL('../update-provider-usage.js', import.meta.url).href;
+
+  it('two interleaved writer processes always leave a parseable published file', async (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-writers-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, 'provider-usage.json');
+    // Documents of very different sizes, so a mix of two writes cannot parse.
+    const script = `const { writeProviderUsage } = await import(${JSON.stringify(MODULE)});
+      const [file, tag] = process.argv.slice(1);
+      let failed = 0;
+      for (let i = 0; i < 400; i += 1) {
+        try { writeProviderUsage({ writer: tag, i, pad: 'x'.repeat(i % 2 ? 40 : 40_000) }, file); } catch { failed += 1; }
+      }
+      process.stdout.write(String(failed));`;
+    const { spawn } = await import('node:child_process');
+    const writer = tag => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--input-type=module', '-e', script, file, tag],
+        { env: { ...process.env, UPDATE_PROVIDER_USAGE_DISABLE_MAIN: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', chunk => { stdout += chunk; });
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      child.on('exit', code => (code === 0 ? resolve(Number(stdout)) : reject(new Error(`writer ${tag} exited ${code}: ${stderr}`))));
+    });
+    let done = false;
+    const writers = Promise.all([writer('a'), writer('b')]).finally(() => { done = true; });
+    let reads = 0;
+    const bad = [];
+    while (!done) {
+      try {
+        const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+        if (!['a', 'b'].includes(doc.writer)) bad.push('foreign document');
+        reads += 1;
+      } catch (err) {
+        if (err.code !== 'ENOENT') bad.push(err.message.slice(0, 80));
+      }
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    const failedWrites = await writers;
+    assert.deepEqual(bad, [], 'every published state parses');
+    assert.doesNotThrow(() => JSON.parse(fs.readFileSync(file, 'utf8')), 'the final published file parses');
+    assert.deepEqual(failedWrites, [0, 0], 'no write failed');
+    assert.ok(reads > 0);
+    assert.deepEqual(fs.readdirSync(dir), ['provider-usage.json'], 'no temp file is left behind');
+  });
+
+  it('a failed write removes its temp file and leaves the published file as it was', (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'provider-writer-fail-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const file = path.join(dir, 'provider-usage.json');
+    writeProviderUsage({ before: true }, file);
+    t.mock.method(fs, 'renameSync', () => { throw Object.assign(new Error('simulated EXDEV'), { code: 'EXDEV' }); });
+    assert.throws(() => writeProviderUsage({ after: true }, file), /EXDEV/);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { before: true });
+    assert.deepEqual(fs.readdirSync(dir), ['provider-usage.json']);
   });
 });
