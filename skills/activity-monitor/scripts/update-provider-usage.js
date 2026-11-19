@@ -353,67 +353,6 @@ function readInventory(zylosDir) {
   return { ok: true, document: undefined };
 }
 
-const LOCK_WAIT_MS = 300_000;
-const LOCK_EMPTY_STALE_MS = 5_000;
-
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === 'EPERM';
-  }
-}
-
-/**
- * One pass at a time per usage file, daemon and one-shot alike. The lock file
- * holds the holder's pid; a dead holder (e.g. a daemon pm2-stopped mid-pass)
- * or an empty/unreadable lock older than a few seconds is taken over.
- */
-async function acquireUsageLock(filePath, { sleepImpl, nowMsImpl, isPidAliveImpl }) {
-  const lockPath = `${filePath}.lock`;
-  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-  const deadline = nowMsImpl() + LOCK_WAIT_MS;
-  while (true) {
-    try {
-      fs.writeFileSync(lockPath, `${process.pid}\n`, { flag: 'wx', mode: 0o600 });
-      return lockPath;
-    } catch (err) {
-      if (err?.code !== 'EEXIST') throw err;
-    }
-    let seen = null;
-    let holder = null;
-    try {
-      seen = fs.statSync(lockPath);
-      holder = Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10);
-    } catch (err) {
-      if (err?.code === 'ENOENT') continue;
-    }
-    const known = Number.isInteger(holder) && holder > 0;
-    const abandoned = known ? !isPidAliveImpl(holder)
-      : seen !== null && nowMsImpl() - seen.mtimeMs > LOCK_EMPTY_STALE_MS;
-    if (abandoned) {
-      // Unlink only the lock judged abandoned, never one created since.
-      try {
-        if (fs.statSync(lockPath).ino === seen.ino) fs.unlinkSync(lockPath);
-      } catch (err) {
-        if (err?.code !== 'ENOENT') throw err;
-      }
-      continue;
-    }
-    if (nowMsImpl() >= deadline) {
-      throw new Error(`${lockPath} held by pid ${known ? holder : 'unknown'} for over ${LOCK_WAIT_MS / 1000} s`);
-    }
-    await sleepImpl(1000);
-  }
-}
-
-function releaseUsageLock(lockPath) {
-  try {
-    if (Number.parseInt(fs.readFileSync(lockPath, 'utf8').trim(), 10) === process.pid) fs.unlinkSync(lockPath);
-  } catch { /* already gone */ }
-}
-
 /**
  * One pass over every account. Each observation is dated by the moment its
  * own probe started and is published as soon as it returns: the probes run
@@ -430,26 +369,14 @@ function releaseUsageLock(lockPath) {
  * did not probe (only this updater writes provider entries) when the profile
  * list was read; if it could not be, nothing is pruned.
  *
- * The whole pass holds provider-usage.json.lock, so passes never overlap: a
- * slower pass cannot write an older entry over a newer one or prune an account
- * a newer pass just added, and the shared .tmp name has one writer.
+ * Caller contract: one pass at a time per usage file. The daemon is the only
+ * standing writer; a one-shot pass may run only while the daemon is stopped
+ * (the codex rotation handoff pm2-stops it first and starts it again after:
+ * azure-agents-infra scripts/ops/codex_rotation_handoff.py:188-199, :231).
+ * Nothing enforces this. Two overlapping passes can lose one entry, or put
+ * back that entry's previous own-dated value, for up to one cycle.
  */
 export async function runProviderUsageOnce({
-  filePath = PROVIDER_USAGE_FILE,
-  sleepImpl = sleep,
-  nowMsImpl = Date.now,
-  isPidAliveImpl = pidAlive,
-  ...options
-} = {}) {
-  const lockPath = await acquireUsageLock(filePath, { sleepImpl, nowMsImpl, isPidAliveImpl });
-  try {
-    return await providerUsagePass({ ...options, filePath });
-  } finally {
-    releaseUsageLock(lockPath);
-  }
-}
-
-async function providerUsagePass({
   execFileSyncImpl = execFileSync,
   filePath = PROVIDER_USAGE_FILE,
   fetchClaudeNativeUsageImpl = fetchClaudeNativeUsage,

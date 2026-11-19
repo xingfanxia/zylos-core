@@ -3,7 +3,6 @@ import { describe, it } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 
 process.env.UPDATE_PROVIDER_USAGE_DISABLE_MAIN = '1';
 
@@ -708,56 +707,6 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     const payload = await f.run();
     assert.deepEqual(f.labels(), ['claude', 'codex', 'claude-ax-backup', 'quota', 'end']);
     assert.deepEqual(Object.keys(payload.providers).sort(), ['claude', 'claude-ax-backup', 'codex']);
-  });
-
-  // (j) One pass at a time per usage file.
-  it('a second pass waits for the first to release the lock, probing and writing nothing until then', async (t) => {
-    const f = fixture(t, { disk: PREVIOUS });
-    let sleeps = 0;
-    const first = f.run();
-    const second = f.run({ sleepImpl: async () => { sleeps += 1; await new Promise(resolve => setImmediate(resolve)); } });
-    await Promise.all([first, second]);
-    const pass = ['claude', 'codex', 'claude-ax-backup', 'claude-ax-third', 'quota', 'end'];
-    assert.deepEqual(f.labels(), [...pass, ...pass], 'the passes do not interleave');
-    assert.ok(sleeps > 0, 'the second pass waited');
-    assert.deepEqual(f.boundaries[6].doc, f.boundaries[5].doc, 'nothing written while waiting');
-    assert.equal(fs.existsSync(`${f.file}.lock`), false, 'released');
-  });
-
-  it('takes over at once a lock left by a dead pid (a daemon pm2-stopped mid-pass)', async (t) => {
-    const f = fixture(t, { disk: PREVIOUS });
-    const dead = spawnSync(process.execPath, ['-e', '']).pid;
-    fs.writeFileSync(`${f.file}.lock`, `${dead}\n`);
-    let sleeps = 0;
-    await f.run({ sleepImpl: async () => { sleeps += 1; } });
-    assert.equal(sleeps, 0);
-    assert.equal(f.labels().length, 6, 'the pass ran');
-    assert.equal(fs.existsSync(`${f.file}.lock`), false, 'the taken-over lock is released');
-  });
-
-  it('waits on an empty lock while it is fresh and takes it over after 5 s', async (t) => {
-    const f = fixture(t, { disk: PREVIOUS });
-    fs.writeFileSync(`${f.file}.lock`, '');
-    fs.utimesSync(`${f.file}.lock`, (T0 - 1000) / 1000, (T0 - 1000) / 1000);
-    let sleeps = 0;
-    await f.run({ sleepImpl: async ms => { sleeps += 1; f.advance(ms); } });
-    assert.equal(sleeps, 5, 'ages 1-5 s are waited for; at 6 s the lock is taken');
-    assert.equal(f.labels().length, 6);
-    assert.equal(fs.existsSync(`${f.file}.lock`), false);
-  });
-
-  it('gives up after 300 s while a live holder keeps the lock, writing nothing', async (t) => {
-    const f = fixture(t, { disk: PREVIOUS });
-    fs.writeFileSync(`${f.file}.lock`, '4242\n');
-    const bytes = fs.readFileSync(f.file);
-    let sleeps = 0;
-    const outcome = await f.run({ isPidAliveImpl: pid => pid === 4242,
-      sleepImpl: async ms => { sleeps += 1; f.advance(ms); } }).catch(err => err);
-    assert.deepEqual(f.labels(), [], 'no probe while the holder lives');
-    assert.ok(fs.readFileSync(f.file).equals(bytes));
-    assert.equal(sleeps, 300);
-    assert.match(String(outcome?.message), /held by pid 4242 for over 300 s/);
-    assert.equal(fs.readFileSync(`${f.file}.lock`, 'utf8'), '4242\n', 'a live holder\'s lock is never removed');
   });
 
   // (k) The reviewer's decision case, judged by the real planner.
