@@ -137,12 +137,12 @@ export function formatDialogAlert({ instanceId, kind, title, onScreenMs, held, o
  */
 export function formatComposerAlert({ instanceId, composer, heldMs, failed, since }) {
   const seen = composer === 'has_content' ? '里面有文字' : '画面无法识别（例如窗口太小，输入框被卷动）';
-  const lost = failed === null ? '' : `这段时间已有 ${failed} 条发给 ${personaName(instanceId)} 的消息送达失败。`;
+  const lost = failed === null ? '' : `这段时间到达、目前标记为失败的消息有 ${failed} 条（发给 ${personaName(instanceId)}；更早到达、在这期间才失败的不在此数内）。`;
   return [
     `🔴 ${personaName(instanceId)} 的输入框 ${minutes(heldMs)} 分钟没有清空（${seen}），会话空闲，屏幕上没有对话框`,
     `c4-dispatcher 不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。${lost}`,
     '需要人工处理：1. 把该会话窗口调到至少 200x60（tmux resize-window -t <会话> -x 200 -y 60）；2. 清空输入框（按两次 Esc），不要按回车；'
-      + `3. 重新投递从 ${since} UTC 起失败的消息（查询和重新排队的命令见 activity-monitor SKILL.md「输入框没有清空」）。`,
+      + `3. 重新投递 ${since} UTC 之后到达、目前标记为失败的消息，并核对更早到达的是否也失败了（查询和重新排队的命令见 activity-monitor SKILL.md「输入框没有清空」）。`,
   ].join('\n');
 }
 

@@ -308,10 +308,10 @@ describe('dialog watch: an idle composer that is not empty', () => {
     assert.deepEqual(h.watch.deliveryStuck(), { cause: 'composer:indeterminate', pending: 0, oldest_age_seconds: 0 });
     assert.equal(h.alerts.length, 1);
     assert.match(h.alerts[0], /^🔴 pan 的输入框 1 分钟没有清空（画面无法识别（例如窗口太小，输入框被卷动）），会话空闲，屏幕上没有对话框/);
-    assert.match(h.alerts[0], /不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。这段时间已有 0 条/);
+    assert.match(h.alerts[0], /不会往有内容的输入框里粘贴，也不会按键清空它；这期间到达的消息重试两次后标记为失败。这段时间到达、目前标记为失败的消息有 0 条/);
     assert.match(h.alerts[0], /至少 200x60/);
     assert.match(h.alerts[0], /清空输入框（按两次 Esc），不要按回车/);
-    assert.match(h.alerts[0], /重新投递从 2026-11-18 04:15:35 UTC 起失败的消息/);
+    assert.match(h.alerts[0], /重新投递 2026-11-18 04:15:35 UTC 之后到达、目前标记为失败的消息/);
     await h.run(10 * MIN, { modal: null, composer: 'has_content' });
     assert.equal(h.alerts.length, 1, 'one alert per episode');
     assert.equal(h.watch.deliveryStuck().cause, 'composer:has_content');
@@ -321,7 +321,7 @@ describe('dialog watch: an idle composer that is not empty', () => {
     const asked = [];
     const h = harness({ countFailedSince: (sec) => { asked.push(sec); return 3; } });
     await h.run(61 * SEC, { modal: null, composer: 'has_content' });
-    assert.match(h.alerts[0], /这段时间已有 3 条发给 pan 的消息送达失败/);
+    assert.match(h.alerts[0], /这段时间到达、目前标记为失败的消息有 3 条（发给 pan/);
     assert.deepEqual(asked, [Math.floor((T0 - MIN) / SEC)]);
   });
 
@@ -335,7 +335,7 @@ describe('dialog watch: an idle composer that is not empty', () => {
     await h.run(16 * MIN, { modal: null, composer: 'has_content' });
     const composerAlerts = h.alerts.filter((a) => /的输入框/.test(a));
     assert.equal(composerAlerts.length, 2, 'one per composer episode, independent of the backlog episode');
-    assert.doesNotMatch(composerAlerts[0], /送达失败。/);
+    assert.doesNotMatch(composerAlerts[0], /目前标记为失败的消息有/);
   });
 
   it('no alert for a dialog, a busy session, or a composer that empties within the minute', async () => {
