@@ -339,11 +339,11 @@ export function tmuxSendKeys(session, ...keys) {
 // scrolled Claude Code's composer past its prompt row, the dispatcher could
 // not see its own paste, and user-pan, user-elaine and the scheduler received
 // nothing for hours (2026-11-19). Measured on CLI 2.1.327 at 200x60: the
-// composer shows 25 rows before it scrolls. A pasted message is at most 800
-// characters and 2048 bytes (longer ones are spilled to a file: comm-bridge
-// c4-utils truncateForDelivery); 800 double-width characters with two line
-// breaks (a third makes Claude Code collapse the paste into one placeholder
-// row), more than that limit allows, take 11 rows.
+// composer shows 25 rows before it scrolls. Claude Code collapses a paste of
+// more than 800 characters, or with three or more line breaks, into one
+// placeholder row (`[Pasted text #1]`, also for a 3,051-character control);
+// anything else it shows takes at most 11 rows (800 double-width characters
+// with two line breaks), so no pasted message scrolls the composer.
 export const AGENT_WINDOW = Object.freeze({ width: 200, height: 60 });
 
 /**
