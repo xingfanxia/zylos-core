@@ -1357,7 +1357,8 @@ async function monitorLoop() {
     const framed = adapter?.runtimeId !== 'claude' || paneFrame !== null;
     try {
       dialogWatch?.tick({ modal: paneFrame?.modal ?? null, sessionRef: paneFrame?.paneIdentity ?? null,
-        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok' });
+        captureOk: framed && paneFrame?.captureOk !== false, sessionState: lastState, healthOk: engine?.health === 'ok',
+        composer: paneFrame?.inputState ?? null });
     } catch (err) { log(`Dialog watch tick failed: ${err.message}`); }
   }
 }

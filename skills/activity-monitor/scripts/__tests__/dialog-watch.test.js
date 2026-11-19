@@ -274,6 +274,50 @@ describe('dialog watch: stuck delivery is visible', () => {
   });
 });
 
+// 2026-11-19 (PASTE-STRAND-1): a composer scrolled past its prompt row held
+// every paste for user-pan, user-elaine and the scheduler for hours. Each row
+// failed within seconds, so nothing waited the 10 minutes of the stuck rule and
+// no one was told. The dispatcher now holds such rows; the watch reports them.
+describe('dialog watch: text left in the composer holds delivery', () => {
+  it('work waiting behind a composer that is not empty: stuck after a minute, without a 10-minute backlog, one alert', async () => {
+    const h = harness();
+    h.undelivered = { count: 2, oldestAt: T0, conversations: 2 };
+    await h.run(59 * SEC, { modal: null, composer: 'indeterminate' });
+    assert.equal(h.watch.deliveryStuck(), null, 'not within the first minute');
+    assert.deepEqual(h.alerts, []);
+    await h.run(90 * SEC, { modal: null, composer: 'indeterminate' });
+    assert.deepEqual(h.watch.deliveryStuck(), { cause: 'composer:indeterminate', pending: 2, oldest_age_seconds: Math.round((h.t - T0) / SEC) });
+    assert.equal(h.alerts.length, 1);
+    assert.match(h.alerts[0], /^🔴 pan 的输入框 1 分钟没有清空（画面无法识别），2 条待送达（消息 2，控制 0）被挡住/);
+    assert.match(h.alerts[0], /不会在这段文字上再粘贴，也不会按键清空它/);
+    await h.run(5 * MIN, { modal: null, composer: 'has_content' });
+    assert.equal(h.alerts.length, 1, 'one alert per episode');
+    assert.equal(h.watch.deliveryStuck().cause, 'composer:has_content');
+    await h.run(5 * MIN + 2 * SEC, { modal: null, composer: 'empty' });
+    assert.equal(h.watch.deliveryStuck(), null, 'the composer is free again and the backlog is younger than 10 min');
+    assert.ok(h.logs.includes('Dialog watch: waiting work cleared'));
+  });
+
+  it('nothing for a composer that empties within the minute, a busy session, nothing waiting, or a dialog', async () => {
+    const typing = harness();
+    typing.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
+    for (let i = 0; i < 4; i++) {
+      await typing.run((i * 50 + 45) * SEC, { modal: null, composer: 'has_content' });
+      await typing.run((i * 50 + 50) * SEC, { modal: null, composer: 'empty' });
+    }
+    const busy = harness();
+    busy.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
+    await busy.run(5 * MIN, { modal: null, composer: 'has_content', sessionState: 'busy' });
+    const idle = harness();
+    await idle.run(5 * MIN, { modal: null, composer: 'has_content' });
+    const dialog = harness();
+    dialog.undelivered = { count: 1, oldestAt: T0, conversations: 1 };
+    await dialog.run(2 * MIN, { modal: UNKNOWN, composer: 'indeterminate' });
+    for (const h of [typing, busy, idle, dialog]) assert.equal(h.watch.deliveryStuck(), null);
+    assert.deepEqual([...typing.alerts, ...busy.alerts, ...idle.alerts, ...dialog.alerts], []);
+  });
+});
+
 // DELIVER-1 second review.
 describe('dialog watch: a prompt that Escape does not dismiss', () => {
   it('only a queued control held behind the prompt: alert after 5 min, and the status counts it', async () => {
