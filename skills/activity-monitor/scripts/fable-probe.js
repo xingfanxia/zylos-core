@@ -12,6 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { fableLeaseObservation } from '../../multi-session/runtime-files.js';
 
 const PROBE_TIMEOUT_MS = 90_000;
 const VERSION_TIMEOUT_MS = 15_000;
@@ -227,11 +228,15 @@ export async function runFableProbe({
 
 /**
  * Fold one probe result into the usage store. Only a valid observation
- * replaces `last_valid`; a generic 429 backs off (bounded by
- * probe_backoff_max_sec) without touching the lease, which is measured from
- * `last_valid.observed_at` alone.
+ * replaces `last_valid`; the lease is measured from `last_valid.observed_at`
+ * alone. The next probe is due `probe_interval_sec` after this one started
+ * (`startedMs`, default `nowMs`), so a probe that ran into its timeout does not
+ * push the next one later. A generic 429 backs off (bounded by
+ * probe_backoff_max_sec) only once the account has no lease left: while the
+ * lease holds, it retries at the normal cadence, so a short outage cannot
+ * expire the lease (docs/fable-allowance-guard.md, "Choosing lease_sec").
  */
-export function recordProbeResult(store, { account, result, nowMs, config }) {
+export function recordProbeResult(store, { account, result, nowMs, startedMs = nowMs, config }) {
   const next = structuredClone(store && typeof store === 'object' ? store : {});
   next.version = 1;
   next.accounts = next.accounts && typeof next.accounts === 'object' ? next.accounts : {};
@@ -256,9 +261,12 @@ export function recordProbeResult(store, { account, result, nowMs, config }) {
     entry.failures = 0;
   } else if (result.outcome === 'rate_limited') {
     entry.failures = (Number(entry.failures) || 0) + 1;
-    delayMs = Math.min(intervalMs * 2 ** entry.failures, config.probe_backoff_max_sec * 1000);
+    if (!fableLeaseObservation(entry, nowMs, config)) {
+      delayMs = Math.min(intervalMs * 2 ** entry.failures, config.probe_backoff_max_sec * 1000);
+    }
   }
-  entry.next_probe_at = new Date(nowMs + delayMs).toISOString();
+  const startMs = Number.isFinite(startedMs) && startedMs <= nowMs ? startedMs : nowMs;
+  entry.next_probe_at = new Date(startMs + delayMs).toISOString();
   next.accounts[account] = entry;
   next.updated_at = at;
   return next;

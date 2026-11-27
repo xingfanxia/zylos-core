@@ -8,7 +8,7 @@ import { readClaudeUsageFromMonitorFiles } from './usage-monitor-file-reader.js'
 import { readCodexUsageFromActiveRollout } from './usage-codex-rollout-reader.js';
 import { fetchCodexAccountUsage, rawCodexQuotaProbeBin } from './codex-account-usage.js';
 import { refreshQuotaRecoveryProofs } from './codex-quota-recovery.js';
-import { sharedProjectTokenFile } from '../../multi-session/runtime-files.js';
+import { ineligibleProfiles, sharedProjectTokenFile } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const PROVIDER_USAGE_FILE = path.join(ZYLOS_DIR, 'activity-monitor', 'provider-usage.json');
@@ -186,15 +186,38 @@ export function fetchClaudeAccountUsage(provider, settingsFile, {
   }
 }
 
+// Extra Claude accounts to probe, and those whose every profile is on a plan
+// that is not eligible (runtime_failover.ineligible_profiles): their probe
+// cannot succeed, so it is not run until the profile leaves that list.
 function extraClaudeAccounts(document) {
   const accounts = new Map();
-  for (const profile of Object.values(document?.runtime_profiles || {})) {
+  const ineligible = new Map();
+  const skipped = ineligibleProfiles(document?.runtime_failover);
+  for (const [id, profile] of Object.entries(document?.runtime_profiles || {})) {
     if (profile?.runtime === 'claude' && /^claude-[a-z0-9-]+$/.test(profile.usage_provider || '')
         && typeof profile.claude_settings_file === 'string') {
-      accounts.set(profile.usage_provider, profile.claude_settings_file);
+      if (skipped.has(id)) ineligible.set(profile.usage_provider, [...(ineligible.get(profile.usage_provider) || []), id]);
+      else accounts.set(profile.usage_provider, profile.claude_settings_file);
     }
   }
-  return accounts;
+  for (const provider of accounts.keys()) ineligible.delete(provider);
+  return { accounts, ineligible };
+}
+
+function ineligibleAccountUsage(provider, profileIds, now) {
+  return {
+    provider,
+    available: false,
+    plan_eligible: false,
+    fetched_at: now,
+    source: 'policy',
+    error: `plan not eligible (runtime_failover.ineligible_profiles: ${profileIds.join(', ')}); not probed`,
+    primary: null,
+    secondary: null,
+    tertiary: null,
+    account_email: null,
+    version: null,
+  };
 }
 
 export function fetchClaudeNativeUsage({
@@ -460,10 +483,12 @@ export async function runProviderUsageOnce({
     return payload;
   }
   const { document } = inventory;
-  for (const [provider, settingsFile] of extraClaudeAccounts(document)) {
+  const extra = extraClaudeAccounts(document);
+  for (const [provider, settingsFile] of extra.accounts) {
     observe(provider, fetchClaudeAccountUsageImpl(provider, settingsFile,
       { execFileSyncImpl, codexbarBin, now: nowImpl() }));
   }
+  for (const [provider, profileIds] of extra.ineligible) observe(provider, ineligibleAccountUsage(provider, profileIds, nowImpl()));
 
   const quotaRecovery = await refreshQuotaRecoveryProofsImpl({ zylosDir, document });
   // The final write drops accounts no longer configured, so a removed

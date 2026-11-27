@@ -22,6 +22,7 @@ import {
   fableLeaseObservation,
   fableObservationBlocked,
   fableUsagePath,
+  ineligibleProfiles,
   readFableGuardConfig,
 } from '../../multi-session/runtime-files.js';
 import { baseModel, probeDue, recordProbeResult, runFableProbe } from './fable-probe.js';
@@ -88,11 +89,18 @@ function normalizeState(state) {
   return next;
 }
 
-/** Accounts to probe: current Claude account of every enabled Fable persona ∪ probe_accounts. */
+/**
+ * Accounts to probe: current Claude account of every enabled Fable persona ∪
+ * probe_accounts, minus runtime_failover.ineligible_profiles (a lapsed plan
+ * cannot answer; the account failover moves its personas off it). Not probing
+ * never admits Fable: that needs a fresh lease, which only a probe gives.
+ */
 export function fableProbeAccounts(document, config = readFableGuardConfig(document)) {
   const accounts = new Map();
   if (!config) return accounts;
+  const ineligible = ineligibleProfiles(document?.runtime_failover);
   const add = profileId => {
+    if (ineligible.has(profileId)) return;
     const settingsFile = fableAccountSettingsFile(document, profileId);
     if (settingsFile) accounts.set(profileId, settingsFile);
   };
@@ -139,7 +147,7 @@ function setQuotaHold(holds, { nowMs, resetWindow, detail }) {
   return true;
 }
 
-function updateAccountHolds({ account, next, entry, config, nowMs, probed, evidence, crashTrip, events }) {
+function updateAccountHolds({ account, next, entry, config, nowMs, probed, ineligible = false, evidence, crashTrip, events }) {
   const holds = { ...(next.holds[account] || {}) };
   const obs = lastObservation(entry, nowMs);
   const fresh = freshObservation(entry, nowMs, config);
@@ -166,6 +174,15 @@ function updateAccountHolds({ account, next, entry, config, nowMs, probed, evide
   if (holds.stale && fresh && cleanStreak(entry, ms(holds.stale.since), threshold) >= config.stale_clear_observations) {
     delete holds.stale;
     events.push(`${account}: stale hold cleared after ${config.stale_clear_observations} valid observations`);
+  }
+  // A plan-ineligible account is not probed, so its stale hold could never
+  // clear. Drop it once no lease is left (no reading can admit Fable then);
+  // quota and crash holds are allowance evidence and stay. When the plan comes
+  // back the account is probed again and the trigger below re-arms `stale`
+  // until stale_clear_observations fresh readings.
+  if (holds.stale && ineligible && !probed && !fresh) {
+    delete holds.stale;
+    events.push(`${account}: stale hold dropped (plan not eligible; not probed until it is)`);
   }
 
   // Triggers.
@@ -286,10 +303,11 @@ export function planFableGuard({
 
   // 2. Account holds (frozen while the feature is unconfigured: launches are inert then).
   const probed = fableProbeAccounts(document, config);
+  const ineligible = ineligibleProfiles(document?.runtime_failover);
   for (const account of config ? new Set([...probed.keys(), ...Object.keys(next.holds), ...Object.keys(evidenceByAccount)]) : []) {
     updateAccountHolds({
       account, next, entry: usage?.accounts?.[account], config, nowMs,
-      probed: probed.has(account), evidence: evidenceByAccount[account] || [],
+      probed: probed.has(account), ineligible: ineligible.has(account), evidence: evidenceByAccount[account] || [],
       crashTrip: crashByAccount[account] || null, events,
     });
   }
@@ -930,7 +948,8 @@ export function scheduleFableProbes({
       .then(() => probe({ account, settingsFile, fableModel: config.fable_model }))
       .catch(err => ({ outcome: 'invalid', reason: `probe_error:${err.message}` }))
       .then(result => {
-        const updated = recordProbeResult(readJson(usageFile, {}), { account, result, nowMs: Date.now(), config });
+        // The cadence counts from this start, so a slow or timed-out probe never delays the next one.
+        const updated = recordProbeResult(readJson(usageFile, {}), { account, result, nowMs: Date.now(), startedMs: nowMs, config });
         writeJsonAtomic(usageFile, updated);
         if (result.outcome !== 'valid') log(`[fable-guard] probe ${account}: ${result.outcome} (${result.reason})`);
       })

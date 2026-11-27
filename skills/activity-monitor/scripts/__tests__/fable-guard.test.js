@@ -19,6 +19,7 @@ import { writeRuntimeSwitchSignal } from '../runtime-switch-signal.js';
 import {
   FABLE_GUARD_DEFAULTS,
   fableAccountSettingsFile,
+  fableAdmission,
   fableDowngradeDeferral,
   fableGuardStatePath,
   fableUsagePath,
@@ -275,19 +276,21 @@ describe('Fable guard fake-clock sequences', () => {
     assert.equal(late.mode('user-pan'), 'opus');
   });
 
-  it('repeated generic 429s back off without extending the lease', () => {
+  it('generic 429s keep the cadence while the lease holds, back off after it, and never extend it', () => {
     const sim = new Sim();
     sim.toFable();
     const leaseStart = Date.parse(sim.usage.accounts[BACKUP].last_valid.observed_at);
     sim.advance(5 * MIN);
     sim.attempt(BACKUP, 'rate_limited');
-    assert.equal(Date.parse(sim.usage.accounts[BACKUP].next_probe_at), sim.now + 10 * MIN);
+    assert.equal(Date.parse(sim.usage.accounts[BACKUP].next_probe_at), sim.now + 5 * MIN, 'lease still valid: normal cadence');
     sim.pass();
     assert.equal(sim.mode('user-pan'), 'fable');
     sim.advance(leaseStart + 12 * MIN - sim.now);
     const result = sim.pass();
     assert.deepEqual(sim.holds(), ['stale']);
     assert.deepEqual(result.restarts.map(item => item.instanceId).sort(), ['user-elaine', 'user-pan']);
+    sim.attempt(BACKUP, 'rate_limited');
+    assert.equal(Date.parse(sim.usage.accounts[BACKUP].next_probe_at), sim.now + 15 * MIN, 'no lease left: backoff');
   });
 
   it('keeps probing the account while every eligible persona is on Opus', () => {
@@ -1632,5 +1635,255 @@ describe('Fable guard soft-quota downgrade waits for an idle persona', () => {
     sim.advance(MIN);
     sim.observe(BACKUP, 0.1);
     assert.deepEqual(sim.pass().restarts, []);
+  });
+});
+
+describe('Fable guard and plan-ineligible accounts (runtime_failover.ineligible_profiles)', () => {
+  const lapse = (sim, ids = [BACKUP]) => { sim.document.runtime_failover = { ...(sim.document.runtime_failover || {}), ineligible_profiles: ids }; };
+  const restore = sim => { sim.document.runtime_failover.ineligible_profiles = []; };
+  const events = result => result.events.join('\n');
+  // The probe failures a lapsed plan produces until the lease is gone (the 2026-11-24 sequence).
+  const failUntilStale = sim => {
+    for (let i = 0; i < 3; i++) { sim.advance(5 * MIN); sim.attempt(BACKUP, 'invalid', { reason: 'exit_1' }); sim.launchAll(sim.pass().restarts); }
+    assert.ok(sim.holds().includes('stale'));
+  };
+
+  it('does not probe an ineligible account, whether it is a probe account or a persona account', async () => {
+    const document = documentFixture({ guard: { probe_accounts: [BACKUP, CL] } });
+    assert.deepEqual([...fableProbeAccounts(document).keys()].sort(), [BACKUP, CL]);
+    document.runtime_failover = { ineligible_profiles: [BACKUP] };
+    assert.deepEqual([...fableProbeAccounts(document).keys()], [CL], 'neither probe_accounts nor the personas on it bring it back');
+    // The daemon's scheduler spawns nothing for it.
+    const zylosDir = fs.mkdtempSync(path.join(os.tmpdir(), 'fable-guard-ineligible-'));
+    try {
+      const onlyBackup = documentFixture({ guard: { probe_accounts: [BACKUP] } });
+      onlyBackup.runtime_failover = { ineligible_profiles: [BACKUP] };
+      fs.mkdirSync(path.join(zylosDir, 'activity-monitor'), { recursive: true });
+      fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(onlyBackup));
+      const seen = [];
+      const probe = async args => { seen.push(args.account); return { outcome: 'invalid', reason: 'exit_1' }; };
+      assert.equal(scheduleFableProbes({ zylosDir, probe, pending: new Set(), log: () => {} }).length, 0);
+      assert.deepEqual(seen, []);
+      assert.equal(fs.existsSync(fableUsagePath(zylosDir)), false, 'no probe result is recorded either');
+      // Eligible again: the next scheduling pass probes it, with no operator step.
+      onlyBackup.runtime_failover.ineligible_profiles = [];
+      fs.writeFileSync(path.join(zylosDir, 'instances.json'), JSON.stringify(onlyBackup));
+      await Promise.all(scheduleFableProbes({ zylosDir, probe, pending: new Set(), log: () => {} }));
+      assert.deepEqual(seen, [BACKUP]);
+    } finally {
+      fs.rmSync(zylosDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops the stale hold of an ineligible, unprobed account once no lease is left; quota and crash holds stay', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.advance(MIN);
+    sim.attempt(BACKUP, 'rejected', { resets_at: W1 });
+    sim.launchAll(sim.pass().restarts);
+    failUntilStale(sim);
+    assert.deepEqual(sim.holds(), ['quota', 'stale']);
+    sim.state.holds[BACKUP].crash = { since: iso(sim.now), trip: 2, reset_window: W1, probation_until: null, detail: { persona: 'user-pan' } };
+    assert.deepEqual(sim.holds(), ['crash', 'quota', 'stale']);
+    lapse(sim);
+    sim.advance(10_000);
+    const dropped = sim.pass();
+    assert.deepEqual(sim.holds(), ['crash', 'quota'], 'only the hold that could never clear is dropped');
+    assert.match(events(dropped), /claude-ax-backup: stale hold dropped \(plan not eligible/);
+    assert.deepEqual(dropped.restarts, []);
+    // Nothing re-arms it while the account is not probed, and nothing admits Fable.
+    for (let i = 0; i < 4; i++) { sim.advance(5 * MIN); assert.deepEqual(sim.pass().restarts, []); }
+    assert.deepEqual(sim.holds(), ['crash', 'quota']);
+    assert.equal(sim.mode('user-pan'), 'opus');
+    assert.equal(sim.launch('user-pan').launched, OPUS);
+  });
+
+  it('keeps a stale hold while a lease is still fresh, so the drop never skips the three-reading rule', () => {
+    const sim = new Sim();
+    sim.toFable();
+    failUntilStale(sim);
+    sim.advance(5 * MIN);
+    sim.observe(BACKUP, 0.1); // one valid reading: fresh lease, stale hold not yet cleared
+    sim.launchAll(sim.pass().restarts);
+    assert.deepEqual(sim.holds(), ['stale']);
+    lapse(sim);
+    sim.advance(MIN);
+    sim.pass();
+    assert.deepEqual(sim.holds(), ['stale'], 'a fresh lease keeps the hold');
+    assert.equal(sim.mode('user-pan'), 'opus');
+    sim.advance(12 * MIN); // the lease is gone, no probe ran
+    sim.pass();
+    assert.deepEqual(sim.holds(), []);
+    assert.equal(sim.mode('user-pan'), 'opus');
+    assert.equal(sim.launch('user-pan').launched, OPUS);
+  });
+
+  it('eligibility returning: probing resumes, stale re-arms at once and Fable returns only after valid readings', () => {
+    const sim = new Sim();
+    sim.toFable();
+    failUntilStale(sim);
+    lapse(sim);
+    sim.advance(10_000);
+    sim.pass();
+    assert.deepEqual(sim.holds(), []);
+    sim.advance(3 * 3_600_000);
+    sim.pass();
+    restore(sim);
+    assert.deepEqual([...fableProbeAccounts(sim.document).keys()], [BACKUP]);
+    sim.advance(10_000);
+    const back = sim.pass();
+    assert.deepEqual(sim.holds(), ['stale'], 'the old reading is not a lease');
+    assert.deepEqual(back.restarts, []);
+    for (let i = 0; i < 2; i++) {
+      sim.advance(5 * MIN);
+      sim.observe(BACKUP, 0.1);
+      assert.deepEqual(sim.pass().restarts, []);
+      assert.equal(sim.mode('user-pan'), 'opus');
+      assert.equal(sim.launch('user-pan').launched, OPUS);
+    }
+    sim.advance(5 * MIN);
+    sim.observe(BACKUP, 0.1);
+    const upgrade = sim.pass();
+    assert.deepEqual(sim.holds(), []);
+    assert.deepEqual(upgrade.restarts.map(item => [item.instanceId, item.mode]).sort(),
+      [['user-elaine', 'fable'], ['user-pan', 'fable']]);
+    sim.launchAll(upgrade.restarts);
+    assert.equal(sim.launch('user-pan').launched, FABLE);
+  });
+
+  it('a Fable persona whose current account lapses: one restart, carried by the failover move; the old reading is never acted on', () => {
+    const sim = new Sim();
+    sim.toFable();
+    sim.advance(MIN);
+    // The verdict and the failover move land in the same locked pass.
+    lapse(sim);
+    for (const id of ['user-pan', 'user-elaine']) sim.document.instances[id].runtime_profile = CL;
+    const moved = sim.pass({ failover: ['user-pan', 'user-elaine'] });
+    assert.deepEqual(moved.restarts, [], 'the failover restart carries the guard commit');
+    for (const id of ['user-pan', 'user-elaine']) {
+      assert.deepEqual([sim.state.personas[id].desired.account, sim.mode(id), sim.state.personas[id].attempts], [CL, 'opus', 1]);
+    }
+    assert.deepEqual([...fableProbeAccounts(sim.document).keys()], [CL]);
+    sim.launchAll([{ instanceId: 'user-pan' }, { instanceId: 'user-elaine' }]);
+    assert.equal(sim.launches['user-pan'].mode, 'opus');
+    // The lapsed account's reading ages out with no restart and no hold; ax-cl
+    // upgrades on its own readings after the 30-minute dwell.
+    const later = [];
+    for (let i = 0; i < 7; i++) {
+      sim.advance(5 * MIN);
+      sim.observe(CL, 0.1);
+      const { restarts } = sim.pass();
+      later.push(...restarts);
+      sim.launchAll(restarts);
+    }
+    assert.deepEqual(sim.holds(BACKUP), []);
+    assert.deepEqual(later.map(item => [item.instanceId, item.profileId, item.mode]).sort(),
+      [['user-elaine', CL, 'fable'], ['user-pan', CL, 'fable']], 'one upgrade each, on ax-cl; nothing on the lapsed account');
+    assert.equal(sim.launch('user-pan').launched, FABLE);
+  });
+
+  it('a Fable persona left on a lapsed account (no usable tier yet) keeps the lease rule: no Fable once it expires', () => {
+    const sim = new Sim();
+    sim.toFable();
+    const leaseStart = Date.parse(sim.usage.accounts[BACKUP].last_valid.observed_at);
+    sim.advance(MIN);
+    lapse(sim);
+    const kept = sim.pass();
+    assert.deepEqual(kept.restarts, [], 'a running session inside its lease is not restarted on the stale account');
+    assert.equal(sim.mode('user-pan'), 'fable');
+    sim.advance(leaseStart + 12 * MIN - sim.now);
+    const expired = sim.pass();
+    assert.deepEqual(sim.holds(), [], 'an unprobed account gets no stale hold');
+    assert.deepEqual(expired.restarts.map(item => [item.instanceId, item.mode, item.reason]).sort(),
+      [['user-elaine', 'opus', 'fable_blocked:no_lease'], ['user-pan', 'opus', 'fable_blocked:no_lease']]);
+    sim.launchAll(expired.restarts);
+    assert.equal(sim.launch('user-pan').launched, OPUS);
+    // The launcher and the monitor's enforcement read this admission: a Fable
+    // commit on the unprobed account is refused without a fresh observation.
+    const stillFable = { ...sim.state, personas: { 'user-pan': { desired: { account: BACKUP, mode: 'fable', generation: 99 } } } };
+    assert.deepEqual(['admitted', 'reason'].map(key => fableAdmission({ document: sim.document, instanceId: 'user-pan', profileId: BACKUP,
+      guardState: stillFable, usage: sim.usage, nowMs: sim.now })[key]), [false, 'lease_expired']);
+    // The failover then moves it: one restart, by the failover.
+    for (const id of ['user-pan', 'user-elaine']) sim.document.instances[id].runtime_profile = CL;
+    assert.deepEqual(sim.pass({ failover: ['user-pan', 'user-elaine'] }).restarts, []);
+  });
+});
+
+// Choosing lease_sec (docs/fable-allowance-guard.md). The cadence counts from
+// each probe's start; the daemon checks every RUNTIME_FAILOVER_POLL_MS (10 s)
+// plus its pass time, so a probe starts up to one tick (taken as 11 s) after it
+// is due. A probe runs `claude --version` (15 s cap) then the request (90 s cap).
+describe('Fable guard lease survives three failed probes and trips on the fourth (lease_sec 1350, cadence 300 s)', () => {
+  const TICK = 10_000;
+  const LAG = 11_000;
+  const FAIL = { timeout: { outcome: 'invalid', reason: 'exit_timeout', ms: 105_000 }, exit: { outcome: 'invalid', reason: 'exit_1', ms: 2000 },
+    rate_limited: { outcome: 'rate_limited', reason: 'rate_limited', ms: 2000 } };
+
+  // Runs daemon passes every TICK up to `untilMs`; returns the first stale hold time and the restarts.
+  function passUntil(sim, untilMs, seen) {
+    while (sim.now + TICK <= untilMs) {
+      sim.advance(TICK);
+      const result = sim.pass();
+      if (!seen.staleAt && sim.holds().includes('stale')) seen.staleAt = sim.now;
+      seen.restarts.push(...result.restarts);
+    }
+    sim.advance(untilMs - sim.now);
+  }
+
+  function run({ failures, kind, lag, lastProbeMs, firstProbeMs = 0 }) {
+    const sim = new Sim(documentFixture({ guard: { lease_sec: 1350, probe_interval_sec: 300 } }));
+    sim.toFable();
+    const config = sim.config;
+    // Probe 0: valid, started `firstProbeMs` before it answered.
+    const start0 = sim.now - firstProbeMs;
+    sim.usage = recordProbeResult(sim.usage, { account: BACKUP, nowMs: sim.now, startedMs: start0, config, result: { outcome: 'valid',
+      observation: { account: BACKUP, utilization: 0.1, resets_at: W1, observed_at: iso(sim.now), cli_version: '2.1.322', model: 'claude-fable-5-2', status: 'allowed' } } });
+    const leaseStart = sim.now;
+    const seen = { staleAt: null, restarts: [] };
+    for (let k = 1; k <= failures + 1; k++) {
+      const start = Date.parse(sim.usage.accounts[BACKUP].next_probe_at) + lag;
+      const last = k === failures + 1;
+      const end = start + (last ? lastProbeMs : FAIL[kind].ms);
+      passUntil(sim, end, seen);
+      if (last) {
+        sim.usage = recordProbeResult(sim.usage, { account: BACKUP, nowMs: end, startedMs: start, config, result: { outcome: 'valid',
+          observation: { account: BACKUP, utilization: 0.1, resets_at: W1, observed_at: iso(end), cli_version: '2.1.322', model: 'claude-fable-5-2', status: 'allowed' } } });
+      } else {
+        sim.usage = recordProbeResult(sim.usage, { account: BACKUP, nowMs: end, startedMs: start, config,
+          result: { outcome: FAIL[kind].outcome, reason: FAIL[kind].reason } });
+      }
+      seen.lastValidAfter = end - leaseStart;
+    }
+    passUntil(sim, sim.now + 2 * TICK, seen);
+    return { sim, seen, leaseStart };
+  }
+
+  for (const kind of Object.keys(FAIL)) {
+    it(`three ${kind} failures in a row keep Fable when the fourth probe answers, at the worst start lag and probe time`, () => {
+      const { sim, seen } = run({ failures: 3, kind, lag: LAG, lastProbeMs: 105_000 });
+      assert.ok(seen.lastValidAfter < 1350_000, `valid reading ${seen.lastValidAfter / 1000}s after the last one`);
+      assert.equal(seen.staleAt, null);
+      assert.deepEqual(seen.restarts, []);
+      assert.equal(sim.mode('user-pan'), 'fable');
+    });
+
+    it(`a fourth ${kind} failure trips the stale hold before a fifth probe could answer`, () => {
+      // Best case for the lease: no start lag, a slow last valid probe, a fast fifth one.
+      const { seen, leaseStart } = run({ failures: 4, kind, lag: 0, firstProbeMs: 105_000, lastProbeMs: 1000 });
+      assert.ok(seen.staleAt, 'stale hold set');
+      assert.ok(seen.staleAt - leaseStart >= 1350_000 && seen.staleAt - leaseStart < 1350_000 + TICK + 1);
+      assert.ok(seen.staleAt - leaseStart < seen.lastValidAfter, 'before the fifth probe answered');
+      assert.deepEqual(seen.restarts.map(item => [item.instanceId, item.mode, item.reason]).sort(),
+        [['user-elaine', 'opus', 'fable_blocked:stale'], ['user-pan', 'opus', 'fable_blocked:stale']]);
+    });
+  }
+
+  it('the cadence counts from the probe start: a timed-out probe does not delay the next one', () => {
+    const config = { ...FABLE_GUARD_DEFAULTS, lease_sec: 1350 };
+    const start = T0;
+    const store = recordProbeResult({}, { account: BACKUP, nowMs: start + 105_000, startedMs: start, config,
+      result: { outcome: 'invalid', reason: 'exit_timeout' } });
+    assert.equal(Date.parse(store.accounts[BACKUP].next_probe_at), start + 300_000);
+    assert.equal(store.accounts[BACKUP].last_attempt.at, iso(start + 105_000), 'the attempt is still dated when it ended');
   });
 });

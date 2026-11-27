@@ -138,7 +138,7 @@ describe('Fable probe store', () => {
   const valid = utilization => ({ outcome: 'valid', observation: { account: 'a', utilization, resets_at: '2026-11-13T06:00:00.000Z',
     observed_at: new Date(NOW).toISOString(), cli_version: '2.1.322', model: 'claude-fable-5-2', status: 'allowed' } });
 
-  it('backs off a generic 429 to at most 15 minutes and never refreshes the lease', () => {
+  it('backs off a generic 429 only once the lease has expired, to at most 15 minutes, and never refreshes the lease', () => {
     let store = recordProbeResult({}, { account: 'a', result: valid(0.3), nowMs: NOW, config });
     const leaseStart = store.accounts.a.last_valid.observed_at;
     const delays = [];
@@ -148,7 +148,9 @@ describe('Fable probe store', () => {
       store = recordProbeResult(store, { account: 'a', result: { outcome: 'rate_limited', reason: 'rate_limited' }, nowMs: t, config });
       delays.push((Date.parse(store.accounts.a.next_probe_at) - t) / 60_000);
     }
-    assert.deepEqual(delays, [10, 15, 15, 15]);
+    // Lease 720 s: the 429s at +5 and +10 min keep the cadence; from +15 min it backs off.
+    assert.deepEqual(delays, [5, 5, 15, 15]);
+    assert.equal(store.accounts.a.failures, 4);
     assert.equal(store.accounts.a.last_valid.observed_at, leaseStart);
     store = recordProbeResult(store, { account: 'a', result: valid(0.31), nowMs: t + 60_000, config });
     assert.equal(store.accounts.a.failures, 0);

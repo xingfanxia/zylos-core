@@ -31,6 +31,19 @@ export function getConfiguredRuntime({
   return cfg?.runtime === 'codex' ? 'codex' : 'claude';
 }
 
+/**
+ * runtime_failover.ineligible_profiles: profiles whose subscription is on a
+ * free or canceled plan (the rotation service reads each account's plan). One
+ * fact for every reader: the account failover holds them and moves instances
+ * off them, the Fable guard does not probe them, and the provider-usage
+ * updater does not run their usage probe. Removal (resubscription) restores
+ * all three on their next pass.
+ */
+export function ineligibleProfiles(policy) {
+  const list = policy?.ineligible_profiles;
+  return new Set(Array.isArray(list) ? list.filter(id => typeof id === 'string') : []);
+}
+
 // ── Fable allowance guard (FG) ──────────────────────────────────────────────
 // Contract: docs/fable-allowance-guard.md. Inert unless instances.json carries
 // `fable_guard.fable_model`; a persona opts in with `fable_enabled: true`. The

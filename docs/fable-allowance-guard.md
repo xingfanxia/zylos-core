@@ -37,11 +37,11 @@ The policy writer owns these keys. Nothing else writes them.
 | `fable_guard.threshold` | number in (0, 1] | `0.75` | Fraction of the weekly Fable window (not a percent). `>=` holds the account. Out of range ⇒ default. |
 | `fable_guard.hard_threshold` | number in (0, 1] | `0.9` | At or above it a soft-quota downgrade never waits for an idle persona. Out of range ⇒ default. |
 | `fable_guard.downgrade_max_wait_sec` | integer 0–7200 | `1800` | Longest wait for an idle persona after a soft-quota downgrade commit; `0` ⇒ never wait. |
-| `fable_guard.probe_accounts` | array of profile ids | `[]` | Accounts probed even when no enabled persona sits on them (rollout before enabling anyone). |
+| `fable_guard.probe_accounts` | array of profile ids | `[]` | Accounts probed even when no enabled persona sits on them (rollout before enabling anyone). A plan-ineligible account is not probed (below). |
 | `fable_guard.subagent_model` | string | `claude-opus-5-5` | Value of `CLAUDE_CODE_SUBAGENT_MODEL` for Fable personas. |
-| `fable_guard.probe_interval_sec` | integer 60–3600 | `300` | Fixed probe cadence per account. |
-| `fable_guard.lease_sec` | integer 120–7200 | `720` | A Fable launch needs a valid observation younger than this. |
-| `fable_guard.probe_backoff_max_sec` | integer 60–3600 | `900` | Ceiling of the generic-429 backoff. |
+| `fable_guard.probe_interval_sec` | integer 60–3600 | `300` | Fixed probe cadence per account, counted from each probe's start. |
+| `fable_guard.lease_sec` | integer 120–7200 | `720` | A Fable launch needs a valid observation younger than this. The default tolerates at most one failed probe; see "Choosing `lease_sec`". |
+| `fable_guard.probe_backoff_max_sec` | integer 60–3600 | `900` | Ceiling of the generic-429 backoff, which starts only once the account has no lease left. |
 | `fable_guard.upgrade_min_dwell_sec` | integer 0–86400 | `1800` | Minimum time since a persona's last model transition before Opus → Fable. |
 | `fable_guard.stale_clear_observations` | integer 1–20 | `3` | Consecutive valid readings below threshold that clear a `stale` hold. |
 | `fable_guard.crash_window_sec` / `crash_failures` | integers | `1800` / `2` | Fable-session failures per persona within the window that trip a `crash` hold. |
@@ -71,6 +71,24 @@ own settings file. A `fable_enabled` persona that the account failover moves
 to a non-Claude profile (Codex) is marked `not_a_claude_profile`; the guard
 neither restarts nor verifies it (that engine cannot run Fable and the
 failover owns its restart).
+
+**Plan-ineligible accounts.** A profile listed in
+`runtime_failover.ineligible_profiles` (a free or canceled plan, written by the
+rotation service) is read through `ineligibleProfiles` in `runtime-files.js`,
+the same fact the account failover uses to move instances off it. The guard
+does not probe it, even when it is in `probe_accounts` or a persona still sits
+on it, and the provider-usage updater runs no usage probe for it: its
+`provider-usage.json` entry is `available: false, plan_eligible: false,
+source: "policy"` with an error naming the list. Not probing never admits
+Fable, because Fable needs a fresh lease and only a probe makes one: a persona
+still on the account keeps the lease rule (Opus once the last valid reading is
+`lease_sec` old), and the failover's move to another account carries the
+guard's commit as one restart. The account's `stale` hold, which only fresh
+readings could clear, is dropped once it has no lease left; `quota` and
+`crash` holds stay. When the profile leaves the list both probes resume on
+their next pass with no operator step; the guard re-arms `stale` at once (the
+old reading is not a lease) and Fable returns only after
+`stale_clear_observations` valid readings below the threshold.
 
 For `azure-agents-infra` `devbox-runtime-policy.mjs`:
 
@@ -165,8 +183,10 @@ it through a namespace import; without that export no dialog is classified
 ## Probe (FG-1)
 
 Probe accounts = current account of every enabled Fable persona ∪
-`probe_accounts`, regardless of the personas' current mode. Each is probed
-every `probe_interval_sec` with:
+`probe_accounts`, regardless of the personas' current mode, minus
+`runtime_failover.ineligible_profiles`. Each is probed every
+`probe_interval_sec`, counted from the start of its previous probe (a probe
+that runs into its timeout does not push the next one later), with:
 
 ```
 claude -p "Reply OK" --model <fable_model without [1m]> --system-prompt "Reply with OK." --tools "" \
@@ -192,9 +212,14 @@ last good one.
   CLI's fallback events and a successful non-Fable answer is still a
   rejection, with the reset window of the event that rejected. A rejection is
   recorded only under the account that was probed.
-- A generic 429 is no observation and backs off 10, 15, 15 … minutes (ceiling
-  `probe_backoff_max_sec`). The lease is measured from the last valid
-  observation only, so backoff never extends it.
+- A generic 429 is no observation. While the account still has a lease it is
+  retried at the normal cadence, so a short outage cannot expire the lease by
+  itself; once no lease is left it backs off to `cadence × 2^failures`, at
+  most `probe_backoff_max_sec` (10 or 15 minutes, then 15, by default). The lease is measured from the last valid
+  observation only, so neither ever extends it.
+- Every failure kind therefore costs exactly one cadence: a timeout (90 s for
+  the request after up to 15 s for `claude --version`), a fast error and a
+  generic 429 alike.
 
 Store: `<ZYLOS_DIR>/activity-monitor/fable-usage.json`, written only by the
 daemon, separate from `provider-usage.json` (which the usage updater rewrites
@@ -209,6 +234,24 @@ after every probe, each entry dated by its own probe start):
   "recent": [ { "at": "...", "outcome": "valid", "utilization": 0.02, "resets_at": "..." } ],
   "failures": 0, "next_probe_at": "..." } } }
 ```
+
+### Choosing `lease_sec`
+
+The daemon checks the lease and starts due probes once per poll:
+`RUNTIME_FAILOVER_POLL_MS` (10 s) plus the pass time, at most 11 s in steady
+state. A due probe starts at the next poll, so probe *k* starts at most
+`k × (cadence + 11 s)` after probe 0 started, and a probe answers at most
+105 s after it started. With probe 0 valid and probes 1 to N failed:
+
+- probe N+1 answering keeps Fable when `lease_sec > (N+1) × (cadence + 11 s) + 105 s`;
+- failure N+1 trips `stale` before probe N+2 can answer when
+  `lease_sec ≤ (N+2) × cadence − 105 s − 11 s`.
+
+For three failures at the 300 s cadence that is `1349 < lease_sec ≤ 1384`, so
+`1350` is the smallest lease that tolerates three failed probes and still
+trips on the fourth. The 720 s default tolerates at most one. The fake-clock
+tests in `fable-guard.test.js` ("lease survives three failed probes and trips
+on the fourth") check both edges for timeouts, fast errors and generic 429s.
 
 ## Holds and transitions (FG-2)
 
@@ -237,7 +280,7 @@ below threshold). Unknown quota on an account ⇒ Opus.
 | Kind | Set when | Cleared when |
 |---|---|---|
 | `quota` | a fresh reading ≥ threshold; a probe rejection; a classified limit dialog on a persona of that account (these two also set `hard_at`, which stays for the life of the hold) | a valid reading below threshold from a **later** reset window than `reset_window` (a hold without a known window pins the first later reading's window). Never by stale/crash events or by lowering the threshold back. |
-| `stale` | the account is probed and has no valid lease | `stale_clear_observations` consecutive valid readings below threshold made after the hold |
+| `stale` | the account is probed and has no valid lease | `stale_clear_observations` consecutive valid readings below threshold made after the hold; or dropped once the account is plan-ineligible (not probed) and has no lease left |
 | `crash` | `crash_failures` Fable-session failures of one persona within `crash_window_sec` | trip 1: after `crash_probation_sec` (one retry). Trip 2 in the same window: a later-window reading below threshold |
 
 Fable-session failures (`<monitor dir>/fable-session-failures.json`, stamped
@@ -471,7 +514,10 @@ The Guardian relaunch re-evaluates admission and comes up on Opus. The monitor
 only ever forces Opus. It never upgrades and never writes the guard state; the
 daemon stays the single transition owner. PM2 is not a lease enforcer: a
 running Fable session outlives a dead daemon only for the lease plus this
-grace (about 14 minutes with the defaults).
+grace and one 15 s monitor tick (about 14 minutes with the defaults, about 25
+minutes with `lease_sec` 1350). With the daemon alive, the first pass after
+the lease runs out sets `stale` and restarts the persona (lease plus one
+pass).
 
 ## Limit-dialog precedence (FG-4, health half)
 

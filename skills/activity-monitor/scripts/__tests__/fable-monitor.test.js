@@ -72,6 +72,30 @@ function monitorFor(fx, clock, extra = {}) {
   return { monitor, calls, session };
 }
 
+describe('Fable lease enforcement on an account that is no longer probed (plan not eligible)', () => {
+  it('a still-committed Fable session with no hold left is stopped once its lease expires; the relaunch is Opus', () => {
+    const fx = fixture();
+    const clock = { now: T0 };
+    assert.equal(fx.launch(clock.now).model, FABLE);
+    // The plan lapsed: the guard stops probing the account and drops its stale
+    // hold; the Fable commit is still on record (dead or slow daemon).
+    const file = path.join(fx.zylosDir, 'instances.json');
+    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), runtime_failover: { ineligible_profiles: [BACKUP] } }));
+    fx.writeState('fable', 3, {});
+    const { monitor, calls } = monitorFor(fx, clock);
+    clock.now = T0 + 11 * MIN;
+    monitor.tick();
+    assert.equal(calls.stops, 0, 'inside the lease of the last valid reading');
+    clock.now = T0 + 12 * MIN + 1000;
+    assert.equal(fx.launch(clock.now).model, OPUS, 'no fresh observation: a launch is Opus');
+    monitor.tick();
+    clock.now = T0 + 14 * MIN + 2000;
+    monitor.tick();
+    assert.equal(calls.stops, 1, 'not being probed never keeps a Fable session past the lease');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(fx.monitorDir, LEASE_ENFORCEMENT_FILE), 'utf8')).reason, 'lease_expired');
+  });
+});
+
 describe('Fable lease enforcement in the persona monitor (review #1)', () => {
   it('downgrades a running Fable session whose lease expired while the guard daemon is dead', () => {
     const fx = fixture();

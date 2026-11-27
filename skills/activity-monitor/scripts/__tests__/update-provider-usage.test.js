@@ -613,6 +613,28 @@ describe('runProviderUsageOnce: each observation is dated by its own probe and p
     assert.equal(providerUsageState(published, 'claude-ax-backup', Date.now(), 180_000).available, false);
   });
 
+  it('runs no usage probe for a plan-ineligible profile, publishes why, and probes it again once it is eligible', async (t) => {
+    const profiles = { 'claude-ax-main': { runtime: 'claude', usage_provider: 'claude' } };
+    for (const provider of EXTRA) profiles[provider] = { runtime: 'claude', usage_provider: provider, claude_settings_file: `/auth/${provider}.json` };
+    const inventory = ineligible => JSON.stringify({ instances: {}, runtime_profiles: profiles,
+      runtime_failover: { enabled: true, ineligible_profiles: ineligible } });
+    const f = fixture(t, { disk: PREVIOUS, instances: inventory(['claude-ax-backup']) });
+    const payload = await f.run();
+    assert.deepEqual(Object.keys(f.starts).sort(), ['claude', 'claude-ax-third', 'codex'], 'no CLI probe for the lapsed plan');
+    const backup = payload.providers['claude-ax-backup'];
+    assert.deepEqual([backup.available, backup.plan_eligible, backup.source], [false, false, 'policy']);
+    assert.match(backup.error, /plan not eligible \(runtime_failover\.ineligible_profiles: claude-ax-backup\); not probed/);
+    assert.equal(backup.secondary, null, 'the reading from before the lapse does not survive');
+    assert.equal(providerUsageState(payload, 'claude-ax-backup', Date.now(), 180_000).available, false);
+    assert.deepEqual(Object.keys(payload.providers).sort(), ['claude', 'claude-ax-backup', 'claude-ax-third', 'codex'], 'kept, not pruned');
+    // Resubscribed: the next pass probes it with no operator step.
+    fs.writeFileSync(path.join(f.dir, 'instances.json'), inventory([]));
+    const again = await f.run();
+    assert.ok(f.starts['claude-ax-backup']);
+    assert.equal(again.providers['claude-ax-backup'].available, true);
+    assert.equal(again.providers['claude-ax-backup'].plan_eligible, undefined);
+  });
+
   it('starts from an empty document when no file exists yet', async (t) => {
     const fresh = fixture(t);
     await fresh.run();

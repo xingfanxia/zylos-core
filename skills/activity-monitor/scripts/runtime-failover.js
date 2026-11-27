@@ -18,7 +18,7 @@ import {
   scheduleFableProbes,
   writeJsonAtomic as writeGuardJson,
 } from './fable-guard.js';
-import { fableGuardStatePath } from '../../multi-session/runtime-files.js';
+import { fableGuardStatePath, ineligibleProfiles } from '../../multi-session/runtime-files.js';
 
 const ZYLOS_DIR = process.env.ZYLOS_DIR || path.join(os.homedir(), 'zylos');
 const INSTANCES_FILE = path.join(ZYLOS_DIR, 'instances.json');
@@ -234,13 +234,9 @@ function profileList(value) {
   return Array.isArray(value) ? value.filter(id => typeof id === 'string') : [];
 }
 
-// runtime_failover.ineligible_profiles: tiers whose subscription is on a free
-// or canceled plan (the rotation service reads each account's plan). Held like
-// hold_profiles, and an instance already on one leaves it at once instead of
-// waiting for the engine to fail. Removal (resubscription) restores recovery.
-function ineligibleProfiles(policy) {
-  return new Set(profileList(policy.ineligible_profiles));
-}
+// runtime_failover.ineligible_profiles (ineligibleProfiles, runtime-files.js):
+// held like hold_profiles, and an instance already on one leaves it at once
+// instead of waiting for the engine to fail. Removal restores recovery.
 
 function withHeld(blocked, held) {
   return held.size ? { ...blocked, ...Object.fromEntries([...held].map(id => [id, { hold: 'policy' }])) } : blocked;
